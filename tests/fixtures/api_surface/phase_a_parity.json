@@ -1,5 +1,5 @@
 {
-  "schema": "prview.api_delta_phase_a_parity.v3",
+  "schema": "prview.api_delta_phase_a_parity.v4",
   "rows": [
     {
       "corpus_cell": "abi_changed",
@@ -10,7 +10,7 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"before_contract\":\"pub extern \\\"C\\\" fn __prview_name (_ : u32) -> u32 { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"after_contract\":\"pub extern \\\"system\\\" fn __prview_name (_ : u32) -> u32 { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:fd3a395c49197dfc",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_abi_changed",
@@ -94,7 +94,7 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_cfg_guard_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"gated\",\"cfg_region\":[\"feature = \\\"a\\\"\"]},\"before_identity\":{\"crate_name\":\"fixture_cfg_guard_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"gated\",\"cfg_region\":[\"feature = \\\"a\\\"\"]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_cfg_guard_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"gated\",\"cfg_region\":[\"feature = \\\"b\\\"\"]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:52f20313d2752fab",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_cfg_guard_changed",
@@ -280,7 +280,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"GREETING\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"GREETING\",\"cfg_region\":[]},\"before_contract\":\"pub const __prview_name : & str = \\\"hello\\\" ;\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"GREETING\",\"cfg_region\":[]},\"after_contract\":\"pub const __prview_name : & str = \\\"goodbye\\\" ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:be10d87a83c5ec78",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_literal_changed",
@@ -380,7 +380,38 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"b\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"b\",\"cfg_region\":[]},\"after_contract\":\"pub mod __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:667eaa296f0fc8b9",
+          "kind": "removed",
+          "identity": {
+            "crate_name": "fixture_module_scope_changed",
+            "module_path": [],
+            "namespace": "module",
+            "name": "a",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_module_scope_changed",
+              "module_path": [],
+              "namespace": "module",
+              "name": "a",
+              "cfg_region": []
+            },
+            "contract": "pub mod __prview_name ;",
+            "source_path": "src/lib.rs",
+            "evidence": "public module a",
+            "provenance": "git_tree:fixture://module_scope_changed/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "public module a"
+          ]
+        },
+        {
+          "id": "api-delta:94a565bf6d1e0f5d",
           "kind": "added",
           "identity": {
             "crate_name": "fixture_module_scope_changed",
@@ -411,7 +442,7 @@
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"relocated\",\"identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[\"a\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[\"a\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[\"b\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:ff2df220bb35fea0",
           "kind": "relocated",
           "identity": {
             "crate_name": "fixture_module_scope_changed",
@@ -460,37 +491,6 @@
             "pub fn __prview_name () { }",
             "pub fn __prview_name () { }"
           ]
-        },
-        {
-          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"a\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"a\",\"cfg_region\":[]},\"before_contract\":\"pub mod __prview_name ;\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
-          "kind": "removed",
-          "identity": {
-            "crate_name": "fixture_module_scope_changed",
-            "module_path": [],
-            "namespace": "module",
-            "name": "a",
-            "cfg_region": []
-          },
-          "before": {
-            "identity": {
-              "crate_name": "fixture_module_scope_changed",
-              "module_path": [],
-              "namespace": "module",
-              "name": "a",
-              "cfg_region": []
-            },
-            "contract": "pub mod __prview_name ;",
-            "source_path": "src/lib.rs",
-            "evidence": "public module a",
-            "provenance": "git_tree:fixture://module_scope_changed/base",
-            "declared_public": true
-          },
-          "after": null,
-          "analysis_source": "repo_backed_rust_api",
-          "confidence": "confirmed",
-          "evidence": [
-            "public module a"
-          ]
         }
       ],
       "current_legacy_breaking_positive": false,
@@ -529,7 +529,7 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"b\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"b\",\"cfg_region\":[]},\"after_contract\":\"pub mod __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:46263197a8e2fc95",
           "kind": "added",
           "identity": {
             "crate_name": "fixture_module_scope_unseen_opener",
@@ -560,7 +560,7 @@
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"relocated\",\"identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[\"a\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[\"a\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[\"b\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:69baed67c7af7e98",
           "kind": "relocated",
           "identity": {
             "crate_name": "fixture_module_scope_unseen_opener",
@@ -611,7 +611,7 @@
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"a\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"a\",\"cfg_region\":[]},\"before_contract\":\"pub mod __prview_name ;\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:8e0ccb78006bfe34",
           "kind": "removed",
           "identity": {
             "crate_name": "fixture_module_scope_unseen_opener",
@@ -772,7 +772,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_combining_mark_distinct\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"cafè\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_combining_mark_distinct\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"cafè\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:a9aad79f430f8e90",
           "kind": "added",
           "identity": {
             "crate_name": "fixture_combining_mark_distinct",
@@ -803,7 +803,7 @@
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_combining_mark_distinct\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"café\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_combining_mark_distinct\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"café\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:b20147a8c49f17c5",
           "kind": "removed",
           "identity": {
             "crate_name": "fixture_combining_mark_distinct",
@@ -873,7 +873,7 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name (_ : u8 , _ : u8 , _ : u8) { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name (_ : u8 , _ : u16 , _ : u8) { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:2f84679893a629f4",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_long_within_cap_changed",
@@ -955,7 +955,7 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_long_below_32_line_cut\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"TABLE\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_long_below_32_line_cut\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"TABLE\",\"cfg_region\":[]},\"before_contract\":\"pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 250 ,] ;\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_long_below_32_line_cut\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"TABLE\",\"cfg_region\":[]},\"after_contract\":\"pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 251 ,] ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:dc38d1156ed94d3f",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_long_below_32_line_cut",
@@ -1039,7 +1039,7 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"new\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"new\",\"cfg_region\":[]},\"after_contract\":\"pub mod __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:136c500e3b77475c",
           "kind": "added",
           "identity": {
             "crate_name": "fixture_move_relocated",
@@ -1070,7 +1070,38 @@
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"relocated\",\"identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[\"old\"],\"namespace\":\"value\",\"name\":\"moved\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[\"old\"],\"namespace\":\"value\",\"name\":\"moved\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[\"new\"],\"namespace\":\"value\",\"name\":\"moved\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:47c87a8511c25611",
+          "kind": "removed",
+          "identity": {
+            "crate_name": "fixture_move_relocated",
+            "module_path": [],
+            "namespace": "module",
+            "name": "old",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_move_relocated",
+              "module_path": [],
+              "namespace": "module",
+              "name": "old",
+              "cfg_region": []
+            },
+            "contract": "pub mod __prview_name ;",
+            "source_path": "src/lib.rs",
+            "evidence": "public module old",
+            "provenance": "git_tree:fixture://move_relocated/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "public module old"
+          ]
+        },
+        {
+          "id": "api-delta:f3ce09a29a509706",
           "kind": "relocated",
           "identity": {
             "crate_name": "fixture_move_relocated",
@@ -1118,37 +1149,6 @@
           "evidence": [
             "pub fn __prview_name () { }",
             "pub fn __prview_name () { }"
-          ]
-        },
-        {
-          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"old\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[],\"namespace\":\"module\",\"name\":\"old\",\"cfg_region\":[]},\"before_contract\":\"pub mod __prview_name ;\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
-          "kind": "removed",
-          "identity": {
-            "crate_name": "fixture_move_relocated",
-            "module_path": [],
-            "namespace": "module",
-            "name": "old",
-            "cfg_region": []
-          },
-          "before": {
-            "identity": {
-              "crate_name": "fixture_move_relocated",
-              "module_path": [],
-              "namespace": "module",
-              "name": "old",
-              "cfg_region": []
-            },
-            "contract": "pub mod __prview_name ;",
-            "source_path": "src/lib.rs",
-            "evidence": "public module old",
-            "provenance": "git_tree:fixture://move_relocated/base",
-            "declared_public": true
-          },
-          "after": null,
-          "analysis_source": "repo_backed_rust_api",
-          "confidence": "confirmed",
-          "evidence": [
-            "public module old"
           ]
         }
       ],
@@ -1227,7 +1227,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_reexport_removed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"api\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_reexport_removed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"api\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:fa5ec9127d691c1a",
           "kind": "removed",
           "identity": {
             "crate_name": "fixture_reexport_removed",
@@ -1323,7 +1323,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Settings\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Settings\",\"cfg_region\":[]},\"after_contract\":\"pub struct __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:1097e0b8db1a9d9e",
           "kind": "added",
           "identity": {
             "crate_name": "fixture_reexport_changed",
@@ -1354,38 +1354,7 @@
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Settings\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Settings\",\"cfg_region\":[]},\"after_contract\":\"pub struct __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
-          "kind": "added",
-          "identity": {
-            "crate_name": "fixture_reexport_changed",
-            "module_path": [],
-            "namespace": "value",
-            "name": "Settings",
-            "cfg_region": []
-          },
-          "before": null,
-          "after": {
-            "identity": {
-              "crate_name": "fixture_reexport_changed",
-              "module_path": [],
-              "namespace": "value",
-              "name": "Settings",
-              "cfg_region": []
-            },
-            "contract": "pub struct __prview_name ;",
-            "source_path": "src/lib.rs",
-            "evidence": "pub struct __prview_name ;",
-            "provenance": "git_tree:fixture://reexport_changed/head",
-            "declared_public": true
-          },
-          "analysis_source": "repo_backed_rust_api",
-          "confidence": "confirmed",
-          "evidence": [
-            "pub struct __prview_name ;"
-          ]
-        },
-        {
-          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Config\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Config\",\"cfg_region\":[]},\"before_contract\":\"pub struct __prview_name ;\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:3688483a32fb7832",
           "kind": "removed",
           "identity": {
             "crate_name": "fixture_reexport_changed",
@@ -1416,7 +1385,7 @@
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Config\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Config\",\"cfg_region\":[]},\"before_contract\":\"pub struct __prview_name ;\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:3a0d97dab8814e47",
           "kind": "removed",
           "identity": {
             "crate_name": "fixture_reexport_changed",
@@ -1440,6 +1409,37 @@
             "declared_public": true
           },
           "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub struct __prview_name ;"
+          ]
+        },
+        {
+          "id": "api-delta:f0c486845132e978",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture_reexport_changed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "Settings",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture_reexport_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "Settings",
+              "cfg_region": []
+            },
+            "contract": "pub struct __prview_name ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub struct __prview_name ;",
+            "provenance": "git_tree:fixture://reexport_changed/head",
+            "declared_public": true
+          },
           "analysis_source": "repo_backed_rust_api",
           "confidence": "confirmed",
           "evidence": [
@@ -1487,7 +1487,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"visibility_changed\",\"identity\":{\"crate_name\":\"fixture_item_opener_removed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Public\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_item_opener_removed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Public\",\"cfg_region\":[]},\"before_contract\":\"pub struct __prview_name { pub field : u8 }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_item_opener_removed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Public\",\"cfg_region\":[]},\"after_contract\":\"struct __prview_name { pub field : u8 }\",\"after_declared_public\":false,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:fb929a8221b25503",
           "kind": "visibility_changed",
           "identity": {
             "crate_name": "fixture_item_opener_removed",
@@ -1552,7 +1552,7 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_item_body_removed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_item_body_removed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"before_contract\":\"pub field : u8\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:c9d08f759d25ae5f",
           "kind": "removed",
           "identity": {
             "crate_name": "fixture_item_body_removed",
@@ -1629,7 +1629,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_item_body_changed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_item_body_changed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"before_contract\":\"pub field : u8\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_item_body_changed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"after_contract\":\"pub field : u16\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:525b88ccdf8a2858",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_item_body_changed",
@@ -1731,7 +1731,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_backslash_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"VALUE\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_backslash_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"VALUE\",\"cfg_region\":[]},\"before_contract\":\"pub const __prview_name : & str = \\\"left\\\" ;\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_backslash_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"VALUE\",\"cfg_region\":[]},\"after_contract\":\"pub const __prview_name : & str = \\\"right\\\" ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:efc5cd4900e315a4",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_backslash_literal_changed",
@@ -1837,7 +1837,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name (_ : u8) { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name (_ : u16) { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:d179e4e23368af07",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_declaration_pairing_changed",
@@ -1986,7 +1986,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_function_removed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"removed\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_function_removed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"removed\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:5e60deef57ad3f69",
           "kind": "removed",
           "identity": {
             "crate_name": "fixture_function_removed",
@@ -2047,7 +2047,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_function_added\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"added\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_function_added\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"added\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:d594d7af6cbd3c10",
           "kind": "added",
           "identity": {
             "crate_name": "fixture_function_added",
@@ -2109,38 +2109,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"macro\",\"name\":\"Exported\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"macro\",\"name\":\"Exported\",\"cfg_region\":[]},\"after_contract\":\"# [macro_export] macro_rules ! __prview_name { () => { } }\\ndefinition-edition:2015\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
-          "kind": "added",
-          "identity": {
-            "crate_name": "fixture",
-            "module_path": [],
-            "namespace": "macro",
-            "name": "Exported",
-            "cfg_region": []
-          },
-          "before": null,
-          "after": {
-            "identity": {
-              "crate_name": "fixture",
-              "module_path": [],
-              "namespace": "macro",
-              "name": "Exported",
-              "cfg_region": []
-            },
-            "contract": "# [macro_export] macro_rules ! __prview_name { () => { } }\ndefinition-edition:2015",
-            "source_path": "src/lib.rs",
-            "evidence": "# [macro_export] macro_rules ! __prview_name { () => { } }\ndefinition-edition:2015",
-            "provenance": "git_tree:multiplicity_namespace_cfg/target",
-            "declared_public": true
-          },
-          "analysis_source": "repo_backed_rust_api",
-          "confidence": "confirmed",
-          "evidence": [
-            "# [macro_export] macro_rules ! __prview_name { () => { } }\ndefinition-edition:2015"
-          ]
-        },
-        {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Same\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Same\",\"cfg_region\":[]},\"after_contract\":\"pub struct __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:2c07702146d33de2",
           "kind": "added",
           "identity": {
             "crate_name": "fixture",
@@ -2171,14 +2140,16 @@
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Same\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Same\",\"cfg_region\":[]},\"after_contract\":\"pub struct __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:76bcaec4cfb6ed3e",
           "kind": "added",
           "identity": {
             "crate_name": "fixture",
             "module_path": [],
             "namespace": "value",
-            "name": "Same",
-            "cfg_region": []
+            "name": "Variant",
+            "cfg_region": [
+              "windows"
+            ]
           },
           "before": null,
           "after": {
@@ -2186,23 +2157,25 @@
               "crate_name": "fixture",
               "module_path": [],
               "namespace": "value",
-              "name": "Same",
-              "cfg_region": []
+              "name": "Variant",
+              "cfg_region": [
+                "windows"
+              ]
             },
-            "contract": "pub struct __prview_name ;",
+            "contract": "pub fn __prview_name () { }",
             "source_path": "src/lib.rs",
-            "evidence": "pub struct __prview_name ;",
+            "evidence": "pub fn __prview_name () { }",
             "provenance": "git_tree:multiplicity_namespace_cfg/target",
             "declared_public": true
           },
           "analysis_source": "repo_backed_rust_api",
           "confidence": "confirmed",
           "evidence": [
-            "pub struct __prview_name ;"
+            "pub fn __prview_name () { }"
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Variant\",\"cfg_region\":[\"unix\"]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Variant\",\"cfg_region\":[\"unix\"]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:c575df9cc894cf0e",
           "kind": "added",
           "identity": {
             "crate_name": "fixture",
@@ -2237,16 +2210,14 @@
           ]
         },
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Variant\",\"cfg_region\":[\"windows\"]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Variant\",\"cfg_region\":[\"windows\"]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:e12b93c0237fcfa0",
           "kind": "added",
           "identity": {
             "crate_name": "fixture",
             "module_path": [],
             "namespace": "value",
-            "name": "Variant",
-            "cfg_region": [
-              "windows"
-            ]
+            "name": "Same",
+            "cfg_region": []
           },
           "before": null,
           "after": {
@@ -2254,21 +2225,50 @@
               "crate_name": "fixture",
               "module_path": [],
               "namespace": "value",
-              "name": "Variant",
-              "cfg_region": [
-                "windows"
-              ]
+              "name": "Same",
+              "cfg_region": []
             },
-            "contract": "pub fn __prview_name () { }",
+            "contract": "pub struct __prview_name ;",
             "source_path": "src/lib.rs",
-            "evidence": "pub fn __prview_name () { }",
+            "evidence": "pub struct __prview_name ;",
             "provenance": "git_tree:multiplicity_namespace_cfg/target",
             "declared_public": true
           },
           "analysis_source": "repo_backed_rust_api",
           "confidence": "confirmed",
           "evidence": [
-            "pub fn __prview_name () { }"
+            "pub struct __prview_name ;"
+          ]
+        },
+        {
+          "id": "api-delta:f8611bccae49fa4f",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "macro",
+            "name": "Exported",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "macro",
+              "name": "Exported",
+              "cfg_region": []
+            },
+            "contract": "# [macro_export] macro_rules ! __prview_name { () => { } }\ndefinition-edition:2015",
+            "source_path": "src/lib.rs",
+            "evidence": "# [macro_export] macro_rules ! __prview_name { () => { } }\ndefinition-edition:2015",
+            "provenance": "git_tree:multiplicity_namespace_cfg/target",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "# [macro_export] macro_rules ! __prview_name { () => { } }\ndefinition-edition:2015"
           ]
         }
       ]
@@ -2301,7 +2301,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"unknown\",\"name\":\"IncludeMacro\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target snapshot IncludeMacro: include ! (\\\"generated.rs\\\") ;\\ninclude-kind:include\\nincluded-digest:unresolved\",\"unknown_source\":{\"side\":\"target\",\"source_path\":\"src/lib.rs\",\"provenance\":\"git_tree:include_macro_unknown/target\"}}",
+          "id": "api-delta:4b8ee5c1a23f0026",
           "kind": "unknown",
           "identity": {
             "crate_name": "fixture",
@@ -2325,7 +2325,7 @@
           }
         },
         {
-          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target counterpart is unprovable in an unknown snapshot region\",\"unknown_source\":null}",
+          "id": "api-delta:ad9c1aa19f68e325",
           "kind": "unknown",
           "identity": {
             "crate_name": "fixture",
@@ -2352,9 +2352,15 @@
           "analysis_source": "repo_backed_rust_api",
           "confidence": "unknown",
           "evidence": [
-            "target counterpart is unprovable in an unknown snapshot region"
+            "target counterpart is unprovable in an unknown snapshot region",
+            "blocking target region: IncludeMacro in fixture crate"
           ],
-          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region"
+          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region",
+          "unknown_source": {
+            "side": "target",
+            "source_path": "src/lib.rs",
+            "provenance": "git_tree:include_macro_unknown/target"
+          }
         }
       ]
     },
@@ -2392,7 +2398,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"unknown\",\"name\":\"GlobReexport\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target snapshot GlobReexport: donor\",\"unknown_source\":{\"side\":\"target\",\"source_path\":\"src/lib.rs\",\"provenance\":\"git_tree:glob_reexport_unknown/target\"}}",
+          "id": "api-delta:00da5ba154fafd6f",
           "kind": "unknown",
           "identity": {
             "crate_name": "fixture",
@@ -2416,7 +2422,7 @@
           }
         },
         {
-          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target counterpart is unprovable in an unknown snapshot region\",\"unknown_source\":null}",
+          "id": "api-delta:15cc4c25807c9ed9",
           "kind": "unknown",
           "identity": {
             "crate_name": "fixture",
@@ -2443,9 +2449,15 @@
           "analysis_source": "repo_backed_rust_api",
           "confidence": "unknown",
           "evidence": [
-            "target counterpart is unprovable in an unknown snapshot region"
+            "target counterpart is unprovable in an unknown snapshot region",
+            "blocking target region: GlobReexport in fixture crate"
           ],
-          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region"
+          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region",
+          "unknown_source": {
+            "side": "target",
+            "source_path": "src/lib.rs",
+            "provenance": "git_tree:glob_reexport_unknown/target"
+          }
         }
       ]
     },
@@ -2483,63 +2495,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"crate\",\"name\":\"fixture\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"crate\",\"name\":\"fixture\",\"cfg_region\":[]},\"before_contract\":\"library proc_macro=false; crate_types=[\\\"lib\\\"]\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target counterpart is unprovable in an unknown snapshot region\",\"unknown_source\":null}",
-          "kind": "unknown",
-          "identity": {
-            "crate_name": "fixture",
-            "module_path": [],
-            "namespace": "crate",
-            "name": "fixture",
-            "cfg_region": []
-          },
-          "before": {
-            "identity": {
-              "crate_name": "fixture",
-              "module_path": [],
-              "namespace": "crate",
-              "name": "fixture",
-              "cfg_region": []
-            },
-            "contract": "library proc_macro=false; crate_types=[\"lib\"]",
-            "source_path": "Cargo.toml",
-            "evidence": "library crate fixture from Cargo.toml; root=src/lib.rs",
-            "provenance": "git_tree:source_parse_unknown/base",
-            "declared_public": true
-          },
-          "after": null,
-          "analysis_source": "repo_backed_rust_api",
-          "confidence": "unknown",
-          "evidence": [
-            "target counterpart is unprovable in an unknown snapshot region"
-          ],
-          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region"
-        },
-        {
-          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"unknown\",\"name\":\"SourceParse\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target snapshot SourceParse: cannot parse string into token stream\",\"unknown_source\":{\"side\":\"target\",\"source_path\":\"src/lib.rs\",\"provenance\":\"git_tree:source_parse_unknown/target\"}}",
-          "kind": "unknown",
-          "identity": {
-            "crate_name": "fixture",
-            "module_path": [],
-            "namespace": "unknown",
-            "name": "SourceParse",
-            "cfg_region": []
-          },
-          "before": null,
-          "after": null,
-          "analysis_source": "repo_backed_rust_api",
-          "confidence": "unknown",
-          "evidence": [
-            "cannot parse string into token stream"
-          ],
-          "unknown_reason": "target snapshot SourceParse: cannot parse string into token stream",
-          "unknown_source": {
-            "side": "target",
-            "source_path": "src/lib.rs",
-            "provenance": "git_tree:source_parse_unknown/target"
-          }
-        },
-        {
-          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target counterpart is unprovable in an unknown snapshot region\",\"unknown_source\":null}",
+          "id": "api-delta:932b76d0b71e838e",
           "kind": "unknown",
           "identity": {
             "crate_name": "fixture",
@@ -2566,9 +2522,77 @@
           "analysis_source": "repo_backed_rust_api",
           "confidence": "unknown",
           "evidence": [
-            "target counterpart is unprovable in an unknown snapshot region"
+            "target counterpart is unprovable in an unknown snapshot region",
+            "blocking target region: SourceParse in fixture crate"
           ],
-          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region"
+          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region",
+          "unknown_source": {
+            "side": "target",
+            "source_path": "src/lib.rs",
+            "provenance": "git_tree:source_parse_unknown/target"
+          }
+        },
+        {
+          "id": "api-delta:adf0f52888841a95",
+          "kind": "unknown",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "unknown",
+            "name": "SourceParse",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "unknown",
+          "evidence": [
+            "cannot parse string into token stream"
+          ],
+          "unknown_reason": "target snapshot SourceParse: cannot parse string into token stream",
+          "unknown_source": {
+            "side": "target",
+            "source_path": "src/lib.rs",
+            "provenance": "git_tree:source_parse_unknown/target"
+          }
+        },
+        {
+          "id": "api-delta:c69950fa3e9ffd5f",
+          "kind": "unknown",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "crate",
+            "name": "fixture",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "crate",
+              "name": "fixture",
+              "cfg_region": []
+            },
+            "contract": "library proc_macro=false; crate_types=[\"lib\"]",
+            "source_path": "Cargo.toml",
+            "evidence": "library crate fixture from Cargo.toml; root=src/lib.rs",
+            "provenance": "git_tree:source_parse_unknown/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "unknown",
+          "evidence": [
+            "target counterpart is unprovable in an unknown snapshot region",
+            "blocking target region: SourceParse in fixture crate"
+          ],
+          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region",
+          "unknown_source": {
+            "side": "target",
+            "source_path": "src/lib.rs",
+            "provenance": "git_tree:source_parse_unknown/target"
+          }
         }
       ]
     },

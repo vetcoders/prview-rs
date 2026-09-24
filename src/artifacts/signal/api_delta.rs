@@ -263,12 +263,16 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         if base_used[index] {
             continue;
         }
-        if region_is_unknown(&target.unknowns, &before.identity) {
-            delta.unknown.push(pairing_unknown(
+        if let Some(unknown) = blocking_region(&target.unknowns, &before.identity) {
+            delta.unknown.push(region_pairing_unknown(
                 before.identity.clone(),
                 Some(before.clone()),
                 None,
                 "target counterpart is unprovable in an unknown snapshot region",
+                BlockingRegion {
+                    side: ApiSnapshotSide::Target,
+                    unknown,
+                },
             ));
         } else {
             delta.removed.push(known_finding(
@@ -283,12 +287,16 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         if target_used[index] {
             continue;
         }
-        if region_is_unknown(&base.unknowns, &after.identity) {
-            delta.unknown.push(pairing_unknown(
+        if let Some(unknown) = blocking_region(&base.unknowns, &after.identity) {
+            delta.unknown.push(region_pairing_unknown(
                 after.identity.clone(),
                 None,
                 Some(after.clone()),
                 "base counterpart is unprovable in an unknown snapshot region",
+                BlockingRegion {
+                    side: ApiSnapshotSide::Base,
+                    unknown,
+                },
             ));
         } else {
             delta.added.push(known_finding(
@@ -641,7 +649,7 @@ fn merge_comparisons(mut comparisons: Vec<ApiDelta>) -> ApiDelta {
                 finding
                     .evidence
                     .push(format!("revision comparison: {comparison}"));
-                finding.id = format!("{}|comparison:{comparison}", finding.id);
+                finding.id = comparison_finding_id(&finding.id, &comparison);
             }
         }
         merged.added.extend(delta.added);
@@ -1203,17 +1211,30 @@ fn relocation_key(side: &ApiFactSide) -> (String, String, String, String, Vec<St
     )
 }
 
-fn pair_is_certain(
+/// An unknown snapshot region that leaves a pairing unprovable, with the
+/// revision that declared it.
+#[derive(Clone, Copy)]
+struct BlockingRegion<'a> {
+    side: ApiSnapshotSide,
+    unknown: &'a RustApiUnknown,
+}
+
+/// The first unknown region, from either revision, that may hide a
+/// counterpart of either side of a pair; `None` when the pair is certain.
+fn pair_blocking_region<'a>(
     before: &ApiFactSide,
     after: &ApiFactSide,
-    base_unknowns: &[RustApiUnknown],
-    target_unknowns: &[RustApiUnknown],
-) -> bool {
-    ![&before.identity, &after.identity]
+    base_unknowns: &'a [RustApiUnknown],
+    target_unknowns: &'a [RustApiUnknown],
+) -> Option<BlockingRegion<'a>> {
+    [&before.identity, &after.identity]
         .into_iter()
-        .any(|identity| {
-            region_is_unknown(base_unknowns, identity)
-                || region_is_unknown(target_unknowns, identity)
+        .find_map(|identity| {
+            let region = |side, unknowns| {
+                blocking_region(unknowns, identity).map(|unknown| BlockingRegion { side, unknown })
+            };
+            region(ApiSnapshotSide::Base, base_unknowns)
+                .or_else(|| region(ApiSnapshotSide::Target, target_unknowns))
         })
 }
 
@@ -1253,12 +1274,15 @@ fn pair_exact_identities(
             if before.contract == after.contract {
                 continue;
             }
-            if !pair_is_certain(before, after, base_unknowns, target_unknowns) {
-                delta.unknown.push(pairing_unknown(
+            if let Some(region) =
+                pair_blocking_region(before, after, base_unknowns, target_unknowns)
+            {
+                delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
                     Some(before.clone()),
                     Some(after.clone()),
                     "changed contract intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 push_contract_changes(delta, before, after);
@@ -1336,12 +1360,15 @@ fn pair_cfg_changes(
             }
             base_used[base_index] = true;
             target_used[target_index] = true;
-            if !pair_is_certain(before, after, base_unknowns, target_unknowns) {
-                delta.unknown.push(pairing_unknown(
+            if let Some(region) =
+                pair_blocking_region(before, after, base_unknowns, target_unknowns)
+            {
+                delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
                     Some(before.clone()),
                     Some(after.clone()),
                     "cfg-region pairing intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 delta.changed.push(known_finding(
@@ -1408,17 +1435,18 @@ fn pair_visibility_changes(
         if matches.len() == 1 {
             base_used[index] = true;
             let after = declaration_side(matches[0]);
-            if !pair_is_certain(
+            if let Some(region) = pair_blocking_region(
                 before,
                 &after,
                 evidence.base_unknowns,
                 evidence.target_unknowns,
             ) {
-                delta.unknown.push(pairing_unknown(
+                delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
                     Some(before.clone()),
                     Some(after),
                     "visibility transition intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 delta.visibility_changed.push(known_finding(
@@ -1457,17 +1485,18 @@ fn pair_visibility_changes(
         if matches.len() == 1 {
             target_used[index] = true;
             let before = declaration_side(matches[0]);
-            if !pair_is_certain(
+            if let Some(region) = pair_blocking_region(
                 &before,
                 after,
                 evidence.base_unknowns,
                 evidence.target_unknowns,
             ) {
-                delta.unknown.push(pairing_unknown(
+                delta.unknown.push(region_pairing_unknown(
                     after.identity.clone(),
                     Some(before),
                     Some(after.clone()),
                     "visibility transition intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 delta.visibility_changed.push(known_finding(
@@ -1530,12 +1559,15 @@ fn pair_relocations(
             target_used[target_index] = true;
             let before = &base[base_index];
             let after = &target[target_index];
-            if !pair_is_certain(before, after, base_unknowns, target_unknowns) {
-                delta.unknown.push(pairing_unknown(
+            if let Some(region) =
+                pair_blocking_region(before, after, base_unknowns, target_unknowns)
+            {
+                delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
                     Some(before.clone()),
                     Some(after.clone()),
                     "relocation intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 delta.relocated.push(known_finding(
@@ -1623,8 +1655,12 @@ fn consume_one_sided_ambiguities(
     }
 }
 
-fn region_is_unknown(unknowns: &[RustApiUnknown], identity: &ApiIdentity) -> bool {
-    unknowns.iter().any(|unknown| {
+/// The first unknown region of one snapshot that may hide `identity`.
+fn blocking_region<'a>(
+    unknowns: &'a [RustApiUnknown],
+    identity: &ApiIdentity,
+) -> Option<&'a RustApiUnknown> {
+    unknowns.iter().find(|unknown| {
         !(matches!(
             unknown.kind,
             RustApiUnknownKind::PathNonUtf8
@@ -1935,13 +1971,11 @@ fn snapshot_unknown_finding(unknown: &RustApiUnknown, side: ApiSnapshotSide) -> 
         name: format!("{:?}", unknown.kind),
         cfg_region: unknown.cfg_guard.clone(),
     };
-    let side_name = match side {
-        ApiSnapshotSide::Base => "base",
-        ApiSnapshotSide::Target => "target",
-    };
     let reason = format!(
-        "{side_name} snapshot {:?}: {}",
-        unknown.kind, unknown.evidence
+        "{} snapshot {:?}: {}",
+        snapshot_side_name(side),
+        unknown.kind,
+        unknown.evidence
     );
     let mut finding = ApiDeltaFinding {
         id: String::new(),
@@ -1953,14 +1987,25 @@ fn snapshot_unknown_finding(unknown: &RustApiUnknown, side: ApiSnapshotSide) -> 
         confidence: ApiDeltaConfidence::Unknown,
         evidence: vec![unknown.evidence.clone()],
         unknown_reason: Some(reason),
-        unknown_source: Some(ApiUnknownSource {
-            side,
-            source_path: unknown.source_path.clone(),
-            provenance: provenance_id(&unknown.provenance),
-        }),
+        unknown_source: Some(unknown_region_source(unknown, side)),
     };
     finding.id = stable_finding_id(&finding);
     finding
+}
+
+fn snapshot_side_name(side: ApiSnapshotSide) -> &'static str {
+    match side {
+        ApiSnapshotSide::Base => "base",
+        ApiSnapshotSide::Target => "target",
+    }
+}
+
+fn unknown_region_source(unknown: &RustApiUnknown, side: ApiSnapshotSide) -> ApiUnknownSource {
+    ApiUnknownSource {
+        side,
+        source_path: unknown.source_path.clone(),
+        provenance: provenance_id(&unknown.provenance),
+    }
 }
 
 fn known_finding(
@@ -2013,6 +2058,35 @@ fn pairing_unknown(
     finding
 }
 
+/// A pairing unknown that names the region blocking it: `unknown_source`
+/// points at the declaring source and revision, and one evidence line names
+/// the region's kind and module, even when the region's own declaration was
+/// neutralized out of the lossless unknown list.
+fn region_pairing_unknown(
+    identity: ApiIdentity,
+    before: Option<ApiFactSide>,
+    after: Option<ApiFactSide>,
+    reason: &str,
+    region: BlockingRegion<'_>,
+) -> ApiDeltaFinding {
+    let unknown = region.unknown;
+    let module = if unknown.module_path.is_empty() {
+        "crate".to_owned()
+    } else {
+        format!("crate::{}", unknown.module_path.join("::"))
+    };
+    let mut finding = pairing_unknown(identity, before, after, reason);
+    finding.evidence.push(format!(
+        "blocking {} region: {:?} in {} {module}",
+        snapshot_side_name(region.side),
+        unknown.kind,
+        unknown.crate_name.as_deref().unwrap_or("<unknown-crate>"),
+    ));
+    finding.unknown_source = Some(unknown_region_source(unknown, region.side));
+    finding.id = stable_finding_id(&finding);
+    finding
+}
+
 #[derive(serde::Serialize)]
 struct FindingIdMaterial<'a> {
     kind: ApiDeltaKind,
@@ -2027,6 +2101,14 @@ struct FindingIdMaterial<'a> {
     unknown_source: Option<&'a ApiUnknownSource>,
 }
 
+/// Hex digits of the SHA-256 over the serialized identity material that make
+/// up a finding ID. 64 bits keep IDs short enough to list in caveats while
+/// collisions stay negligible at any realistic finding count.
+const FINDING_ID_HEX_DIGITS: usize = 16;
+
+/// A deterministic, fixed-length ID over the complete semantic identity:
+/// both sides' identities, contracts and visibility, the unknown reason and
+/// the typed unknown source.
 fn stable_finding_id(finding: &ApiDeltaFinding) -> String {
     let material = FindingIdMaterial {
         kind: finding.kind,
@@ -2040,10 +2122,23 @@ fn stable_finding_id(finding: &ApiDeltaFinding) -> String {
         unknown_reason: finding.unknown_reason.as_deref(),
         unknown_source: finding.unknown_source.as_ref(),
     };
-    format!(
-        "api-delta:{}",
-        serde_json::to_string(&material).expect("finding ID material is serializable")
+    hashed_finding_id(
+        &serde_json::to_string(&material).expect("finding ID material is serializable"),
     )
+}
+
+/// The ID of a finding from one of several base/target comparisons folded
+/// into one delta: the same finding from different comparisons stays
+/// distinct.
+fn comparison_finding_id(id: &str, comparison: &str) -> String {
+    hashed_finding_id(&format!("{id}|comparison:{comparison}"))
+}
+
+fn hashed_finding_id(material: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = hex::encode(Sha256::digest(material));
+    format!("api-delta:{}", &digest[..FINDING_ID_HEX_DIGITS])
 }
 
 fn push_finding(delta: &mut ApiDelta, bucket: ApiDeltaKind, finding: ApiDeltaFinding) {
@@ -8998,8 +9093,59 @@ mod tests {
             .find(|finding| finding.identity.name == "foo")
             .unwrap();
         assert_ne!(upper.id, lower.id);
-        assert!(upper.id.contains("Foo"));
-        assert!(lower.id.contains("foo"));
+        assert_finding_id_shape(&upper.id);
+        assert_finding_id_shape(&lower.id);
+    }
+
+    #[test]
+    fn pairing_unknowns_name_the_region_that_blocks_them() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let delta = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "include!(\"extra.rs\");\n",
+                "include!(\"extra.rs\");\npub fn added() {}\n",
+            ),
+            ("src/extra.rs", "fn hidden() {}\n", "fn hidden() {}\n"),
+        ]);
+        let finding = delta
+            .unknown
+            .iter()
+            .find(|finding| finding.identity.name == "added")
+            .expect("a root include! can hide the base counterpart");
+        assert_eq!(
+            finding.unknown_reason.as_deref(),
+            Some("base counterpart is unprovable in an unknown snapshot region")
+        );
+        let source = finding
+            .unknown_source
+            .as_ref()
+            .expect("a pairing unknown names its blocking region");
+        assert_eq!(source.side, ApiSnapshotSide::Base);
+        assert_eq!(source.source_path, "src/lib.rs");
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|line| line == "blocking base region: IncludeMacro in fixture crate"),
+            "{:?}",
+            finding.evidence
+        );
+        assert_finding_id_shape(&finding.id);
+    }
+
+    fn assert_finding_id_shape(id: &str) {
+        let digest = id
+            .strip_prefix("api-delta:")
+            .unwrap_or_else(|| panic!("{id} has no api-delta prefix"));
+        assert_eq!(digest.len(), FINDING_ID_HEX_DIGITS, "{id}");
+        assert!(
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "{id}"
+        );
     }
 
     #[test]
@@ -9523,7 +9669,7 @@ mod tests {
             .unwrap();
         assert_eq!(delta.added.len(), 1);
         assert!(!delta.base_revision.starts_with("multiple:"));
-        assert!(!delta.added[0].id.contains("|comparison:"));
+        assert_eq!(delta.added[0].id, stable_finding_id(&delta.added[0]));
     }
 
     #[test]
@@ -9595,12 +9741,14 @@ mod tests {
         let delta = compare_rust_api_revisions(&repo, &diffs).unwrap().unwrap();
         assert_eq!(delta.added.len(), 2);
         assert_ne!(delta.added[0].id, delta.added[1].id);
-        assert!(
-            delta
-                .added
-                .iter()
-                .all(|finding| finding.id.contains("|comparison:"))
-        );
+        assert!(delta.added.iter().all(|finding| {
+            assert_finding_id_shape(&finding.id);
+            finding.id != stable_finding_id(finding)
+                && finding
+                    .evidence
+                    .iter()
+                    .any(|line| line.starts_with("revision comparison: "))
+        }));
     }
 
     fn fixture_patch(cell: &str) -> String {
@@ -10059,7 +10207,7 @@ mod tests {
             23
         );
         let ledger = ParityLedger {
-            schema: "prview.api_delta_phase_a_parity.v3",
+            schema: "prview.api_delta_phase_a_parity.v4",
             rows,
             controlled_cases: controlled_parity_cases(),
         };
