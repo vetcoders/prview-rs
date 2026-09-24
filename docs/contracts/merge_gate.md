@@ -340,9 +340,16 @@ review therefore withholds the proof when any of these holds:
   catches an ignored configuration, which no status read lists.
 
 A snapshot run audits a tree materialised from the target, so there only a
-check boundary that saw the file rewritten withholds the proof. The path is
-matched as Git stores it, so on a case-insensitive filesystem a committed
-`.cargo/Audit.toml`, which `cargo audit` would read, is not compared.
+check boundary that saw the file rewritten withholds the proof.
+
+A case-insensitive filesystem reads `.cargo/audit.toml` under any spelling, so
+a committed `.cargo/Audit.toml` or `.CARGO/audit.toml` is a configuration the
+audit may apply that a comparison by exact path never sees; with two spellings
+committed, which one the checkout leaves on disk is its own choice. A path that
+matches `.cargo/audit.toml` only when case is ignored, in the target or on
+either side of any diff, therefore withholds the proof on its own, and the
+dirty paths above are matched ignoring case as well.
+
 `$CARGO_HOME/audit.toml` lies outside the reviewed tree: it is the
 environment's policy, applied alike to the audit and its baseline, and no
 commit speaks for it.
@@ -410,8 +417,9 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
   proof was withheld — `<gap>` being `no Cargo.lock in the target tree`,
   `Cargo.lock dirty or rewritten in the scanned tree`, `the reviewed commit moved the cargo
   root away from the configured one`, `the cargo-audit configuration
-  (.cargo/audit.toml) changed or is dirty in the scanned tree`, or `the
-  scanned tree could not be tied to the target commit`. When `M` is zero the
+  (.cargo/audit.toml) changed or is dirty in the scanned tree`, `.cargo/audit.toml
+  is committed under another case, which a case-insensitive checkout reads`, or
+  `the scanned tree could not be tied to the target commit`. When `M` is zero the
   parenthetical is omitted and the gap
   stands alone: no line asserts a count it does not have.
 

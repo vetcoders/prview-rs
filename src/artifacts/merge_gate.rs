@@ -2147,6 +2147,12 @@ mod tests {
                  tree (2 advisories not shown to predate this change)",
             ),
             (
+                LockProofGap::AuditConfigCaseVariant,
+                "Cargo audit (Failed): provenance proof unavailable: .cargo/audit.toml \
+                 is committed under another case, which a case-insensitive checkout \
+                 reads (2 advisories not shown to predate this change)",
+            ),
+            (
                 LockProofGap::UnknownProvenance,
                 "Cargo audit (Failed): provenance proof unavailable: the scanned tree \
                  could not be tied to the target commit (2 advisories not shown to \
@@ -2230,6 +2236,7 @@ mod tests {
             LockProofGap::DirtyLock,
             LockProofGap::RelocatedCargoRoot,
             LockProofGap::AuditConfigChanged,
+            LockProofGap::AuditConfigCaseVariant,
             LockProofGap::UnknownProvenance,
         ] {
             let outcome = compute_effective_policy_outcome(

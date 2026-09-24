@@ -1144,6 +1144,63 @@ impl Repository {
         Ok(on_disk.deltas().next().is_some())
     }
 
+    /// Whether an exact commit holds an entry that names `file_path` only
+    /// under ASCII case folding: the path, or the path through a parent,
+    /// spelled in another case, such as `.cargo/Audit.toml` or
+    /// `.Cargo/audit.toml`.
+    ///
+    /// A checkout on a case-insensitive filesystem, the default on macOS and
+    /// Windows, resolves such an entry where a tool asks for `file_path`. An
+    /// exact tree lookup that finds nothing there therefore does not show the
+    /// tool read nothing. A symlink or submodule spelled in another case on
+    /// the way counts too, since it resolves to content the tree does not
+    /// describe.
+    pub(crate) fn case_variant_at_commit(&self, commit_oid: &str, file_path: &str) -> Result<bool> {
+        let safe_path = crate::paths::validate_repo_relative_str(file_path)?;
+        let components = safe_path
+            .components()
+            .map(|component| component.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>()
+            .with_context(|| format!("Path is not UTF-8: {file_path}"))?;
+        let tree = self.exact_commit_tree(commit_oid)?;
+        self.case_variant_below(&tree, &components, false)
+    }
+
+    fn case_variant_below(
+        &self,
+        tree: &git2::Tree<'_>,
+        components: &[&str],
+        varied: bool,
+    ) -> Result<bool> {
+        let Some((first, rest)) = components.split_first() else {
+            return Ok(false);
+        };
+        for entry in tree.iter() {
+            let Some(name) = entry.name() else {
+                continue;
+            };
+            if !name.eq_ignore_ascii_case(first) {
+                continue;
+            }
+            let varied = varied || name != *first;
+            if rest.is_empty() {
+                if varied {
+                    return Ok(true);
+                }
+                continue;
+            }
+            if entry.kind() == Some(git2::ObjectType::Tree) {
+                let subtree = self.inner.find_tree(entry.id())?;
+                if self.case_variant_below(&subtree, rest, varied)? {
+                    return Ok(true);
+                }
+            } else if varied {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn exact_commit_tree(&self, commit_oid: &str) -> Result<git2::Tree<'_>> {
         if commit_oid.len() != 40 {
             anyhow::bail!("Expected a full 40-character commit OID: {commit_oid}");
@@ -1850,6 +1907,78 @@ mod tests {
                 "{flag}: restoring the target's bytes clears it"
             );
         }
+    }
+
+    /// Commit a tree built in the object database, with each file's path as
+    /// its content. Entries that a case-insensitive filesystem would merge
+    /// stay apart here.
+    fn object_commit(repo: &git2::Repository, entries: &[(&str, git2::FileMode)]) -> String {
+        let empty = repo
+            .find_tree(
+                repo.treebuilder(None)
+                    .expect("builder")
+                    .write()
+                    .expect("empty tree"),
+            )
+            .expect("find empty tree");
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        for (path, mode) in entries {
+            let blob = repo.blob(path.as_bytes()).expect("blob");
+            update.upsert(*path, blob, *mode);
+        }
+        let tree = repo
+            .find_tree(update.create_updated(repo, &empty).expect("tree"))
+            .expect("find tree");
+        let signature = git2::Signature::now("Test", "test@example.com").expect("signature");
+        repo.commit(None, &signature, &signature, "tree", &tree, &[])
+            .expect("commit")
+            .to_string()
+    }
+
+    /// On a case-insensitive filesystem, `.cargo/Audit.toml` or
+    /// `.Cargo/audit.toml` is the file a tool asking for `.cargo/audit.toml`
+    /// reads. Every component is folded. A differently cased parent that does
+    /// not lead to the file, and neighbours that only share a prefix, are not
+    /// variants.
+    #[test]
+    fn case_variant_at_commit_folds_every_component() {
+        use git2::FileMode::{Blob, Link};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let raw = git2::Repository::init(tmp.path()).expect("init");
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let variant = |entries: &[(&str, git2::FileMode)]| {
+            repo.case_variant_at_commit(&object_commit(&raw, entries), ".cargo/audit.toml")
+                .expect("tree")
+        };
+
+        assert!(!variant(&[]), "an empty tree has no variant");
+        assert!(
+            !variant(&[(".cargo/audit.toml", Blob)]),
+            "the exact spelling is not a variant"
+        );
+        assert!(
+            !variant(&[
+                (".cargo/audit.toml.off", Blob),
+                (".cargo/config.toml", Blob),
+                ("audit.toml", Blob),
+            ]),
+            "neighbours are not variants"
+        );
+        assert!(
+            !variant(&[(".Cargo/config.toml", Blob)]),
+            "a differently cased parent without the file is not one"
+        );
+        assert!(variant(&[(".cargo/Audit.toml", Blob)]));
+        assert!(variant(&[(".CARGO/audit.toml", Blob)]));
+        assert!(
+            variant(&[(".cargo/audit.toml", Blob), (".Cargo/AUDIT.TOML", Blob)]),
+            "a variant beside the exact file still counts"
+        );
+        assert!(
+            variant(&[(".Cargo", Link)]),
+            "a differently cased symlink on the way counts"
+        );
+        assert!(variant(&[(".cargo/AUDIT.toml", Link)]));
     }
 
     fn init_repo_with_advanced_base() -> (tempfile::TempDir, String, String, String) {

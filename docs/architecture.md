@@ -365,7 +365,14 @@ index and working-tree axes, and where the target has no configuration, any
 file at the path counts. That last test catches an ignored configuration,
 which no status read lists. A snapshot run audits a tree materialised from the
 target, so only a check boundary that saw the file rewritten withholds the
-proof there.
+proof there. A case-insensitive filesystem also reads `.cargo/Audit.toml` or
+`.CARGO/audit.toml` as the configuration, which a comparison by exact path never
+sees, and with two spellings committed the checkout picks which one is on disk.
+`cargo_audit_config_gap` therefore withholds the proof as
+`AuditConfigCaseVariant` when the target, or either side of any diff, commits a
+path that matches `.cargo/audit.toml` only when case is ignored
+(`Repository::case_variant_at_commit`), and the dirty-set match
+(`path_or_parent_is`) ignores case too.
 
 One proof covers every branch of the comparison, because `in_diff` already
 carries the rest: an untouched lock makes every advisory `in_diff = false`; a

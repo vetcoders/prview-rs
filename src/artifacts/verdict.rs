@@ -806,12 +806,18 @@ pub(crate) enum LockProofGap {
     /// asked about.
     RelocatedCargoRoot,
     /// The configuration `cargo audit` read, `.cargo/audit.toml` in the cargo
-    /// root, is not one both sides share ([`cargo_audit_config_changed`]): the
+    /// root, is not one both sides share ([`cargo_audit_config_gap`]): the
     /// change edits it, or the scanned tree's copy differs from the target's.
     /// The lockfile may be the target's, but that file decides which advisories
     /// fail, and no audit reads the base's copy of it, so no lockfile
     /// comparison can show a failure predates the change.
     AuditConfigChanged,
+    /// A compared commit holds `.cargo/audit.toml` only under another case,
+    /// such as `.cargo/Audit.toml`. A checkout on a case-insensitive
+    /// filesystem (the default on macOS and Windows) reads that entry, and the
+    /// exact-path comparison cannot see it, so nothing shows the configuration
+    /// is the one both sides share.
+    AuditConfigCaseVariant,
     /// The worktree status or the checkout's identity could not be read, so
     /// nothing about the scanned lockfile was established either way.
     UnknownProvenance,
@@ -836,6 +842,10 @@ impl LockProofGap {
                 "provenance proof unavailable: the cargo-audit configuration \
                  (.cargo/audit.toml) changed or is dirty in the scanned tree"
             }
+            LockProofGap::AuditConfigCaseVariant => {
+                "provenance proof unavailable: .cargo/audit.toml is committed under \
+                 another case, which a case-insensitive checkout reads"
+            }
             LockProofGap::UnknownProvenance => {
                 "provenance proof unavailable: the scanned tree could not be tied \
                  to the target commit"
@@ -849,7 +859,7 @@ impl LockProofGap {
 /// The lockfile half of the proof has TWO premises, and both branches of the
 /// checkout shape share the first one. The third premise, the audit
 /// configuration, needs the diffs and is applied by [`CleanComparison::resolve`]
-/// ([`cargo_audit_config_changed`]) on the same evidence.
+/// ([`cargo_audit_config_gap`]) on the same evidence.
 ///
 /// **Premise 1 — the target tree has a lockfile at all.** `cargo audit` does
 /// not refuse a crate without `Cargo.lock`; it resolves one from the registry,
@@ -1073,18 +1083,18 @@ impl CleanComparison {
                 target_is_checkout,
                 lock_evidence,
             ) {
-                CargoAuditLockProof::TargetLock
-                    if cargo_audit_config_changed(
-                        config,
-                        repo.as_ref(),
-                        resolved_target,
-                        target_is_checkout,
-                        lock_evidence,
-                        diffs,
-                    ) =>
-                {
-                    CargoAuditLockProof::Unproven(LockProofGap::AuditConfigChanged)
-                }
+                CargoAuditLockProof::TargetLock => cargo_audit_config_gap(
+                    config,
+                    repo.as_ref(),
+                    resolved_target,
+                    target_is_checkout,
+                    lock_evidence,
+                    diffs,
+                )
+                .map_or(
+                    CargoAuditLockProof::TargetLock,
+                    CargoAuditLockProof::Unproven,
+                ),
                 proof => proof,
             },
         }
@@ -1254,9 +1264,10 @@ fn config_file_owner(basename: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether the configuration `cargo audit` reads in the audited Cargo root
-/// differs between the base and the target of any diff, or the scanned tree's
-/// copy of it is not the target's.
+/// The gap, if any, in the premise that the configuration `cargo audit` reads
+/// in the audited Cargo root is one the base and the target share: it differs
+/// between the base and the target of a diff, or the scanned tree's copy of it
+/// is not the target's.
 ///
 /// That file is part of the substrate the audit verdict is computed on, like
 /// the lockfile. Its `ignore` list, `informational_warnings` and
@@ -1279,25 +1290,45 @@ fn config_file_owner(basename: &str) -> Option<&'static str> {
 /// file the audit actually read must also be the target's
 /// ([`scanned_audit_config_is_target`]).
 ///
+/// An exact-path comparison is blind to an entry spelled in another case,
+/// such as `.cargo/Audit.toml`, which a checkout on a case-insensitive
+/// filesystem reads in place of the path. When the target or either side of a
+/// diff holds one ([`crate::git::Repository::case_variant_at_commit`]), the
+/// proof is withheld as [`LockProofGap::AuditConfigCaseVariant`]. This is
+/// checked first, because it makes every exact-path answer moot. A tree that
+/// cannot be searched for one names no case, so it counts as a change like
+/// any other unreadable answer.
+///
 /// With a Cargo root outside the repository there is no in-tree file, and no
 /// lock proof either.
-fn cargo_audit_config_changed(
+fn cargo_audit_config_gap(
     config: &Config,
     repo: Option<&crate::git::Repository>,
     resolved_target: &crate::git::ResolvedRef,
     target_is_checkout: Option<bool>,
     evidence: LockEvidence<'_>,
     diffs: &[crate::git::Diff],
-) -> bool {
-    let Some(path) = crate::artifacts::audit::cargo_audit_config_path(
+) -> Option<LockProofGap> {
+    let path = crate::artifacts::audit::cargo_audit_config_path(
         &config.repo_root,
         config.profile.cargo_root.as_deref(),
-    ) else {
-        return false;
-    };
+    )?;
     let Some(repo) = repo else {
-        return true;
+        return Some(LockProofGap::AuditConfigChanged);
     };
+    let commits = std::iter::once(resolved_target.commit_id.as_str()).chain(
+        diffs
+            .iter()
+            .flat_map(|diff| [diff.base_commit_id.as_str(), diff.target_commit_id.as_str()]),
+    );
+    let mut unreadable = false;
+    for commit in commits {
+        match repo.case_variant_at_commit(commit, &path) {
+            Ok(true) => return Some(LockProofGap::AuditConfigCaseVariant),
+            Ok(false) => {}
+            Err(_) => unreadable = true,
+        }
+    }
     let committed_change = diffs.iter().any(|diff| {
         match (
             repo.regular_blob_at_commit(&diff.base_commit_id, &path),
@@ -1307,14 +1338,10 @@ fn cargo_audit_config_changed(
             _ => true,
         }
     });
-    committed_change
-        || !scanned_audit_config_is_target(
-            repo,
-            &path,
-            resolved_target,
-            target_is_checkout,
-            evidence,
-        )
+    let scanned_is_target =
+        scanned_audit_config_is_target(repo, &path, resolved_target, target_is_checkout, evidence);
+    (unreadable || committed_change || !scanned_is_target)
+        .then_some(LockProofGap::AuditConfigChanged)
 }
 
 /// Whether the `.cargo/audit.toml` the audit read in the scanned tree is the
@@ -1329,9 +1356,11 @@ fn cargo_audit_config_changed(
 /// The observations mirror the lockfile's (premise 2 of
 /// [`resolve_cargo_audit_lock_proof`]):
 /// - the paths dirty before the checks, where a dirty parent such as an
-///   untracked symlinked `.cargo` counts;
-/// - after the checks, the tracked path read against the target in the index
-///   and in the working tree ([`crate::git::Repository::tracked_path_differs_from_oid`]);
+///   untracked symlinked `.cargo` counts, and so does a path spelled in
+///   another case ([`path_or_parent_is`]);
+/// - after the checks, the tracked path read against the target in the index,
+///   in the working tree, and on disk past any skip-worktree flag
+///   ([`crate::git::Repository::tracked_path_differs_from_oid`]);
 /// - where the target has no configuration, any file at the path. This is how
 ///   an ignored configuration is caught, since the status read never lists it.
 ///
@@ -1381,12 +1410,19 @@ fn scanned_audit_config_is_target(
 }
 
 /// Whether the repository-relative `changed` names `path` or a directory above
-/// it. A status read lists an untracked symlink or directory by its own path,
-/// with or without a trailing `/`.
+/// it, under ASCII case folding. A status read lists an untracked symlink or
+/// directory by its own path, with or without a trailing `/`, and a checkout
+/// on a case-insensitive filesystem reads `.cargo/Audit.toml` for
+/// `.cargo/audit.toml`. On a case-sensitive one the folding only withholds a
+/// proof it could have kept.
 fn path_or_parent_is(path: &str, changed: &str) -> bool {
     let changed = changed.trim_end_matches('/');
-    path.strip_prefix(changed)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    path.get(..changed.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(changed))
+        && path[changed.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next == '/')
 }
 
 /// The set of baseline-signal check_ids whose config file appears in `diffs`.
@@ -3084,7 +3120,8 @@ mod tests {
     /// The file is compared at the one path cargo-audit reads, so a rename away
     /// counts even though the changed-file row keeps only the new path. A
     /// member's audit never reads the repository root's file. A symlinked
-    /// `.cargo` is never vouched for.
+    /// `.cargo` is never vouched for, and neither is a configuration committed
+    /// under another case, which a case-insensitive checkout reads in its place.
     #[test]
     fn a_changed_cargo_audit_config_withholds_the_lock_proof() {
         use LockProofEntry::Blob;
@@ -3178,6 +3215,24 @@ mod tests {
             proof(&root(Some(IGNORING)), &renamed, false),
             WITHHELD,
             "a rename away counts, though the changed-file row names only the new path"
+        );
+
+        const CASED: CargoAuditLockProof =
+            CargoAuditLockProof::Unproven(LockProofGap::AuditConfigCaseVariant);
+        let cased = |config: &'static str| {
+            let mut files = root(None);
+            files.push((".cargo/Audit.toml", Blob(config)));
+            files
+        };
+        assert_eq!(
+            proof(&cased(IGNORING), &cased(IGNORING), false),
+            CASED,
+            "a case-insensitive checkout reads .cargo/Audit.toml, which no exact path compares"
+        );
+        assert_eq!(
+            proof(&cased(IGNORING), &root(Some(IGNORING)), false),
+            CASED,
+            "a variant on the base side of a diff counts too"
         );
 
         let member = |root_config: &'static str, own_config: &'static str| {
@@ -3421,6 +3476,9 @@ mod tests {
         assert!(path_or_parent_is(".cargo/audit.toml", ".cargo"));
         assert!(path_or_parent_is(".cargo/audit.toml", ".cargo/"));
         assert!(path_or_parent_is("crates/core/.cargo/audit.toml", "crates"));
+        assert!(path_or_parent_is(".cargo/audit.toml", ".cargo/Audit.toml"));
+        assert!(path_or_parent_is(".cargo/audit.toml", ".CARGO"));
+        assert!(!path_or_parent_is(".cargo/audit.toml", ""));
         assert!(!path_or_parent_is(
             ".cargo/audit.toml",
             ".cargo/audit.toml.off"
