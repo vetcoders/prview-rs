@@ -8389,7 +8389,7 @@ fn a_dirty_lockfile_puts_cargo_audit_back_on_the_blocking_list() {
         cargo_audit_baseline_caveat(decision),
         "Cargo audit baseline: status=not-required, new=0, pre-existing=2, \
          resolved=0, unknown-baseline=0 (provenance proof unavailable: \
-         Cargo.lock dirty in the scanned tree; pre-existing=2 is not shown to \
+         Cargo.lock dirty or rewritten in the scanned tree; pre-existing=2 is not shown to \
          predate this change)"
     );
     assert_dashboard_verdict(&_dashboard, decision["verdict"].as_str().unwrap());

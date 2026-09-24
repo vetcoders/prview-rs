@@ -1095,6 +1095,32 @@ impl Repository {
         Ok(changes)
     }
 
+    /// Whether one tracked path differs between an exact target commit and the
+    /// current index / working directory.
+    ///
+    /// The single-file form of [`Self::worktree_changes_from_oid`]: the diff is
+    /// narrowed to `path` at construction time (a literal path, never a glob)
+    /// and needs no rename detection, so the caller does not pay for a whole
+    /// tree to ask about one file. Untracked content is excluded, as there.
+    pub(crate) fn tracked_path_differs_from_oid(
+        &self,
+        target_oid: &str,
+        path: &str,
+    ) -> Result<bool> {
+        let tree = self.exact_commit_tree(target_oid)?;
+        let mut options = DiffOptions::new();
+        options
+            .include_untracked(false)
+            .include_typechange(true)
+            .include_unreadable(true)
+            .disable_pathspec_match(true)
+            .pathspec(path);
+        let diff = self
+            .inner
+            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))?;
+        Ok(diff.deltas().next().is_some())
+    }
+
     fn exact_commit_tree(&self, commit_oid: &str) -> Result<git2::Tree<'_>> {
         if commit_oid.len() != 40 {
             anyhow::bail!("Expected a full 40-character commit OID: {commit_oid}");
@@ -1659,6 +1685,43 @@ mod tests {
         let github_base_oid = write_commit(tmp.path(), "base.txt", "github base\n");
         assert_ne!(local_base_oid, github_base_oid);
         (tmp, head_oid, github_base_oid)
+    }
+
+    /// One exact path: `a[1].lock` is a file name, not a pattern matching
+    /// `a1.lock`. Untracked content and other paths do not count; a change to
+    /// the asked path does, restoring it clears it, and deleting it counts.
+    #[test]
+    fn tracked_path_differs_from_oid_asks_about_one_literal_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        write_commit(tmp.path(), "a1.lock", "one\n");
+        write_commit(tmp.path(), "a[1].lock", "bracket\n");
+        let target = write_commit(tmp.path(), "other.txt", "other\n");
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let differs = |path: &str| {
+            repo.tracked_path_differs_from_oid(&target, path)
+                .expect("status")
+        };
+
+        assert!(!differs("a1.lock"));
+        fs::write(tmp.path().join("untracked.lock"), "new\n").expect("untracked");
+        fs::write(tmp.path().join("other.txt"), "edited\n").expect("edit other");
+        assert!(
+            !differs("a1.lock"),
+            "untracked and other paths do not count"
+        );
+
+        fs::write(tmp.path().join("a1.lock"), "one\ntwo\n").expect("edit lock");
+        assert!(differs("a1.lock"));
+        assert!(
+            !differs("a[1].lock"),
+            "the asked path is literal, never a glob"
+        );
+
+        fs::write(tmp.path().join("a1.lock"), "one\n").expect("restore lock");
+        assert!(!differs("a1.lock"));
+        fs::remove_file(tmp.path().join("a1.lock")).expect("delete lock");
+        assert!(differs("a1.lock"), "a deleted lock differs too");
     }
 
     fn init_repo_with_advanced_base() -> (tempfile::TempDir, String, String, String) {

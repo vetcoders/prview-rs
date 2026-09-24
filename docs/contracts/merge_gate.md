@@ -361,7 +361,7 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
 - `Cargo audit (<Status>): provenance proof unavailable: <gap> (M advisories not
   shown to predate this change)` when the counts are silent and the lockfile
   proof was withheld — `<gap>` being `no Cargo.lock in the target tree`,
-  `Cargo.lock dirty in the scanned tree`, `the reviewed commit moved the cargo
+  `Cargo.lock dirty or rewritten in the scanned tree`, `the reviewed commit moved the cargo
   root away from the configured one`, or `the scanned tree could not be tied to
   the target commit`. When `M` is zero the parenthetical is omitted and the gap
   stands alone: no line asserts a count it does not have.

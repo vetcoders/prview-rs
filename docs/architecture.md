@@ -308,9 +308,11 @@ therefore also require that the audited lock did not change while the checks
 ran. A snapshot run reads that off the shared snapshot's check-boundary
 observations (the ones `20_quality/SNAPSHOT_INTEGRITY.*` publishes); a boundary
 that saw the audited lock change withholds the proof as `DirtyLock`, and an
-unreadable boundary or a snapshot with no observation as `UnknownProvenance`. A
-local run reads the audited lock once more after the checks, against the target
-commit with untracked files excluded — the in-repo output and check caches
+unreadable boundary or a snapshot with no observation as `UnknownProvenance`.
+The boundaries are unioned over the whole run rather than cut at the audit, so
+a rewrite by a later check withholds the proof too — deliberately conservative.
+A local run reads the audited lock once more after the checks, with a diff
+narrowed to that one path against the target commit and untracked files excluded — the in-repo output and check caches
 R4-19 guards against cannot reach that one tracked file — and a lock that
 differs withholds the proof as `DirtyLock`. A withheld proof names its gap
 (`CargoAuditLockProof::Unproven(LockProofGap)`), and the merge gate states that

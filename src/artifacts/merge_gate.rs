@@ -2131,8 +2131,8 @@ mod tests {
             ),
             (
                 LockProofGap::DirtyLock,
-                "Cargo audit (Failed): provenance proof unavailable: Cargo.lock \
-                 dirty in the scanned tree (2 advisories not shown to predate this change)",
+                "Cargo audit (Failed): provenance proof unavailable: Cargo.lock dirty \
+                 or rewritten in the scanned tree (2 advisories not shown to predate this change)",
             ),
             (
                 LockProofGap::RelocatedCargoRoot,
@@ -2183,7 +2183,7 @@ mod tests {
             vec![
                 "Cargo audit (Failed): 1 new advisory vs the base audit \
                  (RUSTSEC-2026-0003 in serde 1.0.0), 0 pre-existing; provenance proof \
-                 unavailable: Cargo.lock dirty in the scanned tree"
+                 unavailable: Cargo.lock dirty or rewritten in the scanned tree"
                     .to_string()
             ]
         );

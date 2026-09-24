@@ -819,7 +819,7 @@ impl LockProofGap {
                 "provenance proof unavailable: no Cargo.lock in the target tree"
             }
             LockProofGap::DirtyLock => {
-                "provenance proof unavailable: Cargo.lock dirty in the scanned tree"
+                "provenance proof unavailable: Cargo.lock dirty or rewritten in the scanned tree"
             }
             LockProofGap::RelocatedCargoRoot => {
                 "provenance proof unavailable: the reviewed commit moved the cargo \
@@ -866,7 +866,9 @@ impl LockProofGap {
 /// rewrote it. The shared snapshot is observed at every check boundary
 /// ([`LockEvidence::snapshot_integrity`]); the proof holds only when no
 /// boundary saw the audited lock change, and an unreadable boundary — or no
-/// observation at all — establishes nothing. This widens the pre-existing
+/// observation at all — establishes nothing. The boundaries are unioned over
+/// the whole run, not cut at the audit, so a rewrite by a check that ran after
+/// it withholds the proof too: deliberately conservative. This widens the pre-existing
 /// downgrade to `cargo_audit` on snapshot runs — a deliberate gate-semantics
 /// decision (the case `check_scans_target_snapshot` documents as deliberately
 /// deferred), earned here by a proof rather than inherited from a check having
@@ -879,9 +881,10 @@ impl LockProofGap {
 /// `Some(true)` is the local shape: the lock is the target's only while the
 /// lockfile carries no uncommitted change, both in the dirty set frozen before
 /// the checks ran (R4-19) and after them. The second reading is of the audited
-/// lock alone, against the target commit, with untracked files excluded — so
-/// the in-repo output and check caches R4-19 guards against cannot reach it,
-/// while a lock cargo rewrote mid-run does. An unreadable status (`None` or a
+/// lock alone (a diff narrowed to that one path), against the target commit,
+/// with untracked files excluded — so the in-repo output and check caches
+/// R4-19 guards against cannot reach it, while a lock cargo rewrote mid-run
+/// does. An unreadable status (`None` or a
 /// failed read) establishes nothing.
 fn resolve_cargo_audit_lock_proof(
     config: &Config,
@@ -933,16 +936,9 @@ fn resolve_cargo_audit_lock_proof(
         }
         Some(_) => {}
     }
-    match repo.worktree_changes_from_oid(&resolved_target.commit_id) {
-        Ok(changes)
-            if changes.iter().any(|change| {
-                change.old_path.as_deref() == Some(lock.as_str())
-                    || change.new_path.as_deref() == Some(lock.as_str())
-            }) =>
-        {
-            CargoAuditLockProof::Unproven(LockProofGap::DirtyLock)
-        }
-        Ok(_) => CargoAuditLockProof::TargetLock,
+    match repo.tracked_path_differs_from_oid(&resolved_target.commit_id, &lock) {
+        Ok(true) => CargoAuditLockProof::Unproven(LockProofGap::DirtyLock),
+        Ok(false) => CargoAuditLockProof::TargetLock,
         Err(_) => CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
     }
 }
@@ -2602,8 +2598,10 @@ mod tests {
         );
     }
 
-    /// The proof is read off the lockfile, and off the status frozen before the
-    /// checks ran — not off the tree as it stands at artifact time (R4-19).
+    /// The proof asks about the lockfile alone: a dirty source file in the status
+    /// frozen before the checks ran (R4-19) says nothing about it, while a dirty
+    /// lock breaks it. The one later reading is of that same tracked lockfile,
+    /// never of the tree as it stands at artifact time.
     #[test]
     fn cargo_audit_lock_proof_reads_the_lockfile_not_the_tree() {
         let (tmp, _repo, first, target) = comparison_repo_with_lock();

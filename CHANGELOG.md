@@ -258,7 +258,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without regenerating `Cargo.lock` has the lock rewritten before the audit reads
   it. A snapshot run whose check-boundary observations saw the audited lock
   change, or could not be read, withholds the proof, and a local run reads the
-  audited lock again after the checks. A new `warnings`-category advisory (`unmaintained`, `unsound`,
+  audited lock again after the checks. A repository whose committed `Cargo.lock`
+  does not cover its manifest has it rewritten by every cargo run, so it no
+  longer earns the pre-existing downgrade until the regenerated lock is
+  committed; the gate says so as `Cargo.lock dirty or rewritten in the scanned
+  tree`. A new `warnings`-category advisory (`unmaintained`, `unsound`,
   `yanked`) blocks the downgrade like a new vulnerability: it has no
   vulnerability row of its own, so it reaches the classifier as a dashboard
   note, and a changed lock that kept an old vulnerability while adding one no
