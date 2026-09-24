@@ -229,7 +229,7 @@ impl ConsistencyReport {
                 None => (
                     "no readable line".to_string(),
                     format!(
-                        "PR checklist line unreadable: PR_REVIEW.md has no readable '{}' line in the PR Template's `## Checklist`, where the {} check statuses earn {} ({why})",
+                        "PR checklist line unreadable: PR_REVIEW.md has no single readable '{}' line in the PR Template's `## Checklist`, where the {} check statuses earn {} ({why})",
                         claim.item.label(),
                         checks_artifact,
                         mark(earned),
@@ -890,6 +890,50 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         }
 
         // Control: the single honest template is read and agrees.
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{honest}")).unwrap();
+        let report = checklist_report(root);
+        assert!(report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 3);
+    }
+
+    /// One item, one line. With a failed ESLint, an honest `- [ ] No lint
+    /// errors` followed by a false `- [x] No lint errors` used to read as
+    /// consistent: the parser took the first readable line and never saw the
+    /// false claim beneath it. Any second line naming the item — either order,
+    /// an identical copy, or a variant spelling — leaves that item unreadable,
+    /// and the other items are still read.
+    #[test]
+    fn a_duplicated_checklist_item_is_unreadable_not_first_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
+        let honest = INCIDENT_PR_TEMPLATE.replace("- [x] No lint errors", "- [ ] No lint errors");
+        for duplicate in [
+            "- [ ] No lint errors\n- [x] No lint errors\n",
+            "- [x] No lint errors\n- [ ] No lint errors\n",
+            "- [ ] No lint errors\n- [ ] No lint errors\n",
+            "- [ ] No lint errors\n* [x] No lint errors\n",
+            "- [ ] No lint errors\n- [x]  No lint errors\n",
+        ] {
+            let template = honest.replace("- [ ] No lint errors\n", duplicate);
+            std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{template}")).unwrap();
+            let report = checklist_report(root);
+            assert_eq!(report.checked_fields, 3, "{duplicate}");
+            assert_eq!(
+                warning_fields(&report),
+                ["pr_checklist.no_lint_errors"],
+                "{duplicate}"
+            );
+            assert_eq!(report.warnings[0].sources[0].value, "no readable line");
+            assert!(
+                report.warnings[0]
+                    .message
+                    .contains("no single readable 'No lint errors' line"),
+                "{report:?}"
+            );
+        }
+
+        // Control: the single honest line is read and agrees.
         std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{honest}")).unwrap();
         let report = checklist_report(root);
         assert!(report.consistent, "{report:?}");

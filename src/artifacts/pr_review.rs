@@ -156,29 +156,44 @@ pub(crate) fn derive_pr_checklist(
 /// the template, or anything appended after its closing fence — is not the
 /// template's checklist and cannot stand in for it. A file with more than one
 /// `## PR Template` heading, or a template with more than one `## Checklist`,
-/// is ambiguous and yields no section. `None` per item means no readable line
-/// for it — missing, or a mark that is neither `x` nor a space — never a
-/// guessed mark; with no readable section every item is `None`.
+/// is ambiguous and yields no section.
+///
+/// Within the section, every line that names an item's label is a claim about
+/// that item, whatever its shape, and exactly one may exist: `- [x] <label>`
+/// or `- [ ] <label>`. A second line naming the same item — a duplicate, a
+/// contradicting copy, or a variant such as `* [x] <label>` — is ambiguous in
+/// the same way a second template is, so no copy wins; reading the first one
+/// let an honest `- [ ]` hide a false `- [x]` beneath it. `None` per item means
+/// no single readable line for it — missing, ambiguous, or a mark that is
+/// neither `x` nor a space — never a guessed mark; with no readable section
+/// every item is `None`.
 pub(crate) fn parse_pr_checklist(pr_review: &str) -> Vec<(PrChecklistItem, Option<bool>)> {
     let section = pr_template_checklist(pr_review).unwrap_or_default();
     PrChecklistItem::ALL
         .into_iter()
         .map(|item| {
-            let mark = section.iter().find_map(|line| {
-                let rest = line.strip_prefix("- [")?;
-                let (mark, label) = rest.split_once("] ")?;
-                if label != item.label() {
-                    return None;
-                }
-                match mark {
-                    "x" | "X" => Some(true),
-                    " " => Some(false),
-                    _ => None,
-                }
-            });
+            let mut claims = section.iter().filter(|line| line.contains(item.label()));
+            let mark = match (claims.next(), claims.next()) {
+                (Some(line), None) => pr_checklist_mark(line, item),
+                _ => None,
+            };
             (item, mark)
         })
         .collect()
+}
+
+/// The mark on the one line that claims `item`, when that line has exactly the
+/// rendered shape.
+fn pr_checklist_mark(line: &str, item: PrChecklistItem) -> Option<bool> {
+    let (mark, label) = line.strip_prefix("- [")?.split_once("] ")?;
+    if label != item.label() {
+        return None;
+    }
+    match mark {
+        "x" | "X" => Some(true),
+        " " => Some(false),
+        _ => None,
+    }
 }
 
 /// The lines of the single PR Template's `## Checklist` section (see

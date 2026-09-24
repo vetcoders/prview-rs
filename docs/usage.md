@@ -1281,7 +1281,7 @@ quality, policy, and permission axes beside that explanation.
   and `report.json` `/checks` entries without a readable `name` and a `status` from the serialized
   vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`) withhold the comparison behind one `pr_checklist`
   warning. Only the checklist inside the PR Template's fenced block is read; a checklist anywhere else in
-  the file is ignored, and a second PR Template makes every item unreadable. Only without `PR_REVIEW.md` or `report.json` is nothing compared. In a normal
+  the file is ignored, and a second PR Template makes every item unreadable, as does a second line naming the same item for that item. Only without `PR_REVIEW.md` or `report.json` is nothing compared. In a normal
   run both sides come from the same check results, so this catches the rendered checklist diverging from
   the statuses (a rendering regression, or an artifact edited or damaged after the run), not a check filed
   under the wrong category: that mapping is shared by both sides and pinned by tests.

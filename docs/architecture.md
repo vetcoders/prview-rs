@@ -3538,7 +3538,10 @@ reads only the checklist inside the PR Template's fenced block — the
 the block's closing fence — so neither check-derived text rendered above the
 template nor anything appended after it can stand in for it; a second
 `## PR Template`, or a second `## Checklist` inside the template, leaves every
-item unreadable. The fold fails closed: a missing or unreadable checklist line
+item unreadable. Inside that section each item may be named by exactly one
+line, `- [x] <label>` or `- [ ] <label>`: a second line naming the same item (a
+duplicate, a contradicting copy, or a variant spelling) leaves that item
+unreadable instead of letting the first copy win. The fold fails closed: a missing or unreadable checklist line
 is a warning for its item, and `/checks` entries without a readable `name` and a
 status from the serialized vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`)
 withhold the comparison behind one `pr_checklist` warning. Because both sides share the derivation, the checker catches the

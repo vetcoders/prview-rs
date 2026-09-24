@@ -245,7 +245,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check entry that cannot be read (including a status outside the serialized
   vocabulary) is reported too, never skipped. Only the checklist inside the PR
   Template's fenced block counts, so text elsewhere in `PR_REVIEW.md` cannot
-  stand in for it.
+  stand in for it, and each item must be named by exactly one line there: a
+  duplicated item is unreadable rather than read from its first copy.
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch
