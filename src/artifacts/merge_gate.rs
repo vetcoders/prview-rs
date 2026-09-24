@@ -787,12 +787,23 @@ fn cargo_audit_blocker_detail(
         } else {
             format!(" ({})", audit.new_advisories.join(", "))
         };
-        return Some(format!(
-            "{} new advisor{} introduced{ids}, {} pre-existing",
-            audit.new,
-            if audit.new == 1 { "y" } else { "ies" },
-            audit.preexisting
-        ));
+        let plural = if audit.new == 1 { "y" } else { "ies" };
+        // "New" is relative to the base audit; "introduced" additionally says
+        // the target's own lockfile carries it, which only the proof shows.
+        // Without it the count stays — it is still the most specific fact —
+        // but the claim is qualified by the premise that is missing.
+        return Some(match lock_proof {
+            super::verdict::CargoAuditLockProof::TargetLock => format!(
+                "{} new advisor{plural} introduced{ids}, {} pre-existing",
+                audit.new, audit.preexisting
+            ),
+            super::verdict::CargoAuditLockProof::Unproven(gap) => format!(
+                "{} new advisor{plural} vs the base audit{ids}, {} pre-existing; {}",
+                audit.new,
+                audit.preexisting,
+                gap.gate_note()
+            ),
+        });
     }
     if audit.unknown > 0 {
         return Some(format!(
@@ -2124,6 +2135,12 @@ mod tests {
                  dirty in the scanned tree (2 advisories not shown to predate this change)",
             ),
             (
+                LockProofGap::RelocatedCargoRoot,
+                "Cargo audit (Failed): provenance proof unavailable: the reviewed commit \
+                 moved the cargo root away from the configured one (2 advisories not \
+                 shown to predate this change)",
+            ),
+            (
                 LockProofGap::UnknownProvenance,
                 "Cargo audit (Failed): provenance proof unavailable: the scanned tree \
                  could not be tied to the target commit (2 advisories not shown to \
@@ -2144,7 +2161,10 @@ mod tests {
         }
 
         // Counts still outrank the proof note: a named new advisory is the more
-        // specific fact and keeps the sentence.
+        // specific fact and keeps the sentence. It is not called "introduced",
+        // though — new against the base audit, but without the proof the
+        // audited lock is not shown to be the target's — and the missing
+        // premise qualifies the count instead of disappearing behind it.
         let introduced = compute_effective_policy_outcome(
             &summary.evaluations,
             &none_preexisting,
@@ -2161,11 +2181,18 @@ mod tests {
         assert_eq!(
             introduced.blocking_issues,
             vec![
-                "Cargo audit (Failed): 1 new advisory introduced \
-                 (RUSTSEC-2026-0003 in serde 1.0.0), 0 pre-existing"
+                "Cargo audit (Failed): 1 new advisory vs the base audit \
+                 (RUSTSEC-2026-0003 in serde 1.0.0), 0 pre-existing; provenance proof \
+                 unavailable: Cargo.lock dirty in the scanned tree"
                     .to_string()
             ]
         );
+        for issue in &introduced.blocking_issues {
+            assert!(
+                !issue.contains("introduced"),
+                "an unproven lock does not license \"introduced\": {issue}"
+            );
+        }
     }
 
     /// The zero-count shapes of the same blocking row: the sentence must name
@@ -2195,6 +2222,7 @@ mod tests {
         for gap in [
             LockProofGap::NoTargetLock,
             LockProofGap::DirtyLock,
+            LockProofGap::RelocatedCargoRoot,
             LockProofGap::UnknownProvenance,
         ] {
             let outcome = compute_effective_policy_outcome(

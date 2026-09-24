@@ -278,19 +278,25 @@ locations. An advisory is `Cargo.lock` × the advisory database, so no
 uncommitted source can move it and whole-tree cleanliness is not evidence about
 it either way. Its proof has two premises, and both must hold.
 
-First, the target commit's tree must actually carry a `Cargo.lock` (the
-`cargo_root` member lock, or the workspace-root lock it falls back to). `cargo
+First, the target commit's tree must actually carry the `Cargo.lock` the audit
+reads — the one in the cargo root itself, committed as a regular file. `cargo
+audit` opens `Cargo.lock` relative to the directory it runs in and never falls
+back to a workspace root's, so a root lock beside a lock-less member does not
+count, and neither does a symlink committed in the lockfile's place. `cargo
 audit` does not refuse a crate that has no lockfile: it resolves one from the
 registry, audits that, and exits non-zero on a hit. Those advisories are real,
 but they are about a file no commit contains, so nothing about them can be
-"unchanged by this PR". A target with no lockfile, or a lock question that
+"unchanged by this PR". A target with no such lockfile, or a lock question that
 cannot be answered, proves nothing — in every run shape.
 
-Second, the lockfile the audit read must be that one: trivially true when the
-run scanned a target snapshot, and true for a local run when the lockfile
-carried no uncommitted change (read from the status frozen before the checks
-ran). Unrelated dirt in the tree no longer suppresses the downgrade; a dirty
-lockfile does, and an unreadable status establishes nothing.
+Second, the lockfile the audit read must be that one: true by construction when
+the run scanned a target snapshot at the cargo root the first premise asked
+about, and true for a local run when that lockfile carried no uncommitted change
+(read from the status frozen before the checks ran). A reviewed commit that
+moved its crate away from the configured cargo root (`crates/core` → `backend`)
+has cargo run in the new directory, so a snapshot of it proves nothing. Unrelated
+dirt in the tree no longer suppresses the downgrade; a dirty audited lockfile
+does, and an unreadable status establishes nothing.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,
@@ -299,9 +305,9 @@ one reaches the classifier as a dashboard note row with `in_diff: true` (a note,
 never a SARIF result or part of `findings_count`), and an audit that introduced
 one is `mixed` or `introduced`, never downgraded — and a changed lock with no
 base audit leaves every row `in_diff: null`, which stays `unclassified` and
-keeps gating. A run with no
-diff baseline at all (`--current-only`, or no resolved base differing from the
-target) downgrades nothing, whatever the lockfile says.
+keeps gating. A run with no diff baseline at all (`--current-only`, or no
+resolved base differing from the target) downgrades nothing, whatever the
+lockfile says.
 
 A consequence worth stating: an advisory published *after* the base commit, on a
 lockfile this change never touched, is reported as pre-existing. It is debt
@@ -335,7 +341,10 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
 `decision.blocking_issues` as one of
 
 - `Cargo audit (<Status>): N new advisories introduced (RUSTSEC-… in <package>
-  <version>, …), M pre-existing`,
+  <version>, …), M pre-existing` when the lockfile proof holds, or `Cargo audit
+  (<Status>): N new advisories vs the base audit (…), M pre-existing; provenance
+  proof unavailable: <gap>` when it was withheld — new against the base audit,
+  but not shown to be the target's own, so not called introduced,
 - `Cargo audit (<Status>): N advisories with no base comparison (baseline
   <status>)` when nothing could be compared,
 - `Cargo audit (<Status>): no readable advisory report (baseline
@@ -345,9 +354,10 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
 - `Cargo audit (<Status>): provenance proof unavailable: <gap> (M advisories not
   shown to predate this change)` when the counts are silent and the lockfile
   proof was withheld — `<gap>` being `no Cargo.lock in the target tree`,
-  `Cargo.lock dirty in the scanned tree`, or `the scanned tree could not be tied
-  to the target commit`. When `M` is zero the parenthetical is omitted and the
-  gap stands alone: no line asserts a count it does not have.
+  `Cargo.lock dirty in the scanned tree`, `the reviewed commit moved the cargo
+  root away from the configured one`, or `the scanned tree could not be tied to
+  the target commit`. When `M` is zero the parenthetical is omitted and the gap
+  stands alone: no line asserts a count it does not have.
 
 The set the first line counts and the set it names are one set: `new` counts
 every advisory in the report, `vulnerabilities` and the `warnings` categories

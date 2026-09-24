@@ -1018,10 +1018,16 @@ const CARGO_ROOT_DISCOVERY_DEPTH: usize = 2;
 /// resolving it would let cargo read foreign code under the reviewed commit's
 /// cache key.
 fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
-    let (Some(commit), Some(relative)) = (
-        off_head_target_commit(config),
-        repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root),
-    ) else {
+    match off_head_target_commit(config) {
+        Some(commit) => resolve_reviewed_cargo_root_at(config, &commit),
+        None => ReviewedCargoRoot::Unknown,
+    }
+}
+
+/// [`resolve_reviewed_cargo_root`] for an already-resolved reviewed commit.
+fn resolve_reviewed_cargo_root_at(config: &Config, commit: &str) -> ReviewedCargoRoot {
+    let Some(relative) = repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root)
+    else {
         return ReviewedCargoRoot::Unknown;
     };
     let Ok(repo) = crate::git::Repository::open(&config.repo_root) else {
@@ -1035,7 +1041,7 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
         } else {
             format!("{candidate}/Cargo.toml")
         };
-        match repo.regular_file_at_commit(&commit, &path) {
+        match repo.regular_file_at_commit(commit, &path) {
             Ok(true) => return ReviewedCargoRoot::Resolved(candidate.to_string()),
             Ok(false) => {}
             // The question could not be asked — do not answer it.
@@ -1044,7 +1050,7 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
     }
 
     let Ok(moved) =
-        repo.dirs_containing_at_commit(&commit, "Cargo.toml", CARGO_ROOT_DISCOVERY_DEPTH)
+        repo.dirs_containing_at_commit(commit, "Cargo.toml", CARGO_ROOT_DISCOVERY_DEPTH)
     else {
         return ReviewedCargoRoot::Unknown;
     };
@@ -1055,7 +1061,7 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
         mapped
     };
     match moved.as_slice() {
-        [only] => match moved_manifest_is_configured_project(config, &repo, &commit, only) {
+        [only] => match moved_manifest_is_configured_project(config, &repo, commit, only) {
             Ok(()) => ReviewedCargoRoot::Resolved(only.clone()),
             Err(why) => ReviewedCargoRoot::Unavailable(format!(
                 "commit {short} has no Cargo.toml at {aimed_at}; the only one elsewhere ({only}) \
@@ -1071,6 +1077,32 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
             many.join(", "),
         )),
     }
+}
+
+/// Whether the reviewed commit keeps its cargo project somewhere other than the
+/// configured cargo root — the moved-manifest case [`plan_cargo_run`] follows.
+///
+/// Cargo checks of such a commit run in the directory the manifest moved to,
+/// while every artifact-side question about the cargo project (which
+/// `Cargo.lock` the audit read, whether that lock changed) is still asked of
+/// the configured root. The two disagree exactly here, and a proof about the
+/// configured root's lockfile says nothing about the lockfile cargo read. The
+/// resolution is the one `plan_cargo_run` makes, not a re-derivation, so this
+/// answers for the directory the checks actually ran in.
+///
+/// `false` whenever no relocation is established: the commit keeps the manifest
+/// where the configured root maps to, the configured root lies outside the
+/// repository, or git cannot answer. Callers use a `true` to withhold a claim,
+/// so the unanswerable cases stay with whatever the caller already concluded.
+pub(crate) fn reviewed_cargo_root_relocated(config: &Config, commit: &str) -> bool {
+    let Some(relative) = repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root)
+    else {
+        return false;
+    };
+    matches!(
+        resolve_reviewed_cargo_root_at(config, commit),
+        ReviewedCargoRoot::Resolved(resolved) if resolved != cargo_root_path(&relative)
+    )
 }
 
 /// What a manifest says it IS, so a manifest found somewhere else in the
@@ -4077,6 +4109,36 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             resolve_reviewed_cargo_root(&config),
             ReviewedCargoRoot::Resolved("backend".to_string()),
             "the same workspace one level down is still the project under review",
+        );
+    }
+
+    /// The lockfile proof withholds itself on a `true` here, so the answer must
+    /// be the plan's own resolution: relocated for the moved commit, not for a
+    /// commit that keeps the manifest where the configured root maps to.
+    #[test]
+    fn a_relocated_cargo_root_is_reported_for_the_moved_commit_only() {
+        let workspace = "[workspace]\nmembers=[\"core\"]\nresolver=\"2\"\n";
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        std::fs::write(root.join("backend/Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root moved into backend");
+        let moved = head_sha(root);
+        std::fs::remove_file(root.join("backend/Cargo.toml")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root back at the top");
+        let stayed = head_sha(root);
+
+        let config = test_config_builder()
+            .repo_root(root)
+            .profile(test_rust_profile(true))
+            .target(Some(&moved))
+            .build();
+
+        assert!(reviewed_cargo_root_relocated(&config, &moved));
+        assert!(
+            !reviewed_cargo_root_relocated(&config, &stayed),
+            "a manifest still at the configured root is no relocation",
         );
     }
 

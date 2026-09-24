@@ -247,12 +247,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target tree actually carry a `Cargo.lock`: `cargo audit` resolves one from the
   registry when a crate has none and audits that, so advisories from such a run
   are real but concern a file no commit contains, and they now keep gating
-  instead of being reported as unchanged. The gate states which proof it
+  instead of being reported as unchanged. That lockfile is the one the audit
+  reads — `Cargo.lock` in the cargo root itself, since `cargo audit` never falls
+  back to a workspace root's — so a root lock beside a lock-less member, or a
+  symlink committed in the lockfile's place, proves nothing; and a reviewed
+  commit that moved its crate away from the configured cargo root withholds the
+  proof, because cargo ran in a directory the lockfile questions were not asked
+  about. A new `warnings`-category advisory (`unmaintained`, `unsound`,
+  `yanked`) blocks the downgrade like a new vulnerability: it has no
+  vulnerability row of its own, so it reaches the classifier as a dashboard
+  note, and a changed lock that kept an old vulnerability while adding one no
+  longer passes as pre-existing. The gate states which proof it
   applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this
   PR (N advisories)`; a blocking one names the advisories it blocks on — all of
   them, counted and named from one set, so an `unmaintained` warning is no
-  longer counted as a "vulnerability" nor silently left unnamed — and an audit
-  that blocks for want of the proof says which premise was missing instead of
+  longer counted as a "vulnerability" nor silently left unnamed, and they are
+  called "introduced" only while the lockfile proof holds — and an audit that
+  blocks for want of the proof says which premise was missing instead of
   reporting a bare `Cargo audit (Failed)`. The dashboard now states the gate
   verdict as a `data-merge-verdict` attribute on the merge chip, so its parity
   with `MERGE_GATE.json` is assertable rather than assumed.

@@ -295,18 +295,27 @@ fn effective_cargo_lock_path_at_commit(
     }
 }
 
-/// The repository-relative `Cargo.lock` recorded IN `commit_id`'s tree for
-/// `cargo_root`, resolved through the same member-then-workspace-root
-/// precedence the live run follows.
+/// The repository-relative `Cargo.lock` recorded IN `commit_id`'s tree at
+/// `cargo_root` itself — the one file a `cargo audit` run there reads.
 ///
 /// `Some(Some(path))` is "the target tree carries this lockfile", `Some(None)`
 /// is "the target tree carries none", and `None` is "the question could not be
 /// answered". Only the first licenses cargo audit's provenance proof: `cargo
-/// audit` GENERATES a lockfile from the registry when none is present
-/// (measured on cargo-audit 0.22.2), so a run in a lock-less tree reports real
-/// advisories against a lockfile that exists in no commit at all. Naming that
-/// "pre-existing: Cargo.lock unchanged by this PR" would assert a fact about a
-/// file the target does not have.
+/// audit` GENERATES a lockfile when none is present (measured on cargo-audit
+/// 0.22.2), so a run in a lock-less tree reports real advisories against a
+/// lockfile that exists in no commit at all. Naming that "pre-existing:
+/// Cargo.lock unchanged by this PR" would assert a fact about a file the
+/// target does not have.
+///
+/// There is deliberately no workspace-root fallback here, unlike
+/// [`effective_cargo_lock_path_at_commit`]. `cargo audit` opens `Cargo.lock`
+/// relative to the directory it runs in and never walks up to a workspace root;
+/// when that file is absent beside a `Cargo.toml` it runs `cargo update
+/// --workspace` instead (cargo-audit 0.22, `lockfile::locate_or_generate`). A
+/// root lock beside a lock-less member is therefore a file the audit did not
+/// read, and it proves nothing about the one it did. The member lock is also
+/// held to [`crate::git::Repository::regular_file_at_commit`]: a symlink or a
+/// gitlink committed in its place is not a committed lockfile.
 ///
 /// A `cargo_root` outside the repository is treated as "no lockfile in the
 /// target tree": nothing inside the reviewed tree can vouch for what was
@@ -317,47 +326,42 @@ pub(crate) fn cargo_audit_lock_path_in_commit(
     repo_root: &std::path::Path,
     cargo_root: Option<&std::path::Path>,
 ) -> Option<Option<String>> {
-    let configured_root = cargo_root.unwrap_or(repo_root);
-    let normalized =
-        crate::paths::normalize_to_repo_relative(&configured_root.display().to_string(), repo_root);
-    if normalized.is_external {
+    let Some(lock) = cargo_audit_lock_path(repo_root, cargo_root) else {
         return Some(None);
+    };
+    match repo.regular_file_at_commit(commit_id, &lock) {
+        Ok(true) => Some(Some(lock)),
+        Ok(false) => Some(None),
+        Err(_) => None,
     }
-    effective_cargo_lock_path_at_commit(repo, commit_id, std::path::Path::new(&normalized.display))
 }
 
-/// The working-tree `Cargo.lock` paths (repository-relative) the live
-/// `cargo audit` run could have read for `cargo_root`.
+/// The repository-relative path of the `Cargo.lock` a `cargo audit` run in
+/// `cargo_root` reads — `Cargo.lock` in that directory, and only there (see
+/// [`cargo_audit_lock_path_in_commit`]).
 ///
-/// Mirrors [`effective_cargo_lock_path_at_commit`], which resolves the same
-/// question against a commit: the member lock first, then the workspace-root
-/// lock it falls back to when the member has none. The working tree cannot be
-/// interrogated as cheaply as a tree object, so BOTH candidates are returned
-/// and the caller treats either one being dirty as a lost proof. That is the
-/// conservative direction: an unrelated dirty member lock suppresses the
-/// pre-existing downgrade instead of licensing it.
-///
-/// A `cargo_root` outside the repository yields no candidate — nothing inside
-/// the reviewed tree can vouch for the lockfile that was scanned.
-pub(crate) fn cargo_audit_candidate_lock_paths(
+/// `None` for a `cargo_root` outside the repository: no path inside the
+/// reviewed tree names the lockfile that was scanned.
+pub(crate) fn cargo_audit_lock_path(
     repo_root: &std::path::Path,
     cargo_root: Option<&std::path::Path>,
-) -> Vec<String> {
+) -> Option<String> {
     let configured_root = cargo_root.unwrap_or(repo_root);
     let normalized =
         crate::paths::normalize_to_repo_relative(&configured_root.display().to_string(), repo_root);
     if normalized.is_external {
-        return Vec::new();
+        return None;
     }
     let relative_root = std::path::Path::new(&normalized.display);
     if relative_root == std::path::Path::new(".") {
-        return vec!["Cargo.lock".to_string()];
+        return Some("Cargo.lock".to_string());
     }
-    let member_lock = relative_root
-        .join("Cargo.lock")
-        .to_string_lossy()
-        .replace('\\', "/");
-    vec![member_lock, "Cargo.lock".to_string()]
+    Some(
+        relative_root
+            .join("Cargo.lock")
+            .to_string_lossy()
+            .replace('\\', "/"),
+    )
 }
 
 fn cargo_audit_comparison_context_for_diff(

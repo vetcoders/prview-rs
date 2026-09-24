@@ -32,11 +32,11 @@ mod semgrep;
 pub(crate) mod snapshot_integrity;
 mod typescript;
 
-pub(crate) use cargo::planned_cargo_cwd;
 pub(crate) use cargo::validated_cargo_audit_vulnerability_list;
 pub use cargo::{
     CargoAuditCheck, CargoCheck, CargoGeigerCheck, CargoTestCheck, ClippyCheck, RustfmtCheck,
 };
+pub(crate) use cargo::{planned_cargo_cwd, reviewed_cargo_root_relocated};
 pub use python::{MypyCheck, PytestCheck, RuffCheck};
 pub use semgrep::SemgrepCheck;
 pub(crate) use semgrep::output_reports_scan_errors as semgrep_output_reports_scan_errors;

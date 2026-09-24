@@ -799,6 +799,10 @@ pub(crate) enum LockProofGap {
     /// The scanned checkout's lockfile carried an uncommitted change, so it is
     /// not provably the target's.
     DirtyLock,
+    /// The reviewed commit moved its cargo project away from the configured
+    /// cargo root, so cargo ran in a directory the lockfile questions were not
+    /// asked about.
+    RelocatedCargoRoot,
     /// The worktree status or the checkout's identity could not be read, so
     /// nothing about the scanned lockfile was established either way.
     UnknownProvenance,
@@ -814,6 +818,10 @@ impl LockProofGap {
             }
             LockProofGap::DirtyLock => {
                 "provenance proof unavailable: Cargo.lock dirty in the scanned tree"
+            }
+            LockProofGap::RelocatedCargoRoot => {
+                "provenance proof unavailable: the reviewed commit moved the cargo \
+                 root away from the configured one"
             }
             LockProofGap::UnknownProvenance => {
                 "provenance proof unavailable: the scanned tree could not be tied \
@@ -835,9 +843,10 @@ impl LockProofGap {
 /// and calling them "pre-existing: Cargo.lock unchanged by this PR" is a claim
 /// about a file the target does not have — a false PASS on a security gate, in
 /// a repository whose `Cargo.lock` is untracked or ignored and whose PR just
-/// added a vulnerable dependency. So the proof asks the target COMMIT, through
-/// the same member-then-workspace-root precedence the live run follows; a tree
-/// with no lockfile, or an unanswerable question, establishes nothing.
+/// added a vulnerable dependency. So the proof asks the target COMMIT for the
+/// one lockfile the audit reads — `Cargo.lock` in the cargo root itself, since
+/// `cargo audit` never falls back to a workspace root's — and a tree without
+/// it, or an unanswerable question, establishes nothing.
 ///
 /// **Premise 2 — the lockfile that was read was that one.**
 /// `target_is_checkout == Some(false)` is the remote/snapshot shape: `cargo
@@ -847,6 +856,11 @@ impl LockProofGap {
 /// snapshot runs — a deliberate gate-semantics decision (the case
 /// `check_scans_target_snapshot` documents as deliberately deferred), earned
 /// here by a proof rather than inherited from a check having moved substrate.
+/// "By construction" holds only while cargo ran in the cargo root premise 1
+/// asked about: a reviewed commit that moved its manifest (`crates/core` →
+/// `backend`) has cargo run in the new directory, while premise 1 and the
+/// lock-changed classification still read the configured one — possibly a
+/// stale lock left behind. That shape is refused before premise 1 is asked.
 ///
 /// `Some(true)` is the local shape: the lock is the target's only while the
 /// lockfile carries no uncommitted change. The dirty set is the one frozen
@@ -860,44 +874,39 @@ fn resolve_cargo_audit_lock_proof(
     target_is_checkout: Option<bool>,
     worktree_dirty_paths: Option<&std::collections::BTreeSet<String>>,
 ) -> CargoAuditLockProof {
-    if target_is_checkout.is_none() {
+    let Some(target_is_checkout) = target_is_checkout else {
         return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance);
-    }
-    // Premise 1, shared by both shapes: no lockfile in the target tree, or no
-    // readable answer, and there is nothing for premise 2 to be about.
+    };
     let Some(repo) = repo else {
         return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance);
     };
-    match crate::artifacts::audit::cargo_audit_lock_path_in_commit(
+    if !target_is_checkout
+        && crate::checks::reviewed_cargo_root_relocated(config, &resolved_target.commit_id)
+    {
+        return CargoAuditLockProof::Unproven(LockProofGap::RelocatedCargoRoot);
+    }
+    // Premise 1, shared by both shapes: no lockfile in the target tree, or no
+    // readable answer, and there is nothing for premise 2 to be about.
+    let lock = match crate::artifacts::audit::cargo_audit_lock_path_in_commit(
         repo,
         &resolved_target.commit_id,
         &config.repo_root,
         config.profile.cargo_root.as_deref(),
     ) {
-        Some(Some(_)) => {}
+        Some(Some(lock)) => lock,
         Some(None) => return CargoAuditLockProof::Unproven(LockProofGap::NoTargetLock),
         None => return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
-    }
+    };
 
-    match target_is_checkout {
-        Some(false) => CargoAuditLockProof::TargetLock,
-        Some(true) => {
-            let Some(dirty) = worktree_dirty_paths else {
-                return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance);
-            };
-            let candidates = crate::artifacts::audit::cargo_audit_candidate_lock_paths(
-                &config.repo_root,
-                config.profile.cargo_root.as_deref(),
-            );
-            if candidates.is_empty() {
-                CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance)
-            } else if candidates.iter().any(|path| dirty.contains(path)) {
-                CargoAuditLockProof::Unproven(LockProofGap::DirtyLock)
-            } else {
-                CargoAuditLockProof::TargetLock
-            }
-        }
+    if !target_is_checkout {
+        return CargoAuditLockProof::TargetLock;
+    }
+    match worktree_dirty_paths {
         None => CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
+        Some(dirty) if dirty.contains(&lock) => {
+            CargoAuditLockProof::Unproven(LockProofGap::DirtyLock)
+        }
+        Some(_) => CargoAuditLockProof::TargetLock,
     }
 }
 
@@ -2660,6 +2669,253 @@ mod tests {
             );
             assert!(proven.applies_to("cargo_audit"));
         }
+    }
+
+    const CORE_MANIFEST: &str = "[package]\nname = \"core\"\nversion = \"0.1.0\"\n";
+    const CORE_LOCK: &str = "version = 3\n\n[[package]]\nname = \"core\"\n";
+
+    /// What a [`lock_proof_repo`] commit holds at one path.
+    enum LockProofEntry {
+        Blob(&'static str),
+        /// A symlink with this target — committed as a link, not as content.
+        #[cfg(unix)]
+        Link(&'static str),
+    }
+
+    /// A two-commit repository for the cargo-root cases of the lockfile proof.
+    /// `HEAD` holds `head_files` and stays checked out with a clean tree;
+    /// `target` holds `target_files` and has `HEAD` as its parent.
+    fn lock_proof_repo(
+        head_files: &[(&str, LockProofEntry)],
+        target_files: &[(&str, LockProofEntry)],
+    ) -> (tempfile::TempDir, String, String) {
+        fn write_tree(
+            repo: &git2::Repository,
+            root: &std::path::Path,
+            files: &[(&str, LockProofEntry)],
+        ) -> git2::Oid {
+            let mut index = repo.index().unwrap();
+            index.clear().unwrap();
+            for (path, entry) in files {
+                let on_disk = root.join(path);
+                std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+                match entry {
+                    LockProofEntry::Blob(content) => std::fs::write(&on_disk, content).unwrap(),
+                    #[cfg(unix)]
+                    LockProofEntry::Link(to) => std::os::unix::fs::symlink(to, &on_disk).unwrap(),
+                }
+                index.add_path(std::path::Path::new(path)).unwrap();
+            }
+            index.write().unwrap();
+            index.write_tree().unwrap()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let target_tree = write_tree(&repo, tmp.path(), target_files);
+        for (path, _) in target_files {
+            let _ = std::fs::remove_file(tmp.path().join(path));
+        }
+        let head_tree = write_tree(&repo, tmp.path(), head_files);
+        let head_tree = repo.find_tree(head_tree).unwrap();
+        let head = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "operator",
+                &head_tree,
+                &[],
+            )
+            .unwrap();
+        let target_tree = repo.find_tree(target_tree).unwrap();
+        let parent = repo.find_commit(head).unwrap();
+        let target = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "target",
+                &target_tree,
+                &[&parent],
+            )
+            .unwrap();
+        (tmp, head.to_string(), target.to_string())
+    }
+
+    fn member_config(tmp: &tempfile::TempDir) -> Config {
+        let mut config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        config.profile.cargo_root = Some(tmp.path().join("crates/core"));
+        config
+    }
+
+    /// The reviewed commit moved its crate (`crates/core` → `backend`), so the
+    /// snapshot run executed cargo in `backend/` — while a stale
+    /// `crates/core/Cargo.lock` left behind is exactly the file premise 1 and
+    /// the lock-changed classification would have asked about. Proving that
+    /// lock proves nothing about the one the audit read, so the proof is
+    /// withheld and says why.
+    #[test]
+    fn a_relocated_cargo_root_withholds_the_lock_proof() {
+        use LockProofEntry::Blob;
+        let clean: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let configured = || {
+            [
+                ("crates/core/Cargo.toml", Blob(CORE_MANIFEST)),
+                ("crates/core/Cargo.lock", Blob(CORE_LOCK)),
+            ]
+        };
+        let (tmp, head, target) = lock_proof_repo(
+            &configured(),
+            &[
+                ("backend/Cargo.toml", Blob(CORE_MANIFEST)),
+                ("backend/Cargo.lock", Blob(CORE_LOCK)),
+                ("crates/core/Cargo.lock", Blob(CORE_LOCK)),
+            ],
+        );
+        let config = member_config(&tmp);
+        assert!(
+            crate::checks::reviewed_cargo_root_relocated(&config, &target),
+            "fixture precondition: cargo resolves the moved crate in backend/"
+        );
+        let comparison = CleanComparison::resolve(
+            &config,
+            &resolved_ref(&target),
+            &[resolved_ref(&head)],
+            Some(true),
+            Some(&clean),
+            Some(&head),
+            &[],
+        );
+        assert_eq!(
+            comparison.cargo_audit_lock_proof(),
+            CargoAuditLockProof::Unproven(LockProofGap::RelocatedCargoRoot)
+        );
+        assert!(!comparison.applies_to("cargo_audit"));
+
+        // The control: a target that keeps the crate where it was configured.
+        let (tmp, head, target) = lock_proof_repo(&configured(), &configured());
+        let config = member_config(&tmp);
+        let relocated = crate::checks::reviewed_cargo_root_relocated(&config, &target);
+        assert!(!relocated, "a crate that stayed put is not relocated");
+        let kept = CleanComparison::resolve(
+            &config,
+            &resolved_ref(&target),
+            &[resolved_ref(&head)],
+            Some(true),
+            Some(&clean),
+            Some(&head),
+            &[],
+        );
+        assert_eq!(
+            kept.cargo_audit_lock_proof(),
+            CargoAuditLockProof::TargetLock
+        );
+    }
+
+    /// `cargo audit` reads `Cargo.lock` in the directory it runs in and never a
+    /// workspace root's, so a root lock beside a lock-less member vouches for a
+    /// file the audit did not read — in both checkout shapes.
+    #[test]
+    fn a_workspace_root_lock_does_not_vouch_for_a_lockless_member() {
+        use LockProofEntry::Blob;
+        let clean: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let files = || {
+            [
+                ("crates/core/Cargo.toml", Blob(CORE_MANIFEST)),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+            ]
+        };
+        let (tmp, head, target) = lock_proof_repo(&files(), &files());
+        let config = member_config(&tmp);
+        for (reviewed, base) in [(&head, &target), (&target, &head)] {
+            let comparison = CleanComparison::resolve(
+                &config,
+                &resolved_ref(reviewed),
+                &[resolved_ref(base)],
+                Some(true),
+                Some(&clean),
+                Some(&head),
+                &[],
+            );
+            assert_eq!(
+                comparison.cargo_audit_lock_proof(),
+                CargoAuditLockProof::Unproven(LockProofGap::NoTargetLock),
+                "reviewing {reviewed}: the root lock is not the member's"
+            );
+        }
+    }
+
+    /// A member lock committed as a symlink is not a committed lockfile, and
+    /// the root lock it points at does not stand in for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_member_lock_is_not_a_target_lock() {
+        use LockProofEntry::{Blob, Link};
+        let clean: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let files = || {
+            [
+                ("crates/core/Cargo.toml", Blob(CORE_MANIFEST)),
+                ("crates/core/Cargo.lock", Link("../../Cargo.lock")),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+            ]
+        };
+        let (tmp, head, target) = lock_proof_repo(&files(), &files());
+        let comparison = CleanComparison::resolve(
+            &member_config(&tmp),
+            &resolved_ref(&target),
+            &[resolved_ref(&head)],
+            Some(true),
+            Some(&clean),
+            Some(&head),
+            &[],
+        );
+        assert_eq!(
+            comparison.cargo_audit_lock_proof(),
+            CargoAuditLockProof::Unproven(LockProofGap::NoTargetLock)
+        );
+    }
+
+    /// The local dirty check asks about the lockfile the audit read — the
+    /// member's — and nothing else.
+    #[test]
+    fn the_local_dirty_check_asks_about_the_audited_lock() {
+        use LockProofEntry::Blob;
+        let files = || {
+            [
+                ("crates/core/Cargo.toml", Blob(CORE_MANIFEST)),
+                ("crates/core/Cargo.lock", Blob(CORE_LOCK)),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+            ]
+        };
+        let (tmp, head, target) = lock_proof_repo(&files(), &files());
+        let config = member_config(&tmp);
+        let local = |dirty: &[&str]| {
+            let dirty: std::collections::BTreeSet<String> =
+                dirty.iter().map(|path| path.to_string()).collect();
+            CleanComparison::resolve(
+                &config,
+                &resolved_ref(&head),
+                &[resolved_ref(&target)],
+                Some(dirty.is_empty()),
+                Some(&dirty),
+                Some(&head),
+                &[],
+            )
+            .cargo_audit_lock_proof()
+        };
+        assert_eq!(
+            local(&["crates/core/Cargo.lock"]),
+            CargoAuditLockProof::Unproven(LockProofGap::DirtyLock)
+        );
+        assert_eq!(
+            local(&["Cargo.lock"]),
+            CargoAuditLockProof::TargetLock,
+            "a root lock the member's audit never reads cannot revoke its proof"
+        );
     }
 
     #[test]

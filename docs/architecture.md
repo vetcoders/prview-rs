@@ -279,15 +279,24 @@ forge, since it lives in `Cargo.lock` × the advisory database. The proof that i
 load-bearing is therefore lockfile provenance: the audited `Cargo.lock` is the
 analysed target's — which first requires that the target HAVE one. `cargo audit`
 generates a lockfile from the registry when the crate has none and audits that,
-so the proof asks the target commit's tree (the `cargo_root` member lock, then
-the workspace-root lock it falls back to) before anything else; no lockfile
-there, or no readable answer, and the proof is withheld in every run shape.
-Given the file, the proof holds when the run scanned a target snapshot (`cargo
-audit` executes inside the materialised snapshot via `plan_cargo_run`), and,
-for a local run, when the lockfile itself carried no uncommitted change — read
-from the dirty-path set frozen before the checks ran (R4-19). Dirt anywhere
-else in the tree is not evidence about the lockfile and no longer suppresses the
-downgrade; dirt in the lockfile is, and does. A withheld proof names its gap
+so the proof asks the target commit's tree before anything else — for the one
+lockfile the audit reads, `Cargo.lock` in the cargo root itself. `cargo audit`
+opens that file relative to its working directory and never falls back to a
+workspace root's (cargo-audit 0.22, `lockfile::locate_or_generate`), so a root
+lock beside a lock-less member proves nothing, and neither does a symlink
+committed in the lockfile's place. No such lockfile, or no readable answer, and
+the proof is withheld in every run shape. Given the file, the proof holds when
+the run scanned a target snapshot (`cargo audit` executes inside the
+materialised snapshot via `plan_cargo_run`) at the cargo root the proof asked
+about. A reviewed commit that moved its crate (`crates/core` → `backend`, the
+case `resolve_reviewed_cargo_root` follows) has cargo run in the new directory
+while the lockfile and lock-changed questions still concern the configured one —
+possibly a stale lock left behind — so that shape withholds the proof
+(`RelocatedCargoRoot`). For a local run the proof holds when the audited
+lockfile carried no uncommitted change — read from the dirty-path set frozen
+before the checks ran (R4-19). Dirt anywhere else in the tree is not evidence
+about that lockfile and no longer suppresses the downgrade; dirt in it is, and
+does. A withheld proof names its gap
 (`CargoAuditLockProof::Unproven(LockProofGap)`), and the merge gate states that
 gap rather than blocking on a bare `Cargo audit (Failed)`.
 
@@ -298,8 +307,9 @@ comparison over the full advisory set — rows exist only for
 `vulnerabilities.list`, so each new `warnings`-category advisory (`unmaintained`,
 `unsound`, `yanked`) gets a dashboard note row with `in_diff = true` (a note:
 never a SARIF result, never counted in `findings_count`), and an audit that
-introduced one classifies Mixed or Introduced instead of pre-existing; a changed lock with no base audit leaves every row `in_diff = null`,
-which R5-23 keeps Unclassified whatever the lockfile proof says. R3-14
+introduced one classifies Mixed or Introduced instead of pre-existing; a changed
+lock with no base audit leaves every row `in_diff = null`, which R5-23 keeps
+Unclassified whatever the lockfile proof says. R3-14
 (`--current-only`) and R4-20 (no resolvable base diff) still veto the downgrade
 upstream of the proof. A newly published advisory against an unchanged lock is
 therefore reported as pre-existing debt newly revealed, not as debt this change
@@ -310,8 +320,12 @@ The gate says which of these it applied. A downgraded audit carries
 `reason: "pre-existing: Cargo.lock unchanged by this PR (N advisories)"` or
 `"pre-existing: unchanged vs base audit (N advisories)"`; a blocking one names
 what it blocks on — `Cargo audit (Failed): N new advisories introduced
-(RUSTSEC-… in <crate> <version>), M pre-existing`, or `N advisories with no base comparison (baseline
-unavailable)` when nothing could be compared.
+(RUSTSEC-… in <crate> <version>), M pre-existing`, or `N advisories with no base
+comparison (baseline unavailable)` when nothing could be compared. "Introduced"
+is what the proof licenses: under a withheld proof the same count reads `N new
+advisories vs the base audit (…), M pre-existing; provenance proof unavailable:
+<gap>`, because an audited lock not shown to be the target's cannot say the
+target introduced anything.
 
 Semgrep's `errors[]` remains a completeness signal independently of findings.
 Path-like `path`, `location.path`, and span `file` fields are collected into a
