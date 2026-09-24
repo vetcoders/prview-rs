@@ -266,7 +266,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yanked`) blocks the downgrade like a new vulnerability: it has no
   vulnerability row of its own, so it reaches the classifier as a dashboard
   note, and a changed lock that kept an old vulnerability while adding one no
-  longer passes as pre-existing. The gate states which proof it
+  longer passes as pre-existing. A yanked crate is part of that set too:
+  cargo-audit reports it with no advisory, and it used to be dropped from the
+  comparison while the check status still counted it; it is now keyed as
+  `yanked`, and any counted `warnings` item that cannot be keyed makes the
+  report unreadable rather than invisible. The base audit reads the base's copy
+  of the lockfile the audit read: a member that gains its own `Cargo.lock` is
+  no longer compared against the repository-root lock (a superset of every
+  member's resolution), so an advisory the new member lock introduced is no
+  longer classified as pre-existing — that baseline is unavailable instead. The gate states which proof it
   applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this
   PR (N advisories)`; a blocking one names the advisories it blocks on — all of
   them, counted and named from one set, so an `unmaintained` warning is no

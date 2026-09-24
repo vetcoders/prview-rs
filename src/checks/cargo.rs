@@ -2146,7 +2146,11 @@ fn cargo_audit_warning_count(stdout: &str) -> Option<usize> {
     Some(count_cargo_audit_warning_items(warnings))
 }
 
-fn count_cargo_audit_warning_items(value: &serde_json::Value) -> usize {
+/// How many advisory-like items one `warnings` value carries, as the check
+/// status counts them. The baseline key builder holds itself to this same
+/// count, so an item that makes the check report warnings can never be one the
+/// pre-existing comparison silently cannot see.
+pub(crate) fn count_cargo_audit_warning_items(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Array(items) => items.len(),
         serde_json::Value::Object(map) => {

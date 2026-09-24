@@ -2609,6 +2609,87 @@ FAILED tests/test_parser.py::test_roundtrip\n\
         );
     }
 
+    /// The same shape with a yanked crate instead of an `unmaintained` one.
+    /// cargo-audit reports a yanked release with `"advisory": null`, so it has
+    /// no advisory id to key.
+    const PREEXISTING_VULNERABILITY_NEW_YANKED_CARGO_AUDIT: &str = r#"{
+        "vulnerabilities": {
+            "found": true,
+            "count": 1,
+            "list": [{
+                "advisory": {"id": "RUSTSEC-2024-0001", "title": "demo advisory"},
+                "package": {"name": "demo", "version": "1.2.3"},
+                "versions": {"patched": [">=1.2.4"]}
+            }]
+        },
+        "warnings": {
+            "yanked": [{
+                "kind": "yanked",
+                "package": {"name": "shiny", "version": "2.0.0"},
+                "advisory": null
+            }]
+        }
+    }"#;
+
+    /// A yanked crate the change introduced must reach the classifier like any
+    /// other warnings-category item. The key builder used to require an
+    /// advisory id, so the yanked entry was never keyed: `new` stayed 0, no note
+    /// was emitted, and the pre-existing vulnerability row downgraded the
+    /// failed audit on its own.
+    #[test]
+    fn a_new_yanked_crate_blocks_the_preexisting_downgrade() {
+        let current = crate::artifacts::audit::cargo_audit_report_advisory_keys(
+            PREEXISTING_VULNERABILITY_NEW_YANKED_CARGO_AUDIT,
+        )
+        .expect("a valid current report");
+        let base = crate::artifacts::audit::cargo_audit_report_advisory_keys(BASE_CARGO_AUDIT)
+            .expect("a valid base report");
+        let vulnerabilities = crate::artifacts::audit::parse_cargo_audit_findings(
+            PREEXISTING_VULNERABILITY_NEW_YANKED_CARGO_AUDIT,
+        );
+
+        let unrepresented = cargo_audit_unrepresented_new_advisories(
+            Some(&current),
+            true,
+            Some(&base),
+            &vulnerabilities,
+        );
+        assert_eq!(unrepresented, vec!["yanked in shiny 2.0.0".to_string()]);
+        assert_eq!(
+            cargo_audit_baseline_counts(Some(&current), true, Some(&base)).new,
+            1,
+            "the yanked crate is counted as new, exactly as the check status counts it"
+        );
+
+        let mut rows: Vec<DashboardFinding> = vulnerabilities
+            .iter()
+            .map(|finding| DashboardFinding {
+                file: None,
+                line: None,
+                level: finding.sarif_level,
+                check_name: "Cargo audit".to_string(),
+                check_id: "cargo_audit".to_string(),
+                message: finding.sarif_message(),
+                in_diff: cargo_audit_finding_in_diff(
+                    &crate::artifacts::audit::cargo_audit_finding_key(finding),
+                    true,
+                    true,
+                    Some(&base),
+                ),
+            })
+            .collect();
+        rows.extend(
+            unrepresented
+                .iter()
+                .map(|label| cargo_audit_new_advisory_note("Cargo audit", "cargo_audit", label)),
+        );
+        assert_eq!(
+            classify_quality_failure("cargo_audit", &rows, true),
+            QualityFailureClass::Mixed,
+            "a pre-existing vulnerability beside an introduced yanked crate is mixed"
+        );
+    }
+
     /// A new advisory that already has a vulnerability row is not duplicated:
     /// its row carries the in-diff origin itself.
     #[test]

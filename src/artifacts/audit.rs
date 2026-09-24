@@ -214,6 +214,23 @@ pub(crate) fn cargo_audit_finding_key(finding: &CargoAuditFinding) -> (String, S
 /// The outer `Option` distinguishes a valid clean report from truncated output
 /// or a tool error. Treating both as an empty set would manufacture resolved
 /// advisories and a false clean baseline.
+///
+/// The key set is TOTAL over what the check status counts
+/// ([`crate::checks::count_cargo_audit_warning_items`]): every `warnings` item
+/// that can turn the audit into a warning is keyed here, or the report is
+/// unreadable (`None`). Skipping an item the counter counts is how a change
+/// introduced a warning the pre-existing comparison could not see — the
+/// remaining vulnerability row then downgraded the failed audit on its own.
+///
+/// * A `yanked` item carries no advisory at all (`"advisory": null`): a
+///   yanked release is a fact about the package, not an advisory. Its identity
+///   is the category plus the locked package, so it is keyed as `yanked` —
+///   stable across the base and target reports, and one key per yanked
+///   package version, which is exactly what the counter counts.
+/// * Any other item without an advisory id, or without its locked package
+///   name and version, cannot be keyed without inventing a sentinel that would
+///   collapse distinct items into one. It makes the whole report unreadable,
+///   which the gate treats as causation unknown.
 pub(crate) fn cargo_audit_report_advisory_keys(
     output: &str,
 ) -> Option<std::collections::HashSet<(String, String, String)>> {
@@ -224,28 +241,26 @@ pub(crate) fn cargo_audit_report_advisory_keys(
         .iter()
         .map(cargo_audit_finding_key)
         .collect();
-    let Some(warnings) = parsed.get("warnings").and_then(|value| value.as_object()) else {
+    let Some(warnings) = parsed.get("warnings") else {
         return Some(keys);
     };
-    for entries in warnings.values().filter_map(|value| value.as_array()) {
+    let Some(categories) = warnings.as_object() else {
+        return (crate::checks::count_cargo_audit_warning_items(warnings) == 0).then_some(keys);
+    };
+    for (category, value) in categories {
+        let Some(entries) = value.as_array() else {
+            if crate::checks::count_cargo_audit_warning_items(value) == 0 {
+                continue;
+            }
+            return None;
+        };
         for entry in entries {
-            let Some(advisory_id) = entry
-                .pointer("/advisory/id")
-                .and_then(|value| value.as_str())
-            else {
-                continue;
-            };
-            let Some(package_name) = entry
-                .pointer("/package/name")
-                .and_then(|value| value.as_str())
-            else {
-                continue;
-            };
-            let Some(package_version) = entry
-                .pointer("/package/version")
-                .and_then(|value| value.as_str())
-            else {
-                continue;
+            let package_name = entry.pointer("/package/name")?.as_str()?;
+            let package_version = entry.pointer("/package/version")?.as_str()?;
+            let advisory_id = match entry.get("advisory") {
+                Some(advisory) if !advisory.is_null() => advisory.get("id")?.as_str()?,
+                _ if category == "yanked" => "yanked",
+                _ => return None,
             };
             keys.insert((
                 advisory_id.to_string(),
@@ -260,8 +275,22 @@ pub(crate) fn cargo_audit_report_advisory_keys(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CargoAuditComparisonContext {
     base_commit_id: String,
+    /// The lockfile governing `cargo_root` in the base, with the workspace-root
+    /// fallback. It answers "did the relevant lock change?", nothing more.
     base_lock_path: Option<String>,
     target_lock_path: Option<String>,
+    /// The base's copy of the one lockfile the target audit READ
+    /// ([`cargo_audit_lock_path`]) — the only base file whose advisories are
+    /// comparable with that audit. `None` when the base has no such file.
+    ///
+    /// Kept apart from `base_lock_path` because the two questions differ. A
+    /// member that gains its own `Cargo.lock` is audited against that file,
+    /// while the base resolves to the repository-root lock by fallback; that
+    /// root lock is a superset of every member's resolution (or an unrelated
+    /// file outright), so a vulnerable tuple found there proves nothing about
+    /// the member. Comparing against it classified an advisory the member lock
+    /// introduced as out-of-diff, and the failed audit downgraded to PASS.
+    comparable_base_lock_path: Option<String>,
     cargo_cwd: std::path::PathBuf,
     lock_changed: bool,
 }
@@ -392,11 +421,16 @@ fn cargo_audit_comparison_context_for_diff(
             base_lock_path.as_deref() == Some(file.path.as_str())
                 || target_lock_path.as_deref() == Some(file.path.as_str())
         });
+    let audited_lock_path = cargo_audit_lock_path(repo.path(), cargo_root);
+    let comparable_base_lock_path = base_lock_path
+        .clone()
+        .filter(|path| audited_lock_path.as_deref() == Some(path.as_str()));
 
     Some(CargoAuditComparisonContext {
         base_commit_id: diff.base_commit_id.clone(),
         base_lock_path,
         target_lock_path,
+        comparable_base_lock_path,
         cargo_cwd,
         lock_changed,
     })
@@ -459,7 +493,9 @@ pub(crate) fn get_base_cargo_audit_findings(
     if !context.lock_changed {
         return Ok(None);
     }
-    let Some(cargo_lock_path) = context.base_lock_path else {
+    // Only the base's copy of the lockfile the audit read is comparable with
+    // it; a base that has none leaves the baseline unavailable.
+    let Some(cargo_lock_path) = context.comparable_base_lock_path else {
         return Ok(None);
     };
     let Ok(base_content) = repo.file_at_commit(&context.base_commit_id, &cargo_lock_path) else {
@@ -819,21 +855,66 @@ mod tests {
         )));
     }
 
+    /// cargo-audit reports a yanked release with `"advisory": null` — there is
+    /// no advisory, only the package. It used to be skipped for lacking
+    /// `/advisory/id`, while the check status still counted it, so a change
+    /// that added a yanked crate beside a pre-existing vulnerability downgraded
+    /// the failed audit as if nothing had been introduced.
     #[test]
-    fn malformed_informational_entries_do_not_collapse_into_sentinel_keys() {
-        let output = r#"{
-          "vulnerabilities":{"list":[]},
-          "warnings":{"unmaintained":[
-            {"advisory":{"id":"RUSTSEC-2024-0001"},"package":{"name":"demo"}},
-            {"package":{"name":"demo","version":"1.2.3"}}
-          ]}
-        }"#;
+    fn a_yanked_package_is_keyed_by_its_category() {
+        for entry in [
+            r#"{"kind":"yanked","package":{"name":"shiny","version":"2.0.0"},"advisory":null}"#,
+            r#"{"kind":"yanked","package":{"name":"shiny","version":"2.0.0"}}"#,
+        ] {
+            let output =
+                format!(r#"{{"vulnerabilities":{{"list":[]}},"warnings":{{"yanked":[{entry}]}}}}"#);
+            let keys = cargo_audit_report_advisory_keys(&output).expect("valid report");
+            assert_eq!(
+                keys,
+                std::iter::once((
+                    "yanked".to_string(),
+                    "shiny".to_string(),
+                    "2.0.0".to_string()
+                ))
+                .collect::<std::collections::HashSet<_>>(),
+                "{entry}",
+            );
+        }
+    }
 
-        assert!(
-            cargo_audit_report_advisory_keys(output)
-                .expect("valid report")
-                .is_empty()
-        );
+    /// An item the check status counts but the key set cannot hold makes the
+    /// report unreadable. Skipping it silently hid it from the pre-existing
+    /// comparison; keying it by a sentinel (`cargo-audit`, `unknown`) would
+    /// collapse distinct items into one key. Neither may happen.
+    #[test]
+    fn unkeyable_informational_entries_make_the_report_unreadable() {
+        for warnings in [
+            // A locked package without its version.
+            r#"{"unmaintained":[{"advisory":{"id":"RUSTSEC-2024-0001"},"package":{"name":"demo"}}]}"#,
+            // An advisory-bearing category without an advisory id.
+            r#"{"unmaintained":[{"package":{"name":"demo","version":"1.2.3"}}]}"#,
+            r#"{"unsound":[{"advisory":null,"package":{"name":"demo","version":"1.2.3"}}]}"#,
+            // Counted shapes that carry no keyable entries.
+            r#"{"notice":{"count":1}}"#,
+            r#"[{"package":{"name":"demo","version":"1.2.3"}}]"#,
+        ] {
+            let output = format!(r#"{{"vulnerabilities":{{"list":[]}},"warnings":{warnings}}}"#);
+            assert!(
+                cargo_audit_report_advisory_keys(&output).is_none(),
+                "{warnings} is counted by the check status but cannot be keyed",
+            );
+        }
+
+        // Control: shapes the counter counts as zero stay a readable, clean
+        // report.
+        for warnings in [r#"{}"#, r#"{"yanked":[],"notice":{}}"#, r#"[]"#] {
+            let output = format!(r#"{{"vulnerabilities":{{"list":[]}},"warnings":{warnings}}}"#);
+            assert_eq!(
+                cargo_audit_report_advisory_keys(&output),
+                Some(std::collections::HashSet::new()),
+                "{warnings}",
+            );
+        }
     }
 
     #[test]
@@ -865,10 +946,18 @@ mod tests {
             context.target_lock_path.as_deref(),
             Some("crates/member/Cargo.lock")
         );
+        assert_eq!(
+            context.comparable_base_lock_path.as_deref(),
+            Some("crates/member/Cargo.lock"),
+            "the base carries the lockfile the audit reads, so it is comparable"
+        );
         assert_eq!(context.cargo_cwd, member);
         assert!(context.lock_changed);
     }
 
+    /// The workspace-root fallback still decides whether the relevant lock
+    /// changed, but the root lock is not the file an audit run in the member
+    /// reads, so it is never the comparison baseline.
     #[test]
     fn baseline_context_falls_back_to_workspace_lock_for_member() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -887,8 +976,56 @@ mod tests {
             cargo_audit_comparison_context(&repo, &[diff], Some(&member)).expect("context");
         assert_eq!(context.base_lock_path.as_deref(), Some("Cargo.lock"));
         assert_eq!(context.target_lock_path.as_deref(), Some("Cargo.lock"));
+        assert_eq!(context.comparable_base_lock_path, None);
         assert_eq!(context.cargo_cwd, member);
         assert!(context.lock_changed);
+    }
+
+    /// A member that gains its own `Cargo.lock` is audited against that file,
+    /// while its base resolves to the repository-root lock by fallback. The
+    /// root lock holds every member's resolution, so a vulnerable tuple in it
+    /// proves nothing about this member: comparing against it classified an
+    /// advisory the new member lock introduced as out-of-diff, and the failed
+    /// audit downgraded to PASS. The base has no copy of the audited file, so
+    /// the baseline is unavailable.
+    #[test]
+    fn a_member_lock_new_in_the_target_is_not_compared_with_the_root_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = commit_fixture(
+            tmp.path(),
+            &[
+                ("Cargo.lock", "workspace"),
+                ("crates/member/Cargo.toml", "[package]\nname='member'\n"),
+            ],
+        );
+        let target = commit_fixture(tmp.path(), &[("crates/member/Cargo.lock", "member")]);
+        let repo = crate::git::Repository::open(tmp.path()).expect("repository");
+        let diff = lock_diff(&base, &target, &["crates/member/Cargo.lock"]);
+        let member = tmp.path().join("crates/member");
+
+        let context =
+            cargo_audit_comparison_context(&repo, std::slice::from_ref(&diff), Some(&member))
+                .expect("context");
+        assert_eq!(context.base_lock_path.as_deref(), Some("Cargo.lock"));
+        assert_eq!(
+            context.target_lock_path.as_deref(),
+            Some("crates/member/Cargo.lock")
+        );
+        assert!(
+            context.lock_changed,
+            "the audited lock is new, so it changed"
+        );
+        assert_eq!(
+            context.comparable_base_lock_path, None,
+            "the base has no copy of the lockfile the audit read"
+        );
+
+        // The entry point refuses before it would spawn a base audit at all.
+        assert_eq!(
+            get_base_cargo_audit_findings(Some(&repo), &[diff], Some(&member))
+                .expect("no base audit is attempted"),
+            None,
+        );
     }
 
     #[test]
