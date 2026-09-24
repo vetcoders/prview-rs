@@ -818,6 +818,12 @@ pub(crate) enum LockProofGap {
     /// exact-path comparison cannot see it, so nothing shows the configuration
     /// is the one both sides share.
     AuditConfigCaseVariant,
+    /// The `CARGO_HOME` the checks inherited is relative, so it resolves
+    /// inside the directory `cargo audit` ran in. The fallback configuration
+    /// `$CARGO_HOME/audit.toml` and the advisory database under it are then
+    /// files in the scanned tree, which no comparison of `.cargo/audit.toml`
+    /// covers.
+    RelativeCargoHome,
     /// The worktree status or the checkout's identity could not be read, so
     /// nothing about the scanned lockfile was established either way.
     UnknownProvenance,
@@ -845,6 +851,11 @@ impl LockProofGap {
             LockProofGap::AuditConfigCaseVariant => {
                 "provenance proof unavailable: .cargo/audit.toml is committed under \
                  another case, which a case-insensitive checkout reads"
+            }
+            LockProofGap::RelativeCargoHome => {
+                "provenance proof unavailable: CARGO_HOME is relative, so cargo \
+                 audit read its fallback configuration and advisory database \
+                 inside the scanned tree"
             }
             LockProofGap::UnknownProvenance => {
                 "provenance proof unavailable: the scanned tree could not be tied \
@@ -977,6 +988,13 @@ pub(crate) struct LockEvidence<'a> {
     /// learns whether a command rewrote the tree the audit read. `None` for a
     /// local review, which has no snapshot to observe.
     pub(crate) snapshot_integrity: Option<&'a super::signal::SnapshotIntegrity>,
+    /// The shared snapshot's working tree, the one an off-`HEAD` audit ran in,
+    /// where an untracked or ignored file it read can still be found. `None`
+    /// for a local review.
+    pub(crate) snapshot_root: Option<&'a std::path::Path>,
+    /// The `CARGO_HOME` the checks inherited, which `cargo audit` resolves
+    /// against the directory it runs in when it is relative. `None` when unset.
+    pub(crate) cargo_home: Option<&'a std::ffi::OsStr>,
 }
 
 impl<'a> LockEvidence<'a> {
@@ -985,7 +1003,7 @@ impl<'a> LockEvidence<'a> {
     pub(crate) fn before_checks(dirty: Option<&'a std::collections::BTreeSet<String>>) -> Self {
         LockEvidence {
             dirty_before_checks: dirty,
-            snapshot_integrity: None,
+            ..LockEvidence::default()
         }
     }
 }
@@ -1299,6 +1317,14 @@ fn config_file_owner(basename: &str) -> Option<&'static str> {
 /// cannot be searched for one names no case, so it counts as a change like
 /// any other unreadable answer.
 ///
+/// cargo-audit falls back to `$CARGO_HOME/audit.toml` when the cargo root has
+/// no `.cargo/audit.toml`, and reads its advisory database under
+/// `$CARGO_HOME` either way. An absolute `CARGO_HOME` lies outside what the
+/// change can edit, but a relative one resolves against the directory the
+/// audit ran in, making both files part of the scanned tree that no comparison
+/// here covers. The proof is then withheld as
+/// [`LockProofGap::RelativeCargoHome`] before anything else is asked.
+///
 /// With a Cargo root outside the repository there is no in-tree file, and no
 /// lock proof either.
 fn cargo_audit_config_gap(
@@ -1313,6 +1339,14 @@ fn cargo_audit_config_gap(
         &config.repo_root,
         config.profile.cargo_root.as_deref(),
     )?;
+    // The same reading as `home::cargo_home`, which cargo-audit uses: an
+    // empty value counts as unset.
+    if evidence
+        .cargo_home
+        .is_some_and(|home| !home.is_empty() && !std::path::Path::new(home).is_absolute())
+    {
+        return Some(LockProofGap::RelativeCargoHome);
+    }
     let Some(repo) = repo else {
         return Some(LockProofGap::AuditConfigChanged);
     };
@@ -1365,8 +1399,13 @@ fn cargo_audit_config_gap(
 ///   an ignored configuration is caught, since the status read never lists it.
 ///
 /// A snapshot run audits a tree materialised from the target, so only a check
-/// that rewrote the file there can make it differ. Anything that cannot be
-/// read counts as a difference.
+/// can make the file there differ. The check boundaries report a tracked file
+/// it rewrote, in the index, the working tree or on disk past a skip flag. They
+/// never list an untracked or ignored file, and an earlier check's build
+/// script can generate one where the target has no configuration. So, as
+/// locally, any file at that path in the snapshot's working tree counts.
+///
+/// Anything that cannot be read counts as a difference.
 fn scanned_audit_config_is_target(
     repo: &crate::git::Repository,
     path: &str,
@@ -1374,15 +1413,29 @@ fn scanned_audit_config_is_target(
     target_is_checkout: Option<bool>,
     evidence: LockEvidence<'_>,
 ) -> bool {
+    let absent_from = |root: &std::path::Path| {
+        matches!(
+            std::fs::symlink_metadata(root.join(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    };
     match target_is_checkout {
-        Some(false) => evidence
-            .snapshot_integrity
-            .and_then(|integrity| integrity.tracked_changes())
-            .is_some_and(|changed| {
-                !changed
-                    .iter()
-                    .any(|changed| path_or_parent_is(path, changed))
-            }),
+        Some(false) => {
+            let untouched = evidence
+                .snapshot_integrity
+                .and_then(|integrity| integrity.tracked_changes())
+                .is_some_and(|changed| {
+                    !changed
+                        .iter()
+                        .any(|changed| path_or_parent_is(path, changed))
+                });
+            untouched
+                && match repo.regular_blob_at_commit(&resolved_target.commit_id, path) {
+                    Ok(Some(_)) => true,
+                    Ok(None) => evidence.snapshot_root.is_some_and(absent_from),
+                    Err(_) => false,
+                }
+        }
         Some(true) => {
             let Some(dirty) = evidence.dirty_before_checks else {
                 return false;
@@ -1396,12 +1449,7 @@ fn scanned_audit_config_is_target(
             }
             match repo.regular_blob_at_commit(target, path) {
                 Ok(Some(_)) => true,
-                Ok(None) => repo.workdir().is_some_and(|workdir| {
-                    matches!(
-                        std::fs::symlink_metadata(workdir.join(path)),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                    )
-                }),
+                Ok(None) => repo.workdir().is_some_and(absent_from),
                 Err(_) => false,
             }
         }
@@ -2924,6 +2972,8 @@ mod tests {
                 LockEvidence {
                     dirty_before_checks: Some(&clean),
                     snapshot_integrity: Some(&untouched),
+                    snapshot_root: Some(lock_tmp.path()),
+                    ..LockEvidence::default()
                 },
                 Some(&lock_first.to_string()),
                 &[],
@@ -3100,6 +3150,8 @@ mod tests {
             LockEvidence {
                 dirty_before_checks: Some(&clean),
                 snapshot_integrity: Some(&untouched),
+                snapshot_root: Some(tmp.path()),
+                ..LockEvidence::default()
             },
             Some(&head),
             &[],
@@ -3160,6 +3212,8 @@ mod tests {
                 LockEvidence {
                     dirty_before_checks: Some(&clean),
                     snapshot_integrity: Some(&untouched),
+                    snapshot_root: Some(tmp.path()),
+                    ..LockEvidence::default()
                 },
                 Some(&head),
                 &[diff],
@@ -3431,17 +3485,34 @@ mod tests {
         }
 
         // Snapshot shape: the audit read a tree materialised from the target,
-        // so only a check boundary that saw the file rewritten makes it differ.
-        let (tmp, head, target) = lock_proof_repo(&files(Some(COMMITTED)), &files(Some(COMMITTED)));
-        let config = crate::config::test_config_builder()
-            .repo_root(tmp.path())
-            .build();
-        let diff = crate::git::Repository::open(tmp.path())
-            .unwrap()
-            .diff_refs(&resolved_ref(&head), &resolved_ref(&target))
-            .unwrap();
-        let clean = std::collections::BTreeSet::new();
-        let snapshot = |changed: &[&str]| {
+        // so only a check makes the file differ: a boundary that saw the
+        // tracked file rewritten, or, where the target has none, a file a
+        // check left at the path, which no boundary lists.
+        enum SnapshotTree {
+            Unreadable,
+            Materialised,
+            Generated,
+        }
+        fn snapshot(
+            committed: Option<&'static str>,
+            changed: &[&str],
+            tree: SnapshotTree,
+        ) -> CargoAuditLockProof {
+            let (tmp, head, target) = lock_proof_repo(&files(committed), &files(committed));
+            let config = crate::config::test_config_builder()
+                .repo_root(tmp.path())
+                .build();
+            let diff = crate::git::Repository::open(tmp.path())
+                .unwrap()
+                .diff_refs(&resolved_ref(&head), &resolved_ref(&target))
+                .unwrap();
+            // The snapshot's own working tree, apart from the operator's
+            // checkout.
+            let worktree = tempfile::tempdir().unwrap();
+            if let SnapshotTree::Generated = tree {
+                edit(worktree.path());
+            }
+            let clean = std::collections::BTreeSet::new();
             let observed = snapshot_observed(&target, changed);
             CleanComparison::resolve(
                 &config,
@@ -3451,23 +3522,107 @@ mod tests {
                 LockEvidence {
                     dirty_before_checks: Some(&clean),
                     snapshot_integrity: Some(&observed),
+                    snapshot_root: match tree {
+                        SnapshotTree::Unreadable => None,
+                        _ => Some(worktree.path()),
+                    },
+                    ..LockEvidence::default()
                 },
                 Some(&head),
                 std::slice::from_ref(&diff),
             )
             .cargo_audit_lock_proof()
-        };
-        assert_eq!(snapshot(&[]), KEPT, "an untouched snapshot keeps the proof");
+        }
+        use SnapshotTree::{Generated, Materialised, Unreadable};
         assert_eq!(
-            snapshot(&["notes.txt"]),
+            snapshot(Some(COMMITTED), &[], Materialised),
+            KEPT,
+            "an untouched snapshot keeps the proof"
+        );
+        assert_eq!(
+            snapshot(Some(COMMITTED), &["notes.txt"], Materialised),
             KEPT,
             "an unrelated rewrite says nothing about the configuration"
         );
         assert_eq!(
-            snapshot(&[CONFIG]),
+            snapshot(Some(COMMITTED), &[CONFIG], Materialised),
             WITHHELD,
             "a check that rewrote the configuration in the snapshot"
         );
+        assert_eq!(
+            snapshot(None, &[], Materialised),
+            KEPT,
+            "no configuration in the target or the snapshot keeps the proof"
+        );
+        assert_eq!(
+            snapshot(None, &[], Generated),
+            WITHHELD,
+            "a configuration a check generated applies where the target has none, \
+             though no boundary lists an untracked file"
+        );
+        assert_eq!(
+            snapshot(None, &[], Unreadable),
+            WITHHELD,
+            "a snapshot tree nobody can look at vouches for no absence"
+        );
+    }
+
+    /// cargo-audit falls back to `$CARGO_HOME/audit.toml` where the cargo root
+    /// has no configuration, and reads its advisory database under
+    /// `$CARGO_HOME` either way. A relative `CARGO_HOME` resolves against the
+    /// directory the audit ran in, so both are files in the scanned tree, and
+    /// the change can edit them with the lockfile untouched.
+    #[test]
+    fn a_relative_cargo_home_withholds_the_lock_proof() {
+        use LockProofEntry::Blob;
+        let files = || {
+            [
+                ("Cargo.toml", Blob(CORE_MANIFEST)),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+            ]
+        };
+        let (tmp, head, target) = lock_proof_repo(&files(), &files());
+        let config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        let clean = std::collections::BTreeSet::new();
+        let untouched = snapshot_observed(&target, &[]);
+        let proof = |cargo_home: Option<&std::ffi::OsStr>| {
+            CleanComparison::resolve(
+                &config,
+                &resolved_ref(&target),
+                &[resolved_ref(&head)],
+                Some(true),
+                LockEvidence {
+                    dirty_before_checks: Some(&clean),
+                    snapshot_integrity: Some(&untouched),
+                    snapshot_root: Some(tmp.path()),
+                    cargo_home,
+                },
+                Some(&head),
+                &[],
+            )
+            .cargo_audit_lock_proof()
+        };
+        let absolute = std::env::temp_dir().join("cargo-home");
+        assert_eq!(proof(None), CargoAuditLockProof::TargetLock, "unset");
+        assert_eq!(
+            proof(Some("".as_ref())),
+            CargoAuditLockProof::TargetLock,
+            "an empty CARGO_HOME counts as unset"
+        );
+        assert_eq!(
+            proof(Some(absolute.as_os_str())),
+            CargoAuditLockProof::TargetLock,
+            "an absolute CARGO_HOME lies outside what the change edits"
+        );
+        for relative in [".cargo-home", "../cargo-home", "."] {
+            assert_eq!(
+                proof(Some(relative.as_ref())),
+                CargoAuditLockProof::Unproven(LockProofGap::RelativeCargoHome),
+                "CARGO_HOME={relative}"
+            );
+        }
     }
 
     #[test]
@@ -3617,6 +3772,8 @@ mod tests {
                 LockEvidence {
                     dirty_before_checks: Some(&clean),
                     snapshot_integrity: integrity,
+                    snapshot_root: Some(tmp.path()),
+                    ..LockEvidence::default()
                 },
                 Some(&first.to_string()),
                 &[],
@@ -3679,6 +3836,8 @@ mod tests {
                 LockEvidence {
                     dirty_before_checks: Some(&clean),
                     snapshot_integrity: Some(&observed),
+                    snapshot_root: Some(member_tmp.path()),
+                    ..LockEvidence::default()
                 },
                 Some(&head),
                 &[],

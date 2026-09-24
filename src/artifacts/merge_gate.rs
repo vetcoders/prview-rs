@@ -2153,6 +2153,13 @@ mod tests {
                  reads (2 advisories not shown to predate this change)",
             ),
             (
+                LockProofGap::RelativeCargoHome,
+                "Cargo audit (Failed): provenance proof unavailable: CARGO_HOME is \
+                 relative, so cargo audit read its fallback configuration and advisory \
+                 database inside the scanned tree (2 advisories not shown to predate \
+                 this change)",
+            ),
+            (
                 LockProofGap::UnknownProvenance,
                 "Cargo audit (Failed): provenance proof unavailable: the scanned tree \
                  could not be tied to the target commit (2 advisories not shown to \
@@ -2237,6 +2244,7 @@ mod tests {
             LockProofGap::RelocatedCargoRoot,
             LockProofGap::AuditConfigChanged,
             LockProofGap::AuditConfigCaseVariant,
+            LockProofGap::RelativeCargoHome,
             LockProofGap::UnknownProvenance,
         ] {
             let outcome = compute_effective_policy_outcome(
