@@ -2038,6 +2038,16 @@ impl Check for CargoAuditCheck {
         Some(format!("audit-{lock}-{day}"))
     }
 
+    fn replays_cached(&self, status: CheckStatus) -> bool {
+        // Only a clean report is replayed. A failing or warning report is what
+        // the pre-existing downgrade reads, and the lock proof it rests on is
+        // taken from the files as they are now — but the key above does not
+        // bind the audit config, so a replay can be a report an earlier config
+        // produced. A clean report needs no downgrade, so it cannot mislead
+        // one; everything else runs live.
+        status == CheckStatus::Passed
+    }
+
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
@@ -3252,6 +3262,24 @@ mod tests {
             key.ends_with(&today),
             "audit key must be scoped to the current day ({today}), got: {key}"
         );
+    }
+
+    #[test]
+    fn cargo_audit_replays_only_a_clean_report_from_cache() {
+        // The pre-existing downgrade reads a failing or warning report against
+        // a lock proof taken from the files as they are now, and the audit key
+        // does not bind `.cargo/audit.toml`. Only a report that needs no
+        // downgrade may come back from cache.
+        let check = CargoAuditCheck;
+        assert!(check.replays_cached(CheckStatus::Passed));
+        for status in [
+            CheckStatus::Failed,
+            CheckStatus::Warnings,
+            CheckStatus::Error,
+            CheckStatus::Skipped,
+        ] {
+            assert!(!check.replays_cached(status), "{status:?} must run live");
+        }
     }
 
     #[test]
