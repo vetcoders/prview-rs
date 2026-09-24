@@ -314,9 +314,10 @@ one is `mixed` or `introduced`, never downgraded — and a changed lock with no
 base audit leaves every row `in_diff: null`, which stays `unclassified` and
 keeps gating. The base audit reads the base's copy of the lockfile the audit
 read; a base without one (a member lock the change added beside a root lock)
-has no base audit. Every `warnings` item the check status counts is part of
-the compared set — a yanked release, which has no advisory, under the id
-`yanked` — and an item that cannot be keyed makes the report unreadable. A run with no diff baseline at all (`--current-only`, or no
+has no base audit. Every vulnerability entry and every `warnings` item the
+check status counts is part of the compared set — a yanked release, which has
+no advisory, under the id `yanked` — and an item that cannot be keyed makes
+the report unreadable. A run with no diff baseline at all (`--current-only`, or no
 resolved base differing from the target) downgrades nothing, whatever the
 lockfile says.
 

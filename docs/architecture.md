@@ -250,10 +250,13 @@ Cargo-audit baseline comparison covers vulnerability findings and the
 informational warning families (`unmaintained`, `unsound`, `yanked`, `notice`,
 and future warning keys). Its identity is `(advisory id, package, locked
 version)`; a yanked release carries no advisory (`"advisory": null`), so its id
-is the category, `yanked`. The key set is total over what the check status
-counts: a `warnings` item it cannot key (no locked package version, no advisory
-id outside `yanked`, or a counted shape with no entries) makes the report
-unreadable instead of silently leaving that item out of the comparison. An
+is the category, `yanked`. The key set is total over the report: every
+vulnerability entry is keyed, and exactly as many `warnings` items as the check
+status counts. An item it cannot key (no locked package name or version, or no
+advisory id outside `yanked`) or a counted shape with no entries (a `count`
+field, a nested object) makes the report unreadable, instead of silently
+leaving that item out of the comparison or keying it by a placeholder that
+would match an unrelated malformed item in the base. An
 unchanged lock makes current advisories pre-existing without another tool run;
 a changed lock is compared against `cargo audit` over the base revision's copy
 of the lockfile the live audit READ — `Cargo.lock` in the same Cargo root. The

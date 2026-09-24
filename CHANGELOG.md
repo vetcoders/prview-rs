@@ -269,8 +269,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer passes as pre-existing. A yanked crate is part of that set too:
   cargo-audit reports it with no advisory, and it used to be dropped from the
   comparison while the check status still counted it; it is now keyed as
-  `yanked`, and any counted `warnings` item that cannot be keyed makes the
-  report unreadable rather than invisible. The base audit reads the base's copy
+  `yanked`, and any vulnerability or counted `warnings` item that cannot be
+  keyed makes the report unreadable rather than invisible — a vulnerability
+  missing its advisory id or locked version no longer shares a placeholder key
+  with an unrelated malformed one in the base. The base audit reads the base's copy
   of the lockfile the audit read: a member that gains its own `Cargo.lock` is
   no longer compared against the repository-root lock (a superset of every
   member's resolution), so an advisory the new member lock introduced is no
