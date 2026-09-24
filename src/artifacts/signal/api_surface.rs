@@ -1144,6 +1144,7 @@ impl<'a> SnapshotBuilder<'a> {
         );
         let alias_limits =
             private_alias_resolution_limits(&private_aliases, &private_module_aliases);
+        let alias_digest_context = AliasDigestCell::new();
 
         let mut implementation_evidence: BTreeMap<PrivateTypeKey, Vec<GuardedImplEvidence>> =
             BTreeMap::new();
@@ -1180,6 +1181,7 @@ impl<'a> SnapshotBuilder<'a> {
                 &private_module_aliases,
                 alias_limits,
                 || governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled),
+                &alias_digest_context,
             )?;
             let trait_targets = if trait_resolution.terminals.is_empty() {
                 &trait_resolution.states
@@ -1193,6 +1195,7 @@ impl<'a> SnapshotBuilder<'a> {
                 &private_module_aliases,
                 alias_limits,
                 || governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled),
+                &alias_digest_context,
             )?;
             if owner_resolution.exhausted {
                 alias_resolution_unknowns.push(RustApiUnknown {
@@ -4616,6 +4619,7 @@ impl<'a> SnapshotBuilder<'a> {
             &self.self_crate_aliases,
             &self.declarations,
         );
+        let alias_digest_context = AliasDigestCell::new();
         for pending in self.pending_trait_impls.clone() {
             let initial_trait_key = (
                 pending.crate_name.clone(),
@@ -4627,6 +4631,7 @@ impl<'a> SnapshotBuilder<'a> {
                 &pending.cfg_guard,
                 &private_aliases,
                 &private_module_aliases,
+                &alias_digest_context,
             );
             let mut trait_candidates = Vec::new();
             for state in &trait_resolution.states {
@@ -4674,6 +4679,7 @@ impl<'a> SnapshotBuilder<'a> {
                     &pending.cfg_guard,
                     &private_aliases,
                     &private_module_aliases,
+                    &alias_digest_context,
                 )
             });
             let initial_owner_key = (
@@ -4794,6 +4800,7 @@ impl<'a> SnapshotBuilder<'a> {
             &self.self_crate_aliases,
             &self.declarations,
         );
+        let alias_digest_context = AliasDigestCell::new();
         for assoc in self.pending_assoc.clone() {
             let owner_key = SymbolKey {
                 crate_name: assoc.crate_name.clone(),
@@ -4826,6 +4833,7 @@ impl<'a> SnapshotBuilder<'a> {
                         &assoc.owner_name,
                         &private_aliases,
                         &private_module_aliases,
+                        &alias_digest_context,
                     )
                     .into_iter()
                     .filter(|projection| {
@@ -4892,6 +4900,7 @@ impl<'a> SnapshotBuilder<'a> {
                         &transform.owner_name,
                         &private_aliases,
                         &private_module_aliases,
+                        &alias_digest_context,
                     )
                     .into_iter()
                     .filter(|projection| {
@@ -9773,11 +9782,17 @@ fn private_alias_graph(
     (private_aliases, private_module_aliases)
 }
 
+/// Lazily built digest context shared by every resolution over one alias graph.
+/// Callers create one cell per graph; it is initialized only if some walk over
+/// that graph exhausts its bound.
+type AliasDigestCell = std::cell::OnceCell<PrivateAliasDigestContext>;
+
 fn resolve_private_type_alias_keys(
     initial: PrivateTypeKey,
     guard: &[String],
     private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
     private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+    digest_context: &AliasDigestCell,
 ) -> PrivateAliasResolution {
     resolve_private_type_alias_keys_cancellable(
         initial,
@@ -9785,6 +9800,7 @@ fn resolve_private_type_alias_keys(
         private_aliases,
         private_module_aliases,
         || false,
+        digest_context,
     )
     .expect("an uncancellable private alias resolution cannot be cancelled")
 }
@@ -9795,6 +9811,7 @@ fn resolve_private_type_alias_keys_cancellable(
     private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
     private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
     is_cancelled: impl Fn() -> bool,
+    digest_context: &AliasDigestCell,
 ) -> Result<PrivateAliasResolution, crate::governor::Cancelled> {
     resolve_private_type_alias_keys_with_limits(
         initial,
@@ -9803,6 +9820,7 @@ fn resolve_private_type_alias_keys_cancellable(
         private_module_aliases,
         private_alias_resolution_limits(private_aliases, private_module_aliases),
         is_cancelled,
+        digest_context,
     )
 }
 
@@ -9915,6 +9933,7 @@ fn resolve_private_type_alias_keys_with_limits(
     private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
     limits: PrivateAliasResolutionLimits,
     is_cancelled: impl Fn() -> bool,
+    digest_context: &AliasDigestCell,
 ) -> Result<PrivateAliasResolution, crate::governor::Cancelled> {
     let PrivateAliasResolutionLimits { budget, max_depth } = limits;
 
@@ -9990,7 +10009,9 @@ fn resolve_private_type_alias_keys_with_limits(
         exhausted = true;
     }
     let exhaustion_digest = exhausted.then(|| {
-        private_alias_graph_digest(&initial_state, private_aliases, private_module_aliases)
+        digest_context
+            .get_or_init(|| PrivateAliasDigestContext::new(private_aliases, private_module_aliases))
+            .digest(&initial_state)
     });
     Ok(PrivateAliasResolution {
         states: resolved,
@@ -10007,16 +10028,13 @@ fn guarded_private_type_evidence(label: &str, state: &GuardedPrivateTypeKey) -> 
     )
 }
 
-fn private_alias_graph_digest(
-    initial: &GuardedPrivateTypeKey,
-    private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
-    private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
-) -> String {
-    PrivateAliasDigestContext::new(private_aliases, private_module_aliases).digest(initial)
-}
-
+/// Fail-closed evidence for an exhausted alias walk binds the initial state to
+/// the complete private alias graph. The graph is identical for every state of
+/// one snapshot, so it is serialized and hashed exactly once; each state then
+/// hashes only its own row plus that fixed graph identity. Re-hashing the whole
+/// graph per state made large crates spend minutes in SHA-256 alone.
 struct PrivateAliasDigestContext {
-    serialized_rows: String,
+    graph_digest: Option<String>,
 }
 
 impl PrivateAliasDigestContext {
@@ -10024,6 +10042,8 @@ impl PrivateAliasDigestContext {
         private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
         private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
     ) -> Self {
+        use sha2::{Digest, Sha256};
+
         let mut rows = Vec::new();
         for (source, targets) in private_aliases {
             for (target, guard) in targets {
@@ -10044,7 +10064,8 @@ impl PrivateAliasDigestContext {
         rows.sort();
         rows.dedup();
         Self {
-            serialized_rows: rows.join("\n--\n"),
+            graph_digest: (!rows.is_empty())
+                .then(|| format!("{:x}", Sha256::digest(rows.join("\n--\n")))),
         }
     }
 
@@ -10053,10 +10074,16 @@ impl PrivateAliasDigestContext {
 
         let initial_row = guarded_private_type_evidence("initial", initial);
         let mut hasher = Sha256::new();
+        // Length framing keeps the (state, graph) pair injective without
+        // relying on the row grammar never containing the separator.
+        hasher.update((initial_row.len() as u64).to_le_bytes());
         hasher.update(initial_row.as_bytes());
-        if !self.serialized_rows.is_empty() {
-            hasher.update(b"\n--\n");
-            hasher.update(self.serialized_rows.as_bytes());
+        match &self.graph_digest {
+            Some(graph) => {
+                hasher.update(b"graph-sha256:");
+                hasher.update(graph.as_bytes());
+            }
+            None => hasher.update(b"graph:empty"),
         }
         format!("sha256:{:x}", hasher.finalize())
     }
@@ -11705,6 +11732,7 @@ fn external_owner_projections(
     owner_name: &str,
     private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
     private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+    alias_digest_context: &AliasDigestCell,
 ) -> Vec<ExternalOwnerProjection> {
     let direct = item.origin_module_path == owner_module_path && item.origin_name == owner_name;
     if item.kind != RustApiItemKind::TypeAlias {
@@ -11738,6 +11766,7 @@ fn external_owner_projections(
         &item.cfg_guard,
         private_aliases,
         private_module_aliases,
+        alias_digest_context,
     );
     let exhaustion_evidence = resolution.exhaustion_digest.clone();
     for state in resolution.states.into_iter().filter(|state| {
@@ -16003,8 +16032,13 @@ mod tests {
                 (b.clone(), vec!["windows".to_owned()]),
             ],
         );
-        let resolved =
-            resolve_private_type_alias_keys(hidden.clone(), &[], &aliases, &BTreeMap::new());
+        let resolved = resolve_private_type_alias_keys(
+            hidden.clone(),
+            &[],
+            &aliases,
+            &BTreeMap::new(),
+            &AliasDigestCell::new(),
+        );
         assert!(resolved.states.contains(&GuardedPrivateTypeKey {
             key: a.clone(),
             cfg_guard: vec!["unix".to_owned()],
@@ -16024,7 +16058,13 @@ mod tests {
             mid,
             vec![(a.clone(), vec!["not(feature = \"x\")".to_owned()])],
         );
-        let impossible = resolve_private_type_alias_keys(hidden, &[], &aliases, &BTreeMap::new());
+        let impossible = resolve_private_type_alias_keys(
+            hidden,
+            &[],
+            &aliases,
+            &BTreeMap::new(),
+            &AliasDigestCell::new(),
+        );
         assert!(
             impossible.states.iter().all(|state| state.key != a),
             "a later alias edge must be checked against the accumulated path guard"
@@ -16047,14 +16087,42 @@ mod tests {
             &[],
             &BTreeMap::new(),
             &growing("b"),
+            &AliasDigestCell::new(),
         );
-        let right =
-            resolve_private_type_alias_keys(growing_initial, &[], &BTreeMap::new(), &growing("c"));
+        let right = resolve_private_type_alias_keys(
+            growing_initial,
+            &[],
+            &BTreeMap::new(),
+            &growing("c"),
+            &AliasDigestCell::new(),
+        );
         assert!(left.exhausted && right.exhausted);
         assert_ne!(
             left.exhaustion_digest, right.exhaustion_digest,
             "different exhausted alias graphs need different fail-closed evidence"
         );
+
+        // One cell per graph is reused across walks; caching the graph digest
+        // must not leak one walk's state into another's evidence.
+        let shared = AliasDigestCell::new();
+        let resolve_shared = |name: &str, cell: &AliasDigestCell| {
+            resolve_private_type_alias_keys(
+                ("fixture".to_owned(), vec!["a".to_owned()], name.to_owned()),
+                &[],
+                &BTreeMap::new(),
+                &growing("b"),
+                cell,
+            )
+            .exhaustion_digest
+        };
+        let shared_item = resolve_shared("Item", &shared);
+        let shared_other = resolve_shared("Other", &shared);
+        assert_eq!(shared_item, left.exhaustion_digest);
+        assert_eq!(
+            shared_other,
+            resolve_shared("Other", &AliasDigestCell::new())
+        );
+        assert_ne!(shared_item, shared_other);
     }
 
     fn private_dependency_evidence(snapshot: &RustApiSnapshot, public_name: &str) -> String {
@@ -16076,7 +16144,7 @@ mod tests {
     }
 
     #[test]
-    fn private_alias_digest_streaming_matches_materialized_rows() {
+    fn private_alias_digest_binds_each_state_to_a_graph_hashed_once() {
         let initial = GuardedPrivateTypeKey {
             key: (
                 "fixture".to_owned(),
@@ -16100,7 +16168,7 @@ mod tests {
             ("fixture".to_owned(), vec!["nested".to_owned()]),
             vec![(vec!["target".to_owned()], vec!["unix".to_owned()])],
         )]);
-        let mut rows = vec![guarded_private_type_evidence("initial", &initial)];
+        let mut rows = Vec::new();
         for (source, targets) in &private_aliases {
             for (target, guard) in targets {
                 rows.push(format!(
@@ -16119,13 +16187,52 @@ mod tests {
         }
         rows.sort();
         rows.dedup();
-        let materialized = format!("sha256:{:x}", sha2::Sha256::digest(rows.join("\n--\n")));
+        let graph = format!("{:x}", sha2::Sha256::digest(rows.join("\n--\n")));
+        let state_digest = |state: &GuardedPrivateTypeKey| {
+            let initial_row = guarded_private_type_evidence("initial", state);
+            let mut hasher = sha2::Sha256::new();
+            hasher.update((initial_row.len() as u64).to_le_bytes());
+            hasher.update(initial_row.as_bytes());
+            hasher.update(b"graph-sha256:");
+            hasher.update(graph.as_bytes());
+            format!("sha256:{:x}", hasher.finalize())
+        };
 
-        assert_eq!(
-            PrivateAliasDigestContext::new(&private_aliases, &private_module_aliases)
-                .digest(&initial),
-            materialized
+        let context = PrivateAliasDigestContext::new(&private_aliases, &private_module_aliases);
+        assert_eq!(context.digest(&initial), state_digest(&initial));
+
+        let other_state = GuardedPrivateTypeKey {
+            cfg_guard: vec!["windows".to_owned()],
+            ..initial.clone()
+        };
+        assert_eq!(context.digest(&other_state), state_digest(&other_state));
+        assert_ne!(
+            context.digest(&initial),
+            context.digest(&other_state),
+            "each exhausted state keeps distinct fail-closed evidence"
         );
+
+        let mut changed_aliases = private_aliases.clone();
+        changed_aliases
+            .get_mut(&initial.key)
+            .expect("fixture edge")
+            .push((
+                (
+                    "fixture".to_owned(),
+                    vec!["other".to_owned()],
+                    "Hidden".to_owned(),
+                ),
+                Vec::new(),
+            ));
+        assert_ne!(
+            PrivateAliasDigestContext::new(&changed_aliases, &private_module_aliases)
+                .digest(&initial),
+            context.digest(&initial),
+            "a changed alias graph must change the evidence for the same state"
+        );
+
+        let empty = PrivateAliasDigestContext::new(&BTreeMap::new(), &BTreeMap::new());
+        assert_ne!(empty.digest(&initial), context.digest(&initial));
     }
 
     fn shared_private_dependency_fixture(leaf_type: &str) -> String {
