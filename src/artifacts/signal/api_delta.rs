@@ -6527,6 +6527,54 @@ mod tests {
     }
 
     #[test]
+    fn opaque_return_uncertainty_follows_only_the_package_cargo_inputs() {
+        let workspace = |shared: &'static str, worker: &'static str| {
+            let root = "[workspace]\nmembers=['api','shared','worker']\nresolver='2'\n";
+            let api = "[package]\nname='api'\nversion='0.0.0'\n[dependencies]\nshared={path='../shared'}\n";
+            let shared_manifest = "[package]\nname='shared'\nversion='0.0.0'\n";
+            let worker_manifest = "[package]\nname='worker'\nversion='0.0.0'\n";
+            repository_delta(&[
+                ("Cargo.toml", root, root),
+                ("Cargo.lock", "version = 4\n", "version = 4\n"),
+                ("api/Cargo.toml", api, api),
+                (
+                    "api/src/lib.rs",
+                    "pub async fn api() { shared::helper().await; }\n",
+                    "pub async fn api() { shared::helper().await; }\n",
+                ),
+                ("shared/Cargo.toml", shared_manifest, shared_manifest),
+                ("shared/src/lib.rs", "pub async fn helper() {}\n", shared),
+                ("worker/Cargo.toml", worker_manifest, worker_manifest),
+                ("worker/src/lib.rs", "pub fn worker() {}\n", worker),
+                ("docs/guide.md", "guide\n", "changed guide\n"),
+            ])
+        };
+
+        let unrelated = workspace(
+            "pub async fn helper() {}\n",
+            "fn helper() {}\npub fn worker() { helper() }\n",
+        );
+        assert!(
+            unrelated.findings().is_empty(),
+            "a sibling package and docs are not inputs of api: {:?}",
+            unrelated.findings()
+        );
+
+        let dependency_changed = workspace(
+            "pub async fn helper() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); }\n",
+            "pub fn worker() {}\n",
+        );
+        assert!(dependency_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding.identity.crate_name == "api"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("opaque-implementation-digest:sha256:"))
+        }));
+    }
+
+    #[test]
     fn repository_backed_opaque_returns_preserve_body_dependent_auto_trait_uncertainty() {
         let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
         let lock = "version = 4\n";
