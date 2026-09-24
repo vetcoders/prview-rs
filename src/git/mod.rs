@@ -1113,8 +1113,14 @@ impl Repository {
     /// `--assume-unchanged` reads as unchanged on the index-to-working-tree
     /// axis whatever the working file holds (libgit2's `maybe_modified` trusts
     /// both flags, as the status read does), yet a tool reads the working file.
-    /// A tree entry carries no flags, and its content is hashed through the
-    /// same filters Git applies, so a line-ending conversion is not a change.
+    /// A tree entry carries no flags, and the working file is hashed through
+    /// libgit2's built-in filters, so a line-ending conversion is not a change.
+    /// Those are `crlf` and `ident` alone: libgit2 runs no clean driver a
+    /// repository configures. `ident` folds whatever lies between `$Id` and the
+    /// next `$` into `$Id$`, so bytes placed there on purpose read as unchanged;
+    /// only code running during the checks writes such bytes, and that code can
+    /// edit the Cargo home's configuration just as well, which no comparison of
+    /// the reviewed tree can speak for.
     pub(crate) fn tracked_path_differs_from_oid(
         &self,
         target_oid: &str,
@@ -1907,6 +1913,57 @@ mod tests {
                 "{flag}: restoring the target's bytes clears it"
             );
         }
+    }
+
+    /// A clean filter driver the repository configures is Git's, not
+    /// libgit2's. libgit2 registers only its built-in `crlf` and `ident`
+    /// filters (`filter.c`) and runs no `filter.<name>.clean` command, so a
+    /// driver that cleans a rewritten lock back to the target's bytes, and
+    /// hides the rewrite from `git status`, hides nothing from this read.
+    #[cfg(unix)]
+    #[test]
+    fn tracked_path_differs_from_oid_runs_no_configured_clean_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let target = write_commit(tmp.path(), "Cargo.lock", "target\n");
+        let git_dir = tmp.path().join(".git");
+        fs::write(git_dir.join("pristine.lock"), "target\n").expect("pristine copy");
+        fs::create_dir_all(git_dir.join("info")).expect("info dir");
+        fs::write(
+            git_dir.join("info").join("attributes"),
+            "Cargo.lock filter=pristine\n",
+        )
+        .expect("attributes");
+        run_git(
+            tmp.path(),
+            &[
+                "config",
+                "filter.pristine.clean",
+                "cat >/dev/null; cat .git/pristine.lock",
+            ],
+        );
+        // The same size as the target's bytes: Git trusts a size change in
+        // the index without running the driver, so only an equal-size
+        // rewrite reaches it.
+        fs::write(tmp.path().join("Cargo.lock"), "hidden\n").expect("rewrite lock");
+
+        let status = git_cmd()
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git status");
+        assert!(status.status.success(), "git status failed");
+        assert!(
+            status.stdout.is_empty(),
+            "Git's driver cleans the rewrite away: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        assert!(
+            repo.tracked_path_differs_from_oid(&target, "Cargo.lock")
+                .expect("status"),
+            "libgit2 runs no configured driver, so the rewrite still differs"
+        );
     }
 
     /// Commit a tree built in the object database, with each file's path as

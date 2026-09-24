@@ -373,6 +373,19 @@ withholds the proof on its own; containment is judged on the path as spelled
 and as resolved through symbolic links, ignoring case. With no home at all,
 cargo-audit reads no fallback, and rustsec cannot place its default database.
 
+A home outside both trees is still not enough on its own. Its `audit.toml` or
+`advisory-db` can be a symbolic link into the checkout, and the configuration
+the audit applied, the committed `.cargo/audit.toml` or else the fallback, can
+name the advisory database with `[database] path`, which cargo-audit opens as
+written: a relative path lies under the directory the audit ran in. The
+database decides which advisories exist at all, so a change that edits it can
+drop the advisory it introduced with the lockfile untouched, and a configured
+database lets the audit run even with no home. Either input that leads inside
+the checkout or the scanned tree withholds the proof, and so does a fallback
+configuration that exists but cannot be read. Code that runs during the checks
+with the operator's permissions is outside what the proof can speak for: it can
+edit the Cargo home's configuration, or the database, as easily as the tree.
+
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,
 `unsound`, `yanked`): they have no vulnerability row of their own, so each one
@@ -451,7 +464,10 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
   read its fallback configuration and advisory database inside the scanned
   tree`, `the Cargo home (CARGO_HOME, else $HOME/.cargo) lies inside the
   checkout or the scanned tree, so cargo audit read its fallback configuration
-  and advisory database from files there`, or
+  and advisory database from files there`, `cargo audit's fallback
+  configuration or advisory database is not shown to lie outside the checkout
+  and the scanned tree (a link or a configured database path leads there, or it
+  could not be read)`, or
   `the scanned tree could not be tied to the target commit`. When `M` is zero the
   parenthetical is omitted and the gap
   stands alone: no line asserts a count it does not have.

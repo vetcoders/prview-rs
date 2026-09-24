@@ -309,6 +309,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   home (CARGO_HOME, else $HOME/.cargo) lies inside the checkout or the scanned
   tree, so cargo audit read its fallback configuration and advisory database
   from files there`. With `CARGO_HOME` unset, a `HOME` inside the tree counts.
+  An external home whose `audit.toml` or `advisory-db` is a link into either
+  tree, or a configuration (committed or fallback) whose `[database] path` is
+  relative or leads into either tree, withholds the proof as `cargo audit's
+  fallback configuration or advisory database is not shown to lie outside the
+  checkout and the scanned tree (a link or a configured database path leads
+  there, or it could not be read)`.
   The gate states which proof it
   applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this
   PR (N advisories)`; a blocking one names the advisories it blocks on — all of

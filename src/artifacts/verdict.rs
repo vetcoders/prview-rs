@@ -832,6 +832,13 @@ pub(crate) enum LockProofGap {
     /// which no comparison of `.cargo/audit.toml` covers, just as for a relative
     /// one.
     InTreeCargoHome,
+    /// The Cargo home lies outside the checkout and the scanned tree, but what
+    /// cargo-audit read through it is not shown to ([`audit_inputs_outside_trees`]):
+    /// its `audit.toml` or `advisory-db` is a link into either tree, the
+    /// configuration the audit applied names a `[database] path` that is
+    /// relative or leads there, or the fallback configuration could not be read.
+    /// The advisories that fail are then decided by files a change can edit.
+    AuditInputInTree,
     /// The worktree status or the checkout's identity could not be read, so
     /// nothing about the scanned lockfile was established either way.
     UnknownProvenance,
@@ -870,6 +877,12 @@ impl LockProofGap {
                  $HOME/.cargo) lies inside the checkout or the scanned tree, so cargo \
                  audit read its fallback configuration and advisory database from \
                  files there"
+            }
+            LockProofGap::AuditInputInTree => {
+                "provenance proof unavailable: cargo audit's fallback configuration \
+                 or advisory database is not shown to lie outside the checkout and \
+                 the scanned tree (a link or a configured database path leads there, \
+                 or it could not be read)"
             }
             LockProofGap::UnknownProvenance => {
                 "provenance proof unavailable: the scanned tree could not be tied \
@@ -1348,6 +1361,12 @@ fn config_file_owner(basename: &str) -> Option<&'static str> {
 /// [`LockProofGap::InTreeCargoHome`]. Without any home, cargo-audit reads no
 /// fallback, and rustsec cannot place its default database.
 ///
+/// Once the committed comparisons hold, the files cargo-audit read outside
+/// them are followed to where they lead ([`audit_inputs_outside_trees`]): the
+/// fallback `audit.toml` and the advisory database, which a link under an
+/// external home or a configured `[database] path` can place back inside a
+/// tree. Either withholds the proof as [`LockProofGap::AuditInputInTree`].
+///
 /// With a Cargo root outside the repository there is no in-tree file, and no
 /// lock proof either.
 fn cargo_audit_config_gap(
@@ -1365,20 +1384,20 @@ fn cargo_audit_config_gap(
     // The same reading as `home::cargo_home`, which cargo-audit uses: an
     // empty `CARGO_HOME` counts as unset, and then the account home's `.cargo`
     // is the Cargo home. Without either there is no fallback configuration to
-    // read, and rustsec cannot place its default database, so no report
-    // exists to downgrade.
+    // read, and rustsec cannot place its default database; a database the
+    // configuration names is judged with the other inputs below.
     let cargo_home = match evidence.cargo_home.filter(|home| !home.is_empty()) {
         Some(home) => Some(std::path::PathBuf::from(home)),
         None => evidence.operator_home.map(|home| home.join(".cargo")),
     };
-    if let Some(home) = cargo_home {
+    let roots: Vec<&std::path::Path> = std::iter::once(config.repo_root.as_path())
+        .chain(evidence.snapshot_root)
+        .collect();
+    if let Some(home) = &cargo_home {
         if !home.is_absolute() {
             return Some(LockProofGap::RelativeCargoHome);
         }
-        if cargo_home_inside_trees(
-            &home,
-            std::iter::once(config.repo_root.as_path()).chain(evidence.snapshot_root),
-        ) {
+        if cargo_home_inside_trees(home, roots.iter().copied()) {
             return Some(LockProofGap::InTreeCargoHome);
         }
     }
@@ -1409,8 +1428,82 @@ fn cargo_audit_config_gap(
     });
     let scanned_is_target =
         scanned_audit_config_is_target(repo, &path, resolved_target, target_is_checkout, evidence);
-    (unreadable || committed_change || !scanned_is_target)
-        .then_some(LockProofGap::AuditConfigChanged)
+    if unreadable || committed_change || !scanned_is_target {
+        return Some(LockProofGap::AuditConfigChanged);
+    }
+    let inputs_outside = audit_inputs_outside_trees(
+        repo,
+        &path,
+        &resolved_target.commit_id,
+        cargo_home.as_deref(),
+        &roots,
+    );
+    (!inputs_outside).then_some(LockProofGap::AuditInputInTree)
+}
+
+/// Whether what cargo-audit read beyond the cargo root's `.cargo/audit.toml`
+/// is shown to lie outside the checkout and the scanned tree (`roots`): the
+/// fallback configuration, and the advisory database, which decides which
+/// advisories exist at all.
+///
+/// [`cargo_audit_config_gap`] has already placed the Cargo home outside both,
+/// yet a file under it can still lead back in. `audit.toml` or `advisory-db`
+/// there may be a symbolic link into the checkout, whose target a change edits
+/// with the lockfile untouched; [`cargo_home_inside_trees`] resolves such a
+/// link where it exists. A dangling one reads as absent, to cargo-audit as
+/// here.
+///
+/// The configuration the audit applied, the target's `.cargo/audit.toml` when
+/// it has one (the comparisons before this showed the scanned copy is that
+/// file) and otherwise the fallback, can name the database itself:
+/// `[database] path`, which cargo-audit opens as written, so a relative one
+/// lies under the directory the audit ran in. Such a path takes the place of
+/// `advisory-db` in the Cargo home, and it matters even with no home at all,
+/// where it is what lets the audit run.
+///
+/// A fallback configuration that exists but cannot be read shows nothing, so
+/// it counts as leading in. One that is not a TOML table names no database:
+/// cargo-audit refuses to load it, so there is no report to downgrade.
+fn audit_inputs_outside_trees(
+    repo: &crate::git::Repository,
+    path: &str,
+    target: &str,
+    cargo_home: Option<&std::path::Path>,
+    roots: &[&std::path::Path],
+) -> bool {
+    let inside = |input: &std::path::Path| cargo_home_inside_trees(input, roots.iter().copied());
+    let applied = match repo.regular_blob_bytes_at_oid(target, path) {
+        Ok(Some(config)) => Some(config),
+        Ok(None) => match cargo_home.map(|home| home.join("audit.toml")) {
+            None => None,
+            Some(fallback) if inside(&fallback) => return false,
+            Some(fallback) => match std::fs::read(&fallback) {
+                Ok(config) => Some(config),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return false,
+            },
+        },
+        Err(_) => return false,
+    };
+    let database = match applied.as_deref().and_then(configured_advisory_database) {
+        Some(database) if !database.is_absolute() => return false,
+        Some(database) => database,
+        None => match cargo_home {
+            Some(home) => home.join("advisory-db"),
+            None => return true,
+        },
+    };
+    !inside(&database)
+}
+
+/// The `[database] path` a cargo-audit configuration sets, as written.
+fn configured_advisory_database(config: &[u8]) -> Option<std::path::PathBuf> {
+    let config: toml::Table = toml::from_str(std::str::from_utf8(config).ok()?).ok()?;
+    config
+        .get("database")?
+        .get("path")?
+        .as_str()
+        .map(std::path::PathBuf::from)
 }
 
 /// Whether the absolute `home` is, or lies inside, one of `roots`.
@@ -3881,6 +3974,173 @@ mod tests {
             CargoAuditLockProof::TargetLock,
             "with no home at all cargo-audit reads no fallback configuration"
         );
+    }
+
+    /// An external Cargo home is the environment's only while what cargo-audit
+    /// reads through it stays outside too. A link at its `audit.toml` or
+    /// `advisory-db`, or a configured `[database] path` that is relative or
+    /// leads into a tree, puts the audit's policy in files the change can
+    /// edit. A committed configuration can name such a database as well, and
+    /// then it counts even with no home at all.
+    #[test]
+    fn what_an_external_cargo_home_leads_to_is_judged_where_it_leads() {
+        use LockProofEntry::Blob;
+        let files = || {
+            [
+                ("Cargo.toml", Blob(CORE_MANIFEST)),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+            ]
+        };
+        let (tmp, head, target) = lock_proof_repo(&files(), &files());
+        let config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        let parent = tmp.path().parent().unwrap();
+        let snapshot = tempfile::tempdir_in(parent).unwrap();
+        let outside = tempfile::tempdir_in(parent).unwrap();
+        let clean = std::collections::BTreeSet::new();
+        let untouched = snapshot_observed(&target, &[]);
+        let proof = |cargo_home: &std::path::Path| {
+            CleanComparison::resolve(
+                &config,
+                &resolved_ref(&target),
+                &[resolved_ref(&head)],
+                Some(true),
+                LockEvidence {
+                    dirty_before_checks: Some(&clean),
+                    snapshot_integrity: Some(&untouched),
+                    snapshot_root: Some(snapshot.path()),
+                    cargo_home: Some(cargo_home.as_os_str()),
+                    operator_home: None,
+                },
+                Some(&head),
+                &[],
+            )
+            .cargo_audit_lock_proof()
+        };
+        let home_with = |audit_toml: Option<String>| {
+            let home = tempfile::tempdir_in(parent).unwrap();
+            if let Some(audit_toml) = audit_toml {
+                std::fs::write(home.path().join("audit.toml"), audit_toml).unwrap();
+            }
+            home
+        };
+        let database =
+            |path: &std::path::Path| format!("[database]\npath = '{}'\n", path.to_str().unwrap());
+        let led_in = CargoAuditLockProof::Unproven(LockProofGap::AuditInputInTree);
+
+        for (home, why) in [
+            (home_with(None), "no fallback configuration"),
+            (
+                home_with(Some("[advisories]\nignore = []\n".into())),
+                "a fallback configuration naming no database",
+            ),
+            (
+                home_with(Some(database(&outside.path().join("advisory-db")))),
+                "a database outside both trees",
+            ),
+        ] {
+            assert_eq!(
+                proof(home.path()),
+                CargoAuditLockProof::TargetLock,
+                "{why} is the environment's"
+            );
+        }
+        for (home, why) in [
+            (
+                home_with(Some("[database]\npath = 'advisory-db'\n".into())),
+                "a relative database path, opened where the audit ran",
+            ),
+            (
+                home_with(Some(database(&tmp.path().join("vendor/advisory-db")))),
+                "a database in the checkout",
+            ),
+            (
+                home_with(Some(database(&snapshot.path().join("advisory-db")))),
+                "a database in the scanned tree",
+            ),
+        ] {
+            assert_eq!(proof(home.path()), led_in, "{why}");
+        }
+        let unreadable = home_with(None);
+        std::fs::create_dir(unreadable.path().join("audit.toml")).unwrap();
+        assert_eq!(
+            proof(unreadable.path()),
+            led_in,
+            "a fallback configuration that cannot be read shows nothing"
+        );
+        #[cfg(unix)]
+        {
+            let policy = tmp.path().join("policy.toml");
+            std::fs::write(&policy, "[advisories]\nignore = []\n").unwrap();
+            let linked_config = home_with(None);
+            std::os::unix::fs::symlink(&policy, linked_config.path().join("audit.toml")).unwrap();
+            assert_eq!(
+                proof(linked_config.path()),
+                led_in,
+                "a fallback configuration linked into the checkout"
+            );
+            let advisories = tmp.path().join("advisory-db");
+            std::fs::create_dir(&advisories).unwrap();
+            let linked_database = home_with(None);
+            std::os::unix::fs::symlink(&advisories, linked_database.path().join("advisory-db"))
+                .unwrap();
+            assert_eq!(
+                proof(linked_database.path()),
+                led_in,
+                "an advisory database linked into the checkout"
+            );
+        }
+
+        // A committed configuration is the one applied, fallback or not.
+        let committed = |audit_toml: &'static str| {
+            [
+                ("Cargo.toml", Blob(CORE_MANIFEST)),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+                (".cargo/audit.toml", Blob(audit_toml)),
+            ]
+        };
+        for (audit_toml, expected, why) in [
+            (
+                "[advisories]\nignore = []\n",
+                CargoAuditLockProof::TargetLock,
+                "a committed configuration naming no database",
+            ),
+            (
+                "[database]\npath = 'vendor/advisory-db'\nfetch = false\n",
+                led_in,
+                "a committed configuration naming an in-tree database",
+            ),
+        ] {
+            let (tmp, head, target) =
+                lock_proof_repo(&committed(audit_toml), &committed(audit_toml));
+            let config = crate::config::test_config_builder()
+                .repo_root(tmp.path())
+                .build();
+            let untouched = snapshot_observed(&target, &[]);
+            for cargo_home in [None, Some(outside.path().as_os_str())] {
+                assert_eq!(
+                    CleanComparison::resolve(
+                        &config,
+                        &resolved_ref(&target),
+                        &[resolved_ref(&head)],
+                        Some(true),
+                        LockEvidence {
+                            dirty_before_checks: Some(&clean),
+                            snapshot_integrity: Some(&untouched),
+                            snapshot_root: None,
+                            cargo_home,
+                            operator_home: None,
+                        },
+                        Some(&head),
+                        &[],
+                    )
+                    .cargo_audit_lock_proof(),
+                    expected,
+                    "{why}, CARGO_HOME={cargo_home:?}"
+                );
+            }
+        }
     }
 
     #[test]

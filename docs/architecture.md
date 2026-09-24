@@ -399,11 +399,29 @@ and withholds the proof as `RelativeCargoHome` for a relative home and as
 `InTreeCargoHome` for an absolute one that is, or lies inside, the repository
 root or the snapshot root, before any other question. With no home at all,
 cargo-audit reads no fallback, and rustsec's `Repository::default_path` cannot
-place the database, so there is no report to downgrade.
+place the database, so unless a configuration names one there is no report to
+downgrade.
 Containment (`cargo_home_inside_trees`) compares every pairing of a lexical
 reading and a link-resolved reading of both paths, the latter through the
 deepest existing ancestor, and ignores ASCII case, so a spelling through `..`,
 a symbolic link or another case cannot place an in-tree home outside.
+An external home still lets the audit read inside a tree through what lies
+under it. `audit.toml` or `advisory-db` there may be a link into the checkout,
+and the configuration the audit applied (the target's `.cargo/audit.toml`, or
+else the fallback) may name the advisory database itself with
+`[database] path`, which cargo-audit opens as written, so a relative one lies
+under the directory the audit ran in. That database decides which advisories
+exist at all, and a configured one lets the audit run even with no home.
+Once the committed comparisons hold, `audit_inputs_outside_trees` follows both
+inputs to where they lead with the same containment test, and withholds the
+proof as `AuditInputInTree` when either is inside a tree, or when a fallback
+configuration that exists cannot be read. A dangling link reads as absent, to
+cargo-audit as to the proof. The lock and configuration re-reads hash the
+working file through libgit2's built-in filters (`crlf`, `ident`), not through
+a clean driver the repository configures, which libgit2 never runs; `ident`
+can hide bytes placed between `$Id` and `$` on purpose, which only code running
+during the checks writes, and such code can edit the Cargo home's configuration
+just as well, beyond any comparison of the reviewed tree.
 
 `cargo_audit_report_advisory_keys` keys each report item by advisory id,
 package name and locked version, without the package source. rustsec reports
