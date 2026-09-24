@@ -87,6 +87,64 @@ fn cargo_audit_new_advisory_labels(
     labels
 }
 
+/// The new advisories no vulnerability row carries: every `warnings`-category
+/// advisory (`unmaintained`, `unsound`, `yanked`) that `current ∖ base` counts
+/// as new.
+///
+/// The pre-existing classification reads rows, and cargo audit's rows come from
+/// `vulnerabilities.list` alone. An audit whose only vulnerability predated the
+/// change therefore classified as purely pre-existing while `new` said it had
+/// introduced an `unmaintained` crate, and the downgrade then called that audit
+/// "unchanged vs base audit" — a PASS resting on a claim its own counts
+/// contradict. Each advisory returned here becomes one dashboard note, so the
+/// key set the counter counts is also the key set the classifier sees.
+fn cargo_audit_unrepresented_new_advisories(
+    current: Option<&std::collections::HashSet<(String, String, String)>>,
+    cargo_lock_changed: bool,
+    base: Option<&std::collections::HashSet<(String, String, String)>>,
+    vulnerability_rows: &[CargoAuditFinding],
+) -> Vec<String> {
+    // The same single branch that can make `new` non-zero; see
+    // `cargo_audit_new_advisory_labels`.
+    let (Some(current), true, Some(base)) = (current, cargo_lock_changed, base) else {
+        return Vec::new();
+    };
+    let represented: std::collections::HashSet<_> = vulnerability_rows
+        .iter()
+        .map(cargo_audit_finding_key)
+        .collect();
+    let mut labels: Vec<String> = current
+        .difference(base)
+        .filter(|key| !represented.contains(*key))
+        .map(cargo_audit_advisory_label)
+        .collect();
+    labels.sort();
+    labels
+}
+
+/// The row for one [`cargo_audit_unrepresented_new_advisories`] entry.
+///
+/// A note, not an operator finding: it names an advisory the counts already
+/// report, so it reaches the classifier without adding a SARIF result or moving
+/// `findings_count`. `in_diff: Some(true)` is the origin `new` asserts.
+fn cargo_audit_new_advisory_note(
+    check_name: &str,
+    check_id: &str,
+    label: &str,
+) -> DashboardFinding {
+    DashboardFinding {
+        file: None,
+        line: None,
+        level: "note",
+        check_name: check_name.to_string(),
+        check_id: check_id.to_string(),
+        message: format!(
+            "Cargo audit: new advisory {label} (warnings category) is absent from the base audit"
+        ),
+        in_diff: Some(true),
+    }
+}
+
 pub(super) fn is_operator_finding(finding: &DashboardFinding) -> bool {
     matches!(finding.level, "error" | "warning")
 }
@@ -611,6 +669,18 @@ pub(super) fn generate_inline_findings(
                         "severity": finding.severity,
                     }
                 }));
+            }
+            for label in cargo_audit_unrepresented_new_advisories(
+                current_advisories.as_ref(),
+                cargo_lock_changed,
+                base_audit_cache.as_ref(),
+                &audit_findings,
+            ) {
+                dashboard_findings.push(cargo_audit_new_advisory_note(
+                    &check.name,
+                    &check_id,
+                    &label,
+                ));
             }
             cargo_audit_evidence = Some(evidence);
             continue;
@@ -2442,6 +2512,135 @@ FAILED tests/test_parser.py::test_roundtrip\n\
             let labels = cargo_audit_new_advisory_labels(Some(&current), lock_changed, base_report);
             assert_eq!(counts.new, 0);
             assert_eq!(labels.len(), counts.new);
+        }
+    }
+
+    /// The report behind PR #58's T6: the only vulnerability is the base's, and
+    /// the change adds an `unmaintained` crate.
+    const PREEXISTING_VULNERABILITY_NEW_WARNING_CARGO_AUDIT: &str = r#"{
+        "vulnerabilities": {
+            "found": true,
+            "count": 1,
+            "list": [{
+                "advisory": {"id": "RUSTSEC-2024-0001", "title": "demo advisory"},
+                "package": {"name": "demo", "version": "1.2.3"},
+                "versions": {"patched": [">=1.2.4"]}
+            }]
+        },
+        "warnings": {
+            "unmaintained": [{
+                "advisory": {"id": "RUSTSEC-2024-9999"},
+                "package": {"name": "stale", "version": "0.1.0"}
+            }]
+        }
+    }"#;
+
+    /// T6: a warnings-category advisory the change introduced has no
+    /// vulnerability row, so the rows alone classified the audit as purely
+    /// pre-existing while `new == 1` — and the gate downgraded it with the
+    /// sentence "unchanged vs base audit". The note row carries that advisory to
+    /// the classifier, which now sees an in-diff row and refuses the downgrade.
+    #[test]
+    fn a_new_warnings_category_advisory_blocks_the_preexisting_downgrade() {
+        let current = crate::artifacts::audit::cargo_audit_report_advisory_keys(
+            PREEXISTING_VULNERABILITY_NEW_WARNING_CARGO_AUDIT,
+        )
+        .expect("a valid current report");
+        let base = crate::artifacts::audit::cargo_audit_report_advisory_keys(BASE_CARGO_AUDIT)
+            .expect("a valid base report");
+        let vulnerabilities = crate::artifacts::audit::parse_cargo_audit_findings(
+            PREEXISTING_VULNERABILITY_NEW_WARNING_CARGO_AUDIT,
+        );
+
+        let unrepresented = cargo_audit_unrepresented_new_advisories(
+            Some(&current),
+            true,
+            Some(&base),
+            &vulnerabilities,
+        );
+        assert_eq!(
+            unrepresented,
+            vec!["RUSTSEC-2024-9999 in stale 0.1.0".to_string()]
+        );
+        assert_eq!(
+            cargo_audit_baseline_counts(Some(&current), true, Some(&base)).new,
+            unrepresented.len(),
+            "every new advisory reaches the classifier: here none has a vulnerability row"
+        );
+
+        let mut rows: Vec<DashboardFinding> = vulnerabilities
+            .iter()
+            .map(|finding| DashboardFinding {
+                file: None,
+                line: None,
+                level: finding.sarif_level,
+                check_name: "Cargo audit".to_string(),
+                check_id: "cargo_audit".to_string(),
+                message: finding.sarif_message(),
+                in_diff: cargo_audit_finding_in_diff(
+                    &crate::artifacts::audit::cargo_audit_finding_key(finding),
+                    true,
+                    true,
+                    Some(&base),
+                ),
+            })
+            .collect();
+        assert_eq!(
+            classify_quality_failure("cargo_audit", &rows, true),
+            QualityFailureClass::Preexisting,
+            "the vulnerability rows alone read as pre-existing — the false PASS"
+        );
+
+        rows.extend(
+            unrepresented
+                .iter()
+                .map(|label| cargo_audit_new_advisory_note("Cargo audit", "cargo_audit", label)),
+        );
+        assert_eq!(
+            classify_quality_failure("cargo_audit", &rows, true),
+            QualityFailureClass::Mixed,
+            "a pre-existing vulnerability beside an introduced advisory is mixed"
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row.level == "note")
+                .all(|row| !is_operator_finding(row)),
+            "the note never becomes a SARIF-counted operator finding"
+        );
+    }
+
+    /// A new advisory that already has a vulnerability row is not duplicated:
+    /// its row carries the in-diff origin itself.
+    #[test]
+    fn a_new_vulnerability_needs_no_extra_note() {
+        let current = crate::artifacts::audit::cargo_audit_report_advisory_keys(MIXED_CARGO_AUDIT)
+            .expect("a valid current report");
+        let base = crate::artifacts::audit::cargo_audit_report_advisory_keys(BASE_CARGO_AUDIT)
+            .expect("a valid base report");
+        let vulnerabilities =
+            crate::artifacts::audit::parse_cargo_audit_findings(MIXED_CARGO_AUDIT);
+
+        assert_eq!(
+            cargo_audit_unrepresented_new_advisories(
+                Some(&current),
+                true,
+                Some(&base),
+                &vulnerabilities,
+            ),
+            vec!["RUSTSEC-2024-9999 in stale 0.1.0".to_string()],
+            "RUSTSEC-2024-0002 is new but has its own row; only the warning needs a note"
+        );
+        for (lock_changed, base_report) in [(false, Some(&base)), (true, None)] {
+            assert!(
+                cargo_audit_unrepresented_new_advisories(
+                    Some(&current),
+                    lock_changed,
+                    base_report,
+                    &vulnerabilities,
+                )
+                .is_empty(),
+                "no comparison, no new advisory, no note"
+            );
         }
     }
 

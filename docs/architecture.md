@@ -294,7 +294,11 @@ gap rather than blocking on a bare `Cargo audit (Failed)`.
 One proof covers every branch of the comparison, because `in_diff` already
 carries the rest: an untouched lock makes every advisory `in_diff = false`; a
 changed lock with a base audit makes `in_diff` a real `current ∖ base`
-comparison; a changed lock with no base audit leaves every row `in_diff = null`,
+comparison over the full advisory set — rows exist only for
+`vulnerabilities.list`, so each new `warnings`-category advisory (`unmaintained`,
+`unsound`, `yanked`) gets a dashboard note row with `in_diff = true` (a note:
+never a SARIF result, never counted in `findings_count`), and an audit that
+introduced one classifies Mixed or Introduced instead of pre-existing; a changed lock with no base audit leaves every row `in_diff = null`,
 which R5-23 keeps Unclassified whatever the lockfile proof says. R3-14
 (`--current-only`) and R4-20 (no resolvable base diff) still veto the downgrade
 upstream of the proof. A newly published advisory against an unchanged lock is
@@ -305,8 +309,8 @@ advisory database moved, the lockfile did not.
 The gate says which of these it applied. A downgraded audit carries
 `reason: "pre-existing: Cargo.lock unchanged by this PR (N advisories)"` or
 `"pre-existing: unchanged vs base audit (N advisories)"`; a blocking one names
-what it blocks on — `Cargo audit (Failed): N new vulnerabilities introduced
-(RUSTSEC-…), M pre-existing`, or `N advisories with no base comparison (baseline
+what it blocks on — `Cargo audit (Failed): N new advisories introduced
+(RUSTSEC-… in <crate> <version>), M pre-existing`, or `N advisories with no base comparison (baseline
 unavailable)` when nothing could be compared.
 
 Semgrep's `errors[]` remains a completeness signal independently of findings.
