@@ -401,12 +401,23 @@ One proof covers every branch of the comparison, because `in_diff` already
 carries the rest: an untouched lock makes every advisory `in_diff = false`; a
 changed lock with a base audit makes `in_diff` a real `current ∖ base`
 comparison over the full advisory set — rows exist only for
-`vulnerabilities.list`, so each new `warnings`-category advisory (`unmaintained`,
-`unsound`, `yanked`) gets a dashboard note row with `in_diff = true` (a note:
-never a SARIF result, never counted in `findings_count`), and an audit that
-introduced one classifies Mixed or Introduced instead of pre-existing; a changed
-lock with no base audit leaves every row `in_diff = null`, which R5-23 keeps
-Unclassified whatever the lockfile proof says. R3-14
+`vulnerabilities.list`, so each `warnings`-category advisory (`unmaintained`,
+`unsound`, `yanked`) gets a dashboard note row with the origin the counts give
+it, from the same `cargo_audit_finding_in_diff` the vulnerability rows use (a
+note: never a SARIF result, never counted in `findings_count`). The rows the
+classifier reads therefore carry exactly the counts' `new` / `pre-existing` /
+`unknown` split: an audit that introduced a warning classifies Mixed or
+Introduced instead of pre-existing, an audit with only pre-existing warnings
+classifies Preexisting instead of rowless Unclassified, and a changed lock with
+no base audit leaves every row `in_diff = null`, which R5-23 keeps Unclassified
+whatever the lockfile proof says.
+
+The proof reads the files as they are when the gate is written, so it describes
+only an audit executed in this run. `CargoAuditCheck` declines every cached
+status except `Passed` (`Check::replays_cached`, asked on both the write and the
+lookup, so an entry an older prview stored is not replayed either): a clean
+report has nothing to downgrade, and a failing or warning one runs live, because
+the audit's key binds the lockfile and the day but not `.cargo/audit.toml`. R3-14
 (`--current-only`) and R4-20 (no resolvable base diff) still veto the downgrade
 upstream of the proof. A newly published advisory against an unchanged lock is
 therefore reported as pre-existing debt newly revealed, not as debt this change

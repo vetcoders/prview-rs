@@ -312,7 +312,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocks for want of the proof says which premise was missing instead of
   reporting a bare `Cargo audit (Failed)`. The dashboard now states the gate
   verdict as a `data-merge-verdict` attribute on the merge chip, so its parity
-  with `MERGE_GATE.json` is assertable rather than assumed.
+  with `MERGE_GATE.json` is assertable rather than assumed. An audit whose only
+  items are pre-existing warnings-category advisories is downgraded the same
+  way: each warning reaches the classifier with the origin the baseline counts
+  give it, where it used to have no row and held the gate at CONDITIONAL. The
+  proof describes only an audit this run executed, so `Cargo audit` replays
+  only a `passed` result from the check cache; a failing or warning report,
+  which the downgrade reads, always runs live, because the cache key does not
+  bind `.cargo/audit.toml`.
   `docs/contracts/merge_gate.md` and `docs/architecture.md` carry the rule.
 
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The

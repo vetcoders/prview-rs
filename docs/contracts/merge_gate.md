@@ -367,12 +367,21 @@ the proof on its own. An empty one counts as unset, as it does for cargo-audit.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,
-`unsound`, `yanked`): they have no vulnerability row of their own, so each new
-one reaches the classifier as a dashboard note row with `in_diff: true` (a note,
-never a SARIF result or part of `findings_count`), and an audit that introduced
-one is `mixed` or `introduced`, never downgraded — and a changed lock with no
-base audit leaves every row `in_diff: null`, which stays `unclassified` and
-keeps gating. The base audit reads the base's copy of the lockfile the audit
+`unsound`, `yanked`): they have no vulnerability row of their own, so each one
+reaches the classifier as a dashboard note row carrying the origin the baseline
+counts give it (a note, never a SARIF result or part of `findings_count`) —
+`in_diff: true` for one counted `new`, `false` for one counted `pre-existing`,
+`null` for one with no base audit. An audit that introduced one is `mixed` or
+`introduced`, never downgraded; an audit whose only items are pre-existing
+warnings is downgraded exactly like a pre-existing vulnerability instead of
+staying `unclassified`; and a changed lock with no base audit leaves every row
+`in_diff: null`, which stays `unclassified` and keeps gating.
+
+The proof is taken from the files as they are when the gate is written, so it
+can only describe an audit that ran in the same run. `Cargo audit` therefore
+replays only a `passed` result from the check cache — a report with nothing to
+downgrade. A failing or warning report always runs live, since its cache key
+binds the lockfile and the day but not the audit configuration. The base audit reads the base's copy of the lockfile the audit
 read; a base without one (a member lock the change added beside a root lock)
 has no base audit. Every vulnerability entry and every `warnings` item the
 check status counts is part of the compared set — a yanked release, which has
