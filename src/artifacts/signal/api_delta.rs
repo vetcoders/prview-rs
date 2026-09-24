@@ -151,8 +151,79 @@ pub struct ApiArtifactView {
 struct SnapshotEvidence<'a> {
     base_declarations: &'a [RustApiDeclaration],
     target_declarations: &'a [RustApiDeclaration],
-    base_unknowns: &'a [RustApiUnknown],
-    target_unknowns: &'a [RustApiUnknown],
+    base_regions: &'a SnapshotRegions<'a>,
+    target_regions: &'a SnapshotRegions<'a>,
+}
+
+/// What one snapshot's unknown regions can hide from pairing: the unknowns
+/// and the module structure the snapshot still proves around them.
+struct SnapshotRegions<'a> {
+    unknowns: &'a [RustApiUnknown],
+    /// The cfg guard of every processed module, per crate and module path.
+    module_guards: BTreeMap<(&'a str, &'a [String]), Vec<&'a [String]>>,
+    /// The origin module of every re-export, per crate, re-exporting module
+    /// and external name.
+    reexport_origins: BTreeMap<(&'a str, &'a [String], &'a str), Vec<&'a [String]>>,
+    /// Public module aliases as (crate, alias path, target module path).
+    module_aliases: Vec<(&'a str, &'a [String], &'a [String])>,
+}
+
+impl<'a> SnapshotRegions<'a> {
+    fn new(snapshot: &'a RustApiSnapshot) -> Self {
+        let mut module_guards: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for module in &snapshot.modules {
+            module_guards
+                .entry((module.crate_name.as_str(), module.module_path.as_slice()))
+                .or_default()
+                .push(module.cfg_guard.as_slice());
+        }
+        let mut reexport_origins: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for reexport in &snapshot.reexports {
+            reexport_origins
+                .entry((
+                    reexport.crate_name.as_str(),
+                    reexport.module_path.as_slice(),
+                    reexport.external_name.as_str(),
+                ))
+                .or_default()
+                .push(reexport.target_module_path.as_slice());
+        }
+        let module_aliases = snapshot
+            .module_aliases
+            .iter()
+            .map(|alias| {
+                (
+                    alias.crate_name.as_str(),
+                    alias.module_path.as_slice(),
+                    alias.target_module_path.as_slice(),
+                )
+            })
+            .collect();
+        Self {
+            unknowns: &snapshot.unknowns,
+            module_guards,
+            reexport_origins,
+            module_aliases,
+        }
+    }
+
+    /// Whether `child` is declared, in every processed variant of `parent`,
+    /// under exactly that variant's guard. Content hidden in `parent` then
+    /// cannot declare another `child`: it would collide with this one.
+    fn child_module_is_fixed(&self, crate_name: &str, parent: &[String], child: &str) -> bool {
+        let Some(parent_guards) = self.module_guards.get(&(crate_name, parent)) else {
+            return false;
+        };
+        let mut child_path = parent.to_vec();
+        child_path.push(child.to_owned());
+        let Some(child_guards) = self.module_guards.get(&(crate_name, child_path.as_slice()))
+        else {
+            return false;
+        };
+        parent_guards
+            .iter()
+            .all(|guard| child_guards.contains(guard))
+    }
 }
 
 impl ApiDelta {
@@ -194,6 +265,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         visibility_changed: Vec::new(),
         unknown: snapshot_unknown_findings(base, target),
     };
+    let base_regions = SnapshotRegions::new(base);
+    let target_regions = SnapshotRegions::new(target);
 
     let base_items: Vec<_> = base.items.iter().map(item_side).collect();
     let target_items: Vec<_> = target.items.iter().map(item_side).collect();
@@ -203,8 +276,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
     pair_exact_identities(
         &base_items,
         &target_items,
-        &base.unknowns,
-        &target.unknowns,
+        &base_regions,
+        &target_regions,
         &mut base_used,
         &mut target_used,
         &mut delta,
@@ -215,8 +288,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
     pair_cfg_changes(
         &base_items,
         &target_items,
-        &base.unknowns,
-        &target.unknowns,
+        &base_regions,
+        &target_regions,
         &mut base_used,
         &mut target_used,
         &mut delta,
@@ -230,8 +303,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         &SnapshotEvidence {
             base_declarations: &base.declarations,
             target_declarations: &target.declarations,
-            base_unknowns: &base.unknowns,
-            target_unknowns: &target.unknowns,
+            base_regions: &base_regions,
+            target_regions: &target_regions,
         },
         &mut base_used,
         &mut target_used,
@@ -244,8 +317,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
     pair_relocations(
         &base_items,
         &target_items,
-        &base.unknowns,
-        &target.unknowns,
+        &base_regions,
+        &target_regions,
         &mut base_used,
         &mut target_used,
         &mut delta,
@@ -263,7 +336,7 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         if base_used[index] {
             continue;
         }
-        if let Some(unknown) = blocking_region(&target.unknowns, &before.identity) {
+        if let Some(unknown) = blocking_region(&target_regions, &before.identity) {
             delta.unknown.push(region_pairing_unknown(
                 before.identity.clone(),
                 Some(before.clone()),
@@ -287,7 +360,7 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         if target_used[index] {
             continue;
         }
-        if let Some(unknown) = blocking_region(&base.unknowns, &after.identity) {
+        if let Some(unknown) = blocking_region(&base_regions, &after.identity) {
             delta.unknown.push(region_pairing_unknown(
                 after.identity.clone(),
                 None,
@@ -1224,25 +1297,25 @@ struct BlockingRegion<'a> {
 fn pair_blocking_region<'a>(
     before: &ApiFactSide,
     after: &ApiFactSide,
-    base_unknowns: &'a [RustApiUnknown],
-    target_unknowns: &'a [RustApiUnknown],
+    base_regions: &SnapshotRegions<'a>,
+    target_regions: &SnapshotRegions<'a>,
 ) -> Option<BlockingRegion<'a>> {
     [&before.identity, &after.identity]
         .into_iter()
         .find_map(|identity| {
-            let region = |side, unknowns| {
-                blocking_region(unknowns, identity).map(|unknown| BlockingRegion { side, unknown })
+            let region = |side, regions| {
+                blocking_region(regions, identity).map(|unknown| BlockingRegion { side, unknown })
             };
-            region(ApiSnapshotSide::Base, base_unknowns)
-                .or_else(|| region(ApiSnapshotSide::Target, target_unknowns))
+            region(ApiSnapshotSide::Base, base_regions)
+                .or_else(|| region(ApiSnapshotSide::Target, target_regions))
         })
 }
 
 fn pair_exact_identities(
     base: &[ApiFactSide],
     target: &[ApiFactSide],
-    base_unknowns: &[RustApiUnknown],
-    target_unknowns: &[RustApiUnknown],
+    base_regions: &SnapshotRegions<'_>,
+    target_regions: &SnapshotRegions<'_>,
     base_used: &mut [bool],
     target_used: &mut [bool],
     delta: &mut ApiDelta,
@@ -1274,8 +1347,7 @@ fn pair_exact_identities(
             if before.contract == after.contract {
                 continue;
             }
-            if let Some(region) =
-                pair_blocking_region(before, after, base_unknowns, target_unknowns)
+            if let Some(region) = pair_blocking_region(before, after, base_regions, target_regions)
             {
                 delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
@@ -1322,8 +1394,8 @@ fn pair_exact_identities(
 fn pair_cfg_changes(
     base: &[ApiFactSide],
     target: &[ApiFactSide],
-    base_unknowns: &[RustApiUnknown],
-    target_unknowns: &[RustApiUnknown],
+    base_regions: &SnapshotRegions<'_>,
+    target_regions: &SnapshotRegions<'_>,
     base_used: &mut [bool],
     target_used: &mut [bool],
     delta: &mut ApiDelta,
@@ -1360,8 +1432,7 @@ fn pair_cfg_changes(
             }
             base_used[base_index] = true;
             target_used[target_index] = true;
-            if let Some(region) =
-                pair_blocking_region(before, after, base_unknowns, target_unknowns)
+            if let Some(region) = pair_blocking_region(before, after, base_regions, target_regions)
             {
                 delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
@@ -1438,8 +1509,8 @@ fn pair_visibility_changes(
             if let Some(region) = pair_blocking_region(
                 before,
                 &after,
-                evidence.base_unknowns,
-                evidence.target_unknowns,
+                evidence.base_regions,
+                evidence.target_regions,
             ) {
                 delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
@@ -1488,8 +1559,8 @@ fn pair_visibility_changes(
             if let Some(region) = pair_blocking_region(
                 &before,
                 after,
-                evidence.base_unknowns,
-                evidence.target_unknowns,
+                evidence.base_regions,
+                evidence.target_regions,
             ) {
                 delta.unknown.push(region_pairing_unknown(
                     after.identity.clone(),
@@ -1521,8 +1592,8 @@ fn pair_visibility_changes(
 fn pair_relocations(
     base: &[ApiFactSide],
     target: &[ApiFactSide],
-    base_unknowns: &[RustApiUnknown],
-    target_unknowns: &[RustApiUnknown],
+    base_regions: &SnapshotRegions<'_>,
+    target_regions: &SnapshotRegions<'_>,
     base_used: &mut [bool],
     target_used: &mut [bool],
     delta: &mut ApiDelta,
@@ -1559,8 +1630,7 @@ fn pair_relocations(
             target_used[target_index] = true;
             let before = &base[base_index];
             let after = &target[target_index];
-            if let Some(region) =
-                pair_blocking_region(before, after, base_unknowns, target_unknowns)
+            if let Some(region) = pair_blocking_region(before, after, base_regions, target_regions)
             {
                 delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
@@ -1655,33 +1725,154 @@ fn consume_one_sided_ambiguities(
     }
 }
 
-/// The first unknown region of one snapshot that may hide `identity`.
-fn blocking_region<'a>(
-    unknowns: &'a [RustApiUnknown],
-    identity: &ApiIdentity,
-) -> Option<&'a RustApiUnknown> {
-    unknowns.iter().find(|unknown| {
-        !(matches!(
-            unknown.kind,
-            RustApiUnknownKind::PathNonUtf8
-                | RustApiUnknownKind::TraitImplResolution
-                | RustApiUnknownKind::PrivateTypeDependency
-                | RustApiUnknownKind::OpaqueReturnAutoTraits
-        ) || unknown.kind == RustApiUnknownKind::MacroGeneratedItems
-            && unknown
+/// How far the content an unknown region hides can reach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegionReach {
+    /// Manifest- or crate-level uncertainty: anything in the crate.
+    Crate,
+    /// Unresolved re-exports: names bound in the re-exporting module.
+    Names,
+    /// Unread source or unexpanded output: items in its module, plus the
+    /// inherent members and exported macros any module can contribute.
+    Items,
+}
+
+/// The reach of the content `unknown` hides, or `None` when it hides no
+/// item: proof gaps about already visible items do not block pairing.
+fn region_reach(unknown: &RustApiUnknown) -> Option<RegionReach> {
+    use RustApiUnknownKind as Kind;
+    match unknown.kind {
+        Kind::PathNonUtf8
+        | Kind::TraitImplResolution
+        | Kind::PrivateTypeDependency
+        | Kind::OpaqueReturnAutoTraits => None,
+        Kind::MacroGeneratedItems
+            if unknown
                 .evidence
                 .lines()
-                .any(|line| line == "transform-kind:additive-derive"))
-            && unknown
-                .crate_name
-                .as_ref()
-                .is_none_or(|crate_name| crate_name == &identity.crate_name)
-            && (unknown.module_path.is_empty()
-                || identity.module_path.starts_with(&unknown.module_path)
-                || unknown.module_path.starts_with(&identity.module_path))
+                .any(|line| line == "transform-kind:additive-derive") =>
+        {
+            None
+        }
+        Kind::ManifestRead
+        | Kind::ManifestNonUtf8
+        | Kind::ManifestParse
+        | Kind::WorkspaceDiscovery
+        | Kind::MissingLibRoot
+        | Kind::ResolutionLimit => Some(RegionReach::Crate),
+        // A target-level note from the manifest (a native-only library or
+        // binary target) qualifies the whole crate, not one module.
+        Kind::UnsupportedExternResolution if declared_by_manifest(unknown) => {
+            Some(RegionReach::Crate)
+        }
+        Kind::GlobReexport
+        | Kind::UnresolvedReexport
+        | Kind::AmbiguousReexport
+        | Kind::ReexportCycle => Some(RegionReach::Names),
+        Kind::SourceRead
+        | Kind::SourceNonUtf8
+        | Kind::SourceParse
+        | Kind::MissingModule
+        | Kind::AmbiguousModule
+        | Kind::NonRegularModule
+        | Kind::ModuleCycle
+        | Kind::UnsupportedModulePath
+        | Kind::MacroGeneratedItems
+        | Kind::IncludeMacro
+        | Kind::UnsupportedExternResolution
+        | Kind::UnresolvedInherentOwner
+        | Kind::CfgPredicate => Some(RegionReach::Items),
+    }
+}
+
+fn declared_by_manifest(unknown: &RustApiUnknown) -> bool {
+    unknown.source_path == "Cargo.toml" || unknown.source_path.ends_with("/Cargo.toml")
+}
+
+/// Whether `unknown` is a kind the snapshot records when a module source
+/// fails to load, which at the crate root drops the whole crate.
+fn may_fail_root_load(unknown: &RustApiUnknown) -> bool {
+    use RustApiUnknownKind as Kind;
+    matches!(
+        unknown.kind,
+        Kind::SourceRead | Kind::SourceNonUtf8 | Kind::SourceParse | Kind::ModuleCycle
+    )
+}
+
+/// The first unknown region of one snapshot that may hide `identity`.
+fn blocking_region<'a>(
+    regions: &SnapshotRegions<'a>,
+    identity: &ApiIdentity,
+) -> Option<&'a RustApiUnknown> {
+    regions.unknowns.iter().find(|unknown| {
+        unknown
+            .crate_name
+            .as_ref()
+            .is_none_or(|crate_name| crate_name == &identity.crate_name)
+            && region_reach(unknown)
+                .is_some_and(|reach| region_may_cover(regions, unknown, reach, identity))
             && guards_may_overlap(&unknown.cfg_guard, &identity.cfg_region)
             && transform_scope_may_cover(unknown, identity)
     })
+}
+
+/// Whether content hidden in `unknown`'s module may define `identity` or
+/// the name it is bound to there.
+///
+/// Hidden content binds names only in its own module, below it only through
+/// modules the snapshot does not prove, and above it only through a
+/// re-export of a name that originates inside it. Inherent members and
+/// `#[macro_export]` macros are the exception: any module of the crate may
+/// contribute them.
+fn region_may_cover(
+    regions: &SnapshotRegions<'_>,
+    unknown: &RustApiUnknown,
+    reach: RegionReach,
+    identity: &ApiIdentity,
+) -> bool {
+    if reach == RegionReach::Crate {
+        return true;
+    }
+    // Crates and Cargo features come from the manifest, but a crate records
+    // them only once its root loads: a root it cannot read or parse hides them.
+    if matches!(identity.namespace.as_str(), "crate" | "cargo_feature") {
+        return unknown.module_path.is_empty() && may_fail_root_load(unknown);
+    }
+    if reach == RegionReach::Items
+        && (identity.name.contains("::")
+            || identity.namespace == "macro" && identity.module_path.is_empty())
+    {
+        return true;
+    }
+    let crate_name = identity.crate_name.as_str();
+    let region = unknown.module_path.as_slice();
+    // A module is bound by its own path; any other item by its module's.
+    let mut bound_path = identity.module_path.clone();
+    if identity.namespace == "module" {
+        bound_path.push(identity.name.clone());
+    }
+    let mut candidates = vec![bound_path];
+    for (alias_crate, alias_path, target_path) in &regions.module_aliases {
+        if *alias_crate == crate_name && candidates[0].starts_with(alias_path) {
+            let mut projected = target_path.to_vec();
+            projected.extend_from_slice(&candidates[0][alias_path.len()..]);
+            candidates.push(projected);
+        }
+    }
+    let within_region = candidates.iter().any(|path| {
+        path.starts_with(region)
+            && path
+                .get(region.len())
+                .is_none_or(|child| !regions.child_module_is_fixed(crate_name, region, child))
+    });
+    if within_region {
+        return true;
+    }
+    let bound_name = identity.name.split("::").next().unwrap_or_default();
+    regions
+        .reexport_origins
+        .get(&(crate_name, identity.module_path.as_slice(), bound_name))
+        .is_some_and(|origins| origins.iter().any(|origin| origin.starts_with(region)))
 }
 
 fn transform_scope_may_cover(unknown: &RustApiUnknown, identity: &ApiIdentity) -> bool {
@@ -9343,6 +9534,242 @@ mod tests {
                     .as_deref()
                     .is_some_and(|reason| reason.contains("relocation intersects"))
             }));
+        }
+    }
+
+    fn finding_at<'a>(
+        findings: &'a [ApiDeltaFinding],
+        module_path: &[&str],
+        namespace: &str,
+        name: &str,
+    ) -> Option<&'a ApiDeltaFinding> {
+        findings.iter().find(|finding| {
+            finding.identity.module_path == module_path
+                && finding.identity.namespace == namespace
+                && finding.identity.name == name
+        })
+    }
+
+    const BASE_REGION_BLOCKS: &str = "base counterpart is unprovable in an unknown snapshot region";
+
+    #[test]
+    fn a_root_region_does_not_block_pairing_inside_a_declared_child_module() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[tokio::main] async fn main() {}\ninclude!(\"extra.rs\");\npub mod api { pub fn kept() {} pub fn changed(_: u8) {} }\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[tokio::main] async fn main() {}\ninclude!(\"extra.rs\");\npub mod api { pub fn kept() {} pub fn changed(_: u16) {} pub fn added() {} }\npub fn root_added() {}\npub mod fresh { pub fn inside() {} }\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&delta.added, &["api"], "value", "added").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+        assert!(
+            finding_at(&delta.changed, &["api"], "value", "changed").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+        // The root expansion may still define root items and new top-level
+        // modules, so their base counterparts stay unprovable.
+        let root: &[&str] = &[];
+        for (module_path, namespace, name) in [
+            (root, "value", "root_added"),
+            (root, "module", "fresh"),
+            (&["fresh"][..], "value", "inside"),
+        ] {
+            let finding = finding_at(&delta.unknown, module_path, namespace, name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn hidden_content_blocks_inherent_members_and_exported_macros_anywhere_in_its_crate() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod api { pub struct Owner; }\npub mod other { #[my_attr] fn hidden() {} }\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod api { pub struct Owner; impl Owner { pub fn member() {} } }\npub mod other { #[my_attr] fn hidden() {} #[macro_export] macro_rules! exported { () => {} } }\npub fn plain() {}\n",
+                "target",
+            )),
+        );
+        // `other`'s expansion may add an inherent impl or an exported macro,
+        // but it cannot bind an ordinary root item.
+        for (module_path, namespace, name) in [
+            (&["api"][..], "value", "Owner::member"),
+            (&[][..], "macro", "exported"),
+        ] {
+            let finding = finding_at(&delta.unknown, module_path, namespace, name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+        assert!(
+            finding_at(&delta.added, &[], "value", "plain").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn a_region_reaches_its_ancestors_only_through_reexports_of_its_names() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod api { #[my_attr] fn hidden() {} pub struct Name {} }\npub use api::Name;\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod api { #[my_attr] fn hidden() {} pub struct Name {} pub fn Name() {} }\npub use api::Name;\npub fn other() {}\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&delta.added, &[], "value", "other").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+        for module_path in [&["api"][..], &[][..]] {
+            let finding = finding_at(&delta.unknown, module_path, "value", "Name")
+                .unwrap_or_else(|| panic!("{module_path:?}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn a_region_covers_its_module_under_every_public_alias() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "mod private { pub mod inner { #[my_attr] fn hidden() {} pub fn kept() {} } }\npub use private::inner as alias;\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "mod private { pub mod inner { #[my_attr] fn hidden() {} pub fn kept() {} pub fn added() {} } }\npub use private::inner as alias;\npub fn plain() {}\n",
+                "target",
+            )),
+        );
+        let finding = finding_at(&delta.unknown, &["alias"], "value", "added")
+            .unwrap_or_else(|| panic!("{:?}", delta.findings()));
+        assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        assert!(
+            finding_at(&delta.added, &[], "value", "plain").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn only_an_unconditionally_declared_child_module_bounds_a_region() {
+        // The hidden root content may declare `gated` under another cfg, or
+        // produce the transformed inline module itself.
+        for (base, target, module) in [
+            (
+                "#[my_attr] fn hidden() {}\n#[cfg(feature = \"x\")] pub mod gated { pub fn kept() {} }\n",
+                "#[my_attr] fn hidden() {}\n#[cfg(feature = \"x\")] pub mod gated { pub fn kept() {} pub fn added() {} }\n",
+                "gated",
+            ),
+            (
+                "#[my_attr] pub mod generated { pub fn kept() {} }\n",
+                "pub mod generated { pub fn kept() {} pub fn added() {} }\n",
+                "generated",
+            ),
+        ] {
+            let delta = compare_rust_api(
+                &snapshot_rust_api(&MemorySource::source(base, "base")),
+                &snapshot_rust_api(&MemorySource::source(target, "target")),
+            );
+            let finding = finding_at(&delta.unknown, &[module], "value", "added")
+                .unwrap_or_else(|| panic!("{module}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn an_unloaded_module_blocks_its_own_module_item() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source("pub mod a { pub mod c; }\n", "base")),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod a { pub mod c { pub fn x() {} } }\n",
+                "target",
+            )),
+        );
+        for (module_path, namespace, name) in
+            [(&["a"][..], "module", "c"), (&["a", "c"][..], "value", "x")]
+        {
+            let finding = finding_at(&delta.unknown, module_path, namespace, name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn a_root_glob_binds_names_only_in_its_module() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "mod donor { pub fn item() {} }\npub use donor::*;\npub mod api { pub fn kept() {} }\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "mod donor { pub fn item() {} }\npub use donor::*;\npub mod api { pub fn kept() {} pub fn added() {} }\npub fn root_added() {}\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&delta.added, &["api"], "value", "added").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+        let finding = finding_at(&delta.unknown, &[], "value", "root_added")
+            .unwrap_or_else(|| panic!("{:?}", delta.findings()));
+        assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+    }
+
+    #[test]
+    fn source_regions_never_hide_cargo_features() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[features]\nextra=[]\n",
+            ),
+            (
+                "src/lib.rs",
+                "include!(\"extra.rs\");\n",
+                "include!(\"extra.rs\");\n",
+            ),
+            ("src/extra.rs", "fn hidden() {}\n", "fn hidden() {}\n"),
+        ]);
+        assert!(
+            finding_at(&delta.added, &[], "cargo_feature", "extra").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn a_root_that_fails_to_load_hides_its_crate_and_cargo_features() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[features]\nextra=[]\n";
+        let delta = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("src/lib.rs", "pub fn kept() {}\n", "pub fn kept( {}\n"),
+        ]);
+        assert!(delta.removed.is_empty(), "{:?}", delta.findings());
+        for (namespace, name) in [("crate", "fixture"), ("cargo_feature", "extra")] {
+            let finding = finding_at(&delta.unknown, &[], namespace, name)
+                .unwrap_or_else(|| panic!("{namespace} {name}: {:?}", delta.findings()));
+            assert!(
+                finding
+                    .evidence
+                    .iter()
+                    .any(|line| line.contains("blocking target region: SourceParse")),
+                "{:?}",
+                finding.evidence
+            );
         }
     }
 
