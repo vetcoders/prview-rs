@@ -5675,6 +5675,12 @@ fn ghost_audit_in_the_pack_follows_the_shared_reviewed_tree() {
     }];
     let output = tempfile::tempdir().expect("output");
     let pack = output.path().join("pack");
+    // Spelled without an exhaustive literal, like every other fixture here, so
+    // a new `FixturePackOptions` field does not break this call site.
+    let options = FixturePackOptions {
+        diffs: &diffs,
+        ..Default::default()
+    };
 
     generate_fixture_pack_with_ledger_and_diffs(
         repo.path(),
@@ -5684,8 +5690,8 @@ fn ghost_audit_in_the_pack_follows_the_shared_reviewed_tree() {
         &crate::governor::ResourceGovernor::new(),
         &ledger,
         FixturePackOptions {
-            diffs: &diffs,
             worktree_head: FixtureWorktreeHead::Sha(&base_sha),
+            ..options
         },
     )
     .expect("reviewed-tree pack");

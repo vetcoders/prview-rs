@@ -3438,6 +3438,13 @@ relocation and suppressed. Findings in build artifacts, logs and generated asset
 counted as noise rather than reported, and each deleted file is capped at
 `MAX_GHOST_REFS_PER_DELETED_FILE` findings.
 
+The guard and the scan agree on what the reviewed tree is: both skip hidden path
+components and every `node_modules` dependency tree. A target snapshot links the
+operator's `node_modules` in as a symlink the walk does not follow, while a local
+review would walk the same directory for real, so without the skip a vendored
+`node_modules/pkg/util.js` could pass for a relocation survivor and silence a real
+`src/util.js` deletion in one review mode but not the other.
+
 A match counts only when the deleted file's stem appears as a standalone identifier
 in a module-path, import or file-path context: Rust `mod foo;` / `use crate::foo` /
 `foo::Bar`, JS/TS `import … from './foo'` / `require('foo')`, Python `from foo import`,

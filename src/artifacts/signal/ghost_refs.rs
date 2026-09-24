@@ -194,10 +194,10 @@ pub fn generate_ghost_refs(
         let Ok(rel) = entry.path().strip_prefix(scan_root) else {
             continue;
         };
-        // Dot-dir filter on the RELATIVE path: an absolute-path check made every
-        // file under a dotted ancestor (a repo living in ~/.config, ~/.vibecrafted,
+        // Filter on the RELATIVE path: an absolute-path check made every file
+        // under a dotted ancestor (a repo living in ~/.config, ~/.vibecrafted,
         // ...) look hidden, skipping the whole tree — fail-open Ok(None).
-        if has_hidden_component(rel) {
+        if is_outside_reviewed_content(rel) {
             continue;
         }
         if let Some(name) = entry.file_name().to_str() {
@@ -247,9 +247,10 @@ pub fn generate_ghost_refs(
         let Ok(rel) = path.strip_prefix(scan_root) else {
             continue;
         };
-        // Skip hidden paths (.git, etc) by RELATIVE component, so a repo under a
-        // dotted ancestor is not entirely skipped (fail-open Ok(None)).
-        if has_hidden_component(rel) {
+        // Skip hidden paths (.git, etc) and dependency trees by RELATIVE
+        // component, so a repo under a dotted ancestor is not entirely skipped
+        // (fail-open Ok(None)).
+        if is_outside_reviewed_content(rel) {
             continue;
         }
         // Normalize separators so the forward-slash `modified_files` set (from
@@ -478,6 +479,21 @@ fn has_hidden_component(rel: &Path) -> bool {
         matches!(component, std::path::Component::Normal(os)
             if os.to_str().is_some_and(|s| s.starts_with('.')))
     })
+}
+
+/// True when a repo-relative path is not reviewed content: a hidden component
+/// or a `node_modules` dependency tree. Both walks — the relocation index and
+/// the reference scan — share this one predicate, and it must not depend on how
+/// the tree was materialised: a target snapshot links the operator's
+/// `node_modules` in as a symlink that WalkDir does not follow, while a local
+/// review walks the same directory for real. Walking it in one mode only let a
+/// vendored `node_modules/pkg/util.js` pass for a relocation survivor and
+/// silence a real `src/util.js` deletion locally, while `--pr` reported it.
+fn is_outside_reviewed_content(rel: &Path) -> bool {
+    has_hidden_component(rel)
+        || rel.components().any(|component| {
+            matches!(component, std::path::Component::Normal(os) if os == "node_modules")
+        })
 }
 
 fn format_ghost_refs(audit: &GhostRefsAudit) -> String {
@@ -725,6 +741,70 @@ mod tests {
         assert!(
             result_b.is_none(),
             "a relocation visible in the reviewed tree must suppress the audit"
+        );
+    }
+
+    /// A target snapshot links the operator's `node_modules` in as a symlink
+    /// (`git/worktree.rs`, unix only) that WalkDir does not follow; a local
+    /// review walks the same directory for real. A vendored
+    /// `node_modules/pkg/util.js` must neither pass for a relocation survivor
+    /// of the deleted `src/util.js` nor contribute references of its own, so
+    /// both modes report the same ghost.
+    #[test]
+    fn ghost_refs_dependency_tree_is_invisible_in_every_mode() {
+        let main_js = "import { helper } from './util';\n";
+        let (_tmp, repo, commit_id) = make_visible_repo(&[("src/main.js", main_js)]);
+        // Untracked, as installed dependencies are.
+        let vendored = repo.path().join("node_modules/pkg");
+        fs::create_dir_all(&vendored).unwrap();
+        fs::write(vendored.join("util.js"), "module.exports = {};\n").unwrap();
+        fs::write(
+            vendored.join("index.js"),
+            "module.exports = require('./util');\n",
+        )
+        .unwrap();
+
+        let (_snap_tmp, snapshot_dir) = make_snapshot_tree(&[("src/main.js", main_js)]);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            repo.path().join("node_modules"),
+            snapshot_dir.join("node_modules"),
+        )
+        .unwrap();
+
+        let reported_files = |scan_root: &Path, out_name: &str| -> Vec<String> {
+            let out_dir = repo.path().join(out_name);
+            let diff = deletion_diff("src/util.js", commit_id.clone());
+            let result = generate_ghost_refs(&out_dir, &[diff], scan_root).unwrap();
+            assert!(
+                result.is_some(),
+                "the dangling import in src/main.js must be reported when scanning {}",
+                scan_root.display()
+            );
+            let audit: GhostRefsAudit = serde_json::from_str(
+                &fs::read_to_string(out_dir.join("GHOST_REFERENCES.json")).unwrap(),
+            )
+            .unwrap();
+            let mut files: Vec<String> = audit
+                .findings
+                .values()
+                .flatten()
+                .map(|r| r.file.clone())
+                .collect();
+            files.sort();
+            files
+        };
+
+        let local = reported_files(repo.path(), "output-local");
+        let snapshot = reported_files(&snapshot_dir, "output-snapshot");
+        assert_eq!(
+            local,
+            vec!["src/main.js".to_string()],
+            "vendored dependency code leaked into the local audit"
+        );
+        assert_eq!(
+            local, snapshot,
+            "a local review and a target snapshot of the same tree must agree"
         );
     }
 
