@@ -2241,8 +2241,35 @@ pub async fn run_command_with_timeout_and_env(
     .await
 }
 
+/// One JS tool run, carrying the binary that was actually spawned.
+///
+/// The executed path is RETURNED rather than re-derived, because provenance
+/// used to be reconstructed from `which::which("pnpm")` at each call site while
+/// this runner had already stopped using a package-manager launcher. It
+/// executes `<cwd>/node_modules/.bin/<tool>` and nothing else, so every
+/// published `pnpm exec eslint …` / `npx eslint …` named a command that never
+/// ran — in the one change whose subject is truthful provenance.
+pub struct JsRun {
+    /// The program handed to the OS, exactly as it was spawned.
+    pub program: std::path::PathBuf,
+    pub output: Output,
+}
+
+impl JsRun {
+    /// The provenance `command` for this run: the executed binary, then the
+    /// arguments it received.
+    pub fn command(&self, args: &[&str]) -> String {
+        let mut command = self.program.display().to_string();
+        for arg in args {
+            command.push(' ');
+            command.push_str(arg);
+        }
+        command
+    }
+}
+
 /// Run the exact local JS binary selected by eligibility and snapshot overlay.
-pub async fn run_js_command(tool: &str, args: &[&str], cwd: &Path) -> Result<Output> {
+pub async fn run_js_command(tool: &str, args: &[&str], cwd: &Path) -> Result<JsRun> {
     run_js_command_with_timeout(tool, args, cwd, CHECK_TIMEOUT_SECS).await
 }
 
@@ -2256,7 +2283,7 @@ pub async fn run_js_command_with_timeout(
     args: &[&str],
     cwd: &Path,
     timeout_secs: u64,
-) -> Result<Output> {
+) -> Result<JsRun> {
     let bin_path = cwd.join("node_modules/.bin").join(tool);
     #[cfg(unix)]
     if std::fs::metadata(&bin_path).is_ok_and(|metadata| {
@@ -2274,8 +2301,12 @@ pub async fn run_js_command_with_timeout(
             bin_path.display()
         )
     })?;
-    let bin = bin.to_string_lossy().into_owned();
-    run_command_with_timeout(&bin, args, cwd, timeout_secs).await
+    let program = bin.to_string_lossy().into_owned();
+    let output = run_command_with_timeout(&program, args, cwd, timeout_secs).await?;
+    Ok(JsRun {
+        program: bin,
+        output,
+    })
 }
 
 /// Resolve a JS tool to a directly-runnable local binary, bypassing npx.
@@ -4418,11 +4449,11 @@ test result: ok. 2 passed; 0 failed
         // this freshly written executable, so execve races with "Text file busy"
         // (os error 26). Retry the spawn a few times; the racing child exec's and
         // drops the inherited fd almost immediately.
-        let mut output = None;
+        let mut run = None;
         for attempt in 0..8u32 {
             match run_js_command_with_timeout("faketool", &[], tmp.path(), 10).await {
                 Ok(o) => {
-                    output = Some(o);
+                    run = Some(o);
                     break;
                 }
                 Err(e) if attempt < 7 && e.to_string().contains("os error 26") => {
@@ -4431,11 +4462,62 @@ test result: ok. 2 passed; 0 failed
                 Err(e) => panic!("local bin should run: {e}"),
             }
         }
-        let output = output.expect("local bin should run within the ETXTBSY retry budget");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let run = run.expect("local bin should run within the ETXTBSY retry budget");
+        let stdout = String::from_utf8_lossy(&run.output.stdout);
         assert!(
             stdout.contains("LOCAL_BIN_RAN"),
             "run_js_command must exec the local bin directly, got: {stdout}"
+        );
+        assert_eq!(
+            run.program, toolpath,
+            "the runner must report the binary it spawned, so provenance cannot \
+             invent a launcher that never ran"
+        );
+    }
+
+    /// The runner executes `<cwd>/node_modules/.bin/<tool>` and nothing else,
+    /// so the published `command` must name that path. It used to be rebuilt
+    /// from `which::which("pnpm")` at each call site, so a successful direct run
+    /// published `pnpm exec eslint …` — a command no part of the run executed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eslint_provenance_reports_the_executed_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let tool = bin_dir.join("eslint");
+        std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").expect("target-owned eslint");
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("executable tool");
+        let target = commit_fixture(
+            root,
+            "target owns its own eslint",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        let provenance = result.provenance.expect("ESLint provenance");
+        let executed = format!("{}/node_modules/.bin/eslint", provenance.cwd);
+        assert!(
+            provenance.command.starts_with(&executed),
+            "provenance must name the binary that ran ({executed}), got: {}",
+            provenance.command,
+        );
+        assert!(
+            !provenance.command.contains("pnpm") && !provenance.command.contains("npx"),
+            "no package-manager launcher takes part in a resolved JS run: {}",
+            provenance.command,
         );
     }
 
@@ -4785,10 +4867,28 @@ test result: ok. 2 passed; 0 failed
         .expect("ambient eslint payload");
 
         let config = exact_js_config(root, &target);
-        let result = typescript::ESLintCheck
-            .run(&config)
-            .await
-            .expect("exact ESLint run");
+        // An `ENOEXEC` launcher has two different futures, and which one a host
+        // gets is a property of the SPAWN PATH, not of this product. Where the
+        // spawn goes through `fork` + `execvp` (and on macOS, measured), POSIX
+        // requires the retry through `/bin/sh` and the ambient payload really
+        // runs; on Rust's default `posix_spawn` path glibc hands `ENOEXEC` back
+        // instead, so nothing runs at all — measured on Linux CI as
+        // `Exec format error (os error 8)`, which is what made this cell fail
+        // there while passing locally. Both worlds are acceptable and this
+        // pins what must hold in EITHER: an exact `Snapshot` is never claimed.
+        let result = match typescript::ESLintCheck.run(&config).await {
+            Ok(result) => result,
+            Err(error) => {
+                let reported = format!("{error:#}");
+                assert!(
+                    reported.contains("failed to spawn"),
+                    "the only acceptable failure here is the launcher refusing to \
+                     exec at all (fail-closed, nothing was scanned and nothing was \
+                     claimed), got: {reported}",
+                );
+                return;
+            }
+        };
 
         assert_eq!(result.status, CheckStatus::Passed);
         assert!(

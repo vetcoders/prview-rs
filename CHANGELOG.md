@@ -287,6 +287,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0 ok, 1 tooling, 2 unsupported platform, 3 missing artifact, 4
   checksum/archive invalid, 5 macOS signature/notarization, 6 post-install
   verification. `docs/INSTALL.md` carries the full contract.
+- Library API: `prview::checks::run_js_command` and
+  `run_js_command_with_timeout` return `JsRun { program, output }` instead of a
+  bare `std::process::Output`. The recorded provenance of a JS check is now
+  built from `JsRun::command(&args)` — the program the OS was actually handed —
+  so a pack no longer reports `pnpm exec eslint …` for a run that executed
+  `node_modules/.bin/eslint` directly. The published command was previously
+  reconstructed from a second, independent `which::which("pnpm")` probe that the
+  runner never consulted, which could name a launcher the run did not use and,
+  under `--target-sha`, a launcher outside the snapshot. Callers that only need
+  the process result read `run.output`; this is source-incompatible for library
+  consumers.
+
 ### Fixed
 
 - **A snapshot never writes through an entry the reviewed commit owns.** The
