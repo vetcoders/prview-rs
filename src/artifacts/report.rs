@@ -1157,7 +1157,8 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             // called inconsistent: one fact, two values.
             consistency.merge_provenance(input.provenance);
             // The same checklist fold `CONSISTENCY_CHECK.json` applies, against
-            // the in-memory statuses this report is about to serialize.
+            // the in-memory statuses this report is about to serialize (every
+            // one readable, hence no unreadable entries).
             let check_outcomes: Vec<_> = input
                 .checks
                 .iter()
@@ -1171,6 +1172,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             consistency.merge_pr_checklist(
                 disk.pr_checklist.as_deref(),
                 Some(&check_outcomes),
+                0,
                 "report.json",
             );
 

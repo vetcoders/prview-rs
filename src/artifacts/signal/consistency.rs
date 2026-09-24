@@ -26,10 +26,16 @@ pub struct DiskArtifactCounters {
     pub files_changed_report: Option<usize>,
     pub findings_count_report: Option<usize>,
     pub commit_count_report: Option<usize>,
-    /// Checklist marks rendered in `PR_REVIEW.md` (pack root).
+    /// Checklist marks rendered in `PR_REVIEW.md` (pack root); `None` only when
+    /// the file itself is absent or unreadable.
     pub pr_checklist: Option<Vec<(PrChecklistItem, Option<bool>)>>,
-    /// `(name, outcome)` per check serialized in report.json `/checks`.
+    /// `(name, outcome)` per readable check serialized in report.json `/checks`.
     pub check_outcomes_report: Option<Vec<(String, ChecklistCheckOutcome)>>,
+    /// How much of report.json `/checks` could not be read: one per entry
+    /// without a string `name` and `status`, or one for a `/checks` that is
+    /// missing or not an array. `report.json` always serializes both, so a
+    /// nonzero count is a damaged artifact, never a quiet subset.
+    pub check_entries_unreadable: usize,
 }
 
 /// Read the serialized cross-artifact counters under `pack_root` (the pack
@@ -73,28 +79,29 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
         out.files_changed_report = usize_at(&report, "/diff/stats/files_changed");
         out.findings_count_report = usize_at(&report, "/quality/sarif/findings_count");
         out.commit_count_report = usize_at(&report, "/diff/stats/commits");
-        out.check_outcomes_report =
-            report
-                .pointer("/checks")
-                .and_then(|c| c.as_array())
-                .map(|checks| {
-                    checks
-                        .iter()
-                        .filter_map(|check| {
-                            let name = check.get("name")?.as_str()?;
-                            let status = check.get("status")?.as_str()?;
-                            Some((
-                                name.to_string(),
-                                ChecklistCheckOutcome::from_report_status(status),
-                            ))
-                        })
-                        .collect()
-                });
+        let mut outcomes = Vec::new();
+        match report.pointer("/checks").and_then(|c| c.as_array()) {
+            Some(checks) => {
+                for check in checks {
+                    let name = check.get("name").and_then(|v| v.as_str());
+                    let status = check.get("status").and_then(|v| v.as_str());
+                    match (name, status) {
+                        (Some(name), Some(status)) => outcomes.push((
+                            name.to_string(),
+                            ChecklistCheckOutcome::from_report_status(status),
+                        )),
+                        _ => out.check_entries_unreadable += 1,
+                    }
+                }
+            }
+            None => out.check_entries_unreadable += 1,
+        }
+        out.check_outcomes_report = Some(outcomes);
     }
 
     out.pr_checklist = std::fs::read_to_string(pack_root.join("PR_REVIEW.md"))
         .ok()
-        .and_then(|text| crate::artifacts::parse_pr_checklist(&text));
+        .map(|text| crate::artifacts::parse_pr_checklist(&text));
 
     out
 }
@@ -154,35 +161,46 @@ impl ConsistencyReport {
     /// about to be serialized into, `checks_artifact`). A ticked universal claim
     /// ("No lint errors") next to a failed check of that category is the vbl-190
     /// class; a claim left unticked that the checks earn is the same divergence
-    /// in the other direction. An item with no rendered line, or a run with no
-    /// serialized checks, is not compared — never faked into agreement.
+    /// in the other direction.
+    ///
+    /// Fail-closed on unreadable evidence: an item whose line is missing or
+    /// carries an unknown mark is compared and reported, and `unreadable_checks`
+    /// entries in `checks_artifact` withhold the whole comparison behind one
+    /// warning rather than re-deriving the claims from a subset. Only an absent
+    /// side — no `PR_REVIEW.md`, or no serialized checks — is not compared.
     pub fn merge_pr_checklist(
         &mut self,
         rendered: Option<&[(PrChecklistItem, Option<bool>)]>,
         checks: Option<&[(String, ChecklistCheckOutcome)]>,
+        unreadable_checks: usize,
         checks_artifact: &str,
     ) {
         let (Some(rendered), Some(checks)) = (rendered, checks) else {
             return;
         };
+        if unreadable_checks > 0 {
+            self.checked_fields += 1;
+            self.warnings.push(ConsistencyWarning {
+                field: "pr_checklist".to_string(),
+                sources: vec![ConsistencySource {
+                    artifact: checks_artifact.to_string(),
+                    value: format!("unreadable `/checks` entries: {unreadable_checks}"),
+                }],
+                message: format!(
+                    "PR checklist not verifiable: {checks_artifact} has `/checks` entries without a readable name and status ({unreadable_checks}), so the PR_REVIEW.md claims cannot be re-derived from it"
+                ),
+            });
+            self.consistent = self.warnings.is_empty();
+            return;
+        }
         let outcomes: Vec<_> = checks
             .iter()
             .map(|(name, outcome)| (name.as_str(), *outcome))
             .collect();
+        let mark = |ticked: bool| if ticked { "[x]" } else { "[ ]" };
         for claim in derive_pr_checklist(&outcomes) {
-            let Some(rendered_mark) = rendered
-                .iter()
-                .find(|(item, _)| *item == claim.item)
-                .and_then(|(_, mark)| *mark)
-            else {
-                continue;
-            };
             self.checked_fields += 1;
             let earned = claim.ticked();
-            if rendered_mark == earned {
-                continue;
-            }
-            let mark = |ticked: bool| if ticked { "[x]" } else { "[ ]" };
             let why = if !claim.not_passed.is_empty() {
                 format!("not passed: {}", claim.not_passed.join(", "))
             } else if claim.executed.is_empty() {
@@ -190,25 +208,45 @@ impl ConsistencyReport {
             } else {
                 format!("every executed check passed: {}", claim.executed.join(", "))
             };
+            let rendered_mark = rendered
+                .iter()
+                .find(|(item, _)| *item == claim.item)
+                .and_then(|(_, line_mark)| *line_mark);
+            let (rendered_value, message) = match rendered_mark {
+                Some(rendered_mark) if rendered_mark == earned => continue,
+                Some(rendered_mark) => (
+                    mark(rendered_mark).to_string(),
+                    format!(
+                        "PR checklist mismatch: PR_REVIEW.md renders {} '{}', but the {} check statuses earn {} ({why})",
+                        mark(rendered_mark),
+                        claim.item.label(),
+                        checks_artifact,
+                        mark(earned),
+                    ),
+                ),
+                None => (
+                    "no readable line".to_string(),
+                    format!(
+                        "PR checklist line unreadable: PR_REVIEW.md has no readable '{}' line under `## Checklist`, where the {} check statuses earn {} ({why})",
+                        claim.item.label(),
+                        checks_artifact,
+                        mark(earned),
+                    ),
+                ),
+            };
             self.warnings.push(ConsistencyWarning {
                 field: format!("pr_checklist.{}", claim.item.key()),
                 sources: vec![
                     ConsistencySource {
                         artifact: "PR_REVIEW.md".to_string(),
-                        value: mark(rendered_mark).to_string(),
+                        value: rendered_value,
                     },
                     ConsistencySource {
                         artifact: checks_artifact.to_string(),
                         value: format!("{} ({why})", mark(earned)),
                     },
                 ],
-                message: format!(
-                    "PR checklist mismatch: PR_REVIEW.md renders {} '{}', but the {} check statuses earn {} ({why})",
-                    mark(rendered_mark),
-                    claim.item.label(),
-                    checks_artifact,
-                    mark(earned),
-                ),
+                message,
             });
         }
         self.consistent = self.warnings.is_empty();
@@ -631,6 +669,7 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         report.merge_pr_checklist(
             disk.pr_checklist.as_deref(),
             disk.check_outcomes_report.as_deref(),
+            disk.check_entries_unreadable,
             "report.json",
         );
         report
@@ -706,12 +745,157 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         let report = checklist_report(root);
         assert_eq!(report.checked_fields, 0);
 
-        // Checkbox lines outside `## Checklist` are not checklist claims.
-        std::fs::write(root.join("PR_REVIEW.md"), "# R\n\n- [x] No lint errors\n").unwrap();
+        // report.json without PR_REVIEW.md: still unchecked.
+        std::fs::remove_file(root.join("PR_REVIEW.md")).unwrap();
         std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
         let report = checklist_report(root);
         assert_eq!(report.checked_fields, 0);
         assert!(report.consistent);
+    }
+
+    fn warning_fields(report: &ConsistencyReport) -> Vec<&str> {
+        report.warnings.iter().map(|w| w.field.as_str()).collect()
+    }
+
+    /// Both artifacts present but a line gone: the item is compared and
+    /// reported, so `checked_fields` never depends on what happened to render.
+    #[test]
+    fn a_missing_or_unreadable_checklist_line_is_reported_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("report.json"), incident_report_json("PASS")).unwrap();
+
+        for broken in [
+            INCIDENT_PR_TEMPLATE.replace("- [x] Tests pass\n", ""),
+            INCIDENT_PR_TEMPLATE.replace("- [x] Tests pass", "- [?] Tests pass"),
+        ] {
+            std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{broken}")).unwrap();
+            let report = checklist_report(root);
+            assert!(!report.consistent, "{report:?}");
+            assert_eq!(report.checked_fields, 3, "{report:?}");
+            assert_eq!(warning_fields(&report), ["pr_checklist.tests_pass"]);
+            assert_eq!(report.warnings[0].sources[0].value, "no readable line");
+            assert!(report.warnings[0].message.contains("'Tests pass'"));
+        }
+
+        // No `## Checklist` at all: a checkbox elsewhere is not a claim, and
+        // every item is reported as unreadable rather than silently dropped.
+        std::fs::write(root.join("PR_REVIEW.md"), "# R\n\n- [x] No lint errors\n").unwrap();
+        std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
+        let report = checklist_report(root);
+        assert_eq!(report.checked_fields, 3, "{report:?}");
+        assert_eq!(
+            warning_fields(&report),
+            [
+                "pr_checklist.compiles",
+                "pr_checklist.tests_pass",
+                "pr_checklist.no_lint_errors"
+            ]
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| w.sources[0].value == "no readable line"),
+            "{report:?}"
+        );
+    }
+
+    /// PR_REVIEW.md embeds check-derived text (names, evidence excerpts) above
+    /// the PR Template. A `## Checklist` smuggled in there must not stand in for
+    /// the template's own checklist, and nothing past the template's closing
+    /// fence is part of it.
+    #[test]
+    fn only_the_templates_own_checklist_section_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
+
+        let injected = "### ESLint\n- Evidence: log\n## Checklist\n- [x] Compiles / type-checks\n\
+- [x] Tests pass\n- [ ] No lint errors\n\n";
+        std::fs::write(
+            root.join("PR_REVIEW.md"),
+            format!("# R\n\n{injected}{INCIDENT_PR_TEMPLATE}"),
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert_eq!(warning_fields(&report), ["pr_checklist.no_lint_errors"]);
+        assert_eq!(report.warnings[0].sources[0].value, "[x]", "{report:?}");
+
+        // The template lost its lint line; an agreeing line after the closing
+        // fence must not fill in for it.
+        let truncated = INCIDENT_PR_TEMPLATE.replace("- [x] No lint errors\n", "");
+        std::fs::write(
+            root.join("PR_REVIEW.md"),
+            format!("# R\n\n{truncated}\n- [ ] No lint errors\n"),
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert_eq!(warning_fields(&report), ["pr_checklist.no_lint_errors"]);
+        assert_eq!(report.warnings[0].sources[0].value, "no readable line");
+    }
+
+    /// An empty `/checks` is evidence, not absence: nothing executed, so
+    /// nothing is earned. This is what catches the old renderer that ticked
+    /// "Compiles / type-checks" for a run with no checks at all.
+    #[test]
+    fn an_empty_checks_list_earns_no_claim_and_is_still_compared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("report.json"), r#"{"checks": []}"#).unwrap();
+        let old_renderer = INCIDENT_PR_TEMPLATE
+            .replace("- [x] Tests pass", "- [ ] Tests pass")
+            .replace("- [x] No lint errors", "- [ ] No lint errors");
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{old_renderer}")).unwrap();
+        let report = checklist_report(root);
+        assert_eq!(report.checked_fields, 3, "{report:?}");
+        assert_eq!(warning_fields(&report), ["pr_checklist.compiles"]);
+        assert!(
+            report.warnings[0].sources[1]
+                .value
+                .contains("no check of this category executed"),
+            "{report:?}"
+        );
+
+        let honest = old_renderer.replace("- [x] Compiles", "- [ ] Compiles");
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{honest}")).unwrap();
+        let report = checklist_report(root);
+        assert!(report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 3);
+    }
+
+    /// report.json always serializes every check with a string name and
+    /// status. A damaged `/checks` withholds the comparison behind one warning
+    /// instead of re-deriving the claims from whatever rows survived.
+    #[test]
+    fn unreadable_serialized_checks_withhold_the_checklist_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("PR_REVIEW.md"),
+            format!("# R\n\n{INCIDENT_PR_TEMPLATE}"),
+        )
+        .unwrap();
+        for (report_json, unreadable) in [
+            (
+                r#"{"checks": [{"name": "Clippy", "status": "PASS"}, {"name": "ESLint", "status": null}, {"status": "FAIL"}]}"#,
+                2,
+            ),
+            (r#"{"checks": "damaged"}"#, 1),
+            (r#"{"meta": {}}"#, 1),
+        ] {
+            std::fs::write(root.join("report.json"), report_json).unwrap();
+            let disk = read_disk_artifact_counters(root);
+            assert_eq!(disk.check_entries_unreadable, unreadable, "{report_json}");
+            let report = checklist_report(root);
+            assert!(!report.consistent, "{report_json}: {report:?}");
+            assert_eq!(report.checked_fields, 1, "{report_json}");
+            assert_eq!(warning_fields(&report), ["pr_checklist"], "{report_json}");
+            assert!(
+                report.warnings[0].message.contains("not verifiable"),
+                "{report:?}"
+            );
+        }
     }
 
     #[test]

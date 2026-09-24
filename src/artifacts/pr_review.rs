@@ -25,8 +25,10 @@ pub(crate) const REWRITTEN_RANGE_NOTE: &str = "Force-push detected: the file set
 /// itself stays in its copy-paste shape.
 ///
 /// This is the single derivation of the claim. `PR_REVIEW.md` renders it, and
-/// the consistency checker re-derives it from the serialized statuses in
-/// `report.json` to prove the rendered marks still match.
+/// the consistency checker re-derives it to prove the rendered marks still
+/// match: `CONSISTENCY_CHECK.json` from the statuses serialized in
+/// `report.json`, and `report.json`'s own `quality.consistency` from the
+/// in-memory statuses it is about to serialize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrChecklistItem {
     Compiles,
@@ -59,7 +61,9 @@ impl PrChecklistItem {
     fn covers(self, check_name: &str) -> bool {
         let name = check_name.to_lowercase();
         match self {
-            Self::Compiles => name.contains("typescript") || name == "cargo check",
+            Self::Compiles => {
+                name.contains("typescript") || name == "cargo check" || name == "mypy"
+            }
             Self::TestsPass => name.contains("test") || name == "vitest" || name == "pytest",
             Self::NoLintErrors => name.contains("lint") || name == "clippy" || name == "ruff",
         }
@@ -142,30 +146,43 @@ pub(crate) fn derive_pr_checklist(
 
 /// Read the rendered checklist marks back from a `PR_REVIEW.md`.
 ///
-/// Only lines inside the `## Checklist` section count. `None` per item means
-/// the line is not there (nothing to compare), never a guessed mark.
-pub(crate) fn parse_pr_checklist(pr_review: &str) -> Option<Vec<(PrChecklistItem, Option<bool>)>> {
-    let section = &pr_review[pr_review.find("\n## Checklist\n")?..];
-    Some(
-        PrChecklistItem::ALL
-            .into_iter()
-            .map(|item| {
-                let mark = section.lines().find_map(|line| {
-                    let rest = line.strip_prefix("- [")?;
-                    let (mark, label) = rest.split_once("] ")?;
-                    if label != item.label() {
-                        return None;
-                    }
-                    match mark {
-                        "x" | "X" => Some(true),
-                        " " => Some(false),
-                        _ => None,
-                    }
-                });
-                (item, mark)
-            })
-            .collect(),
-    )
+/// Only lines inside the PR Template's `## Checklist` section count. The
+/// template is the last thing `generate_pr_review` writes, so the LAST such
+/// heading is the checklist: check-derived text earlier in the file (a log
+/// excerpt carrying its own `## Checklist`) cannot stand in for it. The section
+/// ends at the template's closing fence or the next level-2 heading. `None` per
+/// item means no readable line for it — missing, or a mark that is neither
+/// `x` nor a space — never a guessed mark; with no section at all every item
+/// is `None`.
+pub(crate) fn parse_pr_checklist(pr_review: &str) -> Vec<(PrChecklistItem, Option<bool>)> {
+    const HEADING: &str = "\n## Checklist\n";
+    let section: Vec<&str> = pr_review
+        .rfind(HEADING)
+        .map(|start| {
+            pr_review[start + HEADING.len()..]
+                .lines()
+                .take_while(|line| !line.starts_with("## ") && !line.starts_with("```"))
+                .collect()
+        })
+        .unwrap_or_default();
+    PrChecklistItem::ALL
+        .into_iter()
+        .map(|item| {
+            let mark = section.iter().find_map(|line| {
+                let rest = line.strip_prefix("- [")?;
+                let (mark, label) = rest.split_once("] ")?;
+                if label != item.label() {
+                    return None;
+                }
+                match mark {
+                    "x" | "X" => Some(true),
+                    " " => Some(false),
+                    _ => None,
+                }
+            });
+            (item, mark)
+        })
+        .collect()
 }
 
 /// Whether this run actually reviewed a rewritten range: `--exact-base` is in

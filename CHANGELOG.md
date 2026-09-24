@@ -233,6 +233,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `PR_REVIEW.md` PR Template checklist no longer claims what the checks did
+  not prove. `Compiles / type-checks`, `Tests pass` and `No lint errors` were each
+  ticked when ANY check of the category passed, so a failing ESLint hid behind a
+  passing Clippy, and a run with no checks at all ticked `Compiles / type-checks`.
+  A claim is now ticked only when at least one check of its category executed and
+  every executed one passed, and Mypy counts toward `Compiles / type-checks`.
+  `CONSISTENCY_CHECK.json` and `report.json`'s `quality.consistency` re-derive the
+  three claims from the check statuses and report a rendered mark those statuses
+  do not earn as a `pr_checklist.<item>` warning; a checklist line or serialized
+  check entry that cannot be read is reported too, never skipped.
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch

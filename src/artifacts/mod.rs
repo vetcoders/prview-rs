@@ -1564,6 +1564,7 @@ fn generate_consistency_check(
     report.merge_pr_checklist(
         disk.pr_checklist.as_deref(),
         disk.check_outcomes_report.as_deref(),
+        disk.check_entries_unreadable,
         "report.json",
     );
 

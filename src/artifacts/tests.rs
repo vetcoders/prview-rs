@@ -8173,10 +8173,16 @@ fn rendered_checklist(checks: &[CheckResult]) -> String {
 #[test]
 fn every_checklist_claim_needs_every_check_of_its_category_to_pass() {
     use CheckStatus::{Failed, Passed};
-    let cases: [(&str, &[(&str, CheckStatus)]); 3] = [
+    let cases: [(&str, &[(&str, CheckStatus)]); 4] = [
         (
             "Compiles / type-checks",
             &[("TypeScript", Failed), ("Cargo check", Passed)],
+        ),
+        // Mypy is the Python type-checker: a polyglot run's failing Mypy must
+        // not hide behind a passing `cargo check`.
+        (
+            "Compiles / type-checks",
+            &[("Mypy", Failed), ("Cargo check", Passed)],
         ),
         ("Tests pass", &[("Cargo test", Failed), ("Vitest", Passed)]),
         ("No lint errors", &[("ESLint", Failed), ("Clippy", Passed)]),
@@ -8202,6 +8208,13 @@ fn every_checklist_claim_needs_every_check_of_its_category_to_pass() {
     for label in ["Compiles / type-checks", "Tests pass", "No lint errors"] {
         assert!(checklist.contains(&format!("- [x] {label}")), "{checklist}");
     }
+
+    // A Python-only run earns the type-check claim from Mypy alone.
+    let checklist = rendered_checklist(&[lint_check("Mypy", Passed)]);
+    assert!(
+        checklist.contains("- [x] Compiles / type-checks"),
+        "{checklist}"
+    );
 }
 
 /// A claim with no executed check behind it is not evidence: a run with no

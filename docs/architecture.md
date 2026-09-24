@@ -3527,12 +3527,21 @@ Beyond counters it cross-checks one set of claims: the `PR_REVIEW.md` checklist.
 claim (`Compiles / type-checks`, `Tests pass`, `No lint errors`) is ticked only
 when every executed check of its category passed and at least one executed.
 The renderer prints that derivation; `ConsistencyReport::merge_pr_checklist`
-re-derives it from the statuses serialized in `report.json` (`/checks`) and
-compares it with the marks parsed back from `PR_REVIEW.md` — a divergence is a
-`pr_checklist.<item>` warning in both `CONSISTENCY_CHECK.json` and `report.json`'s
-`quality.consistency`. Because both sides share the derivation, the checker
-catches the rendered text drifting from the statuses; the derivation's own
-semantics (all-of, not any-of) are pinned by the `artifacts::tests` checklist tests.
+re-derives it and compares it with the marks `parse_pr_checklist` reads back
+from `PR_REVIEW.md` — a divergence is a `pr_checklist.<item>` warning.
+`CONSISTENCY_CHECK.json` re-derives from the statuses serialized in
+`report.json` (`/checks`, read from disk after report.json is written);
+`report.json`'s `quality.consistency` is built before report.json exists, so it
+re-derives from the in-memory statuses it is about to serialize. The parser
+reads only the PR Template's own section — the last `## Checklist` heading, up
+to the template's closing fence — so check-derived text rendered earlier in the
+file cannot stand in for it. The fold fails closed: a missing or unreadable
+checklist line is a warning for its item, and `/checks` entries without a
+readable `name` and `status` withhold the comparison behind one `pr_checklist`
+warning. Because both sides share the derivation, the checker catches the
+rendered text drifting from the statuses; the derivation's own semantics
+(all-of, not any-of, and which check belongs to which item) are pinned by the
+`artifacts::tests` checklist tests.
 
 #### signal/semantic.rs — semantic cross-file rules
 
