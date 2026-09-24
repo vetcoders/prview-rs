@@ -236,6 +236,15 @@ pub(crate) fn cargo_audit_finding_key(finding: &CargoAuditFinding) -> (String, S
 ///   a malformed advisory in the target would match an unrelated malformed one
 ///   in the base and read as pre-existing. It makes the whole report
 ///   unreadable, which the gate treats as causation unknown.
+/// * Two items that share a key would leave the set smaller than the report,
+///   with nothing to say which of them the base's copy of that key accounts
+///   for. The key names no package source, and rustsec needs none to tell
+///   genuine items apart: it matches vulnerabilities and warnings against
+///   default-registry packages only, so a git or alternate-registry package of
+///   the same name and version is never reported. Its yanked check does accept
+///   both spellings of the crates.io index, though, so a lockfile listing one
+///   version under each would repeat a `yanked` key. A repeated key of any kind
+///   makes the report unreadable rather than silently shorter.
 pub(crate) fn cargo_audit_report_advisory_keys(
     output: &str,
 ) -> Option<std::collections::HashSet<(String, String, String)>> {
@@ -243,7 +252,9 @@ pub(crate) fn cargo_audit_report_advisory_keys(
 
     let mut keys = std::collections::HashSet::new();
     for entry in crate::checks::validated_cargo_audit_vulnerability_list(&parsed)? {
-        keys.insert(cargo_audit_item_key(entry, None)?);
+        if !keys.insert(cargo_audit_item_key(entry, None)?) {
+            return None;
+        }
     }
     let Some(warnings) = parsed.get("warnings") else {
         return Some(keys);
@@ -257,7 +268,9 @@ pub(crate) fn cargo_audit_report_advisory_keys(
                 continue;
             };
             for entry in entries {
-                keys.insert(cargo_audit_item_key(entry, Some(category.as_str()))?);
+                if !keys.insert(cargo_audit_item_key(entry, Some(category.as_str()))?) {
+                    return None;
+                }
                 keyed += 1;
             }
         }
@@ -1027,6 +1040,64 @@ mod tests {
                 std::iter::once(cargo_audit_finding_key(&rows[0]))
                     .collect::<std::collections::HashSet<_>>()
             ),
+        );
+    }
+
+    /// The key names no package source, so two items for one name and version
+    /// from different sources share it. Collapsed into one key, the report
+    /// counts one item fewer than it lists, and a base report holding either
+    /// of them accounts for both. rustsec reports vulnerabilities and warnings
+    /// for default-registry packages only, but its yanked check accepts both
+    /// spellings of the crates.io index, and a report is not to be trusted to
+    /// be one rustsec wrote. A repeated key makes the report unreadable.
+    #[test]
+    fn items_that_share_a_key_make_the_report_unreadable() {
+        let vulnerability = |source: &str| {
+            format!(
+                r#"{{"advisory":{{"id":"RUSTSEC-2024-0001"}},"package":{{"name":"demo","version":"1.2.3","source":"{source}"}}}}"#
+            )
+        };
+        let registry = vulnerability("registry+https://github.com/rust-lang/crates.io-index");
+        let git = vulnerability("git+https://example.com/demo#0123456789abcdef");
+        let repeated = format!(
+            r#"{{"vulnerabilities":{{"found":true,"count":2,"list":[{registry},{git}]}},"warnings":{{}}}}"#
+        );
+        assert!(
+            cargo_audit_report_advisory_keys(&repeated).is_none(),
+            "two sources of one vulnerable version"
+        );
+
+        let yanked = |source: &str| {
+            format!(
+                r#"{{"kind":"yanked","advisory":null,"package":{{"name":"shiny","version":"2.0.0","source":"{source}"}}}}"#
+            )
+        };
+        let both_spellings = format!(
+            r#"{{"vulnerabilities":{{"list":[]}},"warnings":{{"yanked":[{},{}]}}}}"#,
+            yanked("registry+https://github.com/rust-lang/crates.io-index"),
+            yanked("sparse+https://index.crates.io/"),
+        );
+        assert!(
+            cargo_audit_report_advisory_keys(&both_spellings).is_none(),
+            "one yanked version under both crates.io index spellings"
+        );
+
+        let across_categories = format!(
+            r#"{{"vulnerabilities":{{"list":[]}},"warnings":{{"unmaintained":[{registry}],"unsound":[{registry}]}}}}"#
+        );
+        assert!(
+            cargo_audit_report_advisory_keys(&across_categories).is_none(),
+            "one advisory repeated across warning categories"
+        );
+
+        // Control: the same advisory for two versions keys twice.
+        let other_version = registry.replace("1.2.3", "1.2.4");
+        let distinct = format!(
+            r#"{{"vulnerabilities":{{"found":true,"count":2,"list":[{registry},{other_version}]}},"warnings":{{}}}}"#
+        );
+        assert_eq!(
+            cargo_audit_report_advisory_keys(&distinct).map(|keys| keys.len()),
+            Some(2)
         );
     }
 
