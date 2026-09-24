@@ -1020,6 +1020,16 @@ are discarded fail-closed, while coherent mode-only add/delete metadata remains
 valid. Confirmed removed, changed, relocated, and
 visibility-changed Rust facts are breaking; added-only facts are informational.
 
+A JS/TS export removed and added again in the same file under the same name
+(and, for `interface`/`type`, in the same type namespace) is paired rather than
+reported as a removal plus an addition. When the two lines agree once
+formatting, comments and implementation are set aside, the export was only
+re-emitted, for example a formatter turning an arrow function's `=> {` block
+body into an `=>` expression body, and nothing is reported. When they differ,
+the pair is one signature change. The comparison is a single-line heuristic:
+an export with no single declared name (`export { a } from`, `export *`) or one
+moved to another file keeps its removal, since its importers still break.
+
 The ordinary remote `prview --pr <number>` fast preset does not enter the full
 repo-backed Rust engine. It emits an exact-revision typed unknown instead, so
 the run is degraded and requires review rather than reporting a clean scan.

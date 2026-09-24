@@ -2917,6 +2917,21 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
+JS/TS `export` lines pair the same way, after the patch is read
+(`pair_js_ts_exports`). Every removed export line used to be a
+`RemovedSymbol`, so a formatter rewriting an unchanged export (an arrow
+function's `=> {` block body turned into an `=>` expression body, as in the
+vbl-190 review) reported it removed. `common::js_ts_export` gives each line the
+binding importers use (the declared name or `default`), whether it lives in
+TypeScript's type namespace (`interface`, `type`), and a comparison form with
+formatting, comments and implementation removed: an arrow function up to its
+`=>`, a `function`/`class` without the body it opens. A removal pairs with an
+addition in the same file with the same name and namespace, equal forms
+first. Equal forms report nothing; different forms are one `ChangedSignature`.
+A line with no single name (`export { a } from`, `export *`, `export =`) or an
+export moved to another file stays a `RemovedSymbol`: its importers still
+break.
+
 The old Rust limitation below is historical only: a diff-only scanner could not
 see an enum variant, trait method, or public struct field removed beneath an
 unchanged item opener. Production Rust now reads both exact repository trees,
@@ -3480,11 +3495,17 @@ repo-backed Rust `ApiArtifactView` additively. Rust findings are projected only
 for old-reader compatibility; the embedded view is authoritative. Legacy
 analysis receives JS/TS patch sections only.
 
-- `PublicSymbol` struct — name, kind (`Fn`, `Struct`, `Enum`, `Trait`, `Type`, `Const`, `Static`),
-  file path, and whether it was added or removed
-- `compute_public_api_diff(diffs)` — scans added and removed lines in diff patches for
-  `pub` symbol declarations, then pairs added/removed names to identify renames and
-  signature changes. Produces `PUBLIC_API_DIFF.json`.
+- `PublicApiDiff` — the legacy `added` / `removed` (`ApiFinding`: file, symbol
+  type, signature) and `changed` (`ApiSignatureChange`: before/after) rows,
+  plus the embedded Rust view
+- `generate_public_api_diff(dir, patch_texts)` / `write_public_api_diff(...)` —
+  write `PUBLIC_API_DIFF.json` and `.md`
+- `analyze_js_ts_public_api_diff(patch_texts)` — scans added and removed
+  export lines, then pairs the two sides of one declaration (`api_pair_key`):
+  same file, symbol type and name, and for JS/TS the same namespace. JS/TS
+  lines compare on `common::js_ts_export`'s comparison form, so a formatter
+  rewriting an unchanged export is no change; equal forms are claimed first and
+  report nothing, and a pair that differs is one signature change.
 
 Confirmed Rust facts include namespace, cfg, before/after contracts, source
 paths, provenance, confidence, evidence, and stable IDs. JS/TS remains a bounded

@@ -1,7 +1,7 @@
 //! Breaking changes manifest — heuristic scan for API-breaking changes.
 
 use super::api_delta::{ApiArtifactView, ApiDeltaConfidence, ApiDeltaKind};
-use super::common::{ReviewFileCategory, classify_review_file, js_ts_patch_sections};
+use super::common::{ReviewFileCategory, classify_review_file, js_ts_export, js_ts_patch_sections};
 use anyhow::Result;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -683,6 +683,10 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     let mut removed_syms: Vec<SymbolDecl> = Vec::new();
     let mut added_syms: Vec<SymbolDecl> = Vec::new();
 
+    // JS/TS `export` lines per side, as (file, trimmed line).
+    let mut removed_exports: Vec<(String, String)> = Vec::new();
+    let mut added_exports: Vec<(String, String)> = Vec::new();
+
     // A public declaration may span several diff lines — `pub fn name(` with the
     // parameters below it (BUG-4 / TOOLING-15), but equally `pub struct Name<`
     // with its bounds below it. Accumulate continuation lines on BOTH sides so
@@ -768,16 +772,9 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             );
             before_cfg.feed(content);
 
-            // JS/TS exports
-            if trimmed.starts_with("export ") || trimmed.starts_with("export default") {
-                findings.push(BreakingFinding {
-                    file: current_file.clone(),
-                    kind: BreakingKind::RemovedSymbol {
-                        symbol_type: "export".to_string(),
-                    },
-                    line: trimmed.to_string(),
-                    risk_level: compute_breaking_risk(&current_file),
-                });
+            // JS/TS exports, paired with the added side once the patch is read.
+            if is_export_line(trimmed) {
+                removed_exports.push((current_file.clone(), trimmed.to_string()));
             }
 
             before_scope.feed(content);
@@ -803,6 +800,10 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             after_cfg.feed(content);
 
             after_scope.feed(content);
+
+            if is_export_line(trimmed) {
+                added_exports.push((current_file.clone(), trimmed.to_string()));
+            }
 
             findings.extend(new_env_requirement_findings(&current_file, trimmed));
             continue;
@@ -903,7 +904,88 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
         }
     }
 
+    pair_js_ts_exports(&removed_exports, &added_exports, &mut findings);
+
     findings
+}
+
+/// Whether a trimmed diff line is an `export` statement, including a bare
+/// `export default` whose value starts on the next line.
+fn is_export_line(trimmed: &str) -> bool {
+    trimmed.starts_with("export ") || trimmed.starts_with("export default")
+}
+
+/// Report the removed JS/TS `export` lines of one patch against its added ones.
+///
+/// Every removed export line used to be a `RemovedSymbol`, so a formatter
+/// rewriting an unchanged export (`=> {` block body to `=>` expression body)
+/// reported the export as removed although importers see the same binding.
+/// A removal now pairs with an addition in the same file that exports the same
+/// name in the same namespace ([`js_ts_export`]), in the same two passes as the
+/// Rust declarations above:
+///   - equal comparison forms -> the export was re-emitted: no finding
+///   - different forms -> a `ChangedSignature`
+///
+/// A removal that pairs with nothing, or has no single exported name
+/// (`export { a } from`, `export * from`), stays a `RemovedSymbol`. An export
+/// moved to another file is not paired here: its importers still break.
+fn pair_js_ts_exports(
+    removed: &[(String, String)],
+    added: &[(String, String)],
+    findings: &mut Vec<BreakingFinding>,
+) {
+    let identity =
+        |(file, line): &(String, String)| js_ts_export(line).map(|export| (file.clone(), export));
+    let removed_ids: Vec<_> = removed.iter().map(identity).collect();
+    let added_ids: Vec<_> = added.iter().map(identity).collect();
+    let mut removed_paired = vec![false; removed.len()];
+    let mut added_used = vec![false; added.len()];
+
+    for require_equal_contract in [true, false] {
+        for (r_index, r_id) in removed_ids.iter().enumerate() {
+            let Some((r_file, r_export)) = r_id.as_ref().filter(|_| !removed_paired[r_index])
+            else {
+                continue;
+            };
+            let Some(a_index) = added_ids.iter().enumerate().position(|(a_index, a_id)| {
+                !added_used[a_index]
+                    && a_id.as_ref().is_some_and(|(a_file, a_export)| {
+                        a_file == r_file
+                            && a_export.name == r_export.name
+                            && a_export.type_only == r_export.type_only
+                            && (!require_equal_contract || a_export.contract == r_export.contract)
+                    })
+            }) else {
+                continue;
+            };
+            removed_paired[r_index] = true;
+            added_used[a_index] = true;
+            if !require_equal_contract {
+                findings.push(BreakingFinding {
+                    file: r_file.clone(),
+                    kind: BreakingKind::ChangedSignature {
+                        before: removed[r_index].1.clone(),
+                        after: added[a_index].1.clone(),
+                    },
+                    line: String::new(),
+                    risk_level: compute_breaking_risk(r_file),
+                });
+            }
+        }
+    }
+
+    for ((file, line), paired) in removed.iter().zip(removed_paired) {
+        if !paired {
+            findings.push(BreakingFinding {
+                file: file.clone(),
+                kind: BreakingKind::RemovedSymbol {
+                    symbol_type: "export".to_string(),
+                },
+                line: line.clone(),
+                risk_level: compute_breaking_risk(file),
+            });
+        }
+    }
 }
 
 /// Index of the first not-yet-consumed addition that may pair with `removed`.

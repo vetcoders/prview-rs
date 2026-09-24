@@ -4,7 +4,7 @@ use super::api_delta::{
     ApiArtifactView, ApiDeltaConfidence, ApiDeltaFinding, ApiDeltaKind, REPO_BACKED_RUST_API_SOURCE,
 };
 use super::common::{
-    ReviewFileCategory, RustLexState, classify_review_file, js_ts_patch_sections,
+    ReviewFileCategory, RustLexState, classify_review_file, js_ts_export, js_ts_patch_sections,
     strip_rust_non_code,
 };
 use crate::checks::{CheckResult, CheckStatus};
@@ -381,7 +381,7 @@ fn analyze_patch_for_api_diff(
     let mut rust_state_old = RustLexState::default();
     let mut rust_state_new = RustLexState::default();
 
-    let mut raw_added = Vec::new(); // (file, type, sig, used)
+    let mut raw_added = Vec::new(); // (file, type, sig)
     let mut raw_removed = Vec::new();
 
     for line in patch.lines() {
@@ -431,47 +431,65 @@ fn analyze_patch_for_api_diff(
             && let Some((sym_type, sig)) =
                 extract_public_symbol_for_file(&current_file, content, &mut rust_state_new)
         {
-            raw_added.push((current_file.clone(), sym_type, sig, false));
+            raw_added.push((current_file.clone(), sym_type, sig));
         }
     }
 
-    // Detect signature changes: same type and name, but different full signature
-    for (r_file, r_type, r_sig) in &raw_removed {
-        let r_name = extract_name(r_sig);
-        let mut matched = false;
-
-        for (a_file, a_type, a_sig, used) in &mut raw_added {
-            if *used {
+    // Pair the two sides of one declaration: same file, type and identity.
+    // A pair whose comparison forms are equal is the declaration re-emitted by
+    // the diff (a moved line, a formatter pass, a rewritten body) and reports
+    // nothing; a pair that differs is a signature change. Equal forms are
+    // claimed first, so an unchanged re-emission is never spent on a removal a
+    // different addition replaced, and re-emitted overloads cannot read as
+    // changes of each other.
+    let removed_keys: Vec<_> = raw_removed
+        .iter()
+        .map(|(file, sym_type, sig)| api_pair_key(file, sym_type, sig))
+        .collect();
+    let added_keys: Vec<_> = raw_added
+        .iter()
+        .map(|(file, sym_type, sig)| api_pair_key(file, sym_type, sig))
+        .collect();
+    let mut removed_used = vec![false; raw_removed.len()];
+    let mut added_used = vec![false; raw_added.len()];
+    for require_equal_contract in [true, false] {
+        for (r_index, r_key) in removed_keys.iter().enumerate() {
+            let Some(r_key) = r_key.as_ref().filter(|_| !removed_used[r_index]) else {
                 continue;
-            }
-            let a_name = extract_name(a_sig);
-            // Match by exact prefix if it changed slightly
-            if r_file == a_file && r_type == a_type && r_name == a_name && r_name.is_some() {
-                if r_sig != a_sig {
-                    changed.push(ApiSignatureChange {
-                        file: r_file.clone(),
-                        symbol_type: r_type.clone(),
-                        before: r_sig.clone(),
-                        after: a_sig.clone(),
-                    });
-                }
-                *used = true;
-                matched = true;
-                break;
+            };
+            let Some(a_index) = added_keys.iter().enumerate().position(|(a_index, a_key)| {
+                !added_used[a_index]
+                    && a_key.as_ref().is_some_and(|a_key| {
+                        a_key.identity == r_key.identity
+                            && (!require_equal_contract || a_key.contract == r_key.contract)
+                    })
+            }) else {
+                continue;
+            };
+            removed_used[r_index] = true;
+            added_used[a_index] = true;
+            if !require_equal_contract {
+                let (r_file, r_type, r_sig) = &raw_removed[r_index];
+                changed.push(ApiSignatureChange {
+                    file: r_file.clone(),
+                    symbol_type: r_type.clone(),
+                    before: r_sig.clone(),
+                    after: raw_added[a_index].2.clone(),
+                });
             }
         }
+    }
 
-        if !matched {
+    for ((r_file, r_type, r_sig), used) in raw_removed.into_iter().zip(removed_used) {
+        if !used {
             removed.push(ApiFinding {
-                file: r_file.clone(),
-                symbol_type: r_type.clone(),
-                signature: r_sig.clone(),
+                file: r_file,
+                symbol_type: r_type,
+                signature: r_sig,
             });
         }
     }
-
-    // Now adding the remaining added that weren't matched as changed
-    for (a_file, a_type, a_sig, used) in raw_added {
+    for ((a_file, a_type, a_sig), used) in raw_added.into_iter().zip(added_used) {
         if !used {
             added.push(ApiFinding {
                 file: a_file,
@@ -482,6 +500,32 @@ fn analyze_patch_for_api_diff(
     }
 
     (added, removed, changed)
+}
+
+/// What pairs a removed declaration line with an added one.
+struct ApiPairKey {
+    /// (file, symbol type, type-namespace, name): the declaration importers see.
+    identity: (String, String, bool, String),
+    /// The text the two sides are compared on.
+    contract: String,
+}
+
+/// Rust declarations pair on their name and compare verbatim. JS/TS exports
+/// pair on the exported name in its namespace and compare on the form that
+/// leaves formatting and implementation out ([`js_ts_export`]), so a formatter
+/// rewriting an unchanged export is no API change. A line without a
+/// recognizable identity never pairs.
+fn api_pair_key(file: &str, sym_type: &str, sig: &str) -> Option<ApiPairKey> {
+    let (type_only, name, contract) = if file.ends_with(".rs") {
+        (false, extract_name(sig)?, sig.to_owned())
+    } else {
+        let export = js_ts_export(sig)?;
+        (export.type_only, export.name, export.contract)
+    };
+    Some(ApiPairKey {
+        identity: (file.to_owned(), sym_type.to_owned(), type_only, name),
+        contract,
+    })
 }
 
 fn extract_public_symbol_for_file(
