@@ -1459,7 +1459,9 @@ fn cargo_audit_config_gap(
 /// `[database] path`, which cargo-audit opens as written, so a relative one
 /// lies under the directory the audit ran in. Such a path takes the place of
 /// `advisory-db` in the Cargo home, and it matters even with no home at all,
-/// where it is what lets the audit run.
+/// where it is what lets the audit run. `[database] url` is not followed:
+/// rustsec's `Repository::fetch` accepts only an `https://` address, and on
+/// any other cargo-audit exits without a report, so nothing is downgraded.
 ///
 /// A fallback configuration that exists but cannot be read shows nothing, so
 /// it counts as leading in. One that is not a TOML table names no database:

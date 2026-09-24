@@ -373,8 +373,11 @@ audits a tree materialised from the target, so only a check can make the file
 differ there: a boundary that saw the tracked file rewritten withholds the
 proof, and where the target has no configuration, so does any file at the path
 in the snapshot's working tree (`LockEvidence::snapshot_root`), because no
-boundary lists the untracked or ignored file a check's build script can
-generate. A case-insensitive filesystem also reads `.cargo/Audit.toml` or
+boundary lists an untracked or ignored file. That probe catches a configuration
+a check leaves behind; one that code run during the checks writes and removes
+again is beyond the proof (see below), and since non-Cargo checks run alongside
+`cargo audit` (PV-17), no capture at the audit's boundaries could close that
+race. A case-insensitive filesystem also reads `.cargo/Audit.toml` or
 `.CARGO/audit.toml` as the configuration, which a comparison by exact path never
 sees, and with two spellings committed the checkout picks which one is on disk.
 `cargo_audit_config_gap` therefore withholds the proof as
@@ -416,7 +419,9 @@ Once the committed comparisons hold, `audit_inputs_outside_trees` follows both
 inputs to where they lead with the same containment test, and withholds the
 proof as `AuditInputInTree` when either is inside a tree, or when a fallback
 configuration that exists cannot be read. A dangling link reads as absent, to
-cargo-audit as to the proof. The lock and configuration re-reads hash the
+cargo-audit as to the proof. `[database] url` is not followed: rustsec's
+`Repository::fetch` accepts only an `https://` address, and on any other
+cargo-audit exits without a report, which leaves nothing to downgrade. The lock and configuration re-reads hash the
 working file through libgit2's built-in filters (`crlf`, `ident`), not through
 a clean driver the repository configures, which libgit2 never runs; `ident`
 can hide bytes placed between `$Id` and `$` on purpose, which only code running

@@ -344,9 +344,13 @@ review therefore withholds the proof when any of these holds:
 A snapshot run audits a tree materialised from the target, so there only a
 check can make the file differ. A check boundary that saw the tracked file
 rewritten withholds the proof. No boundary lists an untracked or ignored file,
-though, and a check's build script can generate one, so where the target has no
-configuration any file at the path in the snapshot's working tree withholds the
-proof too, and a snapshot tree that cannot be looked at proves nothing.
+though, so where the target has no configuration any file at the path in the
+snapshot's working tree withholds the proof too, and a snapshot tree that cannot
+be looked at proves nothing. That catches a configuration a check leaves
+behind. A file that code run during the checks writes and removes again is
+beyond the proof, like everything else such code can do (below): non-Cargo
+checks run alongside `cargo audit`, so no capture at the audit's boundaries
+could close that race either.
 
 A case-insensitive filesystem reads `.cargo/audit.toml` under any spelling, so
 a committed `.cargo/Audit.toml` or `.CARGO/audit.toml` is a configuration the
@@ -382,9 +386,12 @@ database decides which advisories exist at all, so a change that edits it can
 drop the advisory it introduced with the lockfile untouched, and a configured
 database lets the audit run even with no home. Either input that leads inside
 the checkout or the scanned tree withholds the proof, and so does a fallback
-configuration that exists but cannot be read. Code that runs during the checks
-with the operator's permissions is outside what the proof can speak for: it can
-edit the Cargo home's configuration, or the database, as easily as the tree.
+configuration that exists but cannot be read. `[database] url` is not such an
+input: rustsec fetches the database only from an `https://` address, and on any
+other cargo-audit exits without a report, which leaves nothing to downgrade.
+Code that runs during the checks with the operator's permissions is outside
+what the proof can speak for: it can edit the Cargo home's configuration, or
+the database, as easily as the tree.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,
