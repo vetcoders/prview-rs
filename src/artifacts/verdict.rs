@@ -394,9 +394,15 @@ pub(crate) fn apply_rust_api_delta_outcome(
     }
 }
 
+/// How many finding IDs a Rust API delta caveat names before summarizing the
+/// rest as `+K more`.
+const CAVEAT_FINDING_ID_EXAMPLES: usize = 5;
+
 /// Exact operator caveats derived from the same serialized view used by both
-/// API artifacts. IDs are included so consumers can join caveats to evidence
-/// without recounting or reparsing Markdown.
+/// API artifacts. Each caveat carries the exact count and up to
+/// [`CAVEAT_FINDING_ID_EXAMPLES`] example IDs so consumers can join it to
+/// evidence without recounting or reparsing Markdown; the complete list lives
+/// in the API artifacts, not in every caveat that repeats it.
 pub(crate) fn rust_api_delta_review_caveats(
     view: Option<&api_delta::ApiArtifactView>,
 ) -> Vec<String> {
@@ -428,11 +434,7 @@ pub(crate) fn rust_api_delta_review_caveats(
             "Rust API delta: {} confirmed breaking finding{} [{}]",
             breaking.len(),
             if breaking.len() == 1 { "" } else { "s" },
-            breaking
-                .iter()
-                .map(|finding| finding.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            caveat_finding_ids(&breaking)
         ));
     }
     if !unknown.is_empty() {
@@ -440,14 +442,24 @@ pub(crate) fn rust_api_delta_review_caveats(
             "Rust API delta: {} unknown finding{} [{}]",
             unknown.len(),
             if unknown.len() == 1 { "" } else { "s" },
-            unknown
-                .iter()
-                .map(|finding| finding.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            caveat_finding_ids(&unknown)
         ));
     }
     caveats
+}
+
+fn caveat_finding_ids(findings: &[&api_delta::ApiDeltaFinding]) -> String {
+    let mut ids = findings
+        .iter()
+        .take(CAVEAT_FINDING_ID_EXAMPLES)
+        .map(|finding| finding.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = findings.len().saturating_sub(CAVEAT_FINDING_ID_EXAMPLES);
+    if rest > 0 {
+        ids.push_str(&format!(", +{rest} more"));
+    }
+    ids
 }
 
 pub(crate) fn build_review_caveats(
@@ -2872,6 +2884,121 @@ mod tests {
         assert!(
             !read_late_dirty.applies_to("rustfmt"),
             "a late dirty read would wrongly kill the downgrade"
+        );
+    }
+
+    fn rust_api_delta_view(
+        findings: Vec<api_delta::ApiDeltaFinding>,
+    ) -> api_delta::ApiArtifactView {
+        let unknown = findings
+            .iter()
+            .filter(|finding| finding.confidence == api_delta::ApiDeltaConfidence::Unknown)
+            .count();
+        api_delta::ApiArtifactView {
+            view: api_delta::ApiArtifactViewKind::BreakingChanges,
+            analysis_source: "fixture",
+            base_revision: "base".to_string(),
+            target_revision: "target".to_string(),
+            counts: api_delta::ApiDeltaCounts {
+                added: 0,
+                removed: findings.len() - unknown,
+                changed: 0,
+                relocated: 0,
+                visibility_changed: 0,
+                unknown,
+            },
+            findings,
+        }
+    }
+
+    fn rust_api_delta_finding(
+        index: usize,
+        kind: api_delta::ApiDeltaKind,
+        confidence: api_delta::ApiDeltaConfidence,
+    ) -> api_delta::ApiDeltaFinding {
+        api_delta::ApiDeltaFinding {
+            id: format!("api-delta:{index:016x}"),
+            kind,
+            identity: api_delta::ApiIdentity {
+                crate_name: "fixture".to_string(),
+                module_path: Vec::new(),
+                namespace: "value".to_string(),
+                name: format!("item_{index}"),
+                cfg_region: Vec::new(),
+            },
+            before: None,
+            after: None,
+            analysis_source: "fixture",
+            confidence,
+            evidence: Vec::new(),
+            unknown_reason: None,
+            unknown_source: None,
+        }
+    }
+
+    #[test]
+    fn rust_api_delta_caveats_keep_exact_counts_but_bound_the_listed_ids() {
+        let unknown = (0..964).map(|index| {
+            rust_api_delta_finding(
+                index,
+                api_delta::ApiDeltaKind::Unknown,
+                api_delta::ApiDeltaConfidence::Unknown,
+            )
+        });
+        let breaking = (1000..1003).map(|index| {
+            rust_api_delta_finding(
+                index,
+                api_delta::ApiDeltaKind::Removed,
+                api_delta::ApiDeltaConfidence::Confirmed,
+            )
+        });
+        let view = rust_api_delta_view(breaking.chain(unknown).collect());
+
+        let caveats = rust_api_delta_review_caveats(Some(&view));
+
+        assert_eq!(
+            caveats,
+            vec![
+                "Rust API delta: 3 confirmed breaking findings \
+                 [api-delta:00000000000003e8, api-delta:00000000000003e9, \
+                 api-delta:00000000000003ea]"
+                    .to_string(),
+                "Rust API delta: 964 unknown findings \
+                 [api-delta:0000000000000000, api-delta:0000000000000001, \
+                 api-delta:0000000000000002, api-delta:0000000000000003, \
+                 api-delta:0000000000000004, +959 more]"
+                    .to_string(),
+            ]
+        );
+        assert!(
+            caveats.iter().all(|caveat| caveat.len() < 256),
+            "caveat size must not grow with the finding count: {caveats:?}"
+        );
+    }
+
+    #[test]
+    fn rust_api_delta_caveats_list_every_id_up_to_the_example_limit() {
+        let findings = (0..CAVEAT_FINDING_ID_EXAMPLES)
+            .map(|index| {
+                rust_api_delta_finding(
+                    index,
+                    api_delta::ApiDeltaKind::Unknown,
+                    api_delta::ApiDeltaConfidence::Unknown,
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_ids = findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let view = rust_api_delta_view(findings);
+
+        assert_eq!(
+            rust_api_delta_review_caveats(Some(&view)),
+            vec![format!(
+                "Rust API delta: 5 unknown findings [{expected_ids}]"
+            )]
         );
     }
 }
