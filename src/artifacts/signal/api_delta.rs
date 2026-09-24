@@ -168,6 +168,8 @@ struct SnapshotRegions<'a> {
     unknowns: &'a [RustApiUnknown],
     /// The cfg guard of every processed module, per crate and module path.
     module_guards: BTreeMap<ModuleKey<'a>, Vec<&'a [String]>>,
+    /// Crate names built from more than one root.
+    shared_crates: BTreeSet<&'a str>,
     /// The origin module of every re-export, per crate, re-exporting module
     /// and external name.
     reexport_origins: BTreeMap<ReexportKey<'a>, Vec<&'a [String]>>,
@@ -184,6 +186,30 @@ impl<'a> SnapshotRegions<'a> {
                 .or_default()
                 .push(module.cfg_guard.as_slice());
         }
+        // A crate name that several packages build has one root per package,
+        // loaded or not, and one package's modules prove nothing about what
+        // another package's hidden content declares.
+        let mut roots: BTreeMap<&str, usize> = BTreeMap::new();
+        for module in &snapshot.modules {
+            if module.module_path.is_empty() {
+                *roots.entry(module.crate_name.as_str()).or_default() += 1;
+            }
+        }
+        for unknown in &snapshot.unknowns {
+            if let Some(crate_name) = &unknown.crate_name
+                && unknown.module_path.is_empty()
+                && may_fail_root_load(unknown)
+            {
+                *roots.entry(crate_name.as_str()).or_default() += 1;
+            }
+        }
+        let shared_crates = roots
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(crate_name, _)| crate_name)
+            .collect();
+        // Keyed without the namespace on purpose: a name any namespace of the
+        // module re-exports from the region stays covered in every namespace.
         let mut reexport_origins: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for reexport in &snapshot.reexports {
             reexport_origins
@@ -209,15 +235,20 @@ impl<'a> SnapshotRegions<'a> {
         Self {
             unknowns: &snapshot.unknowns,
             module_guards,
+            shared_crates,
             reexport_origins,
             module_aliases,
         }
     }
 
     /// Whether `child` is declared, in every processed variant of `parent`,
-    /// under exactly that variant's guard. Content hidden in `parent` then
-    /// cannot declare another `child`: it would collide with this one.
+    /// under exactly that variant's guard, by the only root of its crate.
+    /// Content hidden in `parent` then cannot declare another `child`: it
+    /// would collide with this one.
     fn child_module_is_fixed(&self, crate_name: &str, parent: &[String], child: &str) -> bool {
+        if self.shared_crates.contains(crate_name) {
+            return false;
+        }
         let Some(parent_guards) = self.module_guards.get(&(crate_name, parent)) else {
             return false;
         };
@@ -9778,6 +9809,35 @@ mod tests {
                 finding.evidence
             );
         }
+    }
+
+    #[test]
+    fn another_packages_modules_do_not_bound_a_region_of_a_shared_crate_name() {
+        // Two packages build a lib crate named `api`. `a`'s root never parses,
+        // so it may declare its own `m::added`; `c` proving `pub mod m` bounds
+        // nothing in `a`.
+        let manifest = |package: &str| {
+            format!("[package]\nname='{package}'\nversion='0.0.0'\n[lib]\nname='api'\n")
+        };
+        let a = manifest("api-a");
+        let c = manifest("api-c");
+        let root = "[workspace]\nmembers=['a','c']\nresolver='2'\n";
+        let delta = repository_delta(&[
+            ("Cargo.toml", root, root),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("a/Cargo.toml", a.as_str(), a.as_str()),
+            ("a/src/lib.rs", "pub fn x() { ) }\n", "pub fn x() { ) }\n"),
+            ("c/Cargo.toml", c.as_str(), c.as_str()),
+            (
+                "c/src/lib.rs",
+                "pub mod m {}\n",
+                "pub mod m { pub fn added() {} }\n",
+            ),
+        ]);
+        assert!(delta.added.is_empty(), "{:?}", delta.findings());
+        let finding = finding_at(&delta.unknown, &["m"], "value", "added")
+            .unwrap_or_else(|| panic!("{:?}", delta.findings()));
+        assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
     }
 
     #[test]
