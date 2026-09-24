@@ -8144,13 +8144,14 @@ fn cargo_audit_pack(
     String,
     PathBuf,
 ) {
-    cargo_audit_pack_inner(dirty, pack_name, true)
+    cargo_audit_pack_inner(dirty, pack_name, true, cargo_audit_pack_check())
 }
 
 fn cargo_audit_pack_inner(
     dirty: &[&str],
     pack_name: &str,
     with_lock: bool,
+    audit: CheckResult,
 ) -> (
     tempfile::TempDir,
     serde_json::Value,
@@ -8164,7 +8165,7 @@ fn cargo_audit_pack_inner(
     let governor = crate::governor::ResourceGovernor::new();
     let output = publication_home.path().join(pack_name);
     let diffs = [source_only_diff(&base, &target)];
-    let checks = [cargo_audit_pack_check()];
+    let checks = [audit];
     let pack = generate_fixture_pack_with_ledger_and_diffs(
         repo.path(),
         &output,
@@ -8330,6 +8331,60 @@ fn assert_dashboard_verdict(dashboard: &str, verdict: &str) {
     }
 }
 
+/// PR #58 round six: the same untouched lock and the same proof, with an audit
+/// that reports only a warnings-category advisory. Its classification rows came
+/// from the vulnerability list alone, so it had none: the check read
+/// `Unclassified` and held the gate at CONDITIONAL, while the identical debt
+/// reported as a vulnerability was downgraded. The counts call the advisory
+/// pre-existing, and now the classifier reads that same origin.
+#[test]
+fn a_preexisting_warnings_only_audit_takes_the_same_downgrade() {
+    let audit = CheckResult {
+        name: "Cargo audit".to_string(),
+        status: crate::checks::CheckStatus::Warnings,
+        duration: std::time::Duration::from_millis(900),
+        output: r#"{
+            "vulnerabilities": {"found": false, "count": 0, "list": []},
+            "warnings": {
+                "unmaintained": [{
+                    "kind": "unmaintained",
+                    "advisory": {"id": "RUSTSEC-2024-0436"},
+                    "package": {"name": "paste", "version": "1.0.15"}
+                }]
+            }
+        }"#
+        .to_string(),
+        cached: false,
+        provenance: None,
+    };
+    let (_home, gate, _report, _dashboard, _pack) =
+        cargo_audit_pack_inner(&["notes.md"], "warnings-only", true, audit);
+
+    let decision = &gate["decision"];
+    assert_eq!(
+        decision["preexisting_quality_failures"][0].as_str(),
+        Some("Cargo audit"),
+        "{decision}"
+    );
+    assert!(
+        decision["unclassified_quality_failures"]
+            .as_array()
+            .is_none_or(|arr| arr.is_empty()),
+        "the counts established the origin, so the check is not unclassified"
+    );
+    let audit_row = gate["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Cargo audit")
+        .expect("cargo audit row");
+    assert_eq!(audit_row["policy_conclusion"], "advisory");
+    assert_eq!(
+        audit_row["reason"].as_str(),
+        Some("pre-existing: Cargo.lock unchanged by this PR (1 advisory)")
+    );
+}
+
 /// The one edit that revokes the proof. Same diff, same advisories, but the
 /// lockfile the audit read carried uncommitted changes — so it is not provably
 /// the target's, and the audit keeps gating.
@@ -8408,7 +8463,7 @@ fn a_dirty_lockfile_puts_cargo_audit_back_on_the_blocking_list() {
 #[test]
 fn a_target_without_a_lockfile_keeps_cargo_audit_on_the_blocking_list() {
     let (_home, gate, report, dashboard, pack) =
-        cargo_audit_pack_inner(&["notes.md"], "no-lock", false);
+        cargo_audit_pack_inner(&["notes.md"], "no-lock", false, cargo_audit_pack_check());
 
     let decision = &gate["decision"];
     let audit_blocker = decision["blocking_issues"]
