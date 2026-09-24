@@ -931,6 +931,7 @@ impl<'a> SnapshotBuilder<'a> {
         self.attach_public_reexport_origins();
         self.record_private_type_dependencies()?;
         self.ensure_analysis_active()?;
+        self.retain_non_test_surface();
         self.crates.sort_by(|left, right| {
             (&left.name, &left.manifest_path, &left.root_path).cmp(&(
                 &right.name,
@@ -1057,6 +1058,25 @@ impl<'a> SnapshotBuilder<'a> {
             reexports: self.reexports,
             unknowns: self.unknowns,
         })
+    }
+
+    /// `walk_items` skips test-only items, but member-level attributes (an impl,
+    /// trait or foreign member under `#[cfg(test)]`) still produce records whose
+    /// guard requires `test`. None of them is observable outside the crate's own
+    /// unit-test build, so they leave the surface together with their unknowns.
+    fn retain_non_test_surface(&mut self) {
+        self.modules
+            .retain(|module| !guard_requires_test(&module.cfg_guard));
+        self.module_aliases
+            .retain(|alias| !guard_requires_test(&alias.cfg_guard));
+        self.items
+            .retain(|item| !guard_requires_test(&item.cfg_guard));
+        self.declarations
+            .retain(|declaration| !guard_requires_test(&declaration.cfg_guard));
+        self.reexports
+            .retain(|reexport| !guard_requires_test(&reexport.cfg_guard));
+        self.unknowns
+            .retain(|unknown| !guard_requires_test(&unknown.cfg_guard));
     }
 
     /// A local type that is not itself externally reachable can still affect a
@@ -2251,6 +2271,13 @@ impl<'a> SnapshotBuilder<'a> {
             cfg_guard.extend(cfg.guards);
             cfg_guard.sort();
             cfg_guard.dedup();
+            // Test-only items (typically `#[cfg(test)] mod tests`) never reach
+            // a dependent. Skipping them here, before any module load, macro or
+            // include handling, also keeps their unknowns out of the surface;
+            // an unparsed extra predicate cannot make the conjunction observable.
+            if guard_requires_test(&cfg_guard) {
+                continue;
+            }
             if !cfg.errors.is_empty() {
                 for evidence in cfg.errors {
                     self.unknown_guarded(
@@ -7226,6 +7253,40 @@ fn canonical_meta(meta: &Meta) -> String {
             format!("{name}({})", operands.join(","))
         }
     }
+}
+
+/// `cfg(test)` holds only while rustc compiles the crate's own unit-test
+/// harness. Dependents, integration tests and doctests link the crate built
+/// without it, so nothing gated on `test` is ever part of the observable API.
+/// A guard is a conjunction: one conjunct that requires `test` is enough.
+fn guard_requires_test(guard: &[String]) -> bool {
+    guard
+        .iter()
+        .any(|predicate| cfg_predicate_requires_test(predicate))
+}
+
+/// Only `test` itself and an `all(..)` with an operand that requires `test`
+/// qualify. `any`, `not` and `cfg_attr(..)` entries never imply `test`, and a
+/// canonical predicate that does not re-parse stays in the surface. The
+/// re-parse (instead of splitting the string) keeps string literals such as
+/// raw `feature` values from being read as operands.
+fn cfg_predicate_requires_test(predicate: &str) -> bool {
+    fn meta_requires_test(meta: &Meta) -> bool {
+        match meta {
+            Meta::Path(path) => path.is_ident("test"),
+            Meta::List(list) if list.path.is_ident("all") => {
+                let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+                parser
+                    .parse2(list.tokens.clone())
+                    .is_ok_and(|operands| operands.iter().any(meta_requires_test))
+            }
+            Meta::List(_) | Meta::NameValue(_) => false,
+        }
+    }
+    predicate == "test"
+        || (predicate.starts_with("all(")
+            && predicate.contains("test")
+            && syn::parse_str::<Meta>(predicate).is_ok_and(|meta| meta_requires_test(&meta)))
 }
 
 fn flatten_use_tree(tree: &UseTree, prefix: Vec<String>, output: &mut Vec<UseLeaf>) {
@@ -13486,6 +13547,87 @@ mod tests {
         assert_eq!(left.items, right.items);
         let different = snapshot_rust_api(&source("#[cfg(windows)] pub fn gated() {}"));
         assert_ne!(left.items[0].cfg_guard, different.items[0].cfg_guard);
+    }
+
+    #[test]
+    fn rust_api_snapshot_test_only_items_leave_the_surface_with_their_unknowns() {
+        let snapshot = snapshot_rust_api(&source(concat!(
+            "pub fn kept() {}\n",
+            "#[cfg(test)] mod tests { include!(\"fixtures.rs\"); generated!(); pub fn helper() {} }\n",
+            "#[cfg(test)] mod external_tests;\n",
+            "#[cfg(all(unix, test))] pub fn unix_test_only() {}\n",
+            "#[cfg(any(test, feature = \"fixtures\"))] pub fn fixture_helper() {}\n",
+            "#[cfg(not(test))] pub fn production_only() {}\n",
+            "pub struct Owner;\n",
+            "impl Owner { pub fn method() {} #[cfg(test)] pub fn test_method() {} }\n",
+        )));
+        let names = names(&snapshot);
+        for kept in ["kept", "fixture_helper", "production_only", "Owner"] {
+            assert!(names.iter().any(|name| name == kept), "{kept}: {names:?}");
+        }
+        assert!(
+            names
+                .iter()
+                .any(|name| name.contains("method") && !name.contains("test_method")),
+            "{names:?}"
+        );
+        for dropped in ["tests::helper", "unix_test_only", "Owner::test_method"] {
+            assert!(
+                !names
+                    .iter()
+                    .any(|name| name == dropped || name.ends_with("test_method")),
+                "{dropped}: {names:?}"
+            );
+        }
+        assert!(
+            snapshot.unknowns.is_empty(),
+            "test-only includes, macros and modules must not reach the API surface: {:#?}",
+            snapshot.unknowns
+        );
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .all(|item| !guard_requires_test(&item.cfg_guard))
+        );
+        assert!(
+            snapshot
+                .modules
+                .iter()
+                .all(|module| module.module_path.is_empty())
+        );
+    }
+
+    #[test]
+    fn cfg_test_requirement_reads_only_conjunctive_test() {
+        fn guard(attrs: &str) -> Vec<String> {
+            let item: syn::ItemFn =
+                syn::parse_str(&format!("{attrs} fn item() {{}}")).expect("fixture item");
+            let outcome = canonical_cfg(&item.attrs);
+            assert!(outcome.errors.is_empty(), "{attrs}: {:?}", outcome.errors);
+            outcome.guards
+        }
+        for requires in [
+            "#[cfg(test)]",
+            "#[cfg(all(unix, test))]",
+            "#[cfg(all(all(windows, test), unix))]",
+            "#[cfg(unix)] #[cfg(test)]",
+        ] {
+            assert!(guard_requires_test(&guard(requires)), "{requires}");
+        }
+        for observable in [
+            "",
+            "#[cfg(any(test, unix))]",
+            "#[cfg(not(test))]",
+            "#[cfg(all(any(test, unix), windows))]",
+            "#[cfg(feature = \"test\")]",
+            "#[cfg(all(feature = \"test\", unix))]",
+            "#[cfg(all(feature = r#\",test,\"#, unix))]",
+            "#[cfg_attr(test, derive(Debug))]",
+            "#[cfg_attr(all(test, unix), derive(Debug))]",
+        ] {
+            assert!(!guard_requires_test(&guard(observable)), "{observable}");
+        }
     }
 
     #[test]

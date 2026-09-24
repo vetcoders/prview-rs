@@ -4560,6 +4560,49 @@ mod tests {
     }
 
     #[test]
+    fn repository_backed_test_only_code_is_not_api_surface() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let test_module = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "pub fn api() {}\n",
+                concat!(
+                    "pub fn api() {}\n",
+                    "#[cfg(test)] mod tests { include!(\"fixtures.rs\"); generated!(); #[tokio::test] async fn smoke() {} }\n",
+                ),
+            ),
+        ]);
+        assert!(
+            test_module.findings().is_empty(),
+            "a unit-test module never reaches a dependent: {:?}",
+            test_module.findings()
+        );
+
+        let moved_under_test = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "pub fn api() {}\npub fn helper() {}\n",
+                "pub fn api() {}\n#[cfg(test)] pub fn helper() {}\n",
+            ),
+        ]);
+        assert!(
+            moved_under_test.unknown.is_empty(),
+            "{:?}",
+            moved_under_test.unknown
+        );
+        assert!(
+            moved_under_test
+                .removed
+                .iter()
+                .any(|finding| finding.identity.name == "helper"),
+            "gating an item on `test` removes it from every observable build: {:?}",
+            moved_under_test.findings()
+        );
+    }
+
+    #[test]
     fn repository_backed_builtin_default_and_rust_2024_unsafe_attrs_remain_confirmed_contracts() {
         let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
         let builtin_default = repository_delta(&[
