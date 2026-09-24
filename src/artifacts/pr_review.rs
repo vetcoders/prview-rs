@@ -91,12 +91,15 @@ impl ChecklistCheckOutcome {
     }
 
     /// The status token `report.json` serializes (`PASS`/`FAIL`/`ERROR`/`SKIP`/
-    /// `WARN`). An unknown token is not read as a pass.
-    pub(crate) fn from_report_status(status: &str) -> Self {
+    /// `WARN`, a closed vocabulary). Any other token is evidence of neither
+    /// outcome: `None`, which the consistency checker reports as an unreadable
+    /// entry instead of reading it as a failure that might happen to agree.
+    pub(crate) fn from_report_status(status: &str) -> Option<Self> {
         match status {
-            "PASS" => Self::Passed,
-            "SKIP" => Self::Skipped,
-            _ => Self::NotPassed,
+            "PASS" => Some(Self::Passed),
+            "SKIP" => Some(Self::Skipped),
+            "FAIL" | "ERROR" | "WARN" => Some(Self::NotPassed),
+            _ => None,
         }
     }
 }
@@ -146,25 +149,18 @@ pub(crate) fn derive_pr_checklist(
 
 /// Read the rendered checklist marks back from a `PR_REVIEW.md`.
 ///
-/// Only lines inside the PR Template's `## Checklist` section count. The
-/// template is the last thing `generate_pr_review` writes, so the LAST such
-/// heading is the checklist: check-derived text earlier in the file (a log
-/// excerpt carrying its own `## Checklist`) cannot stand in for it. The section
-/// ends at the template's closing fence or the next level-2 heading. `None` per
-/// item means no readable line for it — missing, or a mark that is neither
-/// `x` nor a space — never a guessed mark; with no section at all every item
-/// is `None`.
+/// Only lines inside the PR Template's `## Checklist` section count: the
+/// `## Checklist` heading inside the ```` ```markdown ```` block that follows
+/// the `## PR Template` heading, up to the next level-2 heading or the block's
+/// closing fence. A `## Checklist` anywhere else — check-derived text above
+/// the template, or anything appended after its closing fence — is not the
+/// template's checklist and cannot stand in for it. A file with more than one
+/// `## PR Template` heading, or a template with more than one `## Checklist`,
+/// is ambiguous and yields no section. `None` per item means no readable line
+/// for it — missing, or a mark that is neither `x` nor a space — never a
+/// guessed mark; with no readable section every item is `None`.
 pub(crate) fn parse_pr_checklist(pr_review: &str) -> Vec<(PrChecklistItem, Option<bool>)> {
-    const HEADING: &str = "\n## Checklist\n";
-    let section: Vec<&str> = pr_review
-        .rfind(HEADING)
-        .map(|start| {
-            pr_review[start + HEADING.len()..]
-                .lines()
-                .take_while(|line| !line.starts_with("## ") && !line.starts_with("```"))
-                .collect()
-        })
-        .unwrap_or_default();
+    let section = pr_template_checklist(pr_review).unwrap_or_default();
     PrChecklistItem::ALL
         .into_iter()
         .map(|item| {
@@ -183,6 +179,37 @@ pub(crate) fn parse_pr_checklist(pr_review: &str) -> Vec<(PrChecklistItem, Optio
             (item, mark)
         })
         .collect()
+}
+
+/// The lines of the single PR Template's `## Checklist` section (see
+/// [`parse_pr_checklist`]), or `None` when there is no such section or it is
+/// ambiguous.
+fn pr_template_checklist(pr_review: &str) -> Option<Vec<&str>> {
+    let lines: Vec<&str> = pr_review.lines().collect();
+    let mut templates = (0..lines.len()).filter(|&i| lines[i] == "## PR Template");
+    let heading = templates.next()?;
+    if templates.next().is_some() {
+        return None;
+    }
+    let after = &lines[heading + 1..];
+    let open = after
+        .iter()
+        .take_while(|line| !line.starts_with("## "))
+        .position(|line| *line == "```markdown")?;
+    let body = &after[open + 1..];
+    let block = &body[..body.iter().position(|line| line.starts_with("```"))?];
+    let mut checklists = (0..block.len()).filter(|&i| block[i] == "## Checklist");
+    let start = checklists.next()? + 1;
+    if checklists.next().is_some() {
+        return None;
+    }
+    Some(
+        block[start..]
+            .iter()
+            .take_while(|line| !line.starts_with("## "))
+            .copied()
+            .collect(),
+    )
 }
 
 /// Whether this run actually reviewed a rewritten range: `--exact-base` is in

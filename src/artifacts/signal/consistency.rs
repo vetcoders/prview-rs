@@ -84,12 +84,14 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
             Some(checks) => {
                 for check in checks {
                     let name = check.get("name").and_then(|v| v.as_str());
-                    let status = check.get("status").and_then(|v| v.as_str());
-                    match (name, status) {
-                        (Some(name), Some(status)) => outcomes.push((
-                            name.to_string(),
-                            ChecklistCheckOutcome::from_report_status(status),
-                        )),
+                    let outcome = check
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .and_then(ChecklistCheckOutcome::from_report_status);
+                    match (name, outcome) {
+                        (Some(name), Some(outcome)) => {
+                            outcomes.push((name.to_string(), outcome));
+                        }
                         _ => out.check_entries_unreadable += 1,
                     }
                 }
@@ -227,7 +229,7 @@ impl ConsistencyReport {
                 None => (
                     "no readable line".to_string(),
                     format!(
-                        "PR checklist line unreadable: PR_REVIEW.md has no readable '{}' line under `## Checklist`, where the {} check statuses earn {} ({why})",
+                        "PR checklist line unreadable: PR_REVIEW.md has no readable '{}' line in the PR Template's `## Checklist`, where the {} check statuses earn {} ({why})",
                         claim.item.label(),
                         checks_artifact,
                         mark(earned),
@@ -833,6 +835,65 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         let report = checklist_report(root);
         assert_eq!(warning_fields(&report), ["pr_checklist.no_lint_errors"]);
         assert_eq!(report.warnings[0].sources[0].value, "no readable line");
+
+        // A whole agreeing checklist appended after the template must not
+        // shadow the template's contradicting `[x] No lint errors`.
+        let appended = "\n## Checklist\n- [x] Compiles / type-checks\n- [x] Tests pass\n\
+- [ ] No lint errors\n";
+        std::fs::write(
+            root.join("PR_REVIEW.md"),
+            format!("# R\n\n{INCIDENT_PR_TEMPLATE}{appended}"),
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert_eq!(warning_fields(&report), ["pr_checklist.no_lint_errors"]);
+        assert_eq!(report.warnings[0].sources[0].value, "[x]", "{report:?}");
+    }
+
+    /// A second `## PR Template` (or a second `## Checklist` inside the
+    /// template) makes the rendered checklist ambiguous: every item is
+    /// reported unreadable instead of one copy silently winning.
+    #[test]
+    fn an_ambiguous_pr_template_checklist_is_unreadable_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
+        let honest = INCIDENT_PR_TEMPLATE.replace("- [x] No lint errors", "- [ ] No lint errors");
+        let doubled_section = INCIDENT_PR_TEMPLATE.replace(
+            "- [ ] Manually tested\n",
+            "- [ ] Manually tested\n## Checklist\n- [ ] No lint errors\n",
+        );
+        for pr_review in [
+            format!("# R\n\n{INCIDENT_PR_TEMPLATE}\n{honest}"),
+            format!("# R\n\n{honest}\n{INCIDENT_PR_TEMPLATE}"),
+            format!("# R\n\n{doubled_section}"),
+        ] {
+            std::fs::write(root.join("PR_REVIEW.md"), &pr_review).unwrap();
+            let report = checklist_report(root);
+            assert_eq!(report.checked_fields, 3, "{pr_review}");
+            assert_eq!(
+                warning_fields(&report),
+                [
+                    "pr_checklist.compiles",
+                    "pr_checklist.tests_pass",
+                    "pr_checklist.no_lint_errors"
+                ],
+                "{pr_review}"
+            );
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .all(|w| w.sources[0].value == "no readable line"),
+                "{report:?}"
+            );
+        }
+
+        // Control: the single honest template is read and agrees.
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{honest}")).unwrap();
+        let report = checklist_report(root);
+        assert!(report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 3);
     }
 
     /// An empty `/checks` is evidence, not absence: nothing executed, so
@@ -864,9 +925,10 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         assert_eq!(report.checked_fields, 3);
     }
 
-    /// report.json always serializes every check with a string name and
-    /// status. A damaged `/checks` withholds the comparison behind one warning
-    /// instead of re-deriving the claims from whatever rows survived.
+    /// report.json always serializes every check with a string name and a
+    /// status from its closed vocabulary. A damaged `/checks` withholds the
+    /// comparison behind one warning instead of re-deriving the claims from
+    /// whatever rows survived.
     #[test]
     fn unreadable_serialized_checks_withhold_the_checklist_comparison() {
         let dir = tempfile::tempdir().unwrap();
@@ -883,6 +945,11 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
             ),
             (r#"{"checks": "damaged"}"#, 1),
             (r#"{"meta": {}}"#, 1),
+            // Outside the serialized vocabulary: neither a pass nor a failure.
+            (
+                r#"{"checks": [{"name": "ESLint", "status": "PSS"}, {"name": "Clippy", "status": "pass"}]}"#,
+                2,
+            ),
         ] {
             std::fs::write(root.join("report.json"), report_json).unwrap();
             let disk = read_disk_artifact_counters(root);

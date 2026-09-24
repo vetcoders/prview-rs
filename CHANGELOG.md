@@ -242,7 +242,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONSISTENCY_CHECK.json` and `report.json`'s `quality.consistency` re-derive the
   three claims from the check statuses and report a rendered mark those statuses
   do not earn as a `pr_checklist.<item>` warning; a checklist line or serialized
-  check entry that cannot be read is reported too, never skipped.
+  check entry that cannot be read (including a status outside the serialized
+  vocabulary) is reported too, never skipped. Only the checklist inside the PR
+  Template's fenced block counts, so text elsewhere in `PR_REVIEW.md` cannot
+  stand in for it.
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch

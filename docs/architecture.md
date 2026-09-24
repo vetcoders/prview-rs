@@ -3533,12 +3533,15 @@ from `PR_REVIEW.md` — a divergence is a `pr_checklist.<item>` warning.
 `report.json` (`/checks`, read from disk after report.json is written);
 `report.json`'s `quality.consistency` is built before report.json exists, so it
 re-derives from the in-memory statuses it is about to serialize. The parser
-reads only the PR Template's own section — the last `## Checklist` heading, up
-to the template's closing fence — so check-derived text rendered earlier in the
-file cannot stand in for it. The fold fails closed: a missing or unreadable
-checklist line is a warning for its item, and `/checks` entries without a
-readable `name` and `status` withhold the comparison behind one `pr_checklist`
-warning. Because both sides share the derivation, the checker catches the
+reads only the checklist inside the PR Template's fenced block — the
+`## Checklist` heading under the file's single `## PR Template` heading, up to
+the block's closing fence — so neither check-derived text rendered above the
+template nor anything appended after it can stand in for it; a second
+`## PR Template`, or a second `## Checklist` inside the template, leaves every
+item unreadable. The fold fails closed: a missing or unreadable checklist line
+is a warning for its item, and `/checks` entries without a readable `name` and a
+status from the serialized vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`)
+withhold the comparison behind one `pr_checklist` warning. Because both sides share the derivation, the checker catches the
 rendered text drifting from the statuses; the derivation's own semantics
 (all-of, not any-of, and which check belongs to which item) are pinned by the
 `artifacts::tests` checklist tests.
