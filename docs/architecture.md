@@ -605,8 +605,17 @@ The finished-snapshot resolver follows the invocation path to its canonical
 filesystem identity and publishes one of **three** provenance states. The rule
 is intentionally asymmetric, and the asymmetry runs in both directions:
 
-- `Snapshot` requires the complete statically visible executable closure to be
-  **proved** target-owned.
+- `Snapshot` requires the JS-tree closure to be **proved** target-owned: no
+  bytes the proof can see the tool read — the invocation, and a recognized
+  wrapper's payload — come from outside the snapshot. The **ambient runtime is
+  outside the proof**, and always was: `exec node "$basedir/<payload>"` resolves
+  `node` through `PATH`, and a validated platform header says nothing about
+  `ld.so`/`dyld`, libc, or any shared object the loader maps. Requiring the
+  interpreter would not strengthen the claim, it would make it unobtainable —
+  prview ships no `node`, so every JS tool on every platform would be unproven
+  and the state would mean nothing. The promise is therefore the narrower one:
+  the scanned tree is exactly the reviewed commit's; the machine it ran on is
+  the operator's.
 - `SnapshotBorrowedDeps` requires **positive evidence** of borrowed bytes: a
   prview-created link inside the closure, a canonical identity resolving outside
   the snapshot root, or a case-ambiguous creator identity.
@@ -631,9 +640,20 @@ else is unproven.
 
 The native test is whether the kernel's own image loader **claims** the file,
 not whether prview recognises its opening bytes. The distinction is the whole
-proof. prview spawns through `Command`, hence `execvp`, and POSIX requires
-`execvp` to retry through `/bin/sh` on exactly one condition: `ENOEXEC`, meaning
-no loader recognised the image as its own.
+proof. What no loader claims returns `ENOEXEC`, and `ENOEXEC` has two different
+futures depending on how the spawn was made. POSIX requires `execvp` to retry
+such a file through `/bin/sh`, and prview reaches `execvp` on Rust's
+`fork`+`exec` spawn path (which prview forces with `pre_exec` on the MCP
+child-group path); on the **default `posix_spawn` path there is no such retry** —
+glibc hands `ENOEXEC` straight back to the parent. Measured: the same
+shebangless launcher ran under `/bin/sh` on macOS and failed to spawn at all on
+Linux CI with `Exec format error (os error 8)`.
+
+So the header proof is justified by **caution, not by a universal law**. One
+world executes bytes nobody read; the other refuses to start and is fail-closed.
+Only the first can publish a false `snapshot`, and refusing the unclaimed image
+is correct in both — which is why the classifier, not the spawn, decides the
+provenance state.
 
 Validating a header is not the same as predicting that verdict, and the proof is
 stated in those terms: it holds where the loader claims the file **and** the
@@ -723,7 +743,16 @@ The recognized content grammars are two, both narrow, and both able only to
 RAISE confidence: the strict pnpm-shaped shell skeleton (a shell shebang, a
 `basedir=$(dirname "$0")` assignment, and `exec node "$basedir/<payload>"
 "$@"`), and the proved-direct script of terminal shell builtins used by direct
-launchers. Real `npm`/`pnpm`/`yarn` shims do **not** match: a current pnpm shim
+launchers. `<payload>` must be a **literal** path — only
+`[A-Za-z0-9._@+/-]`, so nothing the shell would expand, split or glob (`$`,
+backtick, backslash, quotes, whitespace, `~`, `*`, `?`, `[`, `{`, `(`, `;`,
+`|`, `&`) can appear in it. The proof records the file the wrapper executes, and
+it may do that only where the recorded text and the executed text are the same
+string: a grammar admitting `exec node "$basedir/$HOME/x" "$@"` matched a
+wrapper whose payload is chosen by the shell at run time. The payload is
+extracted from the very match that recognized the grammar, so the recognizer and
+the recorded closure cannot disagree — the earlier second, looser scan could
+silently record nothing while the closure stayed "proved". Real `npm`/`pnpm`/`yarn` shims do **not** match: a current pnpm shim
 is ~18 active lines with a `sed`-normalised `basedir`, a `case uname` block, a
 `NODE_PATH` export and an `if [ -x "$basedir/node" ]` fork. Matching a grammar
 can prove a closure; failing to match proves nothing and publishes
@@ -791,22 +820,55 @@ at `4bd02645` are pinned by regression tests: alternate-variable wrapper
 in a comment (`exact_eslint_direct_script_ignores_wrapper_text_in_comments`),
 and mode `100644` (`exact_eslint_non_executable_file_fails_before_spawn`).
 
-Target entries always win collisions: prview never overwrites them. Missing
-top-level packages and tools may be linked around them. A proved-direct
-target-owned shell script does not become borrowed merely because unrelated
-ambient packages were exposed elsewhere in `node_modules`; an unrecognized
-script does, because its closure is not proved.
+**Target entries always win collisions**, and that rule has three faces, all of
+which must hold at once: prview never overwrites a target entry, never writes
+*through* one, and never aborts a review *over* one. The decision is made with
+`symlink_metadata`, never `exists()`, so the reviewed commit's own entry is read
+and not followed:
+
+- the target committed **nothing** at `node_modules`/`.venv` — the operator's
+  whole directory is exposed as one borrowed link;
+- the target committed a **real directory** — only the top-level entries it does
+  not own are linked inside it, and `.bin` likewise when the target owns it as a
+  real directory too. The top-level merge is independent of whether the operator
+  has a `.bin` at all: packages are what a shim resolves (`../<package>`), and
+  when the target owns no `.bin`, `.bin` is simply one of the entries this merge
+  exposes;
+- the target committed **anything else** — a symlink (resolving anywhere, or
+  broken) or a file — it is left exactly as the commit spelled it. No merge, no
+  borrow, no failure. `exists()` used to follow that symlink, so a commit
+  carrying `node_modules -> /somewhere/writable` opened the merge path and every
+  "missing" entry was created **inside the operator's own filesystem**; and a
+  commit carrying a *broken* `node_modules` link made the borrow fail `EEXIST`
+  and aborted the whole review.
+
+`create_borrowed_link` re-proves containment per link — the created link's
+parent, canonicalized, must stay inside the canonical snapshot root — so a
+future caller cannot reintroduce a write that leaves the snapshot through a path
+the reviewed commit chose. `strip_prefix` alone compares spelling, not identity,
+and does not catch that.
+
+A proved-direct target-owned shell script does not become borrowed merely
+because unrelated ambient packages were exposed elsewhere in `node_modules`; an
+unrecognized script is `SnapshotUnprovenDeps`, because its closure is not
+proved in either direction.
 
 This remains a static proof, not a syscall trace. A proved-direct target script
 can read a runtime path without syntactic indirection that the classifier can
 see. That residual limitation is accepted here; expanding the direct grammar
-requires a new regression and cannot weaken the rule that an unknown wrapper is
-borrowed.
+requires a new regression and cannot weaken the rule that an **unknown wrapper
+is unproven** — not borrowed, because nothing observed a borrow, and not
+`snapshot`, because nothing proved one.
 
 A failed required link aborts snapshot creation instead of leaving eligibility
 and execution on different toolchains. Non-Unix exact-target JS checks may run a
 tool already present in the target; a tool requiring ambient borrowing is
-skipped with an explicit unsupported-borrow reason. Ambient JS checks remain
+skipped with an explicit unsupported-borrow reason. That platform has neither
+the header proof nor the script grammars, so its closure answer is drawn from
+canonical identity alone: nothing resolving at the invocation path is
+`Snapshot` (nothing will execute), an invocation resolving outside the snapshot
+root is `SnapshotBorrowedDeps`, and anything else is `SnapshotUnprovenDeps` —
+never an exact claim for a file this build cannot read. Ambient JS checks remain
 unchanged. Snapshot creation uses an empty per-snapshot `core.hooksPath`;
 checkout hooks belong to the operator's workflow and must not mutate or block
 exact-SHA review input.

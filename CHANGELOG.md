@@ -287,9 +287,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0 ok, 1 tooling, 2 unsupported platform, 3 missing artifact, 4
   checksum/archive invalid, 5 macOS signature/notarization, 6 post-install
   verification. `docs/INSTALL.md` carries the full contract.
-
 ### Fixed
 
+- **A snapshot never writes through an entry the reviewed commit owns.** The
+  dependency merge decided whether the target already had `node_modules` /
+  `.venv` with `Path::exists()`, which follows symlinks. A commit carrying
+  `node_modules -> /some/writable/path` therefore looked like a plain directory,
+  the merge opened, and every "missing" package was created **inside the
+  operator's own filesystem** — outside the snapshot, at a location the reviewed
+  branch chose. The decision now reads the commit's own entry with
+  `symlink_metadata`: only a real directory receives borrowed entries, an absent
+  entry receives one whole borrowed link, and anything else the commit spelled
+  (a symlink, resolving anywhere or nowhere, or a file) is left exactly as it
+  is — no merge, no borrow, no failure. `create_borrowed_link` additionally
+  re-proves per link that the parent it is about to write into canonicalizes
+  inside the snapshot root, because `strip_prefix` compares spelling, not
+  identity.
+- **A broken dependency symlink in the reviewed commit no longer aborts the
+  review.** `node_modules -> nowhere` made `exists()` report `false`, the borrow
+  was attempted anyway, and `symlink(2)` failed `EEXIST`, so snapshot creation —
+  and with it the whole run — died on a repository that is merely unusual. Such
+  a commit is now left alone and reviewed.
+- **The exposure of top-level packages no longer depends on the operator having
+  a `.bin`.** The merge was gated on `ambient_bin.exists()`, so an operator
+  install without `node_modules/.bin` suppressed the package merge as well, even
+  though what a shim resolves is `../<package>`. The two merges are now
+  independent, and `.bin` is simply one more entry the top-level merge can
+  expose.
+- **A `.bin` shim that resolves inside the tree to an entry the commit does not
+  contain is `Missing`, not `Unresolved`.** Following a repository-relative link
+  lands on another path in the *same* tree, so the tree can answer for it.
+  Reporting `Unresolved` made JS eligibility treat an absent tool as a target
+  candidate; the check was scheduled and then failed at execution time with
+  `resolved JS tool disappeared` instead of being skipped with a reason.
+- **The recognized pnpm wrapper grammar admits only a literal payload.** The
+  grammar accepted any text between the quotes of `exec node "$basedir/…" "$@"`,
+  while a second, looser scan extracted the closure path. A wrapper reading
+  `exec node "$basedir/$HOME/x" "$@"` therefore proved a closure whose contents
+  the shell picks at run time, and the two passes could disagree — the extractor
+  could record nothing while the closure stayed "proved". The payload must now
+  match `[A-Za-z0-9._@+/-]+` (nothing the shell expands, splits or globs) and is
+  taken from the very match that recognized the grammar, so the recognizer and
+  the recorded closure cannot diverge.
+- **On non-Unix, an invocation that exists is no longer certified as an exact
+  snapshot scan.** The non-Unix closure proof answered `TargetOnly` for every
+  path, so a Windows run published `tree_state: "snapshot"` — "the scanned bytes
+  are exactly `target_sha`" — for a launcher this build cannot read at all
+  (there is no header proof and no script grammar there). It now answers from
+  canonical identity alone: nothing at the invocation path is `TargetOnly`
+  (nothing will execute), an invocation resolving outside the snapshot root is
+  `Borrowed`, and everything else is `Unproven`. All three variants are
+  therefore constructed on every platform, which also removes the `dead_code`
+  asymmetry that broke the Windows build.
+- **Two claims about the proof were stated more broadly than the code
+  supports, and are corrected in place** (`ClosureProof::TargetOnly` docstring,
+  `docs/architecture.md`): `snapshot` never promised that "every statically
+  visible byte is target-owned" — the ambient `node` runtime is outside the
+  proof and always was, prview ships none; and the `/bin/sh` retry that
+  motivates the platform-header proof happens on the `fork`+`execvp` path, not
+  on Rust's default `posix_spawn`, which hands `ENOEXEC` straight back
+  (`Exec format error (os error 8)`, measured on Linux CI). The header proof is
+  justified by caution, not by a universal law. An unrecognized wrapper is
+  `snapshot-unproven-deps`, never "borrowed".
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch

@@ -38,6 +38,17 @@ pub(crate) enum CommitPathResolution {
 /// tool candidate too, but its final host path cannot be resolved from the Git
 /// tree; admit it here and let the finished-snapshot resolver either reject a
 /// missing/non-file target or classify the external bytes as borrowed.
+///
+/// An entry the tree does not carry is [`CommitPathResolution::Missing`]
+/// whether or not a symlink was followed to reach it, because following a
+/// repository-relative link is not a loss of information: it lands on another
+/// path in the SAME tree, and that tree either has the entry or does not.
+/// Escapes never reach this point — `resolved_symlink_path` refuses them — and
+/// an absolute link returns above. Reporting `Unresolved` for a followed chain
+/// made JS eligibility treat an absent tool as a target candidate (only
+/// `Missing` is not one), plan the check, and then fail at execution time with
+/// "resolved JS tool disappeared" instead of borrowing the operator's tool or
+/// skipping with a reason.
 pub(crate) fn commit_path_resolution(
     repo_root: &Path,
     commit: &str,
@@ -59,7 +70,6 @@ pub(crate) fn commit_path_resolution(
         return CommitPathResolution::Unresolved;
     };
     let mut resolved = PathBuf::new();
-    let mut followed_symlink = false;
 
     for _ in 0..MAX_SYMLINK_RESOLUTIONS {
         let Some(component) = pending.pop_front() else {
@@ -67,15 +77,10 @@ pub(crate) fn commit_path_resolution(
         };
         resolved.push(component);
         let Ok(entry) = tree.get_path(&resolved) else {
-            return if followed_symlink {
-                CommitPathResolution::Unresolved
-            } else {
-                CommitPathResolution::Missing
-            };
+            return CommitPathResolution::Missing;
         };
 
         if entry.filemode() == 0o120000 {
-            followed_symlink = true;
             let Ok(object) = entry.to_object(&repo) else {
                 return CommitPathResolution::Unresolved;
             };
@@ -157,8 +162,20 @@ fn resolved_symlink_path(
 /// both directions; it is not evidence that ambient bytes ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClosureProof {
-    /// Every statically visible byte of the closure is target-owned: the
-    /// scanned bytes are exactly the reviewed commit's.
+    /// No JS-tree bytes from outside the snapshot enter this closure: every
+    /// file the proof can see the tool read — the invocation, and a recognised
+    /// wrapper's payload — is the reviewed commit's own.
+    ///
+    /// The ambient RUNTIME is outside the proof and always was. `exec node
+    /// "$basedir/<payload>"` resolves `node` through `PATH`, and the header
+    /// proof likewise says nothing about `ld.so`/`dyld`, libc, or any shared
+    /// object the loader maps. Requiring the interpreter would not make the
+    /// claim stronger, it would make it unobtainable: prview ships no `node`,
+    /// so every JS tool on every platform would be unproven and the state would
+    /// mean nothing. So the promise is deliberately narrower than "every
+    /// statically visible byte is target-owned", which is what this used to
+    /// say: the SCANNED TREE is exactly the commit's, and the machine it runs
+    /// on is the operator's.
     TargetOnly,
     /// Positive evidence that the closure consumes bytes from outside the
     /// snapshot — a link prview itself created, or a canonical identity that
@@ -256,9 +273,20 @@ fn path_is_external_or_borrowed(snapshot_root: &Path, path: &Path, borrowed: &[P
 ///
 /// This is the one positive proof that no interpreter indirection exists, and
 /// the bar has to be "the loader claims the file", never "the file opens with a
-/// magic we recognise". prview spawns through `Command`, hence `execvp`, and
-/// POSIX requires `execvp` to retry a file through `/bin/sh` on exactly one
-/// condition: `ENOEXEC` — no loader recognised the image as its own.
+/// magic we recognise". What the loader refuses with `ENOEXEC` may then be run
+/// by `/bin/sh`: POSIX requires that retry of `execvp`, and prview spawns
+/// through `Command`, which reaches `execvp` on its `fork`+`exec` path.
+///
+/// That retry is a real but NOT a universal future, and this proof is justified
+/// by caution rather than by a law. Rust only takes the `fork`+`execvp` path
+/// when the spawn cannot use `posix_spawn` (prview forces it with `pre_exec`
+/// on the MCP child-group path); the default `posix_spawn` path has no such
+/// retry, and glibc hands `ENOEXEC` straight back to the parent — measured on
+/// Linux CI, a shebangless launcher failed to spawn with `Exec format error
+/// (os error 8)` while the same fixture ran under `/bin/sh` on macOS. So one
+/// world executes unread bytes and the other refuses to start; only the first
+/// can publish a false `TargetOnly`, and the second is fail-closed. Refusing
+/// the unclaimed image is right in both.
 ///
 /// What that buys is narrower than "a header that parses", and the difference
 /// is the proof. Validating a header is not the same as predicting the
@@ -710,11 +738,12 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
         };
     };
     // No `#!` and no claimed platform header proves NOTHING about the closure,
-    // and it must never be read as "native binary". prview spawns through
-    // `Command`, hence `execvp`, and POSIX requires `execvp` to retry an
-    // `ENOEXEC` file through `/bin/sh` — so this file is a shell script whose
-    // interpreter was chosen for it, with the full, unbounded indirection a
-    // shell allows. The header proof above is the only thing that rules it out.
+    // and it must never be read as "native binary". On the `fork`+`execvp`
+    // spawn path POSIX requires the `ENOEXEC` retry through `/bin/sh`, so this
+    // file is then a shell script whose interpreter was chosen for it, with the
+    // full, unbounded indirection a shell allows; on the default `posix_spawn`
+    // path it simply fails to start. The header proof above is the only thing
+    // that rules the first out.
     if !bytes.starts_with(b"#!") {
         return ConsumedPaths {
             paths: consumed,
@@ -743,7 +772,8 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect();
-    let package_wrapper = is_known_pnpm_shell_wrapper(text, &active_lines);
+    let payload = known_pnpm_shell_wrapper_payload(text, &active_lines);
+    let package_wrapper = payload.is_some();
     if !package_wrapper && !is_proved_direct_shell_script(text, &active_lines) {
         return ConsumedPaths {
             paths: consumed,
@@ -752,20 +782,13 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
         };
     }
 
-    if package_wrapper {
-        let basedir =
-            regex::Regex::new(r#"\$basedir/([^\"'\s;|&)]+)"#).expect("static basedir regex");
-        for line in &active_lines {
-            for capture in basedir.captures_iter(line) {
-                let Some(relative) = capture.get(1) else {
-                    continue;
-                };
-                let candidate = bin_dir.join(relative.as_str());
-                if candidate.exists() {
-                    consumed.push(candidate);
-                }
-            }
-        }
+    // The payload comes out of the SAME match that recognised the grammar, so
+    // the two can never disagree. A second, looser scan used to extract it: a
+    // grammar admitting `$HOME` or `$(...)` matched, the extractor recorded a
+    // literal that does not exist, the loop silently added nothing, and
+    // `closure_proven` stayed true for a wrapper that executes an external file.
+    if let Some(payload) = payload {
+        consumed.push(bin_dir.join(payload));
     }
 
     consumed.sort();
@@ -777,20 +800,41 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
     }
 }
 
+/// The characters a proved `$basedir` payload may be spelled with.
+///
+/// Every character a shell would expand, split, or glob is absent: `$`,
+/// backtick, backslash, quotes, whitespace, `~`, `*`, `?`, `[`, `{`, `(`, `;`,
+/// `|`, `&`. What remains can only denote itself, which is the whole point —
+/// the proof records the path this wrapper executes, and it may do that only
+/// where the recorded text and the executed text are the same string. The
+/// previous `[^\"]+` matched anything but a quote, so `exec node
+/// "$basedir/$HOME/x" "$@"` was read as the known grammar while the file that
+/// actually runs is chosen by the shell at run time.
 #[cfg(unix)]
-fn is_known_pnpm_shell_wrapper(text: &str, active_lines: &[&str]) -> bool {
-    let Some(shebang) = text.lines().next() else {
-        return false;
-    };
+const PNPM_PAYLOAD_PATH: &str = r"[A-Za-z0-9._@+/-]+";
+
+/// The payload of a strict pnpm-shaped shell wrapper, or `None` when this text
+/// is not that grammar.
+#[cfg(unix)]
+fn known_pnpm_shell_wrapper_payload(text: &str, active_lines: &[&str]) -> Option<String> {
+    let shebang = text.lines().next()?;
     if !matches!(shebang.trim(), "#!/bin/sh" | "#!/usr/bin/env sh") {
-        return false;
+        return None;
     }
     if active_lines.len() != 2 || active_lines[0] != "basedir=$(dirname \"$0\")" {
-        return false;
+        return None;
     }
-    regex::Regex::new(r#"^exec node \"\$basedir/[^\"]+\" \"\$@\"$"#)
-        .expect("static pnpm wrapper regex")
-        .is_match(active_lines[1])
+    let grammar = regex::Regex::new(&format!(
+        r#"^exec node "\$basedir/({PNPM_PAYLOAD_PATH})" "\$@"$"#
+    ))
+    .expect("static pnpm wrapper regex");
+    Some(
+        grammar
+            .captures(active_lines[1])?
+            .get(1)?
+            .as_str()
+            .to_string(),
+    )
 }
 
 #[cfg(unix)]
@@ -818,14 +862,50 @@ fn is_proved_direct_shell_script(text: &str, active_lines: &[&str]) -> bool {
     })
 }
 
+/// The same question on a platform with neither of the two proofs above.
+///
+/// There is no borrowed-links manifest here (this build creates no dependency
+/// links), no kernel-header validator, and no script grammar — so the only
+/// evidence available is the canonical identity of the path itself. That is
+/// enough for exactly two honest answers, and `TargetOnly` is not one of them
+/// whenever something can actually run:
+///
+/// * nothing resolves at the invocation path — nothing will execute, so the
+///   provenance describes the target tree and nothing else;
+/// * the invocation canonically resolves outside the snapshot root — a
+///   target-owned absolute symlink into the operator's tree is a borrow this
+///   platform can see as plainly as any other;
+/// * anything else — a real file is there and this build cannot read one byte
+///   of its closure, so the claim is withheld rather than granted.
+///
+/// Returning `TargetOnly` unconditionally published `snapshot` for a wrapper
+/// that could still invoke ambient `node` and ambient dependencies.
 #[cfg(not(unix))]
-pub(crate) fn path_uses_prview_borrow(
-    _snapshot_root: &Path,
-    _relative_path: &Path,
-) -> ClosureProof {
-    ClosureProof::TargetOnly
+pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path) -> ClosureProof {
+    let invocation = snapshot_root.join(relative_path);
+    if std::fs::symlink_metadata(&invocation).is_err() {
+        return ClosureProof::TargetOnly;
+    }
+    match (
+        std::fs::canonicalize(snapshot_root),
+        std::fs::canonicalize(&invocation),
+    ) {
+        (Ok(root), Ok(path)) if !path.starts_with(&root) => ClosureProof::Borrowed,
+        _ => ClosureProof::Unproven,
+    }
 }
 
+/// Create one borrowed dependency link and record it for provenance.
+///
+/// The containment check is defence in depth for the only write this module
+/// performs. `strip_prefix` compares spelling, not identity: a path spelled
+/// inside the snapshot can still land outside it when any directory on the way
+/// is a symlink the REVIEWED COMMIT chose — which is how a committed
+/// `node_modules -> /somewhere/writable` turned this call into a write into the
+/// operator's own filesystem. Callers must already refuse to merge into a
+/// target-owned symlink; canonicalising the parent here means a later caller
+/// cannot quietly reintroduce that write, and the cost is one `realpath` per
+/// created link.
 #[cfg(unix)]
 fn create_borrowed_link(
     source: &Path,
@@ -833,6 +913,32 @@ fn create_borrowed_link(
     snapshot_root: &Path,
     borrowed_links: &mut Vec<PathBuf>,
 ) -> Result<()> {
+    let relative = exposed
+        .strip_prefix(snapshot_root)
+        .context("borrowed dependency escaped snapshot root")?
+        .to_path_buf();
+    let parent = exposed
+        .parent()
+        .context("borrowed dependency has no parent directory")?;
+    let root_identity = std::fs::canonicalize(snapshot_root).with_context(|| {
+        format!(
+            "failed to resolve snapshot root {}",
+            snapshot_root.display()
+        )
+    })?;
+    let parent_identity = std::fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve borrowed dependency directory {}",
+            parent.display()
+        )
+    })?;
+    if !parent_identity.starts_with(&root_identity) {
+        anyhow::bail!(
+            "refusing to expose {} at {}: that directory resolves outside the snapshot",
+            source.display(),
+            exposed.display()
+        );
+    }
     std::os::unix::fs::symlink(source, exposed).with_context(|| {
         format!(
             "failed to expose {} as borrowed dependency {}",
@@ -840,15 +946,57 @@ fn create_borrowed_link(
             exposed.display()
         )
     })?;
-    borrowed_links.push(
-        exposed
-            .strip_prefix(snapshot_root)
-            .context("borrowed dependency escaped snapshot root")?
-            .to_path_buf(),
-    );
+    borrowed_links.push(relative);
     Ok(())
 }
 
+/// What the reviewed commit itself put at a dependency root, decided WITHOUT
+/// following the entry.
+///
+/// `Path::exists()` follows symlinks, so a commit carrying
+/// `node_modules -> /somewhere/writable` answered "yes, a directory is there"
+/// and the merge below then created borrowed links inside that outside
+/// directory. `symlink_metadata` answers the only question this decision may
+/// ask: what did the TARGET put here?
+#[cfg(unix)]
+enum DependencyRoot {
+    /// The target committed nothing here, so the operator's whole directory can
+    /// be exposed as a single borrowed link.
+    Absent,
+    /// The target committed a real directory. Entries it does not own may be
+    /// borrowed into it, and every write stays inside the snapshot.
+    TargetDirectory,
+    /// The target committed something that is not a real directory: a symlink
+    /// (resolving anywhere, or broken) or a file. It wins as-is — no merge, no
+    /// borrow, and no abort either. Writing into it would leave the snapshot,
+    /// replacing it would overwrite a target entry, and failing would let a
+    /// committed broken `node_modules` link abort the whole review.
+    TargetOwnedOpaque,
+}
+
+#[cfg(unix)]
+fn dependency_root(snapshot_entry: &Path) -> Result<DependencyRoot> {
+    match std::fs::symlink_metadata(snapshot_entry) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(DependencyRoot::TargetDirectory),
+        Ok(_) => Ok(DependencyRoot::TargetOwnedOpaque),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DependencyRoot::Absent),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect target-owned dependency path {}",
+                snapshot_entry.display()
+            )
+        }),
+    }
+}
+
+/// Expose the ambient entries `snapshot` does not already own, one link each.
+///
+/// PRECONDITION: `snapshot` is a real directory inside `snapshot_root`, proved
+/// by [`dependency_root`]. Only then is `snapshot.join(name)` a path whose
+/// parent the reviewed commit cannot have redirected, and only then can the
+/// last-component `symlink_metadata` below be the whole collision test.
+/// [`create_borrowed_link`] re-proves containment per link, so a caller that
+/// forgets this fails closed instead of writing outside the snapshot.
 #[cfg(unix)]
 fn link_missing_entries(
     ambient: &Path,
@@ -1101,21 +1249,37 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     // dependency entries in that case. Linking `.bin` alone is insufficient for
     // npm/pnpm shims because they resolve sibling package paths such as
     // `../eslint` from the snapshot.
+    //
+    // Every decision below reads the SNAPSHOT entry with `symlink_metadata`, so
+    // the reviewed commit cannot redirect a write. A target entry that is not a
+    // real directory wins untouched, which is the same rule stated three ways:
+    // prview never overwrites a target entry, never writes through one, and
+    // never aborts a review over one.
     #[cfg(unix)]
     {
         let mut borrowed_links = Vec::new();
         let nm = repo_root.join("node_modules");
         let snapshot_nm = worktree_path.join("node_modules");
         if nm.exists() {
-            if !snapshot_nm.exists() {
-                create_borrowed_link(&nm, &snapshot_nm, &worktree_path, &mut borrowed_links)?;
-            } else {
-                let ambient_bin = nm.join(".bin");
-                let snapshot_bin = snapshot_nm.join(".bin");
-                if ambient_bin.exists() {
+            match dependency_root(&snapshot_nm)? {
+                DependencyRoot::Absent => {
+                    create_borrowed_link(&nm, &snapshot_nm, &worktree_path, &mut borrowed_links)?;
+                }
+                DependencyRoot::TargetDirectory => {
+                    // Top-level packages first, and independently of `.bin`:
+                    // the two answer different questions. Packages are what a
+                    // shim resolves (`../eslint` from `.bin`), so a target that
+                    // committed its own `.bin` still needs them; and when the
+                    // target owns no `.bin` at all, `.bin` is simply one of the
+                    // ambient entries this call exposes.
                     link_missing_entries(&nm, &snapshot_nm, &worktree_path, &mut borrowed_links)?;
-                    if std::fs::symlink_metadata(&snapshot_bin)
-                        .is_ok_and(|metadata| metadata.file_type().is_dir())
+                    let ambient_bin = nm.join(".bin");
+                    let snapshot_bin = snapshot_nm.join(".bin");
+                    if ambient_bin.is_dir()
+                        && matches!(
+                            dependency_root(&snapshot_bin)?,
+                            DependencyRoot::TargetDirectory
+                        )
                     {
                         link_missing_entries(
                             &ambient_bin,
@@ -1125,11 +1289,12 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
                         )?;
                     }
                 }
+                DependencyRoot::TargetOwnedOpaque => {}
             }
         }
         let venv = repo_root.join(".venv");
         let snapshot_venv = worktree_path.join(".venv");
-        if venv.exists() && !snapshot_venv.exists() {
+        if venv.exists() && matches!(dependency_root(&snapshot_venv)?, DependencyRoot::Absent) {
             create_borrowed_link(&venv, &snapshot_venv, &worktree_path, &mut borrowed_links)?;
         }
         write_borrowed_links_manifest(tmp.path(), &mut borrowed_links)?;
@@ -1816,11 +1981,12 @@ mod tests {
     fn an_executable_without_a_shebang_is_unproven_never_native() {
         let relative = Path::new("node_modules/.bin/eslint");
 
-        // The exact regressed vector: no `#!` and no platform header. `Command`
-        // spawns through `execvp`, which POSIX requires to retry an `ENOEXEC`
-        // file through `/bin/sh`, so these bytes run with full shell
-        // indirection. Certifying them as an exact snapshot scan is the claim
-        // this pins shut.
+        // The exact regressed vector: no `#!` and no platform header. On the
+        // `fork`+`execvp` spawn path POSIX requires the `ENOEXEC` retry through
+        // `/bin/sh`, so these bytes run with full shell indirection. Certifying
+        // them as an exact snapshot scan is the claim this pins shut — and this
+        // cell needs no spawn at all to pin it, because the classifier is asked
+        // directly.
         let (_tmp, root) =
             snapshot_with_tool(b"exec node \"$(dirname \"$0\")/../eslint/bin/eslint.js\" \"$@\"\n");
         let proof = path_uses_prview_borrow(&root, relative);
@@ -1999,6 +2165,251 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(borrowed.join("marker")).expect("borrowed marker"),
             "operator dependency\n",
+        );
+    }
+
+    /// Commit exactly these worktree paths with the repository's own `git`, so
+    /// a symlink entry is stored with the mode Git itself chooses rather than
+    /// the one a test reconstructs.
+    #[cfg(unix)]
+    fn commit_paths(repo_root: &Path, message: &str, paths: &[&str]) -> String {
+        let run = |args: &[&str]| {
+            let output = git_cmd()
+                .args(args)
+                .current_dir(repo_root)
+                .output()
+                .expect("git command");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        run(&["config", "commit.gpgsign", "false"]);
+        let mut add = vec!["add", "-f"];
+        add.extend_from_slice(paths);
+        run(&add);
+        run(&["commit", "-q", "-m", message]);
+        let output = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_root)
+            .output()
+            .expect("rev-parse");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("utf8 commit id")
+            .trim()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn borrowed_links_manifest(snapshot: &WorktreeSnapshot) -> PathBuf {
+        snapshot
+            .worktree_path
+            .parent()
+            .expect("snapshot temp root")
+            .join(BORROWED_LINKS_MANIFEST)
+    }
+
+    /// The reviewed commit owns `node_modules` as a symlink to a writable
+    /// directory the operator never offered. `Path::exists()` followed it, the
+    /// merge path opened, and every "missing" ambient entry was then created
+    /// INSIDE that outside directory — a reviewed commit writing into an
+    /// arbitrary host path. The decision now reads the snapshot entry with
+    /// `symlink_metadata`, so the target's own entry wins untouched.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_merge_refuses_a_target_owned_node_modules_symlink() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        let outside_tmp = tempfile::tempdir().expect("outside tempdir");
+        let outside = outside_tmp.path().join("operator-deps");
+        std::fs::create_dir(&outside).expect("outside dir");
+
+        let committed = repo_tmp.path().join("node_modules");
+        std::os::unix::fs::symlink(&outside, &committed).expect("committed dependency symlink");
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns node_modules as a symlink",
+            &["node_modules"],
+        );
+
+        // The operator's own checkout carries a real, populated `node_modules`:
+        // exactly the bytes the merge path would try to expose.
+        std::fs::remove_file(&committed).expect("replace the checked-out link");
+        let ambient_bin = committed.join(".bin");
+        std::fs::create_dir_all(&ambient_bin).expect("ambient bin dir");
+        std::fs::write(ambient_bin.join("eslint"), "#!/bin/sh\nexit 0\n").expect("ambient shim");
+        std::fs::create_dir_all(committed.join("eslint")).expect("ambient package");
+
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head)
+            .expect("a target-owned dependency symlink must not fail the snapshot");
+
+        assert_eq!(
+            std::fs::read_dir(&outside)
+                .expect("outside dependency directory")
+                .count(),
+            0,
+            "the reviewed commit must not be able to write through its own symlink",
+        );
+        assert!(
+            snapshot.worktree_path.join("node_modules").is_symlink(),
+            "the target's entry stays exactly as the commit spelled it",
+        );
+        assert!(
+            !borrowed_links_manifest(&snapshot).exists(),
+            "nothing was borrowed, so no borrow may be recorded",
+        );
+    }
+
+    /// A commit carrying a BROKEN `node_modules`/`.venv` symlink used to abort
+    /// the whole review: `exists()` said "no", the borrow was attempted, and
+    /// `symlink()` failed `EEXIST` through `?`. The entry is target-owned, so
+    /// the honest answer is to leave it alone and review the commit.
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_target_owned_dependency_symlink_does_not_abort_the_snapshot() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        std::os::unix::fs::symlink("nowhere", repo_tmp.path().join("node_modules"))
+            .expect("broken dependency symlink");
+        std::os::unix::fs::symlink("nowhere-either", repo_tmp.path().join(".venv"))
+            .expect("broken venv symlink");
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns broken dependency symlinks",
+            &["node_modules", ".venv"],
+        );
+
+        // Both directories exist for the operator, which is what used to make
+        // the snapshot try to create a link over the target's own entry.
+        std::fs::remove_file(repo_tmp.path().join("node_modules")).expect("drop checked-out link");
+        std::fs::remove_file(repo_tmp.path().join(".venv")).expect("drop checked-out link");
+        std::fs::create_dir(repo_tmp.path().join("node_modules")).expect("ambient node_modules");
+        std::fs::create_dir(repo_tmp.path().join(".venv")).expect("ambient venv");
+
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head)
+            .expect("a broken target-owned dependency link must not abort the review");
+
+        assert!(snapshot.worktree_path.join("node_modules").is_symlink());
+        assert!(snapshot.worktree_path.join(".venv").is_symlink());
+        assert!(
+            !borrowed_links_manifest(&snapshot).exists(),
+            "a target-owned entry is never replaced, so nothing is borrowed here",
+        );
+    }
+
+    /// Following a repository-relative symlink lands on another path in the
+    /// SAME tree, so an absent entry there is `Missing` like any other. Saying
+    /// `Unresolved` made JS eligibility treat the tool as a target candidate
+    /// (only `Missing` is not one), plan the check, and fail at spawn with
+    /// "resolved JS tool disappeared".
+    #[cfg(unix)]
+    #[test]
+    fn relative_bin_symlink_to_absent_entry_is_missing() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        let node_modules = repo_tmp.path().join("node_modules");
+        let owned = node_modules.join("bin-owned");
+        std::fs::create_dir_all(&owned).expect("target-owned bin directory");
+        // Git stores no empty directory, and the tool under test is precisely
+        // the one entry this directory does NOT have.
+        std::fs::write(owned.join("prettier"), "#!/bin/sh\nexit 0\n").expect("unrelated tool");
+        std::os::unix::fs::symlink("bin-owned", node_modules.join(".bin"))
+            .expect("relative .bin symlink");
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns .bin as a relative symlink",
+            &["node_modules"],
+        );
+
+        assert_eq!(
+            commit_path_resolution(
+                repo_tmp.path(),
+                &head,
+                Path::new("node_modules/.bin/eslint"),
+            ),
+            CommitPathResolution::Missing,
+            "the chain resolves inside the tree and the entry is simply absent",
+        );
+        assert_eq!(
+            commit_path_resolution(
+                repo_tmp.path(),
+                &head,
+                Path::new("node_modules/.bin/prettier"),
+            ),
+            CommitPathResolution::Runnable,
+            "control: the same chain finds the entry the tree does carry",
+        );
+    }
+
+    /// The pnpm grammar may only record a payload it can also predict. A path
+    /// carrying shell metacharacters is chosen by the shell at run time, so the
+    /// literal prview would record is not the file that executes.
+    #[cfg(unix)]
+    #[test]
+    fn pnpm_wrapper_with_shell_expansion_is_unproven() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let wrapper = |payload: &str| {
+            format!(
+                "#!/bin/sh\nbasedir=$(dirname \"$0\")\nexec node \"$basedir/{payload}\" \"$@\"\n"
+            )
+        };
+
+        // Control: the same skeleton with a literal payload is still read, so
+        // every refusal below is the metacharacter and not a broken fixture.
+        let (_tmp, root) = snapshot_with_tool(wrapper("../eslint/bin/eslint.js").as_bytes());
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "a literal payload path is the one the wrapper really executes",
+        );
+
+        for payload in [
+            "$HOME/x",
+            "$(cat /etc/hostname)/x",
+            "`id`/x",
+            "*/bin/eslint.js",
+            "~/x",
+            "a\\b",
+            "x;id",
+            "x|id",
+            "x y",
+            "'x'",
+        ] {
+            let (_tmp, root) = snapshot_with_tool(wrapper(payload).as_bytes());
+            let proof = path_uses_prview_borrow(&root, relative);
+            assert_eq!(
+                proof,
+                ClosureProof::Unproven,
+                "`{payload}` is not a literal path, so the closure is unread",
+            );
+            assert_ne!(
+                proof,
+                ClosureProof::TargetOnly,
+                "`{payload}` could execute a file outside the snapshot",
+            );
+        }
+    }
+
+    /// Non-Unix builds have neither proof, so `TargetOnly` may only be the
+    /// answer when nothing is there to run. Returning it unconditionally
+    /// published `snapshot` for a tool this build cannot read at all — and left
+    /// `Borrowed`/`Unproven` unconstructed, which is what `-D warnings` caught
+    /// on Windows.
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_proves_nothing_about_a_present_executable() {
+        let tmp = tempfile::tempdir().expect("snapshot tempdir");
+        let root = tmp.path().join("snapshot");
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("snapshot bin dir");
+        let relative = Path::new("node_modules/.bin/eslint");
+
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "nothing resolves there, so nothing can execute ambient bytes",
+        );
+
+        std::fs::write(bin_dir.join("eslint"), "@echo off\r\n").expect("snapshot tool");
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven,
+            "this platform has no header proof and no grammar, so the closure is unread",
         );
     }
 
