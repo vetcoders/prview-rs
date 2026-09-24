@@ -328,7 +328,12 @@ R4-19 guards against cannot reach that one tracked file — and a lock that
 differs withholds the proof as `DirtyLock`. That reading compares the target
 with the index and the index with the working tree separately, as the
 snapshot-integrity check does: a change staged and then reverted in the
-working file cancels out in one combined target-to-worktree diff. A withheld proof names its gap
+working file cancels out in one combined target-to-worktree diff. A third,
+index-free diff from the target tree to the working directory covers the
+entries the index hides: libgit2 reports an entry flagged skip-worktree or
+assume-unchanged as unmodified in both the index-to-worktree diff and status,
+whatever is on disk (`maybe_modified` in `diff_generate.c`), and a tree-side
+entry carries no such flag. A withheld proof names its gap
 (`CargoAuditLockProof::Unproven(LockProofGap)`), and the merge gate states that
 gap rather than blocking on a bare `Cargo audit (Failed)`.
 

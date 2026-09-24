@@ -1107,6 +1107,14 @@ impl Repository {
     /// the working file cancels out in one combined tree-to-workdir diff. Both
     /// diffs load the index from disk rather than a copy cached before the
     /// checks ran.
+    ///
+    /// The target is also read against the working directory with no index
+    /// in between. An index entry flagged `--skip-worktree` or
+    /// `--assume-unchanged` reads as unchanged on the index-to-working-tree
+    /// axis whatever the working file holds (libgit2's `maybe_modified` trusts
+    /// both flags, as the status read does), yet a tool reads the working file.
+    /// A tree entry carries no flags, and its content is hashed through the
+    /// same filters Git applies, so a line-ending conversion is not a change.
     pub(crate) fn tracked_path_differs_from_oid(
         &self,
         target_oid: &str,
@@ -1127,7 +1135,13 @@ impl Repository {
             return Ok(true);
         }
         let working = self.inner.diff_index_to_workdir(None, Some(&mut options))?;
-        Ok(working.deltas().next().is_some())
+        if working.deltas().next().is_some() {
+            return Ok(true);
+        }
+        let on_disk = self
+            .inner
+            .diff_tree_to_workdir(Some(&tree), Some(&mut options))?;
+        Ok(on_disk.deltas().next().is_some())
     }
 
     fn exact_commit_tree(&self, commit_oid: &str) -> Result<git2::Tree<'_>> {
@@ -1802,6 +1816,40 @@ mod tests {
                 .expect("status"),
             "a staged rewrite hidden by restored working bytes still differs"
         );
+    }
+
+    /// A lock flagged `--skip-worktree` or `--assume-unchanged`, then rewritten
+    /// on disk as cargo rewrites a lock its manifest outgrew. The status read
+    /// and the index-to-worktree diff both trust the flag and see nothing, yet
+    /// cargo reads the working file. The target-to-worktree read carries no
+    /// index flags.
+    #[test]
+    fn tracked_path_differs_from_oid_sees_through_index_skip_flags() {
+        for flag in ["--skip-worktree", "--assume-unchanged"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+            let target = write_commit(tmp.path(), "Cargo.lock", "target\n");
+            run_git(tmp.path(), &["update-index", flag, "Cargo.lock"]);
+            fs::write(tmp.path().join("Cargo.lock"), "rewritten by cargo\n").expect("rewrite lock");
+            let repo = Repository::open(tmp.path()).expect("open repo");
+            assert!(
+                repo.inner.statuses(None).expect("status").is_empty(),
+                "{flag} hides the rewrite from the status read"
+            );
+            assert!(
+                repo.tracked_path_differs_from_oid(&target, "Cargo.lock")
+                    .expect("status"),
+                "{flag} does not hide the rewrite from the target-to-worktree read"
+            );
+
+            fs::write(tmp.path().join("Cargo.lock"), "target\n").expect("restore lock");
+            assert!(
+                !repo
+                    .tracked_path_differs_from_oid(&target, "Cargo.lock")
+                    .expect("status"),
+                "{flag}: restoring the target's bytes clears it"
+            );
+        }
     }
 
     fn init_repo_with_advanced_base() -> (tempfile::TempDir, String, String, String) {

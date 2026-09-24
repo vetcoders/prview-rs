@@ -286,7 +286,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advisory a change introduced while the pre-existing ones still fail and are
   downgraded. A lock that was staged and then reverted in the working file no
   longer reads as untouched: the local re-read checks the index and the working
-  tree separately. The gate states which proof it
+  tree separately. Nor does a lock or configuration edited under a
+  skip-worktree or assume-unchanged flag, which status and the index's view
+  hide: the re-read also compares the working tree with the target commit
+  directly. The gate states which proof it
   applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this
   PR (N advisories)`; a blocking one names the advisories it blocks on — all of
   them, counted and named from one set, so an `unmaintained` warning is no

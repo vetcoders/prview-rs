@@ -305,8 +305,10 @@ observations (`20_quality/SNAPSHOT_INTEGRITY.*`) saw the audited lock change,
 or could not be read, proves nothing; a local run reads the audited lock again
 after the checks, in the index and in the working tree separately (a change
 staged and then reverted in the working file cancels out in one combined
-diff), and a lock that no longer matches the target commit in either proves
-nothing either.
+diff), and once more on disk against the commit itself, past the index: an
+entry marked skip-worktree or assume-unchanged is reported unmodified by status
+and by the index's view of the working tree however it was edited. A lock that
+no longer matches the target commit in any of these proves nothing either.
 
 Third, the configuration the audit applies must not have changed between the
 base and the target. `cargo audit` reads `.cargo/audit.toml` in the directory it
