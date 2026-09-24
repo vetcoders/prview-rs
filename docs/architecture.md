@@ -381,17 +381,25 @@ sees, and with two spellings committed the checkout picks which one is on disk.
 `AuditConfigCaseVariant` when the target, or either side of any diff, commits a
 path that matches `.cargo/audit.toml` only when case is ignored
 (`Repository::case_variant_at_commit`), and the dirty-set match
-(`path_or_parent_is`) ignores case too. The `$CARGO_HOME/audit.toml` fallback
-is the environment's policy only while `CARGO_HOME` is absolute and outside
-the reviewed trees. prview does not set it for its checks, so they inherit the
-operator's value. A relative one resolves against the directory the audit ran
-in, which puts the fallback configuration and the advisory database inside
-the scanned tree, and an absolute one can point into the checkout or the
-snapshot just the same (`CARGO_HOME=$PWD/.cargo-home`).
-`cargo_audit_config_gap` withholds the proof as `RelativeCargoHome` for a
-non-empty relative value, and as `InTreeCargoHome` for an absolute one that is
-or lies inside the repository root or the snapshot root, before any other
-question (`LockEvidence::cargo_home`, read from this process's environment).
+(`path_or_parent_is`) ignores case too. The fallback `audit.toml` in the
+Cargo home is the environment's policy only while that home is absolute and
+outside the reviewed trees. The home is `CARGO_HOME` when set and non-empty,
+and otherwise `$HOME/.cargo` (`home::cargo_home`, which cargo-audit and
+rustsec use). prview sets neither variable for its checks, so they inherit the
+operator's values. A relative home resolves against the directory the audit
+ran in, which puts the fallback configuration and the advisory database inside
+the scanned tree. An absolute one can point into the checkout or the snapshot
+just the same, through `CARGO_HOME=$PWD/.cargo-home` or through a `HOME`
+inside the tree with `CARGO_HOME` unset. For a member cargo root without its
+own configuration, the latter makes the repository root's `.cargo/audit.toml`
+the fallback. `cargo_audit_config_gap` resolves the home the same way
+(`LockEvidence::cargo_home` and `LockEvidence::operator_home`, both read from
+this process's environment, the latter through `checks::cargo_operator_home`),
+and withholds the proof as `RelativeCargoHome` for a relative home and as
+`InTreeCargoHome` for an absolute one that is, or lies inside, the repository
+root or the snapshot root, before any other question. With no home at all,
+cargo-audit reads no fallback, and rustsec's `Repository::default_path` cannot
+place the database, so there is no report to downgrade.
 Containment (`cargo_home_inside_trees`) compares every pairing of a lexical
 reading and a link-resolved reading of both paths, the latter through the
 deepest existing ancestor, and ignores ASCII case, so a spelling through `..`,

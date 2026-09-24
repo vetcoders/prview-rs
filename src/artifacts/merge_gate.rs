@@ -2154,17 +2154,18 @@ mod tests {
             ),
             (
                 LockProofGap::RelativeCargoHome,
-                "Cargo audit (Failed): provenance proof unavailable: CARGO_HOME is \
-                 relative, so cargo audit read its fallback configuration and advisory \
-                 database inside the scanned tree (2 advisories not shown to predate \
-                 this change)",
+                "Cargo audit (Failed): provenance proof unavailable: the Cargo home \
+                 (CARGO_HOME, else $HOME/.cargo) is relative, so cargo audit read its \
+                 fallback configuration and advisory database inside the scanned tree \
+                 (2 advisories not shown to predate this change)",
             ),
             (
                 LockProofGap::InTreeCargoHome,
-                "Cargo audit (Failed): provenance proof unavailable: CARGO_HOME lies \
-                 inside the checkout or the scanned tree, so cargo audit read its \
-                 fallback configuration and advisory database from files there (2 \
-                 advisories not shown to predate this change)",
+                "Cargo audit (Failed): provenance proof unavailable: the Cargo home \
+                 (CARGO_HOME, else $HOME/.cargo) lies inside the checkout or the \
+                 scanned tree, so cargo audit read its fallback configuration and \
+                 advisory database from files there (2 advisories not shown to \
+                 predate this change)",
             ),
             (
                 LockProofGap::UnknownProvenance,

@@ -176,7 +176,9 @@ fn cargo_home_path(
     })
 }
 
-fn cargo_operator_home() -> Option<PathBuf> {
+/// The account home Cargo's `home` crate reads, whose `.cargo` is the Cargo
+/// home when `CARGO_HOME` is unset or empty.
+pub(crate) fn cargo_operator_home() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         std::env::var_os("USERPROFILE")

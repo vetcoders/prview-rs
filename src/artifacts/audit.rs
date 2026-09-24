@@ -413,10 +413,11 @@ pub(crate) fn cargo_audit_lock_path(
 /// `cargo_root` discovers: `.cargo/audit.toml` in that directory, and only
 /// there. cargo-audit reads `./.cargo/audit.toml` relative to its working
 /// directory without walking up, and otherwise falls back to
-/// `$CARGO_HOME/audit.toml` (`CargoAuditCommand::config_path` upstream). That
-/// fallback lies outside the reviewed tree unless `CARGO_HOME` is relative or
-/// points into the checkout or the scanned tree, which the lock proof refuses
-/// on its own ([`crate::artifacts::verdict::LockProofGap::RelativeCargoHome`],
+/// `audit.toml` in the Cargo home, `CARGO_HOME` or else `$HOME/.cargo`
+/// (`CargoAuditCommand::config_path` upstream). That fallback lies outside the
+/// reviewed tree unless the home is relative or points into the checkout or
+/// the scanned tree, which the lock proof refuses on its own
+/// ([`crate::artifacts::verdict::LockProofGap::RelativeCargoHome`],
 /// [`crate::artifacts::verdict::LockProofGap::InTreeCargoHome`]).
 ///
 /// `None` for a `cargo_root` outside the repository, as for the lockfile.

@@ -894,6 +894,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let snapshot_root = ledger.scan_dir();
     // The checks' cargo processes inherit this process's environment.
     let inherited_cargo_home = std::env::var_os("CARGO_HOME");
+    let operator_home = crate::checks::cargo_operator_home();
     let clean_comparison = CleanComparison::resolve(
         config,
         resolved_target,
@@ -904,6 +905,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             snapshot_integrity: snapshot_integrity.as_ref(),
             snapshot_root: snapshot_root.as_deref(),
             cargo_home: inherited_cargo_home.as_deref(),
+            operator_home: operator_home.as_deref(),
         },
         worktree_head_sha.as_deref(),
         diffs,

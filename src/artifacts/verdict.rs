@@ -818,17 +818,19 @@ pub(crate) enum LockProofGap {
     /// exact-path comparison cannot see it, so nothing shows the configuration
     /// is the one both sides share.
     AuditConfigCaseVariant,
-    /// The `CARGO_HOME` the checks inherited is relative, so it resolves
-    /// inside the directory `cargo audit` ran in. The fallback configuration
-    /// `$CARGO_HOME/audit.toml` and the advisory database under it are then
-    /// files in the scanned tree, which no comparison of `.cargo/audit.toml`
-    /// covers.
+    /// The Cargo home cargo-audit resolves is relative: the `CARGO_HOME` the
+    /// checks inherited, or, with that unset, `$HOME/.cargo` under a relative
+    /// or empty `HOME`. It then resolves inside the directory `cargo audit` ran
+    /// in, so the fallback configuration `audit.toml` and the advisory database
+    /// under it are files in the scanned tree, which no comparison of
+    /// `.cargo/audit.toml` covers.
     RelativeCargoHome,
-    /// The `CARGO_HOME` the checks inherited is absolute but lies inside the
-    /// repository checkout or the scanned tree, however it is spelled or
-    /// linked ([`cargo_home_inside_trees`]). The fallback configuration and the
-    /// advisory database are then files there, which no comparison of
-    /// `.cargo/audit.toml` covers, just as for a relative value.
+    /// The Cargo home cargo-audit resolves (`CARGO_HOME`, else `$HOME/.cargo`)
+    /// is absolute but lies inside the repository checkout or the scanned tree,
+    /// however it is spelled or linked ([`cargo_home_inside_trees`]). The
+    /// fallback configuration and the advisory database are then files there,
+    /// which no comparison of `.cargo/audit.toml` covers, just as for a relative
+    /// one.
     InTreeCargoHome,
     /// The worktree status or the checkout's identity could not be read, so
     /// nothing about the scanned lockfile was established either way.
@@ -859,14 +861,15 @@ impl LockProofGap {
                  another case, which a case-insensitive checkout reads"
             }
             LockProofGap::RelativeCargoHome => {
-                "provenance proof unavailable: CARGO_HOME is relative, so cargo \
-                 audit read its fallback configuration and advisory database \
-                 inside the scanned tree"
+                "provenance proof unavailable: the Cargo home (CARGO_HOME, else \
+                 $HOME/.cargo) is relative, so cargo audit read its fallback \
+                 configuration and advisory database inside the scanned tree"
             }
             LockProofGap::InTreeCargoHome => {
-                "provenance proof unavailable: CARGO_HOME lies inside the checkout \
-                 or the scanned tree, so cargo audit read its fallback configuration \
-                 and advisory database from files there"
+                "provenance proof unavailable: the Cargo home (CARGO_HOME, else \
+                 $HOME/.cargo) lies inside the checkout or the scanned tree, so cargo \
+                 audit read its fallback configuration and advisory database from \
+                 files there"
             }
             LockProofGap::UnknownProvenance => {
                 "provenance proof unavailable: the scanned tree could not be tied \
@@ -1006,6 +1009,11 @@ pub(crate) struct LockEvidence<'a> {
     /// The `CARGO_HOME` the checks inherited, which `cargo audit` resolves
     /// against the directory it runs in when it is relative. `None` when unset.
     pub(crate) cargo_home: Option<&'a std::ffi::OsStr>,
+    /// The account home the checks inherited, as the `home` crate reads it
+    /// ([`crate::checks::cargo_operator_home`]). With `CARGO_HOME` unset or
+    /// empty, cargo-audit's Cargo home is `<this>/.cargo`. `None` when no home
+    /// can be found.
+    pub(crate) operator_home: Option<&'a std::path::Path>,
 }
 
 impl<'a> LockEvidence<'a> {
@@ -1328,15 +1336,17 @@ fn config_file_owner(basename: &str) -> Option<&'static str> {
 /// cannot be searched for one names no case, so it counts as a change like
 /// any other unreadable answer.
 ///
-/// cargo-audit falls back to `$CARGO_HOME/audit.toml` when the cargo root has
-/// no `.cargo/audit.toml`, and reads its advisory database under
-/// `$CARGO_HOME` either way. A relative `CARGO_HOME` resolves against the
-/// directory the audit ran in, making both files part of the scanned tree
-/// that no comparison here covers. The proof is then withheld as
-/// [`LockProofGap::RelativeCargoHome`] before anything else is asked. An
+/// cargo-audit falls back to `audit.toml` in its Cargo home when the cargo
+/// root has no `.cargo/audit.toml`, and reads its advisory database under that
+/// home either way. The home is `CARGO_HOME` when set and non-empty, and
+/// otherwise `$HOME/.cargo`, as `home::cargo_home` resolves it. A relative home
+/// resolves against the directory the audit ran in, making both files part of
+/// the scanned tree that no comparison here covers. The proof is then withheld
+/// as [`LockProofGap::RelativeCargoHome`] before anything else is asked. An
 /// absolute one is the environment's only while it lies outside the checkout
 /// and the scanned tree; inside either, the proof is withheld the same way, as
-/// [`LockProofGap::InTreeCargoHome`].
+/// [`LockProofGap::InTreeCargoHome`]. Without any home, cargo-audit reads no
+/// fallback, and rustsec cannot place its default database.
 ///
 /// With a Cargo root outside the repository there is no in-tree file, and no
 /// lock proof either.
@@ -1353,20 +1363,24 @@ fn cargo_audit_config_gap(
         config.profile.cargo_root.as_deref(),
     )?;
     // The same reading as `home::cargo_home`, which cargo-audit uses: an
-    // empty value counts as unset.
-    if evidence
-        .cargo_home
-        .is_some_and(|home| !home.is_empty() && !std::path::Path::new(home).is_absolute())
-    {
-        return Some(LockProofGap::RelativeCargoHome);
-    }
-    if let Some(home) = evidence.cargo_home.filter(|home| !home.is_empty())
-        && cargo_home_inside_trees(
-            std::path::Path::new(home),
+    // empty `CARGO_HOME` counts as unset, and then the account home's `.cargo`
+    // is the Cargo home. Without either there is no fallback configuration to
+    // read, and rustsec cannot place its default database, so no report
+    // exists to downgrade.
+    let cargo_home = match evidence.cargo_home.filter(|home| !home.is_empty()) {
+        Some(home) => Some(std::path::PathBuf::from(home)),
+        None => evidence.operator_home.map(|home| home.join(".cargo")),
+    };
+    if let Some(home) = cargo_home {
+        if !home.is_absolute() {
+            return Some(LockProofGap::RelativeCargoHome);
+        }
+        if cargo_home_inside_trees(
+            &home,
             std::iter::once(config.repo_root.as_path()).chain(evidence.snapshot_root),
-        )
-    {
-        return Some(LockProofGap::InTreeCargoHome);
+        ) {
+            return Some(LockProofGap::InTreeCargoHome);
+        }
     }
     let Some(repo) = repo else {
         return Some(LockProofGap::AuditConfigChanged);
@@ -3674,6 +3688,7 @@ mod tests {
                     snapshot_integrity: Some(&untouched),
                     snapshot_root: Some(tmp.path()),
                     cargo_home,
+                    operator_home: None,
                 },
                 Some(&head),
                 &[],
@@ -3734,6 +3749,7 @@ mod tests {
                     snapshot_integrity: Some(&untouched),
                     snapshot_root: Some(snapshot.path()),
                     cargo_home: Some(cargo_home.as_os_str()),
+                    operator_home: None,
                 },
                 Some(&head),
                 &[],
@@ -3783,6 +3799,88 @@ mod tests {
                 "reached through a link, not yet created"
             );
         }
+    }
+
+    /// With `CARGO_HOME` unset or empty, cargo-audit's Cargo home is
+    /// `$HOME/.cargo`. A `HOME` inside the checkout or the snapshot puts that
+    /// home's `audit.toml` in the tree, where, for a member cargo root with no
+    /// configuration of its own, it is the repository root's
+    /// `.cargo/audit.toml`.
+    #[test]
+    fn a_home_derived_cargo_home_is_judged_like_an_inherited_one() {
+        use LockProofEntry::Blob;
+        let files = || {
+            [
+                ("Cargo.toml", Blob(CORE_MANIFEST)),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+            ]
+        };
+        let (tmp, head, target) = lock_proof_repo(&files(), &files());
+        let config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        let parent = tmp.path().parent().unwrap();
+        let snapshot = tempfile::tempdir_in(parent).unwrap();
+        let outside = tempfile::tempdir_in(parent).unwrap();
+        let clean = std::collections::BTreeSet::new();
+        let untouched = snapshot_observed(&target, &[]);
+        let proof = |cargo_home: Option<&str>, operator_home: Option<&std::path::Path>| {
+            CleanComparison::resolve(
+                &config,
+                &resolved_ref(&target),
+                &[resolved_ref(&head)],
+                Some(true),
+                LockEvidence {
+                    dirty_before_checks: Some(&clean),
+                    snapshot_integrity: Some(&untouched),
+                    snapshot_root: Some(snapshot.path()),
+                    cargo_home: cargo_home.map(std::ffi::OsStr::new),
+                    operator_home,
+                },
+                Some(&head),
+                &[],
+            )
+            .cargo_audit_lock_proof()
+        };
+        let in_tree = CargoAuditLockProof::Unproven(LockProofGap::InTreeCargoHome);
+        assert_eq!(
+            proof(None, Some(outside.path())),
+            CargoAuditLockProof::TargetLock,
+            "a HOME outside both trees is the environment's"
+        );
+        assert_eq!(
+            proof(None, Some(tmp.path())),
+            in_tree,
+            "HOME at the checkout root"
+        );
+        assert_eq!(
+            proof(None, Some(snapshot.path())),
+            in_tree,
+            "HOME at the snapshot root"
+        );
+        assert_eq!(
+            proof(Some(""), Some(tmp.path())),
+            in_tree,
+            "an empty CARGO_HOME falls back to HOME"
+        );
+        let external = outside.path().join("cargo-home");
+        assert_eq!(
+            proof(external.to_str(), Some(tmp.path())),
+            CargoAuditLockProof::TargetLock,
+            "a set CARGO_HOME wins over HOME"
+        );
+        for relative in ["", "home"] {
+            assert_eq!(
+                proof(None, Some(std::path::Path::new(relative))),
+                CargoAuditLockProof::Unproven(LockProofGap::RelativeCargoHome),
+                "HOME={relative:?}"
+            );
+        }
+        assert_eq!(
+            proof(None, None),
+            CargoAuditLockProof::TargetLock,
+            "with no home at all cargo-audit reads no fallback configuration"
+        );
     }
 
     #[test]
