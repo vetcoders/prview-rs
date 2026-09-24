@@ -2022,6 +2022,10 @@ impl<'a> SnapshotBuilder<'a> {
         );
     }
 
+    /// Digests are read only while a package's own items are walked, after
+    /// that package merged its digest in. Dropping them once a crate root
+    /// fails to load therefore reaches only packages recorded later, and each
+    /// of those records its own digest before any of its items read one.
     fn forget_implementation_digests(&mut self, crate_name: &str) {
         self.macro_implementation_digests.remove(crate_name);
         self.macro_invocation_implementation_digests

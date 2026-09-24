@@ -6670,6 +6670,56 @@ mod tests {
     }
 
     #[test]
+    fn an_unloadable_same_name_package_leaves_earlier_opaque_proofs_bound() {
+        // Three packages build a lib crate named `api`; the middle one (in
+        // manifest order) does not parse, so its digests are dropped before
+        // `c` records its own. Only `a` depends on `shared`: `a`'s opaque
+        // return must keep the digest it read while `a` was walked, not one
+        // rebuilt from `c` alone.
+        let manifest = |package: &str, dependency: &str| {
+            format!("[package]\nname='{package}'\nversion='0.0.0'\n[lib]\nname='api'\n{dependency}")
+        };
+        let a = manifest("api-a", "[dependencies]\nshared={path='../shared'}\n");
+        let b = manifest("api-b", "");
+        let c = manifest("api-c", "");
+        let root = "[workspace]\nmembers=['a','b','c','shared']\nresolver='2'\n";
+        let shared_manifest = "[package]\nname='shared'\nversion='0.0.0'\n";
+        let delta = repository_delta(&[
+            ("Cargo.toml", root, root),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("a/Cargo.toml", a.as_str(), a.as_str()),
+            (
+                "a/src/lib.rs",
+                "pub async fn api() { shared::helper().await; }\n",
+                "pub async fn api() { shared::helper().await; }\n",
+            ),
+            ("b/Cargo.toml", b.as_str(), b.as_str()),
+            ("b/src/lib.rs", "pub fn x() { ) }\n", "pub fn x() { ) }\n"),
+            ("c/Cargo.toml", c.as_str(), c.as_str()),
+            ("c/src/lib.rs", "pub fn other() {}\n", "pub fn other() {}\n"),
+            ("shared/Cargo.toml", shared_manifest, shared_manifest),
+            (
+                "shared/src/lib.rs",
+                "pub async fn helper() {}\n",
+                "pub async fn helper() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); }\n",
+            ),
+        ]);
+
+        assert!(
+            delta.unknown.iter().any(|finding| {
+                finding.identity.name == "OpaqueReturnAutoTraits"
+                    && finding.identity.crate_name == "api"
+                    && finding.evidence.iter().any(|line| {
+                        line.starts_with("origin:Value:api\n")
+                            && line.contains("opaque-implementation-digest:sha256:")
+                    })
+            }),
+            "a changed dependency of `a` must keep its opaque return unknown: {:?}",
+            delta.unknown
+        );
+    }
+
+    #[test]
     fn repository_backed_opaque_returns_preserve_body_dependent_auto_trait_uncertainty() {
         let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
         let lock = "version = 4\n";
