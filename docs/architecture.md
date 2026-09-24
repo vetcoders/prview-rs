@@ -2483,6 +2483,18 @@ same-crate module binding for dependency resolution: `alias::Hidden` is followed
 back to the root `Hidden` declaration so its layout/auto-trait uncertainty stays
 attached to the public owner that exposes it.
 
+`cfg(test)` holds only while rustc compiles a crate's own unit-test harness;
+dependents, integration tests, and doctests link the crate built without it. An
+item whose guard provably requires `test` (the conjunct `test`, or an `all(..)`
+with such an operand) is therefore skipped before any module load, macro, or
+include handling, so `#[cfg(test)] mod tests` contributes neither items nor
+unknowns. Member-level records under `#[cfg(test)]` (impl, trait, or foreign
+members) leave the surface in one final pass together with their unknowns.
+`any(test, ..)`, `not(test)`, and `cfg_attr(test, ..)` stay observable, and the
+predicate re-parses the canonical guard, so a string literal never poses as a
+`test` operand. Moving a public item under `#[cfg(test)]` is reported as a
+removal, which is what every dependent observes.
+
 Custom cfg leaves are not assumed to be Cargo's built-in feature/target/runtime
 predicates. An externally relevant custom predicate on an item, field, variant,
 trait or impl member, or foreign item emits `CfgPredicate` evidence bound to a
@@ -2502,9 +2514,9 @@ matches the package's `links`). Declaring `package.links` without a live build
 script is an invalid manifest, not a way to acquire config authority. Configs
 outside the package's ancestor chain and lookalike keys in unrelated sections
 such as `[net]` do not upgrade a proof. Config includes remain unresolved until
-their authority graph is source-backed. The current conservative digest covers the complete live
-revision inventory, so it may over-report after an unrelated tracked edit; it
-never executes `build.rs`. With no complete revision-backed authority, the proof
+their authority graph is source-backed. The digest covers the package's Cargo
+input scope (described below), so it may still over-report after an unrelated
+edit inside that scope; it never executes `build.rs`. With no complete revision-backed authority, the proof
 is explicitly unresolved and cannot neutralize against the same text on the
 other side. A definitely private untransformed free helper does not create a
 standalone cfg unknown; any effect on an exposed opaque return remains covered
@@ -2569,9 +2581,11 @@ crate-root macro API only for Rust-linkable targets. A lock-backed external
 candidate binds all reachable product/path manifests, effective Cargo config
 bytes, and lockfiles.
 When a reachable local proc-macro exists, the current safety floor additionally hashes
-the complete live tracked-entry inventory by Git object identity (excluding
-redundant directory-tree objects), including nonstandard `lib.path`, `#[path]`,
-gitlinks, and build assets outside a package directory. A lock-backed external
+every live tracked entry of the package's Cargo input scope by Git object
+identity (excluding redundant directory-tree objects). That scope holds every
+local transformer the package can reach, its nonstandard `lib.path` and
+`#[path]` targets, gitlinks, and declared build assets outside the package
+directory. A lock-backed external
 candidate must also appear by actual package name, external registry/git source,
 and a version satisfying the declared requirement in the effective lock.
 Registry entries additionally require a valid checksum and Git entries a
@@ -2583,7 +2597,8 @@ symlinks, including working-tree regular-to-symlink type changes, remain
 `unresolved` because their Git blob pins only the target path, not the bytes of
 an outside-repository target. Exact attribute-to-crate resolution remains a
 future precision improvement; the local
-aggregate can therefore over-report after any tracked-file change. Missing
+aggregate can therefore over-report after any change inside the package's
+input scope. Missing
 effective product/workspace lock data, no transformer dependency candidate, or
 unresolved Cargo manifest/config source replacement (`patch`, `replace`,
 `source`, or `paths`) produces an explicit unresolved digest that never
@@ -2591,6 +2606,30 @@ neutralizes. A lockfile owned only by an unrelated fixture cannot qualify the
 proof. An unchanged transformer therefore cannot neutralize a changed item or
 changed implementation substrate. Foreign functions/statics inherit the parent
 ABI, safety, and relevant attributes.
+
+Implementation digests (cfg authority, proc-macro substrate, macro invocation,
+and opaque return) bind a package's Cargo input scope rather than the whole
+revision. The scope is the package directory, its declared target files, every
+literal `include!`/`include_str!`/`include_bytes!`/`#[path]` target of its Rust
+sources (a fixpoint over the files they pull in), the literal
+`rerun-if-changed` targets of its build script, every Cargo authority file (any
+manifest, lock, toolchain pin, or `.cargo` configuration), and the scopes of
+its local path dependencies, dev-dependencies excluded. Sources are lexed, so
+comments and string contents never pose as includes, and `#[path]` resolves to
+a finite superset of the module directories rustc may use. Anything the model
+cannot bound widens that package back to the whole revision: a non-literal
+include argument, an include or `#[path]` inside `macro_rules!`/`quote!`, a
+`#[path]` escaping an included source, a source that does not lex, an
+unresolvable path-dependency graph, a Cargo source override, or a tracked
+symlink. Snapshot-wide preconditions still fail every package alike, a package
+at the repository root keeps the whole revision, and a crate name shared by
+several packages binds all of them. Digests are read only while a package's own
+items are walked, after that package merged its digest in, so dropping the
+digests of a package whose crate root fails to load cannot unbind another
+package of the same crate name. A file outside the scope that a build script or
+proc macro reads without a literal declaration is not bound: Cargo does not
+track it either, and editing only such a file leaves the digest unchanged on
+both sides.
 
 Contracts are emitted from normalized `syn` ASTs. Ordinary function bodies are
 excluded from confirmed item contracts, although private implementation inputs
@@ -2606,8 +2645,9 @@ Bodies of caller-observable `async fn` and return-position `impl Trait` items
 also carry item-local `OpaqueReturnAutoTraits` evidence because their hidden
 types can change `Send`, `Sync`, and other auto traits without a signature edit.
 The proof binds a canonical body/signature to the effective product/workspace
-lock, canonicalized repo-backed Rust files, and cheap Git object identities for
-every other live tracked input. This covers nonstandard `include!`/`#[path]`
+lock, the canonicalized repo-backed Rust files of the package's Cargo input
+scope, and cheap Git object identities for every other live tracked input in
+that scope. This covers nonstandard `include!`/`#[path]`
 files and build-script assets without rereading every blob; redundant directory
 tree objects are excluded so they do not defeat Rust canonicalization. Tracked
 symlinks keep the proof unresolved until their target provenance can be proven;
@@ -2619,8 +2659,7 @@ spelling plus parameter/local irrefutable-destructuring/closure/loop/shadow
 binding names remain neutral; refutable match/`if let`/`while let` pattern names
 stay spelling-sensitive unless name resolution can prove they are bindings.
 Private helper changes remain observable. This conservative implementation
-closure can over-report after an unrelated tracked
-input changes. Missing lock-backed provenance or unresolved Cargo source
+closure can over-report after an unrelated input in the same scope changes. Missing lock-backed provenance or unresolved Cargo source
 replacement never neutralizes.
 Changed digests stay typed uncertainty rather than becoming a confirmed API
 change, and follow public reexports/inherent origins without suppressing an
@@ -2695,7 +2734,8 @@ that scope. Moving an otherwise identical impl can therefore remain a
 conservative unknown, and aliases nested only inside generic arguments are not
 claimed equivalent until compiler-backed resolution exists. Finite alias
 resolution exhaustion is a structural non-neutralizable proof state rather
-than a diagnostic-text heuristic.
+than a diagnostic-text heuristic; its evidence binds the complete private alias
+graph, which is hashed once per graph rather than once per exhausted state.
 
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 
@@ -2745,9 +2785,43 @@ atom versus its direct `not(atom)` negation. Other different feature guards
 remain potentially co-active. One shared pair-certainty
 check tests both identities and both source paths against the unknown regions
 from both revisions before any exact, cfg, relocation, or visibility fact can
-be confirmed. A glob, include, source-parse, or other relevant unknown therefore
-blocks a contradictory confirmed fact at either the source or destination.
-Standalone unknown findings retain their source side, source path, and revision
+be confirmed. A region blocks an identity only when the content it hides could
+define that identity or the name bound to it, and only when its cfg guard may
+overlap the identity's cfg region:
+
+- Manifest- and crate-level uncertainty (manifest read or parse, workspace
+  discovery, a missing library root, a resolution limit, a manifest-declared
+  target note) covers the whole crate.
+- Unread or unexpanded source (a read or parse failure, a missing, ambiguous,
+  or cyclic module, macro-generated items, `include!`, an unresolved inherent
+  owner, a custom cfg predicate) binds names in its own module and in the
+  descendants the snapshot does not prove. A child module declared under every
+  cfg variant its parent was processed with bounds the region; a conditionally
+  declared or generated child does not, and neither does any child of a crate
+  name that several packages build, because one package's modules prove
+  nothing about another package's hidden content. Such a region also covers inherent
+  members and crate-root `#[macro_export]` macros anywhere in its crate,
+  because any module can contribute them.
+- Unresolved re-exports (glob, unresolved, ambiguous, cyclic) bind names only
+  in the re-exporting module and its unproven descendants.
+- A region reaches an ancestor only through a proven re-export of a name whose
+  origin lies inside it, and it covers its module under every public module
+  alias.
+- Crate and Cargo-feature identities come from the manifest; only a source
+  failure at the crate root, which drops the crate from the snapshot, hides
+  them.
+- Proof gaps about already visible items (non-UTF-8 paths, trait-impl
+  resolution, private type dependencies, opaque-return auto traits, additive
+  derive output) block no pairing.
+
+A private `#[tokio::main]` or an `include!` in `lib.rs` therefore no longer
+turns every fact of the crate into an unknown, while a glob, include,
+source-parse, or other region that can hide a counterpart still blocks a
+contradictory confirmed fact at either the source or destination. A blocked
+pair becomes an unknown whose `unknown_source` (side, declaring source,
+revision provenance) and evidence line name the blocking region's kind, crate,
+and module, so the artifact says which region blocked it even when that
+region's own proof was neutralized. Standalone unknown findings retain their source side, source path, and revision
 provenance. Before those findings are emitted, identical one-to-one unknown
 proofs on base and target cancel out: kind, crate/module, cfg guard, evidence,
 and provenance class must match, and each proof must belong to its own snapshot.
@@ -2758,10 +2832,13 @@ Source path must also match for every unknown kind except terminal
 `include_str!` / `include_bytes!`, whose private donor file may move without
 changing the bound public proof. Changed,
 one-sided, duplicate, detached, or Git-tree-versus-overlay proofs remain typed
-unknowns. Finding IDs preserve Rust identifier case and
-serialize the complete semantic identity, including both sides' cfg regions,
-contracts, and typed unknown provenance; legal ambiguous input is data, never
-an assertion failure.
+unknowns. A finding ID is `api-delta:` followed by the first 16 hex digits of
+the SHA-256 over the complete semantic identity material: Rust identifier case,
+both sides' cfg regions, contracts, and typed unknown provenance. IDs are
+therefore deterministic and bounded in size; a finding from one of several
+folded base/target comparisons re-hashes its ID together with that comparison,
+so the same finding from different comparisons stays distinct. Legal ambiguous
+input is data, never an assertion failure.
 
 A legal non-UTF-8 Git tree component is represented by a deterministic internal
 identity whose surrogate component starts with a NUL sentinel — a byte Git

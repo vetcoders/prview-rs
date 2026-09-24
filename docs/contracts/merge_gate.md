@@ -294,8 +294,15 @@ revision-backed view used by `PUBLIC_API_DIFF.json`, `BREAKING_CHANGES.json`,
 Added-only Rust facts do not change the decision axes. Confirmed removed,
 changed, relocated, and visibility-changed facts raise the merge axis to review
 when `breaking_escalation` is enabled. Unknown facts degrade analysis confidence
-and require review; they never masquerade as confirmed removals. Review caveats
-carry the same IDs, so consumers can join directly to this structure.
+and require review; they never masquerade as confirmed removals. A finding
+`id` is `api-delta:` followed by 16 hex digits of a SHA-256 over the finding's
+complete semantic identity, so it is deterministic and bounded in size. Review
+caveats carry the exact finding count and name at most the first five IDs,
+followed by `, +K more` when there are more; the complete list stays in this
+structure, `BREAKING_CHANGES.json`, and `PUBLIC_API_DIFF.json`, and the named
+IDs join directly to it. An unknown produced because an unknown snapshot region
+blocked a pair carries that region's `unknown_source` and an evidence line
+naming the region's kind, crate, and module.
 
 `PrivateTypeDependency` findings retain the canonical guarded declaration,
 alias, and impl evidence that produced them. If finite alias resolution is
@@ -325,7 +332,13 @@ do not, and a proc-macro dependency candidate must appear under its actual
 package name with an external source and a locked version satisfying the
 declared requirement, including registry checksum or precise Git commit.
 Reachable path manifests and effective Cargo config bytes from every reachable
-manifest invocation context participate in the digest. Unresolved
+manifest invocation context participate in the digest. Each digest binds the
+package's Cargo input scope (its directory, declared targets, literal
+`include*!`/`#[path]` and `rerun-if-changed` targets, Cargo authority files,
+and the scopes of its local path dependencies), so a change outside that scope
+leaves it unchanged; anything the scope cannot bound widens it to the whole
+revision. A file outside the scope that a build script or proc macro reads
+without a literal declaration is not bound. Unresolved
 manifest/config Cargo source replacement, a stale same-name local lock entry,
 or a tracked symlink (including an overlay
 typechange to symlink) keeps the digest non-neutralizable. Additive derive
@@ -334,8 +347,9 @@ cover only generated output.
 
 `CfgPredicate` evidence for a custom cfg leaf may include
 `cfg-authority-digest:sha256:<digest>` when an active revision-backed build
-script or Cargo config can define it. The digest is deliberately conservative
-and can over-report after unrelated tracked changes. With no revision-backed
+script or Cargo config can define it. The digest binds the same per-package
+Cargo input scope; it is deliberately conservative and can over-report after
+an unrelated change inside that scope. With no revision-backed
 authority it is `cfg-authority-digest:unresolved:*`; unresolved cfg authority is
 non-neutralizable even when both sides carry identical evidence. Nested fields,
 variants, trait/impl members, and foreign items follow the same rule. For each
