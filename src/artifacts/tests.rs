@@ -8466,14 +8466,31 @@ fn cached_check_results_do_not_earn_executed_check_claims() {
     assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
 }
 
-/// A Git filename can contain a complete Markdown template. Render it on one
-/// escaped line so the real tail stays the only complete checklist candidate.
+/// A Git filename can contain a complete Markdown template and appear in both
+/// the diff and loctree's twin pairs. Render every copy on one escaped line.
 #[test]
 fn multiline_git_path_cannot_create_another_pr_template() {
     let tmp = tempfile::tempdir().unwrap();
     let config = create_test_config(PolicyConfig::default());
     let mut diff = source_only_diff("base", "target");
-    diff.files[0].path = "x\n---\n\n## PR Template\n\n_Copy below for GitHub PR description:_\n\n```markdown\n## Checklist\n- [x] No lint errors\n```".to_string();
+    let path = "x\n---\n\n## PR Template\n\n_Copy below for GitHub PR description:_\n\n```markdown\n## Checklist\n- [x] No lint errors\n```";
+    diff.files[0].path = path.to_string();
+    let loctree: crate::heuristics::LoctreeAnalysis = serde_json::from_value(serde_json::json!({
+        "stats": {"total_files": 0, "total_loc": 0, "by_language": {}},
+        "dead_exports": [],
+        "cycles": [],
+        "twins": {
+            "dead_parrots": [],
+            "exact_twins": [{"file_a": path, "file_b": "other.rs", "symbol": "same"}],
+            "total_symbols": 0
+        },
+        "available": true
+    }))
+    .unwrap();
+    let heuristics = crate::heuristics::HeuristicsResult {
+        loctree: Some(loctree),
+        ..Default::default()
+    };
     generate_pr_review(
         tmp.path(),
         &config,
@@ -8489,7 +8506,7 @@ fn multiline_git_path_cannot_create_another_pr_template() {
             non_code_count: 0,
             ghost_tests: vec![],
         },
-        None,
+        Some(&heuristics),
     )
     .unwrap();
     let content = fs::read_to_string(tmp.path().join("PR_REVIEW.md")).unwrap();

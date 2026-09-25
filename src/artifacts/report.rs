@@ -805,7 +805,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             let gate_entry = ctx.check_gates.iter().find(|g| g.name == c.name);
             let id = gate_entry
                 .map(|g| g.id.clone())
-                .unwrap_or_else(|| c.name.to_lowercase().replace(' ', "_"));
+                .unwrap_or_else(|| crate::check_id::check_id_from_name(&c.name));
             let blocking = gate_entry.map(|g| g.blocking).unwrap_or(false);
 
             let status_str = match c.status {

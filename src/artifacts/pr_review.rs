@@ -463,7 +463,12 @@ pub(crate) fn generate_pr_review(
             writeln!(md)?;
             writeln!(md, "  **Twin pairs (potential duplication):**")?;
             for twin in loctree.twins.exact_twins.iter().take(5) {
-                writeln!(md, "  - `{}` and `{}`", twin.file_a, twin.file_b)?;
+                writeln!(
+                    md,
+                    "  - `{}` and `{}`",
+                    twin.file_a.escape_debug(),
+                    twin.file_b.escape_debug()
+                )?;
             }
             if loctree.twins.exact_twins.len() > 5 {
                 writeln!(

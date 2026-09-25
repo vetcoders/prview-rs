@@ -1279,14 +1279,15 @@ quality, policy, and permission axes beside that explanation.
   unticked — is a `pr_checklist.<item>` warning (`compiles`, `tests_pass`, `no_lint_errors`) and turns
   `consistent` to `false`. The check fails closed: all three items always count toward `checked_fields`, a
   checklist line that is missing or carries an unreadable mark is itself a `pr_checklist.<item>` warning,
-  and `report.json` `/checks` entries without a readable `name`, boolean `cached`, and a `status` from the serialized
+  and `report.json` `/checks` entries without a readable `name`, matching canonical `id`, boolean
+  `cached`, and a `status` from the serialized
   vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`) withhold the comparison behind one `pr_checklist`
   warning. An existing `report.json` that cannot be decoded also withholds the comparison and warns; an
   absent report is expected while the pack is being built. An existing `PR_REVIEW.md` that cannot
   be read as UTF-8 likewise emits a `pr_checklist` warning, including a broken symlink. Only the
   checklist inside the final generated PR Template's fenced block is read; the preceding separator anchors
   it even when earlier diagnostic text or a newline-containing Git path quotes the complete template
-  signature. File paths are escaped onto one line before rendering. A second complete PR Template
+  signature. Changed paths and loctree twin paths are escaped onto one line before rendering. A second complete PR Template
   makes every item unreadable, as does a second line naming the same item for that
   item. Only without `PR_REVIEW.md` or `report.json` is nothing compared. In a normal
   run both sides come from the same check results, so this catches the rendered checklist diverging from

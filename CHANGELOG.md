@@ -253,10 +253,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does the same instead of passing as an absent checklist.
   Template parsing now anchors to the final generated separator, so a
   newline-containing Git path cannot impersonate a second template; paths are
-  rendered with escaped control characters on one line. A genuinely duplicated
+  rendered with escaped control characters on one line, including loctree twin
+  pairs. A genuinely duplicated
   complete template remains unreadable. Cached
   check replays no longer count as execution toward an auto-ticked claim;
-  their serialized `cached` flags are checked alongside statuses.
+  their serialized `cached` flags are checked alongside statuses. Serialized
+  check names are also matched to their canonical IDs, while custom check
+  names remain valid when their IDs agree.
 - A `Cargo audit` failure whose advisories the baseline already proved
   pre-existing no longer blocks the merge because of unrelated uncommitted
   changes. The pre-existing downgrade for this one check now rests on lockfile

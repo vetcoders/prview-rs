@@ -34,8 +34,9 @@ pub struct DiskArtifactCounters {
     /// `(name, outcome)` per readable check serialized in report.json `/checks`.
     pub check_outcomes_report: Option<Vec<(String, ChecklistCheckOutcome)>>,
     /// How much of report.json `/checks` could not be read: one per entry
-    /// without a string `name`, valid `status`, and boolean `cached`, or one
-    /// for a `/checks` that is missing or not an array. `report.json` always serializes all three, so a
+    /// without a string `name`, matching canonical `id`, valid `status`, and
+    /// boolean `cached`, or one for a `/checks` that is missing or not an array.
+    /// `report.json` always serializes all four, so a
     /// nonzero count is a damaged artifact, never a quiet subset.
     pub check_entries_unreadable: usize,
 }
@@ -102,6 +103,7 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
             Some(checks) => {
                 for check in checks {
                     let name = check.get("name").and_then(|v| v.as_str());
+                    let id = check.get("id").and_then(|v| v.as_str());
                     let outcome = check
                         .get("status")
                         .and_then(|v| v.as_str())
@@ -113,8 +115,10 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
                                     ChecklistCheckOutcome::from_report_status(status, cached)
                                 })
                         });
-                    match (name, outcome) {
-                        (Some(name), Some(outcome)) => {
+                    match (name, id, outcome) {
+                        (Some(name), Some(id), Some(outcome))
+                            if id == crate::check_id::check_id_from_name(name).as_str() =>
+                        {
                             outcomes.push((name.to_string(), outcome));
                         }
                         _ => out.check_entries_unreadable += 1,
@@ -244,7 +248,7 @@ impl ConsistencyReport {
                     value: format!("unreadable `/checks` entries: {unreadable_checks}"),
                 }],
                 message: format!(
-                    "PR checklist not verifiable: {checks_artifact} has `/checks` entries without a readable name, status and cached flag ({unreadable_checks}), so the PR_REVIEW.md claims cannot be re-derived from it"
+                    "PR checklist not verifiable: {checks_artifact} has `/checks` entries without a matching name/id, readable status and cached flag ({unreadable_checks}), so the PR_REVIEW.md claims cannot be re-derived from it"
                 ),
             });
             self.consistent = self.warnings.is_empty();
@@ -715,9 +719,14 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
             ("Cargo audit", "FAIL"),
         ]
         .into_iter()
-        .map(
-            |(name, status)| serde_json::json!({ "name": name, "status": status, "cached": false }),
-        )
+        .map(|(name, status)| {
+            serde_json::json!({
+                "id": crate::check_id::check_id_from_name(name),
+                "name": name,
+                "status": status,
+                "cached": false
+            })
+        })
         .collect();
         serde_json::json!({ "checks": checks }).to_string()
     }
@@ -1081,7 +1090,7 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{unticked}")).unwrap();
         std::fs::write(
             root.join("report.json"),
-            r#"{"checks":[{"name":"Clippy","status":"PASS","cached":true}]}"#,
+            r#"{"checks":[{"id":"clippy","name":"Clippy","status":"PASS","cached":true}]}"#,
         )
         .unwrap();
         let report = checklist_report(root);
@@ -1096,11 +1105,44 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         assert_eq!(warning_fields(&report), ["pr_checklist.no_lint_errors"]);
         std::fs::write(
             root.join("report.json"),
-            r#"{"checks":[{"name":"Clippy","status":"PASS"}]}"#,
+            r#"{"checks":[{"id":"clippy","name":"Clippy","status":"PASS"}]}"#,
         )
         .unwrap();
         let report = checklist_report(root);
         assert_eq!(warning_fields(&report), ["pr_checklist"]);
+    }
+
+    /// Names are extensible, but report.json serializes a stable id from each
+    /// name. Damage to one side of that pair cannot silently change a check's
+    /// checklist category while preserving the same unticked mark.
+    #[test]
+    fn serialized_check_identity_must_match_its_stable_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let unticked = INCIDENT_PR_TEMPLATE
+            .replace("- [x] Compiles", "- [ ] Compiles")
+            .replace("- [x] Tests pass", "- [ ] Tests pass")
+            .replace("- [x] No lint errors", "- [ ] No lint errors");
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{unticked}")).unwrap();
+        std::fs::write(
+            root.join("report.json"),
+            r#"{"checks":[{"id":"eslint","name":"ESL1nt","status":"FAIL","cached":false}]}"#,
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert!(!report.consistent, "{report:?}");
+        assert_eq!(warning_fields(&report), ["pr_checklist"]);
+
+        // An arbitrary check name is valid when its id follows the same
+        // canonical normalization as the report generator.
+        std::fs::write(
+            root.join("report.json"),
+            r#"{"checks":[{"id":"custom_lint","name":"Custom lint","status":"FAIL","cached":false}]}"#,
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert!(report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 3);
     }
 
     /// report.json always serializes every check with a string name and a
@@ -1118,7 +1160,7 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         .unwrap();
         for (report_json, unreadable) in [
             (
-                r#"{"checks": [{"name": "Clippy", "status": "PASS", "cached": false}, {"name": "ESLint", "status": null}, {"status": "FAIL"}]}"#,
+                r#"{"checks": [{"id": "clippy", "name": "Clippy", "status": "PASS", "cached": false}, {"name": "ESLint", "status": null}, {"status": "FAIL"}]}"#,
                 2,
             ),
             (r#"{"checks": "damaged"}"#, 1),

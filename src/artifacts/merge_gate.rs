@@ -591,7 +591,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         );
         md.push_str("| Path | Rule |\n|---|---|\n");
         for entry in neutral {
-            let _ = writeln!(md, "| `{}` | `{}` |", entry.path, entry.rule);
+            let _ = writeln!(md, "| `{}` | `{}` |", entry.path.escape_debug(), entry.rule);
         }
         md.push('\n');
     }
