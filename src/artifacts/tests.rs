@@ -1475,6 +1475,35 @@ fn a_js_export_moved_to_another_module_is_not_paired_away() {
 }
 
 #[test]
+fn one_line_js_class_members_and_ambient_return_types_are_contract() {
+    // A method renamed on a one-line class, and an ambient object return type
+    // changed without a `;`: both are changes importers see.
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,2 +1,2 @@\n-export class Client { oldMethod() {} }\n-export declare function load(): { old: string }\n+export class Client { newMethod() {} }\n+export declare function load(): { new: string }\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert!(public.added.is_empty() && public.removed.is_empty());
+    assert_eq!(public.changed.len(), 1, "{:?}", public.changed);
+    assert!(public.changed[0].after.contains("newMethod"));
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    let changed = breaking
+        .iter()
+        .filter_map(|finding| match &finding.kind {
+            BreakingKind::ChangedSignature { after, .. } => Some(after.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changed,
+        [
+            "export class Client { newMethod() {} }",
+            "export declare function load(): { new: string }"
+        ],
+        "{breaking:?}"
+    );
+}
+
+#[test]
 fn a_bare_export_default_line_is_still_an_export() {
     // `export default` with its value on the next line has no trailing space.
     let removed = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1 @@\n-export default\n-  createStore();\n+const unused = 1;\n".to_owned();
