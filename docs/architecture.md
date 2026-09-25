@@ -455,11 +455,10 @@ evidence, and buys no exception anywhere.
 
 **Rust workspace resolution.** One `cargo metadata --format-version 1 --no-deps
 --frozen` per run, with its own timeout, read from the cargo root **inside the
-reviewed tree**. `profile.cargo_root` is detected in the operator checkout,
-which on a `--pr` or `--remote` run is a different revision entirely; reading
-metadata there would describe another revision's members and path edges while
-the change set describes this one. The detected root is therefore expressed
-relative to the repository root and rebased onto the reviewed tree, and a root
+reviewed tree**. An exact review detects `profile.cargo_root` in the pinned
+target tree and expresses it relative to the logical repository root. Reading
+metadata from the operator checkout could describe another revision's members
+and path edges. The detected root is rebased onto the reviewed tree, and a root
 that cannot be placed inside it escalates with that stated reason. This is not
 the network-capable full resolve `cargo.rs` refuses: `--no-deps` returns the
 members' own manifests without resolving the dependency graph, and `--frozen`
@@ -963,7 +962,7 @@ project environment before executing, so a reviewed commit whose dependencies
 differ from the local branch would install into — and remove packages from — the
 operator's active `.venv` through the snapshot symlink. `plan_python_run()`
 therefore sets `UV_PROJECT_ENVIRONMENT` to `Config::uv_env_dir_for()`
-(`~/.prview/uv-env/<repo>/<target-sha>`) for off-`HEAD` runs: the reviewed
+(`~/.prview/uv-env/<repo>/<target-sha>`) for exact-target runs: the reviewed
 dependency set is still installed and judged, in a prview-owned environment kept
 warm across runs. A local review sets no override and uses the checkout's own
 environment exactly as before.
@@ -1169,10 +1168,10 @@ build-dependencies, `[workspace.dependencies]`, `[target.*]`, `[patch]` and
 `[replace]` — against the snapshot. An absolute path dependency, or a relative
 one that climbs out or passes through a symlink, has cargo compile source the
 reviewed commit does not contain while provenance reports `snapshot`, so the run
-is refused with the dependency named. Only off-`HEAD` runs are held to this: a
-local review is about the working tree as it stands, where a path dependency on
-a sibling checkout is an ordinary setup and no claim is made about a commit's
-contents.
+is refused with the dependency named. Exact-target runs are held to this: an
+ordinary target-less local review is about the working tree as it stands, where
+a path dependency on a sibling checkout is an ordinary setup and no claim is
+made about a commit's contents.
 
 `cargo check` at a workspace root builds its members, and a member declares its
 own dependencies, so every manifest within three levels of the cargo root is
@@ -1185,13 +1184,11 @@ refuses what it can prove escapes rather than pretending to be complete, because
 resolving the true graph means `cargo metadata`, a network-capable second
 resolve for each of six gates.
 
-Whether cargo applies at all is decided by the **reviewed** commit, not by the
-local profile. `config.profile.has_cargo` describes the checkout, so reviewing a
-branch that dropped its last `Cargo.toml` from a Rust checkout used to run every
-cargo gate and report cargo's own "could not find `Cargo.toml`" as the target's
-verdict. Eligibility asks the same resolver — the snapshot carries exactly the
-target commit's tree, so no worktree is materialised to answer it — and skips
-with a reason when no candidate resolves. When git cannot answer at all
+Whether cargo applies at all is decided by the **reviewed** commit. The run
+profile now comes from that tree before check selection. Cargo eligibility also
+checks the pinned Git tree before execution and skips with a reason when no
+candidate resolves. This second check preserves a fail-closed answer if a
+profile is supplied programmatically or a target becomes unavailable. When git cannot answer at all
 (unreadable repo, unresolvable ref) nothing is skipped: an unverifiable claim
 may no more become a skip than a verdict.
 
@@ -1203,11 +1200,9 @@ one path component deeper. `regular_file_at_commit()` answers `false` for a
 symlink, matching what manifest discovery already did, and the containment check
 resolves the manifest alongside the directory for the paths git cannot reach.
 
-Python eligibility follows the same rule for the same reason. `runs_python_checks()`
-reads the local profile, so a target that removed its last `pyproject.toml` and
-Python sources still scheduled the Python gates — and pytest exits 5 for "no
-tests collected", a blocking failure for a target the check no longer applies to.
-`missing_reviewed_python_project()` asks the reviewed tree: a `pyproject.toml`
+Python eligibility follows the same rule. The run profile is selected from the
+reviewed tree; `missing_reviewed_python_project()` checks the pinned Git tree
+again before execution. A `pyproject.toml`
 settles it alone, otherwise the tree is walked for runtime Python source. That
 walk is deliberately unbounded, unlike depth-limited cargo root discovery,
 because it concludes *absence* — a bounded search cannot prove absence, only

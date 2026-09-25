@@ -1381,9 +1381,9 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
 
 /// Locate the Tauri crate in the same tree as the context stage.
 ///
-/// The detected profile describes the operator's checkout. Preserve that exact
-/// path for a local review, but project an in-repository `.../src-tauri` cargo
-/// root onto the run-wide target worktree for an off-HEAD review. An external
+/// The run profile describes its reviewed tree. Preserve its logical path for
+/// a local review, but project an in-repository `.../src-tauri` cargo root onto
+/// the run-wide target worktree for an exact review. An external
 /// cargo root cannot exist in a snapshot of this repository, so the reviewed
 /// tree's canonical `src-tauri` location is the only truthful fallback.
 fn tauri_dir_in_context_tree(config: &Config, context_scan_root: &Path) -> PathBuf {
