@@ -1408,7 +1408,15 @@ fn materialize_pinned_gitlinks(
             .ok()
             .filter(|repo| repo.find_commit(pinned_oid).is_ok())
             .or_else(|| {
-                git2::Repository::open(&module_store)
+                // A submodule's administrative repo can outlive its checkout.
+                // Force a bare object-store view: plain `open` follows the
+                // removed core.worktree, while `open_bare` requires the config
+                // itself to declare a bare repository.
+                git2::Repository::open_ext(
+                    &module_store,
+                    git2::RepositoryOpenFlags::NO_SEARCH | git2::RepositoryOpenFlags::BARE,
+                    &[] as &[&std::ffi::OsStr],
+                )
                     .ok()
                     .filter(|repo| repo.find_commit(pinned_oid).is_ok())
             })
