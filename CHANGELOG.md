@@ -361,6 +361,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Exec format error (os error 8)`, measured on Linux CI). The header proof is
   justified by caution, not by a universal law. An unrecognized wrapper is
   `snapshot-unproven-deps`, never "borrowed".
+- The `PR_REVIEW.md` PR Template checklist no longer claims what the checks did
+  not prove. `Compiles / type-checks`, `Tests pass` and `No lint errors` were each
+  ticked when ANY check of the category passed, so a failing ESLint hid behind a
+  passing Clippy, and a run with no checks at all ticked `Compiles / type-checks`.
+  A claim is now ticked only when at least one check of its category executed and
+  every executed one passed, and Mypy counts toward `Compiles / type-checks`.
+  `CONSISTENCY_CHECK.json` and `report.json`'s `quality.consistency` re-derive the
+  three claims from the check statuses and report a rendered mark those statuses
+  do not earn as a `pr_checklist.<item>` warning; a checklist line or serialized
+  check entry that cannot be read (including a status outside the serialized
+  vocabulary) is reported too, never skipped. Only the checklist inside the PR
+  Template's fenced block counts, so text elsewhere in `PR_REVIEW.md` cannot
+  stand in for it, and each item must be named by exactly one line there: a
+  duplicated item is unreadable rather than read from its first copy.
+  A heading-shaped line in earlier check evidence does not create a second
+  template, and a present but unreadable `report.json` now withholds the
+  checklist comparison with an explicit warning. An unreadable `PR_REVIEW.md`
+  does the same instead of passing as an absent checklist.
+  Template parsing now anchors to the final generated separator, so a
+  newline-containing Git path cannot impersonate a second template; paths are
+  rendered with escaped control characters on one line, including loctree twin
+  pairs. A genuinely duplicated
+  complete template remains unreadable. Cached
+  check replays no longer count as execution toward an auto-ticked claim;
+  their serialized `cached` flags are checked alongside statuses. Serialized
+  check names are also matched to their canonical IDs and to the complete
+  executed check set in `MERGE_GATE.json` (name, status and cache state), so an
+  alias collision, omitted failed row, or missing gate cannot silently change a checklist
+  claim. Custom check names remain valid when both artifacts agree.
+- A `Cargo audit` failure whose advisories the baseline already proved
+  pre-existing no longer blocks the merge because of unrelated uncommitted
+  changes. The pre-existing downgrade for this one check now rests on lockfile
+  provenance — the audited `Cargo.lock` is the analysed target's — instead of
+  whole-tree cleanliness, which is evidence about source files and says nothing
+  about an advisory that lives in `Cargo.lock` × the advisory database. A pack
+  could previously carry `Cargo audit baseline: new=0, pre-existing=2` in its
+  review caveats and `BLOCK … Cargo audit (Failed)` in its decision with nothing
+  bridging the two. Dirt in the lockfile itself still revokes the downgrade, an
+  introduced advisory still blocks, and a changed lock with no base audit is
+  still unclassified rather than assumed clean. The proof also requires that the
+  target tree actually carry a `Cargo.lock`: `cargo audit` resolves one from the
+  registry when a crate has none and audits that, so advisories from such a run
+  are real but concern a file no commit contains, and they now keep gating
+  instead of being reported as unchanged. That lockfile is the one the audit
+  reads — `Cargo.lock` in the cargo root itself, since `cargo audit` never falls
+  back to a workspace root's — so a root lock beside a lock-less member, or a
+  symlink committed in the lockfile's place, proves nothing; and a reviewed
+  commit that moved its crate away from the configured cargo root withholds the
+  proof, because cargo ran in a directory the lockfile questions were not asked
+  about. The lock must also stay the committed one while the checks run: none
+  of prview's cargo commands pass `--locked`, so a target that adds a dependency
+  without regenerating `Cargo.lock` has the lock rewritten before the audit reads
+  it. A snapshot run whose check-boundary observations saw the audited lock
+  change, or could not be read, withholds the proof, and a local run reads the
+  audited lock again after the checks. A repository whose committed `Cargo.lock`
+  does not cover its manifest has it rewritten by every cargo run, so it no
+  longer earns the pre-existing downgrade until the regenerated lock is
+  committed; the gate says so as `Cargo.lock dirty or rewritten in the scanned
+  tree`. A new `warnings`-category advisory (`unmaintained`, `unsound`,
+  `yanked`) blocks the downgrade like a new vulnerability: it has no
+  vulnerability row of its own, so it reaches the classifier as a dashboard
+  note, and a changed lock that kept an old vulnerability while adding one no
+  longer passes as pre-existing. A yanked crate is part of that set too:
+  cargo-audit reports it with no advisory, and it used to be dropped from the
+  comparison while the check status still counted it; it is now keyed as
+  `yanked`, and any vulnerability or counted `warnings` item that cannot be
+  keyed makes the report unreadable rather than invisible — a vulnerability
+  missing its advisory id or locked version no longer shares a placeholder key
+  with an unrelated malformed one in the base. Two items that share a key (the
+  key names no package source, and rustsec's yanked check accepts both
+  spellings of the crates.io index) make the report unreadable too, instead of
+  shrinking the compared set. The base audit reads the base's copy
+  of the lockfile the audit read: a member that gains its own `Cargo.lock` is
+  no longer compared against the repository-root lock (a superset of every
+  member's resolution), so an advisory the new member lock introduced is no
+  longer classified as pre-existing — that baseline is unavailable instead. A
+  change to the cargo-audit configuration (`.cargo/audit.toml` in the cargo
+  root, whose base copy no audit reads) withholds the proof as `the
+  cargo-audit configuration (.cargo/audit.toml) changed or is dirty in the
+  scanned tree`, so dropping an ignored advisory no longer passes its failure
+  off as pre-existing. So does a configuration in the checkout that is not the
+  target's, whether staged, unstaged, untracked or ignored: it could ignore the
+  advisory a change introduced while the pre-existing ones still fail and are
+  downgraded. A configuration committed under another case (`.cargo/Audit.toml`,
+  `.CARGO/audit.toml`), which a case-insensitive checkout reads, withholds the
+  proof as `.cargo/audit.toml is committed under another case, which a
+  case-insensitive checkout reads`. A lock that was staged and then reverted in
+  the working file no longer reads as untouched: the local re-read checks the
+  index and the working tree separately. Nor does a lock or configuration
+  edited under a skip-worktree or assume-unchanged flag, which status and the
+  index's view hide: the re-read also compares the working tree with the target
+  commit directly, and the snapshot's check-boundary observations
+  (`SNAPSHOT_INTEGRITY`) read such entries on disk the same way. A snapshot
+  run whose target has no configuration withholds the proof when a check left
+  one at the path in the snapshot, which no boundary lists as untracked. A
+  relative Cargo home (`CARGO_HOME`, else `$HOME/.cargo`), inherited by the
+  checks, resolves inside the scanned tree, where cargo-audit's fallback
+  configuration and advisory database then live; it withholds the proof as
+  `the Cargo home (CARGO_HOME, else $HOME/.cargo) is relative, so cargo audit
+  read its fallback configuration and advisory database inside the scanned
+  tree`. An absolute one that is, or lies inside, the checkout or the snapshot,
+  however it is spelled or linked, withholds it the same way, as `the Cargo
+  home (CARGO_HOME, else $HOME/.cargo) lies inside the checkout or the scanned
+  tree, so cargo audit read its fallback configuration and advisory database
+  from files there`. With `CARGO_HOME` unset, a `HOME` inside the tree counts.
+  An external home whose `audit.toml` or `advisory-db` is a link into either
+  tree, or a configuration (committed or fallback) whose `[database] path` is
+  relative or leads into either tree, withholds the proof as `cargo audit's
+  fallback configuration or advisory database is not shown to lie outside the
+  checkout and the scanned tree (a link or a configured database path leads
+  there, or it could not be read)`.
+  The gate states which proof it
+  applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this
+  PR (N advisories)`; a blocking one names the advisories it blocks on — all of
+  them, counted and named from one set, so an `unmaintained` warning is no
+  longer counted as a "vulnerability" nor silently left unnamed, and they are
+  called "introduced" only while the lockfile proof holds — and an audit that
+  blocks for want of the proof says which premise was missing instead of
+  reporting a bare `Cargo audit (Failed)`. The dashboard now states the gate
+  verdict as a `data-merge-verdict` attribute on the merge chip, so its parity
+  with `MERGE_GATE.json` is assertable rather than assumed. An audit whose only
+  items are pre-existing warnings-category advisories is downgraded the same
+  way: each warning reaches the classifier with the origin the baseline counts
+  give it, where it used to have no row and held the gate at CONDITIONAL. The
+  proof describes only an audit this run executed, so `Cargo audit` replays
+  only a `passed` result from the check cache; a failing or warning report,
+  which the downgrade reads, always runs live, because the cache key does not
+  bind `.cargo/audit.toml`.
+  `docs/contracts/merge_gate.md` and `docs/architecture.md` carry the rule.
+
+- `30_context/GHOST_REFERENCES.*` now audits the reviewed tree instead of the
+  operator's checkout. For an off-`HEAD` target the scan walks the shared target
+  snapshot the rest of `30_context/` is planned from, so untracked or dirty
+  local files no longer surface as ghost findings that belong to no PR, and a
+  file the PR deletes but the checkout still holds no longer passes for a
+  relocation survivor that suppressed the real deletion. Only a local review
+  (`target == HEAD`) scans the checkout, because there it is the reviewed tree.
+  Both the relocation guard and the scan also skip `node_modules`: a snapshot
+  links it in as a symlink the walk does not follow while a local review walked
+  it for real, so a vendored file with the deleted file's name could silence a
+  real deletion in one mode only.
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch

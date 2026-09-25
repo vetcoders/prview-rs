@@ -805,7 +805,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             let gate_entry = ctx.check_gates.iter().find(|g| g.name == c.name);
             let id = gate_entry
                 .map(|g| g.id.clone())
-                .unwrap_or_else(|| c.name.to_lowercase().replace(' ', "_"));
+                .unwrap_or_else(|| crate::check_id::check_id_from_name(&c.name));
             let blocking = gate_entry.map(|g| g.blocking).unwrap_or(false);
 
             let status_str = match c.status {
@@ -1156,6 +1156,26 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             // `consistent: true` for the very run `CONSISTENCY_CHECK.json`
             // called inconsistent: one fact, two values.
             consistency.merge_provenance(input.provenance);
+            // The same checklist fold `CONSISTENCY_CHECK.json` applies, against
+            // the in-memory statuses this report is about to serialize (every
+            // one readable, hence no unreadable entries).
+            let check_outcomes: Vec<_> = input
+                .checks
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        crate::artifacts::ChecklistCheckOutcome::from_status(c.status, c.cached),
+                    )
+                })
+                .collect();
+            consistency.merge_pr_checklist(
+                disk.pr_checklist.as_deref(),
+                disk.pr_checklist_unreadable,
+                Some(&check_outcomes),
+                0,
+                "report.json",
+            );
 
             ConsistencySection {
                 consistent: consistency.consistent,

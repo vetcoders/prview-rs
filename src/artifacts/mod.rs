@@ -164,6 +164,10 @@ pub struct GenerateInput<'a> {
     /// `worktree_clean`. Recorded in `00_summary/PROVENANCE.json`; `None` when
     /// the repository could not be inspected.
     pub worktree_status_digest: Option<String>,
+    /// The dirty paths from that same read, for the per-file substrate proofs
+    /// the whole-tree `worktree_clean` boolean cannot answer (cargo audit's
+    /// lockfile). `None` when the status could not be read.
+    pub worktree_dirty_paths: Option<std::collections::BTreeSet<String>>,
     /// Operator checkout HEAD captured before checks, independently of the
     /// reviewed target. Never read again while publishing provenance.
     pub worktree_head_sha: Option<String>,
@@ -570,6 +574,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         skipped_checks,
         worktree_clean,
         worktree_status_digest,
+        worktree_dirty_paths,
         worktree_head_sha,
         governor,
     } = input;
@@ -744,7 +749,10 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     if let Some(uns) = signal::generate_unsafe_audit(&context_dir, diffs, &repo)? {
         all_checks.push(uns);
     }
-    if let Some(ghr) = signal::generate_ghost_refs(&context_dir, diffs, &repo)? {
+    // The ghost audit judges the reviewed tree, like every other 30_context
+    // artifact: the ambient checkout may carry untracked noise that belongs to
+    // no PR, and may still hold a file this PR deletes.
+    if let Some(ghr) = signal::generate_ghost_refs(&context_dir, diffs, &context_scan_root)? {
         all_checks.push(ghr);
     }
     ensure_generation_active(
@@ -886,11 +894,22 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     // Whether out-of-diff findings may be trusted as pre-existing. Computed once
     // and shared by the merge gate and the dashboard context so both verdict
     // surfaces gate the pre-existing downgrade identically (R2-9).
+    let snapshot_root = ledger.scan_dir();
+    // The checks' cargo processes inherit this process's environment.
+    let inherited_cargo_home = std::env::var_os("CARGO_HOME");
+    let operator_home = crate::checks::cargo_operator_home();
     let clean_comparison = CleanComparison::resolve(
         config,
         resolved_target,
         resolved_bases,
         worktree_clean,
+        LockEvidence {
+            dirty_before_checks: worktree_dirty_paths.as_ref(),
+            snapshot_integrity: snapshot_integrity.as_ref(),
+            snapshot_root: snapshot_root.as_deref(),
+            cargo_home: inherited_cargo_home.as_deref(),
+            operator_home: operator_home.as_deref(),
+        },
         worktree_head_sha.as_deref(),
         diffs,
     );
@@ -1559,6 +1578,15 @@ fn generate_consistency_check(
     // per-check substrate disagree cannot be published as consistent, however
     // well its numbers line up.
     report.merge_provenance(provenance);
+    // Claims, not just counters: the PR_REVIEW.md checklist is re-derived from
+    // the check statuses report.json serialized.
+    report.merge_pr_checklist(
+        disk.pr_checklist.as_deref(),
+        disk.pr_checklist_unreadable,
+        disk.check_outcomes_report.as_deref(),
+        disk.check_entries_unreadable,
+        "report.json",
+    );
 
     fs::write(
         summary_dir.join("CONSISTENCY_CHECK.json"),

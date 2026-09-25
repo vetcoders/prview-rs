@@ -78,9 +78,9 @@ fn observe_tracked_changes(
     let staged = repo.diff_tree_to_index(Some(&tree), Some(&index), Some(&mut options))?;
     let working = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
     let mut paths = BTreeSet::new();
-    for delta in staged.deltas().chain(working.deltas()) {
+    let mut record = |delta: git2::DiffDelta<'_>| {
         if delta.status() == git2::Delta::Untracked || delta.status() == git2::Delta::Ignored {
-            continue;
+            return;
         }
         for path in [delta.old_file().path_bytes(), delta.new_file().path_bytes()]
             .into_iter()
@@ -94,6 +94,36 @@ fn observe_tracked_changes(
             };
             paths.insert(display);
         }
+    };
+    staged
+        .deltas()
+        .chain(working.deltas())
+        .for_each(&mut record);
+    // A check can mark an entry skip-worktree or assume-unchanged, and the
+    // index-to-workdir diff then reports it unmodified however its file was
+    // edited, and an assume-unchanged one even once it is removed: libgit2
+    // trusts both flags (`maybe_modified`, `diff_delta__from_one`). Those
+    // entries are read once more on disk against the target itself, past the
+    // index.
+    let flagged: Vec<Vec<u8>> = index
+        .iter()
+        .filter(|entry| {
+            entry.flags_extended & git2::IndexEntryExtendedFlag::SKIP_WORKTREE.bits() != 0
+                || entry.flags & git2::IndexEntryFlag::VALID.bits() != 0
+        })
+        .map(|entry| entry.path)
+        .collect();
+    if !flagged.is_empty() {
+        let mut on_disk_options = git2::DiffOptions::new();
+        on_disk_options
+            .include_untracked(false)
+            .include_typechange(true)
+            .disable_pathspec_match(true);
+        for path in flagged {
+            on_disk_options.pathspec(path);
+        }
+        let on_disk = repo.diff_tree_to_workdir(Some(&tree), Some(&mut on_disk_options))?;
+        on_disk.deltas().for_each(&mut record);
     }
     anyhow::ensure!(
         repo.head()?.peel_to_commit()?.id() == head,

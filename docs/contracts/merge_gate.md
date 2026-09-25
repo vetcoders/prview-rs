@@ -262,6 +262,233 @@ remains effective. An all-pre-existing count does **not** prove `PASS`, because
 the effective downgrade also depends on baseline/trust provenance that the
 aggregate does not carry.
 
+### What licenses a pre-existing downgrade
+
+An all-out-of-diff failure is downgraded only for a check whose finding
+*locations* are an exhaustive baseline signal, and only when that check's
+findings are provably from the analysed target. For the file-scoped scanners
+(`semgrep_scan`, `eslint`, `stylelint`, `ruff`, `prettier`, `rustfmt`) the
+provenance question is about the tree: a dirty worktree can present an
+uncommitted finding as out-of-diff, so a dirty local scan downgrades nothing,
+and on a remote/snapshot target only the checks that scan the target snapshot
+qualify.
+
+`cargo_audit` is judged differently, because its findings are not source
+locations. An advisory is `Cargo.lock` × the advisory database, filtered by the
+audit's configuration, so no uncommitted source can move it and whole-tree
+cleanliness is not evidence about it either way. Its proof has three premises,
+and all must hold.
+
+First, the target commit's tree must actually carry the `Cargo.lock` the audit
+reads — the one in the cargo root itself, committed as a regular file. `cargo
+audit` opens `Cargo.lock` relative to the directory it runs in and never falls
+back to a workspace root's, so a root lock beside a lock-less member does not
+count, and neither does a symlink committed in the lockfile's place. `cargo
+audit` does not refuse a crate that has no lockfile: it resolves one from the
+registry, audits that, and exits non-zero on a hit. Those advisories are real,
+but they are about a file no commit contains, so nothing about them can be
+"unchanged by this PR". A target with no such lockfile, or a lock question that
+cannot be answered, proves nothing — in every run shape.
+
+Second, the lockfile the audit read must be that one: true by construction when
+the run scanned a target snapshot at the cargo root the first premise asked
+about, and true for a local run when that lockfile carried no uncommitted change
+(read from the status frozen before the checks ran). A reviewed commit that
+moved its crate away from the configured cargo root (`crates/core` → `backend`)
+has cargo run in the new directory, so a snapshot of it proves nothing. Unrelated
+dirt in the tree no longer suppresses the downgrade; a dirty audited lockfile
+does, and an unreadable status establishes nothing. The lockfile must also have
+stayed that one while the checks ran: prview's cargo commands do not pass
+`--locked`, so a lock the manifest has outgrown is rewritten by the first of
+them before the audit reads it. A snapshot run whose check-boundary
+observations (`20_quality/SNAPSHOT_INTEGRITY.*`) saw the audited lock change,
+or could not be read, proves nothing (each boundary also reads an entry marked
+skip-worktree or assume-unchanged on disk, for the reason below); a local run
+reads the audited lock again after the checks, in the index and in the working
+tree separately (a change
+staged and then reverted in the working file cancels out in one combined
+diff), and once more on disk against the commit itself, past the index: an
+entry marked skip-worktree or assume-unchanged is reported unmodified by status
+and by the index's view of the working tree however it was edited. A lock that
+no longer matches the target commit in any of these proves nothing either.
+
+Third, the configuration the audit applies must not have changed between the
+base and the target. `cargo audit` reads `.cargo/audit.toml` in the directory it
+runs in, without walking up, and otherwise `$CARGO_HOME/audit.toml`. That file's
+`ignore` list, `informational_warnings` and `[output] deny` decide which
+advisories fail. No audit reads the base's configuration: the audit runs in the
+reviewed tree, and the base audit reads the base's lockfile but runs in the
+repository's checkout. A change that only drops an ignored advisory therefore
+fails the audit with the lockfile untouched and every finding out-of-diff.
+`.cargo/audit.toml` in the cargo root must be the same committed file in the
+base and the target of every diff, or the proof is withheld. A rename or
+deletion counts, and so does anything a checkout could resolve differently,
+such as a symlink at the path or at a parent. A configuration anywhere else, for
+example the repository root's for a member cargo root, is not the file the audit
+read and does not count.
+
+The file the audit read must also be the target's. A local review audits the
+checkout, so a staged, unstaged, untracked or ignored `.cargo/audit.toml` there
+is the configuration `cargo audit` applied. Such a file can ignore the advisory
+the change introduced while pre-existing ones still fail, and the downgrade
+would then pass a change that its own committed configuration blocks. A local
+review therefore withholds the proof when any of these holds:
+
+- the status read before the checks lists the file or a parent of it, such as
+  an untracked symlinked `.cargo`;
+- after the checks, the tracked file differs from the target's in the index, in
+  the working tree, or on disk past a skip-worktree or assume-unchanged flag;
+- the target has no configuration and a file exists at the path. This is what
+  catches an ignored configuration, which no status read lists.
+
+A snapshot run audits a tree materialised from the target, so there only a
+check can make the file differ. A check boundary that saw the tracked file
+rewritten withholds the proof. No boundary lists an untracked or ignored file,
+though, so where the target has no configuration any file at the path in the
+snapshot's working tree withholds the proof too, and a snapshot tree that cannot
+be looked at proves nothing. That catches a configuration a check leaves
+behind. A file that code run during the checks writes and removes again is
+beyond the proof, like everything else such code can do (below): non-Cargo
+checks run alongside `cargo audit`, so no capture at the audit's boundaries
+could close that race either.
+
+A case-insensitive filesystem reads `.cargo/audit.toml` under any spelling, so
+a committed `.cargo/Audit.toml` or `.CARGO/audit.toml` is a configuration the
+audit may apply that a comparison by exact path never sees; with two spellings
+committed, which one the checkout leaves on disk is its own choice. A path that
+matches `.cargo/audit.toml` only when case is ignored, in the target or on
+either side of any diff, therefore withholds the proof on its own, and the
+dirty paths above are matched ignoring case as well.
+
+cargo-audit's Cargo home is `CARGO_HOME` when it is set and non-empty, and
+otherwise `$HOME/.cargo` (`home::cargo_home`). With an absolute home outside
+the repository checkout and the target snapshot, its `audit.toml` lies outside
+the reviewed tree: it is the environment's policy, applied alike to the audit
+and its baseline, and no commit speaks for it. prview sets neither variable for
+its checks, so they inherit the operator's, and a relative home resolves
+against the directory the audit ran in. That puts the fallback configuration,
+and the advisory database under it, inside the scanned tree, where a change can
+edit them with the lockfile untouched. An absolute home that is, or lies
+inside, the checkout or the snapshot does the same, whether it comes from
+`CARGO_HOME=$PWD/.cargo-home` or from `HOME` pointing into the tree with
+`CARGO_HOME` unset. For a member cargo root with no configuration of its own,
+the latter makes the repository root's `.cargo/audit.toml` the fallback. Either
+withholds the proof on its own; containment is judged on the path as spelled
+and as resolved through symbolic links, ignoring case. With no home at all,
+cargo-audit reads no fallback, and rustsec cannot place its default database.
+
+A home outside both trees is still not enough on its own. Its `audit.toml` or
+`advisory-db` can be a symbolic link into the checkout, and the configuration
+the audit applied, the committed `.cargo/audit.toml` or else the fallback, can
+name the advisory database with `[database] path`, which cargo-audit opens as
+written: a relative path lies under the directory the audit ran in. The
+database decides which advisories exist at all, so a change that edits it can
+drop the advisory it introduced with the lockfile untouched, and a configured
+database lets the audit run even with no home. Either input that leads inside
+the checkout or the scanned tree withholds the proof, and so does a fallback
+configuration that exists but cannot be read. `[database] url` is not such an
+input: rustsec fetches the database only from an `https://` address, and on any
+other cargo-audit exits without a report, which leaves nothing to downgrade.
+Code that runs during the checks with the operator's permissions is outside
+what the proof can speak for: it can edit the Cargo home's configuration, or
+the database, as easily as the tree.
+
+The proof licenses a downgrade; it never manufactures one. Advisories the diff
+introduced stay `introduced` — warnings-category ones too (`unmaintained`,
+`unsound`, `yanked`): they have no vulnerability row of their own, so each one
+reaches the classifier as a dashboard note row carrying the origin the baseline
+counts give it (a note, never a SARIF result or part of `findings_count`) —
+`in_diff: true` for one counted `new`, `false` for one counted `pre-existing`,
+`null` for one with no base audit. An audit that introduced one is `mixed` or
+`introduced`, never downgraded; an audit whose only items are pre-existing
+warnings is downgraded exactly like a pre-existing vulnerability instead of
+staying `unclassified`; and a changed lock with no base audit leaves every row
+`in_diff: null`, which stays `unclassified` and keeps gating.
+
+The proof is taken from the files as they are when the gate is written, so it
+can only describe an audit that ran in the same run. `Cargo audit` therefore
+replays only a `passed` result from the check cache — a report with nothing to
+downgrade. A failing or warning report always runs live, since its cache key
+binds the lockfile and the day but not the audit configuration. The base audit reads the base's copy of the lockfile the audit
+read; a base without one (a member lock the change added beside a root lock)
+has no base audit. Every vulnerability entry and every `warnings` item the
+check status counts is part of the compared set — a yanked release, which has
+no advisory, under the id `yanked` — and an item that cannot be keyed, or two
+items that share a key, make the report unreadable. A run with no diff baseline at all (`--current-only`, or no
+resolved base differing from the target) downgrades nothing, whatever the
+lockfile says.
+
+A consequence worth stating: an advisory published *after* the base commit, on a
+lockfile this change never touched, is reported as pre-existing. It is debt
+newly revealed, not debt introduced — the change moved no dependency, the
+advisory database moved. The `Cargo audit baseline` caveat's `status` and counts
+remain the record of what was compared.
+
+That caveat states a provenance claim, so it is qualified by the same proof the
+check row is. When the lockfile proof holds it reads plainly:
+
+- `Cargo audit baseline: status=<status>, new=N, pre-existing=M, resolved=R,
+  unknown-baseline=U`
+
+When the proof was withheld, the counts are still the right count of advisories
+and the wrong thing to state as settled, so the gap is appended in the same
+words the blocking line uses:
+
+- `… unknown-baseline=U (<gap>; pre-existing=M is not shown to predate this
+  change)`, or `… unknown-baseline=U (<gap>)` when `M` is zero and there is no
+  claim to qualify.
+
+The counts themselves never change — classification is the proof's job, not the
+renderer's. The qualifier also disambiguates `status=not-required`, which means
+"the lock did not change, so no base audit was needed" and would otherwise read,
+against a target carrying no lockfile at all, as an untouched file rather than
+an absent one.
+
+Both outcomes are named in the check row's `reason`: a downgraded audit reads
+`pre-existing: Cargo.lock unchanged by this PR (N advisories)` or `pre-existing:
+unchanged vs base audit (N advisories)`, while a blocking one appears in
+`decision.blocking_issues` as one of
+
+- `Cargo audit (<Status>): N new advisories introduced (RUSTSEC-… in <package>
+  <version>, …), M pre-existing` when the lockfile proof holds, or `Cargo audit
+  (<Status>): N new advisories vs the base audit (…), M pre-existing; provenance
+  proof unavailable: <gap>` when it was withheld — new against the base audit,
+  but not shown to be the target's own, so not called introduced,
+- `Cargo audit (<Status>): N advisories with no base comparison (baseline
+  <status>)` when nothing could be compared,
+- `Cargo audit (<Status>): no readable advisory report (baseline
+  current-unavailable), so no advisory could be classified either way` when the
+  run produced nothing parseable — the report is the missing thing, so the
+  lockfile is not what the sentence is about, or
+- `Cargo audit (<Status>): provenance proof unavailable: <gap> (M advisories not
+  shown to predate this change)` when the counts are silent and the lockfile
+  proof was withheld — `<gap>` being `no Cargo.lock in the target tree`,
+  `Cargo.lock dirty or rewritten in the scanned tree`, `the reviewed commit moved the cargo
+  root away from the configured one`, `the cargo-audit configuration
+  (.cargo/audit.toml) changed or is dirty in the scanned tree`, `.cargo/audit.toml
+  is committed under another case, which a case-insensitive checkout reads`,
+  `the Cargo home (CARGO_HOME, else $HOME/.cargo) is relative, so cargo audit
+  read its fallback configuration and advisory database inside the scanned
+  tree`, `the Cargo home (CARGO_HOME, else $HOME/.cargo) lies inside the
+  checkout or the scanned tree, so cargo audit read its fallback configuration
+  and advisory database from files there`, `cargo audit's fallback
+  configuration or advisory database is not shown to lie outside the checkout
+  and the scanned tree (a link or a configured database path leads there, or it
+  could not be read)`, or
+  `the scanned tree could not be tied to the target commit`. When `M` is zero the
+  parenthetical is omitted and the gap
+  stands alone: no line asserts a count it does not have.
+
+The set the first line counts and the set it names are one set: `new` counts
+every advisory in the report, `vulnerabilities` and the `warnings` categories
+(`unmaintained`, `unsound`, `yanked`) alike, and each one is named with the
+locked package the key carries. The noun is therefore "advisories", not
+"vulnerabilities", and `N` always equals the number of names.
+
+`blocking_issues` entries remain free-form non-empty strings; consumers that
+need structure read `checks[]` and `decision.quality_failure_details[]`, not
+this text.
+
 The emitter and validator share this per-source disposition table:
 
 | Effective inline fact | Per-source disposition |
@@ -437,6 +664,16 @@ carrying a contradiction is also
 reported as `consistent: false` in `00_summary/CONSISTENCY_CHECK.json` **and** in
 `report.json`'s `quality.consistency`: the two sections check different counters,
 but neither may call a run consistent while a substrate contradiction stands.
+Both sections also re-derive the `PR_REVIEW.md` checklist claims from the check
+statuses and report any rendered mark those statuses do not earn — and any
+checklist line or serialized check entry whose name, canonical id, status or cached flag cannot be read — as a
+`pr_checklist` warning. The consistency reader requires this gate's check rows
+to be readable and every executed `(id, name, status, cached)` row to match the
+complete set in `report.json`; alias collisions, omissions and duplicates warn.
+The comparison maps this gate's lowercase raw statuses to the report's uppercase
+display statuses through a closed five-value vocabulary.
+`CONSISTENCY_CHECK.json` is written after this file, so
+none of its warnings changes the gate decision.
 
 `tools/validate_merge_gate.py` enforces the whole of the above on a 3.0 gate, not
 just the row shapes:
