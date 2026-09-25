@@ -241,9 +241,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now pairs with an added one in the same file under the same name and
   namespace. Lines that agree once formatting, comments and implementation are
   set aside report nothing; lines that differ, such as a new parameter, are one
-  signature change in both artifacts instead of a removal. A re-export list, an
-  export with no single name, and an export moved to another file keep their
-  removal.
+  signature change in both artifacts instead of a removal. Comments (`//` and
+  `/* */`, with or without surrounding spaces), string, template and
+  regular-expression literals, a one-line class's members, a return-type
+  literal and whitespace that separates two operators are all kept apart from
+  formatting, so none of them can hide a real change. A re-export list, an
+  export with no single name, an export moved to another file (including the old
+  path of a renamed module), and an export written indented inside a TypeScript
+  `namespace` or `declare module` block keep their removal.
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch

@@ -1309,39 +1309,57 @@ fn cross_language_ts_to_rust_keeps_only_the_js_removed_side() {
 
 #[test]
 fn quoted_and_unquoted_space_js_paths_survive_both_legacy_adapters() {
-    for patch in [
-        "diff --git \"a/src/quoted\\040api.ts\" \"b/src/quoted\\040api.ts\"\n--- \"a/src/quoted\\040api.ts\"\n+++ \"b/src/quoted\\040api.ts\"\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n",
-        "diff --git a/src/plain old.ts b/src/plain new.ts\n--- a/src/plain old.ts\n+++ b/src/plain new.ts\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n",
-    ] {
-        let filtered = signal::js_ts_patch_sections(patch);
-        assert!(filtered.contains("export function api"));
+    // One file: the same export with other parameter types is one signature
+    // change, reported under the decoded path.
+    let quoted = "diff --git \"a/src/quoted\\040api.ts\" \"b/src/quoted\\040api.ts\"\n--- \"a/src/quoted\\040api.ts\"\n+++ \"b/src/quoted\\040api.ts\"\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n";
+    let filtered = signal::js_ts_patch_sections(quoted);
+    assert!(filtered.contains("export function api"));
 
-        // The same export with other parameter types is one signature change,
-        // reported under the path the section was parsed with.
-        let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
-        assert!(
-            public.changed.iter().any(|change| {
-                change.file.ends_with(".ts")
-                    && change.before.contains("value: number")
-                    && change.after.contains("value: string")
-            }),
-            "{filtered}"
-        );
-        assert!(
-            public.removed.is_empty() && public.added.is_empty(),
-            "{filtered}"
-        );
+    let public = signal::analyze_js_ts_public_api_diff(&[quoted.to_owned()]);
+    assert!(
+        public.changed.iter().any(|change| {
+            change.file == "src/quoted api.ts"
+                && change.before.contains("value: number")
+                && change.after.contains("value: string")
+        }),
+        "{filtered}"
+    );
+    assert!(
+        public.removed.is_empty() && public.added.is_empty(),
+        "{filtered}"
+    );
 
-        let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
-        assert!(breaking.iter().any(|finding| {
-            finding.file.ends_with(".ts")
-                && matches!(
-                    &finding.kind,
-                    BreakingKind::ChangedSignature { before, after }
-                        if before.contains("value: number") && after.contains("value: string")
-                )
-        }));
-    }
+    let breaking = signal::analyze_js_ts_breaking_changes(&[quoted.to_owned()]);
+    assert!(breaking.iter().any(|finding| {
+        finding.file == "src/quoted api.ts"
+            && matches!(
+                &finding.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("value: number") && after.contains("value: string")
+            )
+    }));
+
+    // A rename: each side keeps its own spaced path, so the old module's
+    // export is a removal there and the new module's an addition.
+    let renamed = "diff --git a/src/plain old.ts b/src/plain new.ts\n--- a/src/plain old.ts\n+++ b/src/plain new.ts\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n";
+    let filtered = signal::js_ts_patch_sections(renamed);
+    assert!(filtered.contains("export function api"));
+
+    let public = signal::analyze_js_ts_public_api_diff(&[renamed.to_owned()]);
+    assert_eq!(public.removed.len(), 1, "{filtered}");
+    assert_eq!(public.removed[0].file, "src/plain old.ts");
+    assert!(public.removed[0].signature.contains("value: number"));
+    assert_eq!(public.added.len(), 1, "{filtered}");
+    assert_eq!(public.added[0].file, "src/plain new.ts");
+    assert!(public.added[0].signature.contains("value: string"));
+    assert!(public.changed.is_empty(), "{filtered}");
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[renamed.to_owned()]);
+    assert!(breaking.iter().any(|finding| {
+        finding.file == "src/plain old.ts"
+            && finding.line.contains("value: number")
+            && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
+    }));
 }
 
 /// The export lines of the vbl-190 review: two inventories whose arrow
@@ -1472,6 +1490,50 @@ fn a_js_export_moved_to_another_module_is_not_paired_away() {
     assert!(breaking.iter().any(|finding| {
         finding.file == "src/a.ts" && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
     }));
+}
+
+#[test]
+fn a_js_export_reformatted_in_a_renamed_module_stays_removed_from_the_old_path() {
+    // A modified rename, as Git emits it: one section whose removed lines are
+    // the old module's and whose added lines are the new module's. Importers
+    // of `src/old.ts` break even though the export text barely changed.
+    let patch = "diff --git a/src/old.ts b/src/new.ts\nsimilarity index 80%\nrename from src/old.ts\nrename to src/new.ts\nindex 1111111..2222222 100644\n--- a/src/old.ts\n+++ b/src/new.ts\n@@ -1,2 +1,2 @@\n-export const load = (path) => {\n+export const load = (path) =>\n export const keep = 1;\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert_eq!(public.removed.len(), 1, "{public:?}");
+    assert_eq!(public.removed[0].file, "src/old.ts");
+    assert_eq!(public.added.len(), 1, "{public:?}");
+    assert_eq!(public.added[0].file, "src/new.ts");
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert_eq!(breaking.len(), 1, "{breaking:?}");
+    assert_eq!(breaking[0].file, "src/old.ts");
+    assert!(matches!(
+        breaking[0].kind,
+        BreakingKind::RemovedSymbol { .. }
+    ));
+}
+
+#[test]
+fn a_js_export_moved_between_namespaces_is_not_paired_away() {
+    // Consumers of `A.value` break when the line moves to `namespace B`,
+    // although the line itself is unchanged.
+    let patch = "diff --git a/src/ns.ts b/src/ns.ts\n--- a/src/ns.ts\n+++ b/src/ns.ts\n@@ -1,6 +1,6 @@\n export namespace A {\n-  export const value = 1;\n }\n export namespace B {\n+  export const value = 1;\n }\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert_eq!(public.removed.len(), 1, "{public:?}");
+    assert_eq!(public.added.len(), 1, "{public:?}");
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(
+        breaking.iter().any(|finding| {
+            finding.line == "export const value = 1;"
+                && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
+        }),
+        "{breaking:?}"
+    );
 }
 
 #[test]

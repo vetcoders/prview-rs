@@ -240,6 +240,61 @@ fn flush_js_ts_section(output: &mut String, section: &str, header_paths: Option<
     }
 }
 
+/// The file each side of one legacy diff section belongs to.
+///
+/// `diff --git` opens a section, and the `--- a/…` and `+++ b/…` markers
+/// before its first hunk name its old and its new side. The two differ in a
+/// rename: a removed line belongs to the old path and an added line to the
+/// new one, so an export the old module loses is not paired away with its
+/// re-addition under the new path. A section without markers keeps the two
+/// paths of its header, and a `/dev/null` side keeps them too: it has no
+/// lines.
+#[derive(Debug, Default)]
+pub(crate) struct LegacyPatchSides {
+    pub(crate) old: String,
+    pub(crate) new: String,
+    in_hunk: bool,
+}
+
+/// A header line [`LegacyPatchSides::read`] took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyPatchHeader {
+    /// A `diff --git` line: a new section starts.
+    Section,
+    /// A `---` or `+++` side marker of the current section.
+    Marker,
+}
+
+impl LegacyPatchSides {
+    /// Take a section's header lines. Any other line, a hunk's content
+    /// included, returns `None` and is left to the caller.
+    pub(crate) fn read(&mut self, line: &str) -> Option<LegacyPatchHeader> {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some(space_idx) = rest.find(" b/") {
+                self.old = rest[..space_idx].to_owned();
+                self.new = rest[space_idx + 3..].to_owned();
+            }
+            self.in_hunk = false;
+            return Some(LegacyPatchHeader::Section);
+        }
+        if line.starts_with("@@") {
+            self.in_hunk = true;
+        }
+        if self.in_hunk {
+            return None;
+        }
+        let marker_path = |path: &str| path.split('\t').next().unwrap_or(path).to_owned();
+        if let Some(path) = line.strip_prefix("--- a/") {
+            self.old = marker_path(path);
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
+            self.new = marker_path(path);
+        } else if !line.starts_with("--- ") && !line.starts_with("+++ ") {
+            return None;
+        }
+        Some(LegacyPatchHeader::Marker)
+    }
+}
+
 fn legacy_safe_patch_path(path: &str) -> String {
     path.replace('\n', "\\n")
         .replace('\r', "\\r")
@@ -473,6 +528,20 @@ pub(crate) fn js_ts_export(line: &str) -> Option<JsTsExport> {
         type_only: kind == JsDeclKind::Type,
         contract: js_ts_export_contract(line, kind),
     })
+}
+
+/// Whether a JS/TS export line, as the diff shows it, is written indented.
+///
+/// A module's `export` statements sit at its top level, so an indented one is
+/// a member of a TypeScript `namespace` or ambient `module` block. What
+/// importers bind then includes the enclosing name (`A.value`), which the line
+/// does not show and a hunk may not either: moving `export const value = 1`
+/// from `namespace A` to `namespace B` is an unchanged line that breaks every
+/// consumer of `A.value`. Such a line is never paired with the other side.
+/// An unindented member of such a block still pairs: that is the bound of this
+/// line heuristic.
+pub(crate) fn js_ts_export_is_nested(content: &str) -> bool {
+    content.starts_with(char::is_whitespace)
 }
 
 /// What part of a declaration line is its contract.
@@ -1601,5 +1670,53 @@ mod tests {
             "export function load(): Result | { old: string }",
             "export function load(): Result | { new: string }"
         ));
+    }
+
+    #[test]
+    fn js_ts_export_is_nested_only_when_indented() {
+        assert!(!js_ts_export_is_nested("export const value = 1;"));
+        assert!(js_ts_export_is_nested("  export const value = 1;"));
+        assert!(js_ts_export_is_nested("\texport function f() {"));
+    }
+
+    #[test]
+    fn legacy_patch_sides_name_each_side_from_markers_before_the_first_hunk() {
+        let mut sides = LegacyPatchSides::default();
+        assert_eq!(
+            sides.read("diff --git a/src/new.ts b/src/new.ts"),
+            Some(LegacyPatchHeader::Section)
+        );
+        assert_eq!(
+            sides.read("--- a/src/old.ts"),
+            Some(LegacyPatchHeader::Marker)
+        );
+        assert_eq!(
+            sides.read("+++ b/src/new.ts"),
+            Some(LegacyPatchHeader::Marker)
+        );
+        assert_eq!(
+            (sides.old.as_str(), sides.new.as_str()),
+            ("src/old.ts", "src/new.ts")
+        );
+
+        // Inside a hunk, `--- a/…` is a removed line's content.
+        assert_eq!(sides.read("@@ -1 +1 @@"), None);
+        assert_eq!(sides.read("--- a/src/other.ts"), None);
+        assert_eq!(sides.old, "src/old.ts");
+
+        // A new section starts from its own header, `/dev/null` keeping it.
+        assert_eq!(
+            sides.read("diff --git a/src/added.ts b/src/added.ts"),
+            Some(LegacyPatchHeader::Section)
+        );
+        assert_eq!(sides.read("--- /dev/null"), Some(LegacyPatchHeader::Marker));
+        assert_eq!(
+            sides.read("+++ b/src/added.ts\t"),
+            Some(LegacyPatchHeader::Marker)
+        );
+        assert_eq!(
+            (sides.old.as_str(), sides.new.as_str()),
+            ("src/added.ts", "src/added.ts")
+        );
     }
 }

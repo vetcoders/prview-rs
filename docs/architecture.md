@@ -2925,12 +2925,29 @@ vbl-190 review) reported it removed. `common::js_ts_export` gives each line the
 binding importers use (the declared name or `default`), whether it lives in
 TypeScript's type namespace (`interface`, `type`), and a comparison form with
 formatting, comments and implementation removed: an arrow function up to its
-`=>`, a `function`/`class` without the body it opens. A removal pairs with an
-addition in the same file with the same name and namespace, equal forms
-first. Equal forms report nothing; different forms are one `ChangedSignature`.
-A line with no single name (`export { a } from`, `export *`, `export =`) or an
-export moved to another file stays a `RemovedSymbol`: its importers still
-break.
+`=>`, a `function` without the body it opens or holds when that `{` follows the
+parameter list or a finished return type (a `{` after `:`, `=>`, `|` opens a
+return-type literal, which stays), a `class` without only the `{` that opens
+its body below (members written on the line stay). The form is built from a
+line lexer (`common::js_lex`) that reads string, template and
+regular-expression literals as opaque units and `//` / `/* */` comments as
+whitespace; a `/` is a division only after an operand, and whitespace survives
+where it separates two identifier or two operator characters. A removal pairs
+with an addition in the same file with the same name and namespace, equal
+forms first. Equal forms report nothing; different forms are one
+`ChangedSignature`.
+
+Each side of a section has its own file (`common::LegacyPatchSides`): removed
+lines take the `--- a/…` path and added lines the `+++ b/…` path read before
+the first hunk, so a modified rename's old-module export is a removal there and
+not paired away by the new path the normalized `diff --git` header carries. A
+line with no single name (`export { a } from`, `export *`, `export =`), an
+export moved to another file, and an export written indented
+(`common::js_ts_export_is_nested`) stay a `RemovedSymbol`: an indented export
+is a member of a `namespace` or ambient `module` block whose name the line
+does not show, and moving it between blocks breaks consumers of the old
+qualified name. An unindented member of such a block still pairs; that is the
+bound of the line heuristic.
 
 The old Rust limitation below is historical only: a diff-only scanner could not
 see an enum variant, trait method, or public struct field removed beneath an
@@ -3502,10 +3519,12 @@ analysis receives JS/TS patch sections only.
   write `PUBLIC_API_DIFF.json` and `.md`
 - `analyze_js_ts_public_api_diff(patch_texts)` — scans added and removed
   export lines, then pairs the two sides of one declaration (`api_pair_key`):
-  same file, symbol type and name, and for JS/TS the same namespace. JS/TS
-  lines compare on `common::js_ts_export`'s comparison form, so a formatter
-  rewriting an unchanged export is no change; equal forms are claimed first and
-  report nothing, and a pair that differs is one signature change.
+  same file (the old path for a removed line, the new one for an added line),
+  symbol type and name, and for JS/TS the same namespace; an indented JS/TS
+  export never pairs. JS/TS lines compare on `common::js_ts_export`'s
+  comparison form, so a formatter rewriting an unchanged export is no change;
+  equal forms are claimed first and report nothing, and a pair that differs is
+  one signature change.
 
 Confirmed Rust facts include namespace, cfg, before/after contracts, source
 paths, provenance, confidence, evidence, and stable IDs. JS/TS remains a bounded

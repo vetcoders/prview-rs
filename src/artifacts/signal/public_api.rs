@@ -4,8 +4,8 @@ use super::api_delta::{
     ApiArtifactView, ApiDeltaConfidence, ApiDeltaFinding, ApiDeltaKind, REPO_BACKED_RUST_API_SOURCE,
 };
 use super::common::{
-    ReviewFileCategory, RustLexState, classify_review_file, js_ts_export, js_ts_patch_sections,
-    strip_rust_non_code,
+    LegacyPatchHeader, LegacyPatchSides, ReviewFileCategory, RustLexState, classify_review_file,
+    js_ts_export, js_ts_export_is_nested, js_ts_patch_sections, strip_rust_non_code,
 };
 use crate::checks::{CheckResult, CheckStatus};
 use anyhow::Result;
@@ -372,8 +372,11 @@ fn analyze_patch_for_api_diff(
     let mut removed = Vec::new();
     let mut changed = Vec::new();
 
-    let mut current_file = String::new();
-    let mut should_scan = false;
+    // Removed lines belong to the section's old path and added lines to its new
+    // one, so a rename section's two sides are two files.
+    let mut sides = LegacyPatchSides::default();
+    let mut scan_old = false;
+    let mut scan_new = false;
     // The old (removed) and new (added) sides of a diff are two different file
     // versions interleaved. Lexing them through one shared state let a `/*`
     // opened on one side swallow symbols on the other. Track them separately;
@@ -381,20 +384,18 @@ fn analyze_patch_for_api_diff(
     let mut rust_state_old = RustLexState::default();
     let mut rust_state_new = RustLexState::default();
 
-    let mut raw_added = Vec::new(); // (file, type, sig)
+    let mut raw_added = Vec::new(); // (file, type, sig, nested)
     let mut raw_removed = Vec::new();
 
+    let scanned = |path: &str| matches!(classify_review_file(path), ReviewFileCategory::Code);
     for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            if let Some(space_idx) = rest.find(" b/") {
-                current_file = rest[space_idx + 3..].to_string();
-                should_scan = matches!(
-                    classify_review_file(&current_file),
-                    ReviewFileCategory::Code
-                );
+        if let Some(header) = sides.read(line) {
+            if header == LegacyPatchHeader::Section {
                 rust_state_old = RustLexState::default();
                 rust_state_new = RustLexState::default();
             }
+            scan_old = scanned(&sides.old);
+            scan_new = scanned(&sides.new);
             continue;
         }
 
@@ -406,32 +407,42 @@ fn analyze_patch_for_api_diff(
             continue;
         }
 
-        if !should_scan {
-            continue;
-        }
-
         if let Some(content) = line.strip_prefix(' ') {
-            if current_file.ends_with(".rs") {
+            if scan_old && sides.old.ends_with(".rs") {
                 let _ = strip_rust_non_code(content, &mut rust_state_old, false);
+            }
+            if scan_new && sides.new.ends_with(".rs") {
                 let _ = strip_rust_non_code(content, &mut rust_state_new, false);
             }
             continue;
         }
 
-        if let Some(content) = line.strip_prefix('-')
+        if scan_old
+            && let Some(content) = line.strip_prefix('-')
             && !line.starts_with("---")
             && let Some((sym_type, sig)) =
-                extract_public_symbol_for_file(&current_file, content, &mut rust_state_old)
+                extract_public_symbol_for_file(&sides.old, content, &mut rust_state_old)
         {
-            raw_removed.push((current_file.clone(), sym_type, sig));
+            raw_removed.push((
+                sides.old.clone(),
+                sym_type,
+                sig,
+                js_ts_export_is_nested(content),
+            ));
         }
 
-        if let Some(content) = line.strip_prefix('+')
+        if scan_new
+            && let Some(content) = line.strip_prefix('+')
             && !line.starts_with("+++")
             && let Some((sym_type, sig)) =
-                extract_public_symbol_for_file(&current_file, content, &mut rust_state_new)
+                extract_public_symbol_for_file(&sides.new, content, &mut rust_state_new)
         {
-            raw_added.push((current_file.clone(), sym_type, sig));
+            raw_added.push((
+                sides.new.clone(),
+                sym_type,
+                sig,
+                js_ts_export_is_nested(content),
+            ));
         }
     }
 
@@ -444,11 +455,11 @@ fn analyze_patch_for_api_diff(
     // changes of each other.
     let removed_keys: Vec<_> = raw_removed
         .iter()
-        .map(|(file, sym_type, sig)| api_pair_key(file, sym_type, sig))
+        .map(|(file, sym_type, sig, nested)| api_pair_key(file, sym_type, sig, *nested))
         .collect();
     let added_keys: Vec<_> = raw_added
         .iter()
-        .map(|(file, sym_type, sig)| api_pair_key(file, sym_type, sig))
+        .map(|(file, sym_type, sig, nested)| api_pair_key(file, sym_type, sig, *nested))
         .collect();
     let mut removed_used = vec![false; raw_removed.len()];
     let mut added_used = vec![false; raw_added.len()];
@@ -469,7 +480,7 @@ fn analyze_patch_for_api_diff(
             removed_used[r_index] = true;
             added_used[a_index] = true;
             if !require_equal_contract {
-                let (r_file, r_type, r_sig) = &raw_removed[r_index];
+                let (r_file, r_type, r_sig, _) = &raw_removed[r_index];
                 changed.push(ApiSignatureChange {
                     file: r_file.clone(),
                     symbol_type: r_type.clone(),
@@ -480,7 +491,7 @@ fn analyze_patch_for_api_diff(
         }
     }
 
-    for ((r_file, r_type, r_sig), used) in raw_removed.into_iter().zip(removed_used) {
+    for ((r_file, r_type, r_sig, _), used) in raw_removed.into_iter().zip(removed_used) {
         if !used {
             removed.push(ApiFinding {
                 file: r_file,
@@ -489,7 +500,7 @@ fn analyze_patch_for_api_diff(
             });
         }
     }
-    for ((a_file, a_type, a_sig), used) in raw_added.into_iter().zip(added_used) {
+    for ((a_file, a_type, a_sig, _), used) in raw_added.into_iter().zip(added_used) {
         if !used {
             added.push(ApiFinding {
                 file: a_file,
@@ -514,11 +525,16 @@ struct ApiPairKey {
 /// pair on the exported name in its namespace and compare on the form that
 /// leaves formatting and implementation out ([`js_ts_export`]), so a formatter
 /// rewriting an unchanged export is no API change. A line without a
-/// recognizable identity never pairs.
-fn api_pair_key(file: &str, sym_type: &str, sig: &str) -> Option<ApiPairKey> {
+/// recognizable identity, or a JS/TS export written indented inside a block
+/// whose name the line does not show ([`js_ts_export_is_nested`]), never
+/// pairs.
+fn api_pair_key(file: &str, sym_type: &str, sig: &str, nested: bool) -> Option<ApiPairKey> {
     let (type_only, name, contract) = if file.ends_with(".rs") {
         (false, extract_name(sig)?, sig.to_owned())
     } else {
+        if nested {
+            return None;
+        }
         let export = js_ts_export(sig)?;
         (export.type_only, export.name, export.contract)
     };
