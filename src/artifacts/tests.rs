@@ -8444,6 +8444,28 @@ fn checklist_claims_without_an_executed_passing_check_stay_unticked() {
     assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
 }
 
+/// A cached PASS is a replay, not an executed check in this review. A cached
+/// failure remains known negative evidence and cannot be hidden by a live PASS.
+#[test]
+fn cached_check_results_do_not_earn_executed_check_claims() {
+    for (name, label) in [
+        ("Cargo check", "Compiles / type-checks"),
+        ("Cargo test", "Tests pass"),
+        ("Clippy", "No lint errors"),
+    ] {
+        let mut replay = lint_check(name, CheckStatus::Passed);
+        replay.cached = true;
+        let checklist = rendered_checklist(&[replay]);
+        assert!(checklist.contains(&format!("- [ ] {label}")), "{checklist}");
+    }
+
+    let mut replayed_failure = lint_check("ESLint", CheckStatus::Failed);
+    replayed_failure.cached = true;
+    let checklist =
+        rendered_checklist(&[lint_check("Clippy", CheckStatus::Passed), replayed_failure]);
+    assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
+}
+
 // --- Cargo audit lock-based pre-existing proof, through the real pack path ---
 
 fn cargo_audit_pack_check() -> CheckResult {

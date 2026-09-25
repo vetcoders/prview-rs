@@ -18,7 +18,9 @@ pub(crate) const REWRITTEN_RANGE_NOTE: &str = "Force-push detected: the file set
 ///
 /// Each line is a UNIVERSAL claim ("No lint errors", not "some linter
 /// passed"), so it is ticked only when at least one check of its category
-/// executed and every executed check of that category passed. Anything else —
+/// executed in this review and every executed check of that category passed.
+/// Cached PASS replays do not count as execution; cached failures still veto
+/// a universal success claim. Anything else —
 /// a failed, errored or warnings-only check, or no executed check at all —
 /// renders `[ ]`: the pack does not claim what it did not prove. The failing
 /// check is named in the same file's Check Status table, so the template line
@@ -76,17 +78,27 @@ pub(crate) enum ChecklistCheckOutcome {
     Passed,
     /// Ran and did not pass: failed, errored, or finished with warnings.
     NotPassed,
+    /// A replay did not execute in this review and cannot earn a claim.
+    CachedPassed,
+    /// A replayed failure still vetoes a universal success claim.
+    CachedNotPassed,
     /// Did not execute; neither supports nor vetoes the claim.
     Skipped,
 }
 
 impl ChecklistCheckOutcome {
-    pub(crate) fn from_status(status: crate::checks::CheckStatus) -> Self {
+    pub(crate) fn from_status(status: crate::checks::CheckStatus, cached: bool) -> Self {
         use crate::checks::CheckStatus;
-        match status {
-            CheckStatus::Passed => Self::Passed,
-            CheckStatus::Skipped => Self::Skipped,
-            CheckStatus::Failed | CheckStatus::Warnings | CheckStatus::Error => Self::NotPassed,
+        match (status, cached) {
+            (CheckStatus::Passed, false) => Self::Passed,
+            (CheckStatus::Passed, true) => Self::CachedPassed,
+            (CheckStatus::Skipped, _) => Self::Skipped,
+            (CheckStatus::Failed | CheckStatus::Warnings | CheckStatus::Error, false) => {
+                Self::NotPassed
+            }
+            (CheckStatus::Failed | CheckStatus::Warnings | CheckStatus::Error, true) => {
+                Self::CachedNotPassed
+            }
         }
     }
 
@@ -94,11 +106,13 @@ impl ChecklistCheckOutcome {
     /// `WARN`, a closed vocabulary). Any other token is evidence of neither
     /// outcome: `None`, which the consistency checker reports as an unreadable
     /// entry instead of reading it as a failure that might happen to agree.
-    pub(crate) fn from_report_status(status: &str) -> Option<Self> {
-        match status {
-            "PASS" => Some(Self::Passed),
-            "SKIP" => Some(Self::Skipped),
-            "FAIL" | "ERROR" | "WARN" => Some(Self::NotPassed),
+    pub(crate) fn from_report_status(status: &str, cached: bool) -> Option<Self> {
+        match (status, cached) {
+            ("PASS", false) => Some(Self::Passed),
+            ("PASS", true) => Some(Self::CachedPassed),
+            ("SKIP", _) => Some(Self::Skipped),
+            ("FAIL" | "ERROR" | "WARN", false) => Some(Self::NotPassed),
+            ("FAIL" | "ERROR" | "WARN", true) => Some(Self::CachedNotPassed),
             _ => None,
         }
     }
@@ -136,8 +150,12 @@ pub(crate) fn derive_pr_checklist(
                 match outcome {
                     ChecklistCheckOutcome::Skipped => {}
                     ChecklistCheckOutcome::Passed => claim.executed.push((*name).to_string()),
+                    ChecklistCheckOutcome::CachedPassed => {}
                     ChecklistCheckOutcome::NotPassed => {
                         claim.executed.push((*name).to_string());
+                        claim.not_passed.push((*name).to_string());
+                    }
+                    ChecklistCheckOutcome::CachedNotPassed => {
                         claim.not_passed.push((*name).to_string());
                     }
                 }
@@ -151,11 +169,11 @@ pub(crate) fn derive_pr_checklist(
 ///
 /// Only lines inside the PR Template's `## Checklist` section count: the
 /// `## Checklist` heading inside the ```` ```markdown ```` block that follows
-/// the generated `## PR Template` heading and its fixed introduction, up to
+/// the final generated `## PR Template` heading and its preceding separator, up to
 /// the next level-2 heading or the block's closing fence. A `## Checklist`
 /// anywhere else — check-derived text above
 /// the template, or anything appended after its closing fence — is not the
-/// template's checklist and cannot stand in for it. A second complete PR
+/// template's checklist and cannot stand in for it. An appended complete PR
 /// Template, or a template with more than one `## Checklist`,
 /// is ambiguous and yields no section.
 ///
@@ -197,37 +215,41 @@ fn pr_checklist_mark(line: &str, item: PrChecklistItem) -> Option<bool> {
     }
 }
 
-/// The lines of the single PR Template's `## Checklist` section (see
+/// The lines of the generated tail's `## Checklist` section (see
 /// [`parse_pr_checklist`]), or `None` when there is no such section or it is
 /// ambiguous.
 fn pr_template_checklist(pr_review: &str) -> Option<Vec<&str>> {
     let lines: Vec<&str> = pr_review.lines().collect();
-    // Diagnostic excerpts above the generated tail can quote a heading-shaped
-    // line. Only the generator's full heading + introduction names a template.
-    let mut templates = (0..lines.len()).filter(|&i| {
-        lines.get(i..i + 5)
-            == Some(
-                [
-                    "## PR Template",
-                    "",
-                    "_Copy below for GitHub PR description:_",
-                    "",
-                    "```markdown",
-                ]
-                .as_slice(),
-            )
-    });
-    let heading = templates.next()?;
-    if templates.next().is_some() {
-        return None;
-    }
+    // The generator appends a separator and then its template. Text above it,
+    // including raw Git paths with newlines, may quote the entire signature.
+    let signature = [
+        "## PR Template",
+        "",
+        "_Copy below for GitHub PR description:_",
+        "",
+        "```markdown",
+    ];
+    let heading = (2..lines.len()).rev().find(|&i| {
+        lines[i - 2] == "---"
+            && lines[i - 1].is_empty()
+            && lines.get(i..i + signature.len()) == Some(signature.as_slice())
+    })?;
     let after = &lines[heading + 1..];
     let open = after
         .iter()
         .take_while(|line| !line.starts_with("## "))
         .position(|line| *line == "```markdown")?;
     let body = &after[open + 1..];
-    let block = &body[..body.iter().position(|line| line.starts_with("```"))?];
+    let close = body.iter().position(|line| line.starts_with("```"))?;
+    let block = &body[..close];
+    // A later whole template is artifact tampering; a prior one may be a
+    // quoted diagnostic or filename, so only the generated tail is selected.
+    if body[close + 1..]
+        .windows(signature.len())
+        .any(|window| window == signature.as_slice())
+    {
+        return None;
+    }
     let mut checklists = (0..block.len()).filter(|&i| block[i] == "## Checklist");
     let start = checklists.next()? + 1;
     if checklists.next().is_some() {
@@ -804,7 +826,7 @@ pub(crate) fn generate_pr_review(
         .map(|c| {
             (
                 c.name.as_str(),
-                ChecklistCheckOutcome::from_status(c.status),
+                ChecklistCheckOutcome::from_status(c.status, c.cached),
             )
         })
         .collect();

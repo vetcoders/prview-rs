@@ -666,7 +666,7 @@ reported as `consistent: false` in `00_summary/CONSISTENCY_CHECK.json` **and** i
 but neither may call a run consistent while a substrate contradiction stands.
 Both sections also re-derive the `PR_REVIEW.md` checklist claims from the check
 statuses and report any rendered mark those statuses do not earn — and any
-checklist line or serialized check entry that cannot be read — as a
+checklist line or serialized check entry whose name, status or cached flag cannot be read — as a
 `pr_checklist` warning. `CONSISTENCY_CHECK.json` is written after this file, so
 none of its warnings changes the gate decision.
 

@@ -1165,7 +1165,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
                 .map(|c| {
                     (
                         c.name.clone(),
-                        crate::artifacts::ChecklistCheckOutcome::from_status(c.status),
+                        crate::artifacts::ChecklistCheckOutcome::from_status(c.status, c.cached),
                     )
                 })
                 .collect();

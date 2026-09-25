@@ -251,6 +251,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template, and a present but unreadable `report.json` now withholds the
   checklist comparison with an explicit warning. An unreadable `PR_REVIEW.md`
   does the same instead of passing as an absent checklist.
+  Template parsing now anchors to the final generated separator, so a
+  newline-containing Git path cannot impersonate a second template. Cached
+  check replays no longer count as execution toward an auto-ticked claim;
+  their serialized `cached` flags are checked alongside statuses.
 - A `Cargo audit` failure whose advisories the baseline already proved
   pre-existing no longer blocks the merge because of unrelated uncommitted
   changes. The pre-existing downgrade for this one check now rests on lockfile

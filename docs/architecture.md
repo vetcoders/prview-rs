@@ -3778,16 +3778,16 @@ from `PR_REVIEW.md` — a divergence is a `pr_checklist.<item>` warning.
 `report.json`'s `quality.consistency` is built before report.json exists, so it
 re-derives from the in-memory statuses it is about to serialize. The parser
 reads only the checklist inside the PR Template's fenced block — the
-`## Checklist` heading under the generated `## PR Template` heading and its
-fixed introduction, up to the block's closing fence — so a heading-shaped
-line in earlier diagnostics or anything appended after it cannot stand in for
-the template; a second complete PR Template, or a second `## Checklist` inside it, leaves every
+`## Checklist` heading under the final generated `## PR Template` heading and its
+preceding separator, up to the block's closing fence — so even a complete
+signature in an earlier newline-containing Git path cannot stand in for the
+template; an appended complete PR Template, or a second `## Checklist` inside it, leaves every
 item unreadable. Inside that section each item may be named by exactly one
 line, `- [x] <label>` or `- [ ] <label>`: a second line naming the same item (a
 duplicate, a contradicting copy, or a variant spelling) leaves that item
 unreadable instead of letting the first copy win. The fold fails closed: a missing or unreadable checklist line
-is a warning for its item, and `/checks` entries without a readable `name` and a
-status from the serialized vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`)
+is a warning for its item, and `/checks` entries without a readable `name`,
+boolean `cached`, and status from the serialized vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`)
 withhold the comparison behind one `pr_checklist` warning. A present but
 unreadable `report.json` does the same; only an absent report is skipped while
 the pack is being built. A present but unreadable `PR_REVIEW.md` likewise

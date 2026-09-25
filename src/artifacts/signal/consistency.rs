@@ -34,8 +34,8 @@ pub struct DiskArtifactCounters {
     /// `(name, outcome)` per readable check serialized in report.json `/checks`.
     pub check_outcomes_report: Option<Vec<(String, ChecklistCheckOutcome)>>,
     /// How much of report.json `/checks` could not be read: one per entry
-    /// without a string `name` and `status`, or one for a `/checks` that is
-    /// missing or not an array. `report.json` always serializes both, so a
+    /// without a string `name`, valid `status`, and boolean `cached`, or one
+    /// for a `/checks` that is missing or not an array. `report.json` always serializes all three, so a
     /// nonzero count is a damaged artifact, never a quiet subset.
     pub check_entries_unreadable: usize,
 }
@@ -105,7 +105,14 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
                     let outcome = check
                         .get("status")
                         .and_then(|v| v.as_str())
-                        .and_then(ChecklistCheckOutcome::from_report_status);
+                        .and_then(|status| {
+                            check
+                                .get("cached")
+                                .and_then(|v| v.as_bool())
+                                .and_then(|cached| {
+                                    ChecklistCheckOutcome::from_report_status(status, cached)
+                                })
+                        });
                     match (name, outcome) {
                         (Some(name), Some(outcome)) => {
                             outcomes.push((name.to_string(), outcome));
@@ -237,7 +244,7 @@ impl ConsistencyReport {
                     value: format!("unreadable `/checks` entries: {unreadable_checks}"),
                 }],
                 message: format!(
-                    "PR checklist not verifiable: {checks_artifact} has `/checks` entries without a readable name and status ({unreadable_checks}), so the PR_REVIEW.md claims cannot be re-derived from it"
+                    "PR checklist not verifiable: {checks_artifact} has `/checks` entries without a readable name, status and cached flag ({unreadable_checks}), so the PR_REVIEW.md claims cannot be re-derived from it"
                 ),
             });
             self.consistent = self.warnings.is_empty();
@@ -688,7 +695,7 @@ mod tests {
 
     /// The PR Template tail of the vbl-190 incident pack
     /// (run 20260918-180535-08716c4, PR_REVIEW.md:147-164), verbatim.
-    const INCIDENT_PR_TEMPLATE: &str = "## PR Template\n\n\
+    const INCIDENT_PR_TEMPLATE: &str = "---\n\n## PR Template\n\n\
 _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
 <!-- Describe your changes -->\n## Type of Change\n- [ ] Bug fix\n- [ ] New feature\n\
 - [ ] Breaking change\n- [ ] Refactoring\n## Checklist\n- [x] Compiles / type-checks\n\
@@ -708,7 +715,9 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
             ("Cargo audit", "FAIL"),
         ]
         .into_iter()
-        .map(|(name, status)| serde_json::json!({ "name": name, "status": status }))
+        .map(
+            |(name, status)| serde_json::json!({ "name": name, "status": status, "cached": false }),
+        )
         .collect();
         serde_json::json!({ "checks": checks }).to_string()
     }
@@ -899,9 +908,8 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         assert_eq!(report.warnings[0].sources[0].value, "[x]", "{report:?}");
     }
 
-    /// A second `## PR Template` (or a second `## Checklist` inside the
-    /// template) makes the rendered checklist ambiguous: every item is
-    /// reported unreadable instead of one copy silently winning.
+    /// A complete template appended after the generated tail without its
+    /// separator, or a second checklist inside the tail, is ambiguous.
     #[test]
     fn an_ambiguous_pr_template_checklist_is_unreadable_not_guessed() {
         let dir = tempfile::tempdir().unwrap();
@@ -913,8 +921,10 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
             "- [ ] Manually tested\n## Checklist\n- [ ] No lint errors\n",
         );
         for pr_review in [
-            format!("# R\n\n{INCIDENT_PR_TEMPLATE}\n{honest}"),
-            format!("# R\n\n{honest}\n{INCIDENT_PR_TEMPLATE}"),
+            format!(
+                "# R\n\n{INCIDENT_PR_TEMPLATE}\n{}",
+                honest.trim_start_matches("---\n\n")
+            ),
             format!("# R\n\n{doubled_section}"),
         ] {
             std::fs::write(root.join("PR_REVIEW.md"), &pr_review).unwrap();
@@ -958,6 +968,26 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
             format!(
                 "# PR Review\n\n## Review Findings\n\nPytest assertion:\n## PR Template\nquoted failure line\n\n---\n\n{honest}"
             ),
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert!(report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 3);
+    }
+
+    /// Git permits newlines in paths. The Files Changed block can contain a
+    /// full template signature before the renderer appends its real tail.
+    #[test]
+    fn full_template_signature_inside_changed_path_does_not_shadow_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
+        let honest = INCIDENT_PR_TEMPLATE.replace("- [x] No lint errors", "- [ ] No lint errors");
+        let path =
+            "x\n---\n\n## PR Template\n\n_Copy below for GitHub PR description:_\n\n```markdown";
+        std::fs::write(
+            root.join("PR_REVIEW.md"),
+            format!("# PR Review\n\n## Files Changed\n\n```\nA\t{path}\n```\n\n{honest}"),
         )
         .unwrap();
         let report = checklist_report(root);
@@ -1038,6 +1068,39 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         assert_eq!(report.checked_fields, 3);
     }
 
+    #[test]
+    fn cached_pass_does_not_earn_a_serialized_checklist_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let unticked = INCIDENT_PR_TEMPLATE
+            .replace("- [x] Compiles", "- [ ] Compiles")
+            .replace("- [x] Tests pass", "- [ ] Tests pass")
+            .replace("- [x] No lint errors", "- [ ] No lint errors");
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{unticked}")).unwrap();
+        std::fs::write(
+            root.join("report.json"),
+            r#"{"checks":[{"name":"Clippy","status":"PASS","cached":true}]}"#,
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert!(report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 3);
+
+        // A rendered tick or a missing cached flag cannot silently turn this
+        // replay into an executed check in the independent serialized view.
+        let ticked = unticked.replace("- [ ] No lint errors", "- [x] No lint errors");
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{ticked}")).unwrap();
+        let report = checklist_report(root);
+        assert_eq!(warning_fields(&report), ["pr_checklist.no_lint_errors"]);
+        std::fs::write(
+            root.join("report.json"),
+            r#"{"checks":[{"name":"Clippy","status":"PASS"}]}"#,
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert_eq!(warning_fields(&report), ["pr_checklist"]);
+    }
+
     /// report.json always serializes every check with a string name and a
     /// status from its closed vocabulary. A damaged `/checks` withholds the
     /// comparison behind one warning instead of re-deriving the claims from
@@ -1053,7 +1116,7 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         .unwrap();
         for (report_json, unreadable) in [
             (
-                r#"{"checks": [{"name": "Clippy", "status": "PASS"}, {"name": "ESLint", "status": null}, {"status": "FAIL"}]}"#,
+                r#"{"checks": [{"name": "Clippy", "status": "PASS", "cached": false}, {"name": "ESLint", "status": null}, {"status": "FAIL"}]}"#,
                 2,
             ),
             (r#"{"checks": "damaged"}"#, 1),

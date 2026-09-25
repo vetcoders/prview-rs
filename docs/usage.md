@@ -1268,7 +1268,8 @@ quality, policy, and permission axes beside that explanation.
 - The `## Checklist` of the PR Template in `PR_REVIEW.md` auto-ticks three universal claims —
   `Compiles / type-checks` (TypeScript, `cargo check`, Mypy), `Tests pass` (checks named `*test*`, Vitest,
   Pytest) and `No lint errors` (checks named `*lint*`, Clippy, Ruff). A claim is ticked only when at least
-  one check of its category executed and **every** executed check of that category passed; a failed,
+  one check of its category executed in this review and **every** executed check of that category passed;
+  a cached `PASS` replay does not count as execution, while a cached failure still vetoes the claim. A failed,
   errored or warnings-only check, or no executed check at all, leaves it `[ ]` (skipped checks neither
   earn nor veto it). A failing ESLint next to a passing Clippy therefore leaves `No lint errors` unticked;
   the failing check is named in the Check Status table above it. `Manually tested` is never auto-ticked.
@@ -1278,14 +1279,14 @@ quality, policy, and permission axes beside that explanation.
   unticked — is a `pr_checklist.<item>` warning (`compiles`, `tests_pass`, `no_lint_errors`) and turns
   `consistent` to `false`. The check fails closed: all three items always count toward `checked_fields`, a
   checklist line that is missing or carries an unreadable mark is itself a `pr_checklist.<item>` warning,
-  and `report.json` `/checks` entries without a readable `name` and a `status` from the serialized
+  and `report.json` `/checks` entries without a readable `name`, boolean `cached`, and a `status` from the serialized
   vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`) withhold the comparison behind one `pr_checklist`
   warning. An existing `report.json` that cannot be decoded also withholds the comparison and warns; an
   absent report is expected while the pack is being built. An existing `PR_REVIEW.md` that cannot
   be read as UTF-8 likewise emits a `pr_checklist` warning, including a broken symlink. Only the
-  checklist inside the generated PR
-  Template's fenced block is read; a heading-shaped line in earlier diagnostic text is ignored. A second
-  complete PR Template makes every item unreadable, as does a second line naming the same item for that
+  checklist inside the final generated PR Template's fenced block is read; the preceding separator anchors
+  it even when earlier diagnostic text or a newline-containing Git path quotes the complete template
+  signature. An appended complete PR Template makes every item unreadable, as does a second line naming the same item for that
   item. Only without `PR_REVIEW.md` or `report.json` is nothing compared. In a normal
   run both sides come from the same check results, so this catches the rendered checklist diverging from
   the statuses (a rendering regression, or an artifact edited or damaged after the run), not a check filed
