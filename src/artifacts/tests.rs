@@ -8330,6 +8330,51 @@ fn a_failed_lint_check_is_not_hidden_by_a_passed_one_and_the_checker_sees_the_li
     let md = fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.md")).expect("md");
     assert!(md.contains("- Consistent: `false`"), "{md}");
     assert!(md.contains("pr_checklist.no_lint_errors"), "{md}");
+
+    // The full pack writes gate and report rows through separate generators.
+    // A changed report name can keep its canonical id yet lose its compile
+    // category; the gate row must expose that corruption in the real path.
+    fs::write(pack.join("PR_REVIEW.md"), pr_review).expect("restore checklist");
+    let gate: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(pack.join("00_summary/MERGE_GATE.json")).expect("gate"),
+    )
+    .expect("parse gate");
+    assert!(
+        gate["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "cargo" && row["name"] == "Cargo check")
+    );
+    let mut damaged_report = report;
+    let cargo = damaged_report["checks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["name"] == "Cargo check")
+        .expect("cargo report row");
+    cargo["name"] = "cargo".into();
+    fs::write(pack.join("report.json"), damaged_report.to_string()).expect("damage report");
+    generate_consistency_check(
+        &pack.join("00_summary"),
+        &pack,
+        &[],
+        &ProvenanceConsistency::default(),
+    )
+    .expect("re-run checker after alias corruption");
+    let summary: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.json")).expect("check json"),
+    )
+    .expect("parse check json");
+    assert_eq!(summary["consistent"], false, "{summary}");
+    assert!(
+        summary["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| { warning["field"] == "pr_checklist" }),
+        "{summary}"
+    );
 }
 
 fn rendered_checklist(checks: &[CheckResult]) -> String {

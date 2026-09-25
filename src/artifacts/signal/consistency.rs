@@ -35,7 +35,9 @@ pub struct DiskArtifactCounters {
     pub check_outcomes_report: Option<Vec<(String, ChecklistCheckOutcome)>>,
     /// How much of report.json `/checks` could not be read: one per entry
     /// without a string `name`, matching canonical `id`, valid `status`, and
-    /// boolean `cached`, or one for a `/checks` that is missing or not an array.
+    /// boolean `cached`, or not matched by an executed row in MERGE_GATE.json;
+    /// also counts gate rows missing from report.json, or a `/checks` that is
+    /// missing or not an array.
     /// `report.json` always serializes all four, so a
     /// nonzero count is a damaged artifact, never a quiet subset.
     pub check_entries_unreadable: usize,
@@ -65,10 +67,38 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
 
     let mut out = DiskArtifactCounters::default();
 
-    if let Some(gate) = load_json(pack_root.join("00_summary").join("MERGE_GATE.json")) {
+    let gate = load_json(pack_root.join("00_summary").join("MERGE_GATE.json"));
+    if let Some(gate) = gate.as_ref() {
         out.verdict_gate = string_at(&gate, "/decision/verdict");
         out.findings_count_gate = usize_at(&gate, "/inline_findings/findings_count");
     }
+    // The gate independently serializes every evaluated check. Compare the
+    // complete set of executed rows, including name, status and cache state:
+    // id normalization alone is not injective ("Cargo check" and "cargo"
+    // both map to "cargo"), and a missing failed row could hide a veto.
+    let mut gate_checks = gate
+        .as_ref()
+        .and_then(|gate| gate.get("checks"))
+        .map(|checks| {
+            checks.as_array().and_then(|checks| {
+                checks
+                    .iter()
+                    .map(|check| {
+                        let cached = check.get("cached")?;
+                        if cached.is_null() {
+                            return Some(None);
+                        }
+                        Some(Some((
+                            check.get("id")?.as_str()?,
+                            check.get("name")?.as_str()?,
+                            check.get("status")?.as_str()?,
+                            cached.as_bool()?,
+                        )))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .map(|rows| rows.into_iter().flatten().collect::<Vec<_>>())
+            })
+        });
 
     if let Some(sarif) = load_json(pack_root.join("30_context").join("INLINE_FINDINGS.sarif")) {
         out.findings_count_sarif = sarif
@@ -115,14 +145,40 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
                                     ChecklistCheckOutcome::from_report_status(status, cached)
                                 })
                         });
-                    match (name, id, outcome) {
-                        (Some(name), Some(id), Some(outcome))
+                    let status = check.get("status").and_then(|v| v.as_str());
+                    let cached = check.get("cached").and_then(|v| v.as_bool());
+                    let matches_gate = match (&mut gate_checks, name, id, status, cached) {
+                        (
+                            Some(Some(gate_checks)),
+                            Some(name),
+                            Some(id),
+                            Some(status),
+                            Some(cached),
+                        ) => {
+                            if let Some(index) = gate_checks
+                                .iter()
+                                .position(|gate_row| *gate_row == (id, name, status, cached))
+                            {
+                                gate_checks.remove(index);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        (None, _, _, _, _) => true,
+                        _ => false,
+                    };
+                    match (name, id, outcome, matches_gate) {
+                        (Some(name), Some(id), Some(outcome), true)
                             if id == crate::check_id::check_id_from_name(name).as_str() =>
                         {
                             outcomes.push((name.to_string(), outcome));
                         }
                         _ => out.check_entries_unreadable += 1,
                     }
+                }
+                if let Some(gate_checks) = gate_checks {
+                    out.check_entries_unreadable += gate_checks.map_or(1, |rows| rows.len());
                 }
             }
             None => out.check_entries_unreadable += 1,
@@ -248,7 +304,7 @@ impl ConsistencyReport {
                     value: format!("unreadable `/checks` entries: {unreadable_checks}"),
                 }],
                 message: format!(
-                    "PR checklist not verifiable: {checks_artifact} has `/checks` entries without a matching name/id, readable status and cached flag ({unreadable_checks}), so the PR_REVIEW.md claims cannot be re-derived from it"
+                    "PR checklist not verifiable: {checks_artifact} has `/checks` entries without a matching name/id, readable status and cached flag, or rows disagreeing with MERGE_GATE.json ({unreadable_checks}), so the PR_REVIEW.md claims cannot be re-derived from it"
                 ),
             });
             self.consistent = self.warnings.is_empty();
@@ -1143,6 +1199,73 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         let report = checklist_report(root);
         assert!(report.consistent, "{report:?}");
         assert_eq!(report.checked_fields, 3);
+    }
+
+    /// The gate is an independent serialization of the executed check set.
+    /// Alias collisions, changed outcomes, and omitted failures must not make
+    /// the checklist appear consistent; arbitrary custom checks remain valid.
+    #[test]
+    fn serialized_check_set_must_match_gate_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let unticked = INCIDENT_PR_TEMPLATE
+            .replace("- [x] Compiles", "- [ ] Compiles")
+            .replace("- [x] Tests pass", "- [ ] Tests pass")
+            .replace("- [x] No lint errors", "- [ ] No lint errors");
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{unticked}")).unwrap();
+        std::fs::create_dir_all(root.join("00_summary")).unwrap();
+        let gate_rows = serde_json::json!([
+            {"id":"cargo", "name":"Cargo check", "status":"FAIL", "cached":false},
+            {"id":"tsc", "name":"TypeScript", "status":"FAIL", "cached":false},
+            {"id":"tests", "name":"Vitest", "status":"FAIL", "cached":false},
+            {"id":"custom_lint", "name":"Custom lint", "status":"FAIL", "cached":false},
+            {"id":"pytest", "name":"Pytest", "status":"SKIP", "cached":null}
+        ]);
+        std::fs::write(
+            root.join("00_summary/MERGE_GATE.json"),
+            serde_json::json!({"checks":gate_rows}).to_string(),
+        )
+        .unwrap();
+        let original = serde_json::json!([
+            {"id":"cargo", "name":"Cargo check", "status":"FAIL", "cached":false},
+            {"id":"tsc", "name":"TypeScript", "status":"FAIL", "cached":false},
+            {"id":"tests", "name":"Vitest", "status":"FAIL", "cached":false},
+            {"id":"custom_lint", "name":"Custom lint", "status":"FAIL", "cached":false}
+        ]);
+        let verify = |rows: serde_json::Value| {
+            std::fs::write(
+                root.join("report.json"),
+                serde_json::json!({"checks":rows}).to_string(),
+            )
+            .unwrap();
+            checklist_report(root)
+        };
+
+        assert!(verify(original.clone()).consistent);
+        let mut alias = original.clone();
+        alias[0]["name"] = "cargo".into();
+        assert_eq!(warning_fields(&verify(alias)), ["pr_checklist"]);
+        let mut alias = original.clone();
+        alias[1]["name"] = "tsc".into();
+        assert_eq!(warning_fields(&verify(alias)), ["pr_checklist"]);
+        let mut alias = original.clone();
+        alias[2]["name"] = "tests".into();
+        assert_eq!(warning_fields(&verify(alias)), ["pr_checklist"]);
+        let mut alias = original.clone();
+        alias[3]["name"] = "Custom-lint".into();
+        assert_eq!(warning_fields(&verify(alias)), ["pr_checklist"]);
+        let mut changed_status = original.clone();
+        changed_status[0]["status"] = "PASS".into();
+        assert_eq!(warning_fields(&verify(changed_status)), ["pr_checklist"]);
+        let mut changed_cache = original.clone();
+        changed_cache[0]["cached"] = true.into();
+        assert_eq!(warning_fields(&verify(changed_cache)), ["pr_checklist"]);
+        let mut missing_failure = original.clone();
+        missing_failure.as_array_mut().unwrap().remove(0);
+        assert_eq!(warning_fields(&verify(missing_failure)), ["pr_checklist"]);
+        let mut duplicate = original.clone();
+        duplicate.as_array_mut().unwrap().push(original[3].clone());
+        assert_eq!(warning_fields(&verify(duplicate)), ["pr_checklist"]);
     }
 
     /// report.json always serializes every check with a string name and a
