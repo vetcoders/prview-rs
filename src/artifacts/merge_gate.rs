@@ -96,6 +96,8 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let outcome = compute_effective_policy_outcome(
         &policy_summary.evaluations,
         &preexisting_quality_failure_names,
+        inline.cargo_audit.as_ref(),
+        clean_comparison.cargo_audit_lock_proof(),
     );
     let mut worst_confidence = outcome.worst_confidence;
     let mut worst_merge = outcome.worst_merge;
@@ -361,7 +363,10 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     all_review_caveats.extend(review_caveats);
     all_review_caveats.extend(rust_quality_review_caveats(config, checks));
     all_review_caveats.extend(cargo_audit_review_caveats(checks));
-    all_review_caveats.extend(cargo_audit_baseline_review_caveats(inline));
+    all_review_caveats.extend(cargo_audit_baseline_review_caveats(
+        inline,
+        clean_comparison.cargo_audit_lock_proof(),
+    ));
     all_review_caveats.extend(semgrep_partial_parse_review_caveats(checks));
     // Advisory only: a narrower test run is still a real result, but a reviewer
     // must be told the suite was not exhaustive. Never moves the verdict.
@@ -649,6 +654,8 @@ pub(super) struct EffectivePolicyOutcome {
 pub(super) fn compute_effective_policy_outcome(
     evaluations: &[crate::policy::engine::CheckEvaluation],
     preexisting_quality_failure_names: &std::collections::BTreeSet<&str>,
+    cargo_audit: Option<&super::findings::CargoAuditGateEvidence>,
+    cargo_audit_lock_proof: super::verdict::CargoAuditLockProof,
 ) -> EffectivePolicyOutcome {
     use crate::policy::engine::{AnalysisStatus, MergeRecommendation, PolicyConclusion};
 
@@ -660,7 +667,11 @@ pub(super) fn compute_effective_policy_outcome(
 
     for eval in evaluations {
         let preexisting_only = preexisting_quality_failure_names.contains(eval.name.as_str());
-        let effective_eval = effective_quality_gate_eval(eval, preexisting_only);
+        // Cargo audit is the one check whose blocker and whose downgrade both
+        // have counts behind them, and the incident this addresses was the gate
+        // refusing to quote them. Everything else keeps the generic wording.
+        let audit = cargo_audit.filter(|_| eval.name.eq_ignore_ascii_case("cargo audit"));
+        let effective_eval = effective_quality_gate_eval(eval, preexisting_only, audit);
         // The confidence axis bumps for EVERY check, including pre-existing-only
         // ones. The downgrade only neutralises the finding/merge impact — it must
         // not launder a degraded/incomplete analysis into Complete (R5-24). Since
@@ -669,11 +680,16 @@ pub(super) fn compute_effective_policy_outcome(
         bump_effective_gate_axes(&mut worst_confidence, &mut worst_merge, &effective_eval);
         if !preexisting_only {
             if effective_eval.conclusion == PolicyConclusion::Blocked {
-                blocking_issues.push(format!(
-                    "{} ({})",
-                    eval.name,
-                    display_raw_status(&eval.raw_status)
-                ));
+                let detail = audit
+                    .and_then(|audit| cargo_audit_blocker_detail(audit, cargo_audit_lock_proof));
+                blocking_issues.push(match detail {
+                    Some(detail) => format!(
+                        "{} ({}): {detail}",
+                        eval.name,
+                        display_raw_status(&eval.raw_status)
+                    ),
+                    None => format!("{} ({})", eval.name, display_raw_status(&eval.raw_status)),
+                });
             } else if effective_eval.conclusion == PolicyConclusion::Advisory {
                 advisory_caveats.push(describe_policy_advisory(eval));
             }
@@ -693,6 +709,7 @@ pub(super) fn compute_effective_policy_outcome(
 fn effective_quality_gate_eval(
     eval: &crate::policy::engine::CheckEvaluation,
     preexisting_only: bool,
+    cargo_audit: Option<&super::findings::CargoAuditGateEvidence>,
 ) -> crate::policy::engine::CheckEvaluation {
     if !preexisting_only {
         return eval.clone();
@@ -706,8 +723,115 @@ fn effective_quality_gate_eval(
     // partial parse) must keep that signal so the verdict cannot become a clean
     // PASS on a scan that never analysed the whole target (R5-24).
     effective.merge_impact = crate::policy::engine::MergeRecommendation::Approve;
-    effective.reason = Some("pre-existing findings outside the change".to_string());
+    // "outside the change" is a location claim, and cargo audit has no location
+    // to speak of: its proof is about `Cargo.lock`, so it states that proof
+    // instead of borrowing a sentence that does not describe it.
+    effective.reason = Some(
+        cargo_audit
+            .map(cargo_audit_preexisting_reason)
+            .unwrap_or_else(|| "pre-existing findings outside the change".to_string()),
+    );
     effective
+}
+
+/// Why a downgraded `Cargo audit` is advisory: the lock-based proof, in words,
+/// with the counts the baseline caveat also carries.
+fn cargo_audit_preexisting_reason(audit: &super::findings::CargoAuditGateEvidence) -> String {
+    let proof = if audit.lock_changed {
+        "unchanged vs base audit"
+    } else {
+        "Cargo.lock unchanged by this PR"
+    };
+    format!(
+        "pre-existing: {proof} ({} advisor{})",
+        audit.preexisting,
+        if audit.preexisting == 1 { "y" } else { "ies" }
+    )
+}
+
+/// What a blocking `Cargo audit` is blocking on, when the run has something to
+/// say about it.
+///
+/// Four facts can carry the sentence, in order of how much they say:
+/// advisories the diff introduced (named from the same key set they are counted
+/// from), advisories with no base to compare against, an unreadable advisory
+/// report, and — when the counts are silent — a withheld lockfile provenance
+/// proof. The last one matters because a revoked proof is precisely how a
+/// pre-existing-only audit ends up `unclassified` and blocking: the counts then
+/// read `new=0, pre-existing=N` while the decision shows a bare
+/// `Cargo audit (Failed)`, which is the mute blocker this text exists to
+/// abolish. "Unclassified" names the outcome; the gap names the cause.
+///
+/// The unreadable report earns its own branch because it is a DIFFERENT cause
+/// wearing the same zero counts. `status == "current-unavailable"` means
+/// `cargo audit` produced nothing this run could parse, so every count
+/// collapses to zero and the lockfile — proven or not — never entered the
+/// question: there was no advisory to tie to it. Folding that case into the
+/// provenance branch named the wrong cause, and named it with a count of zero.
+///
+/// No branch asserts a count it does not have. A count is printed only where it
+/// is non-zero and earned; `{N} advisories not shown to predate this change`
+/// qualifies a real `pre-existing`, and when that number is zero the gap states
+/// itself alone.
+///
+/// `None` only when there is genuinely nothing to add — the proof held and the
+/// counts are empty — so a bare blocker stays bare rather than gaining a
+/// sentence asserting zero of everything.
+fn cargo_audit_blocker_detail(
+    audit: &super::findings::CargoAuditGateEvidence,
+    lock_proof: super::verdict::CargoAuditLockProof,
+) -> Option<String> {
+    if audit.new > 0 {
+        let ids = if audit.new_advisories.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", audit.new_advisories.join(", "))
+        };
+        let plural = if audit.new == 1 { "y" } else { "ies" };
+        // "New" is relative to the base audit; "introduced" additionally says
+        // the target's own lockfile carries it, which only the proof shows.
+        // Without it the count stays — it is still the most specific fact —
+        // but the claim is qualified by the premise that is missing.
+        return Some(match lock_proof {
+            super::verdict::CargoAuditLockProof::TargetLock => format!(
+                "{} new advisor{plural} introduced{ids}, {} pre-existing",
+                audit.new, audit.preexisting
+            ),
+            super::verdict::CargoAuditLockProof::Unproven(gap) => format!(
+                "{} new advisor{plural} vs the base audit{ids}, {} pre-existing; {}",
+                audit.new,
+                audit.preexisting,
+                gap.gate_note()
+            ),
+        });
+    }
+    if audit.unknown > 0 {
+        return Some(format!(
+            "{} advisor{} with no base comparison (baseline {})",
+            audit.unknown,
+            if audit.unknown == 1 { "y" } else { "ies" },
+            audit.status
+        ));
+    }
+    if audit.status == "current-unavailable" {
+        return Some(
+            "no readable advisory report (baseline current-unavailable), so no \
+             advisory could be classified either way"
+                .to_string(),
+        );
+    }
+    if let super::verdict::CargoAuditLockProof::Unproven(gap) = lock_proof {
+        if audit.preexisting == 0 {
+            return Some(gap.gate_note().to_string());
+        }
+        return Some(format!(
+            "{} ({} advisor{} not shown to predate this change)",
+            gap.gate_note(),
+            audit.preexisting,
+            if audit.preexisting == 1 { "y" } else { "ies" }
+        ));
+    }
+    None
 }
 
 fn bump_effective_gate_axes(
@@ -838,6 +962,7 @@ mod tests {
             })
             .collect();
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".into(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -892,6 +1017,7 @@ mod tests {
             provenance: None,
         }];
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".into(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -936,6 +1062,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config();
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".into(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -1110,6 +1237,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config();
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".into(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -1206,6 +1334,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config();
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".to_owned(),
             findings_count: 0,
             dashboard_findings: Vec::new(),
@@ -1269,6 +1398,7 @@ mod tests {
         check.cached = true;
         let checks = vec![check];
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: if passing { "passed" } else { "failed" }.to_string(),
             findings_count: usize::from(!passing),
             dashboard_findings: (!passing)
@@ -1434,6 +1564,7 @@ mod tests {
         config.security_full = security_full;
         let checks = vec![semgrep_check()];
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "failed".to_string(),
             findings_count: 1,
             dashboard_findings: vec![semgrep_dashboard_finding(
@@ -1481,6 +1612,7 @@ mod tests {
             provenance: None,
         }];
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "failed".to_string(),
             findings_count: 1,
             dashboard_findings: vec![semgrep_dashboard_finding(
@@ -1532,6 +1664,7 @@ mod tests {
         let config = test_config();
         let checks = vec![cargo_test_check()];
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "failed".to_string(),
             findings_count: 1,
             dashboard_findings: vec![DashboardFinding {
@@ -1582,6 +1715,7 @@ mod tests {
         let mut config = test_config();
         config.policy.checks.insert(check_id.to_string(), severity);
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".to_string(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -1639,6 +1773,7 @@ mod tests {
             crate::policy::PolicySeverity::Block,
         );
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "failed".to_string(),
             findings_count: 1,
             dashboard_findings: vec![DashboardFinding {
@@ -1715,6 +1850,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config();
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".to_string(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -1793,7 +1929,12 @@ mod tests {
         // Pre-existing-only: the failing check is downgraded off the axes.
         let mut preexisting = std::collections::BTreeSet::new();
         preexisting.insert("Semgrep scan");
-        let downgraded = compute_effective_policy_outcome(&summary.evaluations, &preexisting);
+        let downgraded = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &preexisting,
+            None,
+            CargoAuditLockProof::TargetLock,
+        );
         assert!(downgraded.blocking_issues.is_empty());
         assert!(downgraded.advisory_caveats.is_empty());
         assert_eq!(downgraded.worst_merge, MergeRecommendation::Approve);
@@ -1802,9 +1943,368 @@ mod tests {
         let kept = compute_effective_policy_outcome(
             &summary.evaluations,
             &std::collections::BTreeSet::new(),
+            None,
+            CargoAuditLockProof::TargetLock,
         );
         assert_eq!(kept.worst_merge, MergeRecommendation::ReviewRequired);
         assert_eq!(kept.advisory_caveats.len(), 1);
+    }
+
+    fn cargo_audit_evidence(
+        status: &'static str,
+        new: usize,
+        preexisting: usize,
+        unknown: usize,
+        lock_changed: bool,
+        new_advisories: &[&str],
+    ) -> super::super::findings::CargoAuditGateEvidence {
+        super::super::findings::CargoAuditGateEvidence {
+            status,
+            new,
+            preexisting,
+            unknown,
+            lock_changed,
+            new_advisories: new_advisories.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    fn cargo_audit_check(status: CheckStatus) -> CheckResult {
+        CheckResult {
+            name: "Cargo audit".to_string(),
+            status,
+            duration: Duration::from_millis(900),
+            output: "{}".to_string(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
+    /// The bridging sentence the incident pack was missing: a downgraded audit
+    /// must SAY what made it pre-existing, and a blocking one must SAY what it
+    /// is blocking on. `Cargo audit (Failed)` beside `new=0, pre-existing=2` is
+    /// the contradiction this text exists to close.
+    #[test]
+    fn a_downgraded_cargo_audit_states_its_lock_proof() {
+        use crate::policy::engine::PolicyEngine;
+
+        let config = test_config();
+        let engine = PolicyEngine::new(&config);
+        let checks = vec![cargo_audit_check(CheckStatus::Failed)];
+        let summary = engine.evaluate_all(&checks, &[]);
+        let mut preexisting = std::collections::BTreeSet::new();
+        preexisting.insert("Cargo audit");
+
+        let untouched_lock = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &preexisting,
+            Some(&cargo_audit_evidence("not-required", 0, 2, 0, false, &[])),
+            CargoAuditLockProof::TargetLock,
+        );
+        assert!(untouched_lock.blocking_issues.is_empty());
+        let reason = untouched_lock.effective_evals[0]
+            .reason
+            .as_deref()
+            .expect("a downgraded check must carry its reason");
+        assert_eq!(
+            reason,
+            "pre-existing: Cargo.lock unchanged by this PR (2 advisories)"
+        );
+
+        let compared_lock = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &preexisting,
+            Some(&cargo_audit_evidence("available", 0, 1, 0, true, &[])),
+            CargoAuditLockProof::TargetLock,
+        );
+        assert_eq!(
+            compared_lock.effective_evals[0].reason.as_deref(),
+            Some("pre-existing: unchanged vs base audit (1 advisory)"),
+            "a changed lock cites the base comparison, not an untouched file"
+        );
+
+        // Every other check keeps the location-shaped sentence, which is true
+        // of them and was never true of cargo audit.
+        let others = compute_effective_policy_outcome(
+            &engine.evaluate_all(&[semgrep_check()], &[]).evaluations,
+            &std::collections::BTreeSet::from(["Semgrep scan"]),
+            None,
+            CargoAuditLockProof::TargetLock,
+        );
+        assert_eq!(
+            others.effective_evals[0].reason.as_deref(),
+            Some("pre-existing findings outside the change")
+        );
+    }
+
+    #[test]
+    fn a_blocking_cargo_audit_names_its_new_advisories() {
+        use crate::policy::engine::PolicyEngine;
+
+        let mut config = test_config();
+        config.policy.mode = crate::policy::PolicyMode::Block;
+        let engine = PolicyEngine::new(&config);
+        let checks = vec![cargo_audit_check(CheckStatus::Failed)];
+        let summary = engine.evaluate_all(&checks, &[]);
+        let none_preexisting = std::collections::BTreeSet::new();
+
+        let introduced = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &none_preexisting,
+            Some(&cargo_audit_evidence(
+                "available",
+                2,
+                3,
+                0,
+                true,
+                &[
+                    "RUSTSEC-2026-0001 in openssl 0.9.0",
+                    "RUSTSEC-2026-0002 in chrono 0.4.19",
+                ],
+            )),
+            CargoAuditLockProof::TargetLock,
+        );
+        assert_eq!(
+            introduced.blocking_issues,
+            vec![
+                "Cargo audit (Failed): 2 new advisories introduced \
+                 (RUSTSEC-2026-0001 in openssl 0.9.0, RUSTSEC-2026-0002 in chrono 0.4.19), \
+                 3 pre-existing"
+                    .to_string()
+            ],
+            "the sentence names every advisory it counts, and calls the set what it is"
+        );
+
+        // An unknown base is a different sentence, because it is a different
+        // fact: nothing was compared, so nothing was introduced.
+        let unknown_base = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &none_preexisting,
+            Some(&cargo_audit_evidence("unavailable", 0, 0, 2, true, &[])),
+            CargoAuditLockProof::TargetLock,
+        );
+        assert_eq!(
+            unknown_base.blocking_issues,
+            vec![
+                "Cargo audit (Failed): 2 advisories with no base comparison \
+                 (baseline unavailable)"
+                    .to_string()
+            ]
+        );
+
+        // Nothing to add: the proof held and the counts are empty, so the
+        // blocker stays as bare as it always was rather than gaining a sentence
+        // that asserts zero of everything.
+        let silent = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &none_preexisting,
+            Some(&cargo_audit_evidence("not-required", 0, 0, 0, false, &[])),
+            CargoAuditLockProof::TargetLock,
+        );
+        assert_eq!(
+            silent.blocking_issues,
+            vec!["Cargo audit (Failed)".to_string()]
+        );
+    }
+
+    /// The incident in the revoke direction: an audit whose counts say
+    /// `new=0, pre-existing=2` blocks because its provenance proof was
+    /// withheld, and the decision used to render that as a bare
+    /// `Cargo audit (Failed)` — the same mute blocker, reproduced by the very
+    /// mechanism built to abolish it. Each gap states itself.
+    #[test]
+    fn a_withheld_lock_proof_is_stated_rather_than_left_unclassified() {
+        use crate::policy::engine::PolicyEngine;
+
+        let mut config = test_config();
+        config.policy.mode = crate::policy::PolicyMode::Block;
+        let engine = PolicyEngine::new(&config);
+        let checks = vec![cargo_audit_check(CheckStatus::Failed)];
+        let summary = engine.evaluate_all(&checks, &[]);
+        let none_preexisting = std::collections::BTreeSet::new();
+        let evidence = cargo_audit_evidence("not-required", 0, 2, 0, false, &[]);
+
+        for (gap, expected) in [
+            (
+                LockProofGap::NoTargetLock,
+                "Cargo audit (Failed): provenance proof unavailable: no Cargo.lock \
+                 in the target tree (2 advisories not shown to predate this change)",
+            ),
+            (
+                LockProofGap::DirtyLock,
+                "Cargo audit (Failed): provenance proof unavailable: Cargo.lock dirty \
+                 or rewritten in the scanned tree (2 advisories not shown to predate this change)",
+            ),
+            (
+                LockProofGap::RelocatedCargoRoot,
+                "Cargo audit (Failed): provenance proof unavailable: the reviewed commit \
+                 moved the cargo root away from the configured one (2 advisories not \
+                 shown to predate this change)",
+            ),
+            (
+                LockProofGap::AuditConfigChanged,
+                "Cargo audit (Failed): provenance proof unavailable: the cargo-audit \
+                 configuration (.cargo/audit.toml) changed or is dirty in the scanned \
+                 tree (2 advisories not shown to predate this change)",
+            ),
+            (
+                LockProofGap::AuditConfigCaseVariant,
+                "Cargo audit (Failed): provenance proof unavailable: .cargo/audit.toml \
+                 is committed under another case, which a case-insensitive checkout \
+                 reads (2 advisories not shown to predate this change)",
+            ),
+            (
+                LockProofGap::RelativeCargoHome,
+                "Cargo audit (Failed): provenance proof unavailable: the Cargo home \
+                 (CARGO_HOME, else $HOME/.cargo) is relative, so cargo audit read its \
+                 fallback configuration and advisory database inside the scanned tree \
+                 (2 advisories not shown to predate this change)",
+            ),
+            (
+                LockProofGap::InTreeCargoHome,
+                "Cargo audit (Failed): provenance proof unavailable: the Cargo home \
+                 (CARGO_HOME, else $HOME/.cargo) lies inside the checkout or the \
+                 scanned tree, so cargo audit read its fallback configuration and \
+                 advisory database from files there (2 advisories not shown to \
+                 predate this change)",
+            ),
+            (
+                LockProofGap::AuditInputInTree,
+                "Cargo audit (Failed): provenance proof unavailable: cargo audit's \
+                 fallback configuration or advisory database is not shown to lie \
+                 outside the checkout and the scanned tree (a link or a configured \
+                 database path leads there, or it could not be read) (2 advisories \
+                 not shown to predate this change)",
+            ),
+            (
+                LockProofGap::UnknownProvenance,
+                "Cargo audit (Failed): provenance proof unavailable: the scanned tree \
+                 could not be tied to the target commit (2 advisories not shown to \
+                 predate this change)",
+            ),
+        ] {
+            let outcome = compute_effective_policy_outcome(
+                &summary.evaluations,
+                &none_preexisting,
+                Some(&evidence),
+                CargoAuditLockProof::Unproven(gap),
+            );
+            assert_eq!(
+                outcome.blocking_issues,
+                vec![expected.to_string()],
+                "{gap:?} must say why the audit could not be classified"
+            );
+        }
+
+        // Counts still outrank the proof note: a named new advisory is the more
+        // specific fact and keeps the sentence. It is not called "introduced",
+        // though — new against the base audit, but without the proof the
+        // audited lock is not shown to be the target's — and the missing
+        // premise qualifies the count instead of disappearing behind it.
+        let introduced = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &none_preexisting,
+            Some(&cargo_audit_evidence(
+                "available",
+                1,
+                0,
+                0,
+                true,
+                &["RUSTSEC-2026-0003 in serde 1.0.0"],
+            )),
+            CargoAuditLockProof::Unproven(LockProofGap::DirtyLock),
+        );
+        assert_eq!(
+            introduced.blocking_issues,
+            vec![
+                "Cargo audit (Failed): 1 new advisory vs the base audit \
+                 (RUSTSEC-2026-0003 in serde 1.0.0), 0 pre-existing; provenance proof \
+                 unavailable: Cargo.lock dirty or rewritten in the scanned tree"
+                    .to_string()
+            ]
+        );
+        for issue in &introduced.blocking_issues {
+            assert!(
+                !issue.contains("introduced"),
+                "an unproven lock does not license \"introduced\": {issue}"
+            );
+        }
+    }
+
+    /// The zero-count shapes of the same blocking row: the sentence must name
+    /// the fact that actually withheld the classification, and must not assert
+    /// a count it does not have.
+    ///
+    /// Two distinct causes used to render as one. When `cargo audit` produces
+    /// no readable report the baseline collapses to
+    /// `status=current-unavailable` with every count zero — the report is the
+    /// missing thing, not the lockfile — yet the row blocked with a sentence
+    /// about lock provenance plus `(0 advisories not shown to predate this
+    /// change)`. That is the wrong cause and an assertion of zero, which is
+    /// exactly what `cargo_audit_blocker_detail`'s contract forbids.
+    #[test]
+    fn a_zero_count_blocker_names_its_cause_without_asserting_a_count() {
+        use crate::policy::engine::PolicyEngine;
+
+        let mut config = test_config();
+        config.policy.mode = crate::policy::PolicyMode::Block;
+        let engine = PolicyEngine::new(&config);
+        let checks = vec![cargo_audit_check(CheckStatus::Failed)];
+        let summary = engine.evaluate_all(&checks, &[]);
+        let none_preexisting = std::collections::BTreeSet::new();
+
+        // An unreadable report: the cause is the report, whatever the lock did.
+        let unreadable = cargo_audit_evidence("current-unavailable", 0, 0, 0, false, &[]);
+        for gap in [
+            LockProofGap::NoTargetLock,
+            LockProofGap::DirtyLock,
+            LockProofGap::RelocatedCargoRoot,
+            LockProofGap::AuditConfigChanged,
+            LockProofGap::AuditConfigCaseVariant,
+            LockProofGap::RelativeCargoHome,
+            LockProofGap::InTreeCargoHome,
+            LockProofGap::AuditInputInTree,
+            LockProofGap::UnknownProvenance,
+        ] {
+            let outcome = compute_effective_policy_outcome(
+                &summary.evaluations,
+                &none_preexisting,
+                Some(&unreadable),
+                CargoAuditLockProof::Unproven(gap),
+            );
+            assert_eq!(
+                outcome.blocking_issues,
+                vec![
+                    "Cargo audit (Failed): no readable advisory report (baseline \
+                     current-unavailable), so no advisory could be classified either way"
+                        .to_string()
+                ],
+                "{gap:?}: the unreadable report is the cause, not the lockfile"
+            );
+        }
+
+        // A readable report with nothing in it: the gap is the cause and it is
+        // named, but there is no count to qualify, so none is printed.
+        let empty = cargo_audit_evidence("not-required", 0, 0, 0, false, &[]);
+        let outcome = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &none_preexisting,
+            Some(&empty),
+            CargoAuditLockProof::Unproven(LockProofGap::NoTargetLock),
+        );
+        assert_eq!(
+            outcome.blocking_issues,
+            vec![
+                "Cargo audit (Failed): provenance proof unavailable: no Cargo.lock \
+                 in the target tree"
+                    .to_string()
+            ]
+        );
+        for issue in &outcome.blocking_issues {
+            assert!(
+                !issue.contains("0 advisor"),
+                "a zero count is never asserted: {issue}"
+            );
+        }
     }
 
     #[test]
@@ -2016,7 +2516,12 @@ mod tests {
 
         let mut preexisting = std::collections::BTreeSet::new();
         preexisting.insert("Semgrep scan");
-        let outcome = compute_effective_policy_outcome(&summary.evaluations, &preexisting);
+        let outcome = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &preexisting,
+            None,
+            CargoAuditLockProof::TargetLock,
+        );
         assert_eq!(outcome.worst_merge, MergeRecommendation::Approve);
         assert!(outcome.blocking_issues.is_empty());
         assert_eq!(
@@ -2076,6 +2581,7 @@ mod tests {
             .insert("rustfmt".to_string(), crate::policy::PolicySeverity::Warn);
         let checks = vec![rustfmt_warnings_check()];
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "warnings".to_string(),
             findings_count: 1,
             dashboard_findings: vec![DashboardFinding {
@@ -2218,6 +2724,7 @@ mod tests {
         // No failing checks and no inline findings: without escalation this is a
         // clean PASS, so any CONDITIONAL comes solely from the breaking change.
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".to_string(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -2262,6 +2769,7 @@ mod tests {
             .insert("rustfmt".to_string(), crate::policy::PolicySeverity::Warn);
         let checks = vec![rustfmt_warnings_check()];
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".to_string(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -2399,6 +2907,7 @@ mod tests {
         fs::create_dir(&summary).expect("summary directory");
         let config = test_config();
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".into(),
             findings_count: 0,
             dashboard_findings: vec![],

@@ -247,14 +247,25 @@ Implementations:
 - `PytestCheck` - `pytest`
 
 Cargo-audit baseline comparison covers vulnerability findings and the
-informational warning families (`unmaintained`, `unsound`, `notice`, and future
-warning keys). Its identity is `(advisory id, package, locked version)`: an
+informational warning families (`unmaintained`, `unsound`, `yanked`, `notice`,
+and future warning keys). Its identity is `(advisory id, package, locked
+version)`; a yanked release carries no advisory (`"advisory": null`), so its id
+is the category, `yanked`. The key set is total over the report: every
+vulnerability entry is keyed, and exactly as many `warnings` items as the check
+status counts. An item it cannot key (no locked package name or version, or no
+advisory id outside `yanked`) or a counted shape with no entries (a `count`
+field, a nested object) makes the report unreadable, instead of silently
+leaving that item out of the comparison or keying it by a placeholder that
+would match an unrelated malformed item in the base. An
 unchanged lock makes current advisories pre-existing without another tool run;
-a changed lock is compared against `cargo audit` over the base revision's
-effective lockfile from the same Cargo root as the live check: a member lock if
-present, otherwise the workspace-root lock. If that base audit is unavailable,
-current vulnerability findings remain unclassified rather than being inferred
-from manifest deltas. A multi-base run with more than one changed effective
+a changed lock is compared against `cargo audit` over the base revision's copy
+of the lockfile the live audit READ — `Cargo.lock` in the same Cargo root. The
+workspace-root fallback (a member lock if present, otherwise the root lock)
+only decides whether the relevant lock changed: a root lock holds every
+member's resolution, so a member whose own lock is new in the target has no
+comparable base, and its baseline is unavailable. If that base audit is
+unavailable, current vulnerability findings remain unclassified rather than
+being inferred from manifest deltas. A multi-base run with more than one changed effective
 lockfile is likewise left unavailable rather than choosing a favorable base. A
 malformed current report fails its check, has the distinct
 `current-unavailable` baseline status, and cannot manufacture a clean or
@@ -262,6 +273,205 @@ resolved result.
 The decision caveat always enumerates counts for `new`, `pre-existing`,
 `resolved`, and `unknown-baseline`, plus an explicit baseline status
 (`not-required`, `available`, `unavailable`, or `current-unavailable`).
+
+Those counts also travel to the gate as structured data
+(`InlineFindingsSummary::cargo_audit`), not as the rendered caveat string. The
+caveat and the decision are one value rendered twice, so the pack cannot state
+`new=0, pre-existing=2` in `review_caveats` while blocking on an unexplained
+`Cargo audit (Failed)` — which is exactly what it did before the counts reached
+the decision path.
+
+**Lock-based pre-existing proof.** Whether an all-out-of-diff cargo-audit
+failure may be downgraded to pre-existing is decided by `CargoAuditLockProof`,
+not by the whole-tree cleanliness rule (R2-9) that governs every other
+baseline-signal check. R2-9 exists because uncommitted *source* bytes can make a
+finding look out-of-diff; a cargo-audit advisory has no source location to
+forge, since it lives in `Cargo.lock` × the advisory database. The proof that is
+load-bearing is therefore lockfile provenance: the audited `Cargo.lock` is the
+analysed target's — which first requires that the target HAVE one. `cargo audit`
+generates a lockfile from the registry when the crate has none and audits that,
+so the proof asks the target commit's tree before anything else — for the one
+lockfile the audit reads, `Cargo.lock` in the cargo root itself. `cargo audit`
+opens that file relative to its working directory and never falls back to a
+workspace root's (cargo-audit 0.22, `lockfile::locate_or_generate`), so a root
+lock beside a lock-less member proves nothing, and neither does a symlink
+committed in the lockfile's place. No such lockfile, or no readable answer, and
+the proof is withheld in every run shape. Given the file, the proof holds when
+the run scanned a target snapshot (`cargo audit` executes inside the
+materialised snapshot via `plan_cargo_run`) at the cargo root the proof asked
+about. A reviewed commit that moved its crate (`crates/core` → `backend`, the
+case `resolve_reviewed_cargo_root` follows) has cargo run in the new directory
+while the lockfile and lock-changed questions still concern the configured one —
+possibly a stale lock left behind — so that shape withholds the proof
+(`RelocatedCargoRoot`). For a local run the proof holds when the audited
+lockfile carried no uncommitted change — read from the dirty-path set frozen
+before the checks ran (R4-19). Dirt anywhere else in the tree is not evidence
+about that lockfile and no longer suppresses the downgrade; dirt in it is, and
+does.
+
+Where the tree starts is only half of the proof. Cargo check, clippy, test and
+audit run in the same tree one after another, none of them passes `--locked`,
+and cargo rewrites a lockfile its manifest has outgrown — so a target that adds
+a dependency without regenerating `Cargo.lock` has the lock updated by the first
+cargo command, the audit reads the updated lock, and the lock-changed
+classification still compares the committed, untouched one. Both shapes
+therefore also require that the audited lock did not change while the checks
+ran. A snapshot run reads that off the shared snapshot's check-boundary
+observations (the ones `20_quality/SNAPSHOT_INTEGRITY.*` publishes); a boundary
+that saw the audited lock change withholds the proof as `DirtyLock`, and an
+unreadable boundary or a snapshot with no observation as `UnknownProvenance`.
+Each boundary diffs the target against the index and the index against the
+working tree, and then reads every index entry flagged skip-worktree or
+assume-unchanged once more straight from the target tree to disk, for the
+reason the local reading below gives; libgit2 also drops a deleted
+assume-unchanged entry from the index-to-worktree diff (`diff_delta__from_one`).
+The boundaries are unioned over the whole run rather than cut at the audit, so
+a rewrite by a later check withholds the proof too — deliberately conservative.
+A local run reads the audited lock once more after the checks, with a diff
+narrowed to that one path against the target commit and untracked files excluded — the in-repo output and check caches
+R4-19 guards against cannot reach that one tracked file — and a lock that
+differs withholds the proof as `DirtyLock`. That reading compares the target
+with the index and the index with the working tree separately, as the
+snapshot-integrity check does: a change staged and then reverted in the
+working file cancels out in one combined target-to-worktree diff. A third,
+index-free diff from the target tree to the working directory covers the
+entries the index hides: libgit2 reports an entry flagged skip-worktree or
+assume-unchanged as unmodified in both the index-to-worktree diff and status,
+whatever is on disk (`maybe_modified` in `diff_generate.c`), and a tree-side
+entry carries no such flag. A withheld proof names its gap
+(`CargoAuditLockProof::Unproven(LockProofGap)`), and the merge gate states that
+gap rather than blocking on a bare `Cargo audit (Failed)`.
+
+The lockfile is not the audit's only in-tree input. `cargo audit` reads
+`.cargo/audit.toml` in its working directory, without walking up, and otherwise
+`$CARGO_HOME/audit.toml` (`CargoAuditCommand::config_path` upstream). That
+file's `ignore` list, `informational_warnings` and `[output] deny` decide which
+advisories fail. No audit reads the base's configuration: the audit runs in the
+reviewed tree (the checkout, or the target snapshot), and the baseline audit
+reads the base's lockfile but runs in the repository's checkout. A change that
+only drops an ignored advisory therefore fails the audit with the lockfile
+untouched and every finding out-of-diff. `CleanComparison::resolve` compares
+`.cargo/audit.toml` in the cargo root by blob identity in the base and the
+target of every diff, and any difference withholds the proof as
+`AuditConfigChanged`. The comparison is by path, not by the changed-file rows,
+so a rename or deletion counts even though those rows keep only a rename's new
+path. Anything a checkout could resolve differently (a symlink at the path or
+at a parent, an unreadable tree) counts as a change. A configuration elsewhere,
+such as the repository root's for a member cargo root, is not the file the
+audit read and does not count. The committed comparison speaks only for the
+commits, so the file the audit read must also be the target's
+(`scanned_audit_config_is_target`). A local review audits the checkout, where a
+staged, unstaged, untracked or ignored configuration can ignore the advisory
+the change introduced while pre-existing ones still fail. The local shape
+mirrors the lockfile's two observations. Before the checks, the frozen dirty
+set must not list the file or a parent of it, such as an untracked symlinked
+`.cargo`. After the checks, the tracked file is read against the target on the
+index and working-tree axes and on disk past any skip flag, and where the
+target has no configuration, any file at the path counts. That last test
+catches an ignored configuration, which no status read lists. A snapshot run
+audits a tree materialised from the target, so only a check can make the file
+differ there: a boundary that saw the tracked file rewritten withholds the
+proof, and where the target has no configuration, so does any file at the path
+in the snapshot's working tree (`LockEvidence::snapshot_root`), because no
+boundary lists an untracked or ignored file. That probe catches a configuration
+a check leaves behind; one that code run during the checks writes and removes
+again is beyond the proof (see below), and since non-Cargo checks run alongside
+`cargo audit` (PV-17), no capture at the audit's boundaries could close that
+race. A case-insensitive filesystem also reads `.cargo/Audit.toml` or
+`.CARGO/audit.toml` as the configuration, which a comparison by exact path never
+sees, and with two spellings committed the checkout picks which one is on disk.
+`cargo_audit_config_gap` therefore withholds the proof as
+`AuditConfigCaseVariant` when the target, or either side of any diff, commits a
+path that matches `.cargo/audit.toml` only when case is ignored
+(`Repository::case_variant_at_commit`), and the dirty-set match
+(`path_or_parent_is`) ignores case too. The fallback `audit.toml` in the
+Cargo home is the environment's policy only while that home is absolute and
+outside the reviewed trees. The home is `CARGO_HOME` when set and non-empty,
+and otherwise `$HOME/.cargo` (`home::cargo_home`, which cargo-audit and
+rustsec use). prview sets neither variable for its checks, so they inherit the
+operator's values. A relative home resolves against the directory the audit
+ran in, which puts the fallback configuration and the advisory database inside
+the scanned tree. An absolute one can point into the checkout or the snapshot
+just the same, through `CARGO_HOME=$PWD/.cargo-home` or through a `HOME`
+inside the tree with `CARGO_HOME` unset. For a member cargo root without its
+own configuration, the latter makes the repository root's `.cargo/audit.toml`
+the fallback. `cargo_audit_config_gap` resolves the home the same way
+(`LockEvidence::cargo_home` and `LockEvidence::operator_home`, both read from
+this process's environment, the latter through `checks::cargo_operator_home`),
+and withholds the proof as `RelativeCargoHome` for a relative home and as
+`InTreeCargoHome` for an absolute one that is, or lies inside, the repository
+root or the snapshot root, before any other question. With no home at all,
+cargo-audit reads no fallback, and rustsec's `Repository::default_path` cannot
+place the database, so unless a configuration names one there is no report to
+downgrade.
+Containment (`cargo_home_inside_trees`) compares every pairing of a lexical
+reading and a link-resolved reading of both paths, the latter through the
+deepest existing ancestor, and ignores ASCII case, so a spelling through `..`,
+a symbolic link or another case cannot place an in-tree home outside.
+An external home still lets the audit read inside a tree through what lies
+under it. `audit.toml` or `advisory-db` there may be a link into the checkout,
+and the configuration the audit applied (the target's `.cargo/audit.toml`, or
+else the fallback) may name the advisory database itself with
+`[database] path`, which cargo-audit opens as written, so a relative one lies
+under the directory the audit ran in. That database decides which advisories
+exist at all, and a configured one lets the audit run even with no home.
+Once the committed comparisons hold, `audit_inputs_outside_trees` follows both
+inputs to where they lead with the same containment test, and withholds the
+proof as `AuditInputInTree` when either is inside a tree, or when a fallback
+configuration that exists cannot be read. A dangling link reads as absent, to
+cargo-audit as to the proof. `[database] url` is not followed: rustsec's
+`Repository::fetch` accepts only an `https://` address, and on any other
+cargo-audit exits without a report, which leaves nothing to downgrade. The lock and configuration re-reads hash the
+working file through libgit2's built-in filters (`crlf`, `ident`), not through
+a clean driver the repository configures, which libgit2 never runs; `ident`
+can hide bytes placed between `$Id` and `$` on purpose, which only code running
+during the checks writes, and such code can edit the Cargo home's configuration
+just as well, beyond any comparison of the reviewed tree.
+
+`cargo_audit_report_advisory_keys` keys each report item by advisory id,
+package name and locked version, without the package source. rustsec reports
+vulnerabilities and warnings for default-registry packages only, so two genuine
+items never share a key through different sources, but its yanked check
+accepts both spellings of the crates.io index. A key two items share would make
+the set smaller than the report, so it makes the report unreadable instead.
+
+One proof covers every branch of the comparison, because `in_diff` already
+carries the rest: an untouched lock makes every advisory `in_diff = false`; a
+changed lock with a base audit makes `in_diff` a real `current ∖ base`
+comparison over the full advisory set — rows exist only for
+`vulnerabilities.list`, so each `warnings`-category advisory (`unmaintained`,
+`unsound`, `yanked`) gets a dashboard note row with the origin the counts give
+it, from the same `cargo_audit_finding_in_diff` the vulnerability rows use (a
+note: never a SARIF result, never counted in `findings_count`). The rows the
+classifier reads therefore carry exactly the counts' `new` / `pre-existing` /
+`unknown` split: an audit that introduced a warning classifies Mixed or
+Introduced instead of pre-existing, an audit with only pre-existing warnings
+classifies Preexisting instead of rowless Unclassified, and a changed lock with
+no base audit leaves every row `in_diff = null`, which R5-23 keeps Unclassified
+whatever the lockfile proof says.
+
+The proof reads the files as they are when the gate is written, so it describes
+only an audit executed in this run. `CargoAuditCheck` declines every cached
+status except `Passed` (`Check::replays_cached`, asked on both the write and the
+lookup, so an entry an older prview stored is not replayed either): a clean
+report has nothing to downgrade, and a failing or warning one runs live, because
+the audit's key binds the lockfile and the day but not `.cargo/audit.toml`. R3-14
+(`--current-only`) and R4-20 (no resolvable base diff) still veto the downgrade
+upstream of the proof. A newly published advisory against an unchanged lock is
+therefore reported as pre-existing debt newly revealed, not as debt this change
+introduced — the correct reading, because the change touched no dependency; the
+advisory database moved, the lockfile did not.
+
+The gate says which of these it applied. A downgraded audit carries
+`reason: "pre-existing: Cargo.lock unchanged by this PR (N advisories)"` or
+`"pre-existing: unchanged vs base audit (N advisories)"`; a blocking one names
+what it blocks on — `Cargo audit (Failed): N new advisories introduced
+(RUSTSEC-… in <crate> <version>), M pre-existing`, or `N advisories with no base
+comparison (baseline unavailable)` when nothing could be compared. "Introduced"
+is what the proof licenses: under a withheld proof the same count reads `N new
+advisories vs the base audit (…), M pre-existing; provenance proof unavailable:
+<gap>`, because an audited lock not shown to be the target's cannot say the
+target introduced anything.
 
 Semgrep's `errors[]` remains a completeness signal independently of findings.
 Path-like `path`, `location.path`, and span `file` fields are collected into a
@@ -1200,7 +1410,10 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   this detects a changed endpoint, not edits under an unchanged HEAD or a change
   followed by a return to the original commit (ABA);
   The gate's pre-existing downgrade also uses the captured HEAD, never a later
-  checkout to infer where checks ran. With no captured HEAD no downgrade is
+  checkout to infer where checks ran. The same single status read also yields
+  the dirty-path set the per-file substrate proofs consult (today: cargo audit's
+  lockfile), so cleanliness, the digest and those paths can never describe
+  different observations of the tree. With no captured HEAD no downgrade is
   authorized. HEAD must still match at artifact generation for any downgrade;
   this extra stability check does not re-read cleanliness or rewrite recorded
   starting provenance. With a stable captured non-target checkout, only checks
