@@ -64,6 +64,16 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
             .and_then(|v| v.as_str())
             .map(str::to_string)
     }
+    fn report_status_from_gate(raw: &str) -> Option<&'static str> {
+        Some(match raw {
+            "passed" => "PASS",
+            "failed" => "FAIL",
+            "error" => "ERROR",
+            "skipped" => "SKIP",
+            "warnings" => "WARN",
+            _ => return None,
+        })
+    }
 
     let mut out = DiskArtifactCounters::default();
 
@@ -91,7 +101,7 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
                         Some(Some((
                             check.get("id")?.as_str()?,
                             check.get("name")?.as_str()?,
-                            check.get("status")?.as_str()?,
+                            report_status_from_gate(check.get("status")?.as_str()?)?,
                             cached.as_bool()?,
                         )))
                     })
@@ -809,8 +819,33 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
                     .and_then(|report| report.get("checks").and_then(|v| v.as_array()).cloned())
             });
         if let Some(rows) = synthetic_gate.as_ref() {
+            let gate_rows = rows
+                .iter()
+                .cloned()
+                .map(|mut row| {
+                    if let Some(raw) =
+                        row.get("status")
+                            .and_then(|v| v.as_str())
+                            .and_then(|v| match v {
+                                "PASS" => Some("passed"),
+                                "FAIL" => Some("failed"),
+                                "ERROR" => Some("error"),
+                                "SKIP" => Some("skipped"),
+                                "WARN" => Some("warnings"),
+                                _ => None,
+                            })
+                    {
+                        row["status"] = raw.into();
+                    }
+                    row
+                })
+                .collect::<Vec<_>>();
             std::fs::create_dir_all(root.join("00_summary")).unwrap();
-            std::fs::write(&gate_path, serde_json::json!({"checks":rows}).to_string()).unwrap();
+            std::fs::write(
+                &gate_path,
+                serde_json::json!({"checks":gate_rows}).to_string(),
+            )
+            .unwrap();
         }
         let disk = read_disk_artifact_counters(root);
         if synthetic_gate.is_some() {
@@ -1242,15 +1277,15 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{unticked}")).unwrap();
         std::fs::create_dir_all(root.join("00_summary")).unwrap();
         let gate_rows = serde_json::json!([
-            {"id":"cargo", "name":"Cargo check", "status":"FAIL", "cached":false},
-            {"id":"tsc", "name":"TypeScript", "status":"FAIL", "cached":false},
-            {"id":"tests", "name":"Vitest", "status":"FAIL", "cached":false},
-            {"id":"custom_lint", "name":"Custom lint", "status":"FAIL", "cached":false},
-            {"id":"pytest", "name":"Pytest", "status":"SKIP", "cached":null}
+            {"id":"cargo", "name":"Cargo check", "status":"failed", "cached":false},
+            {"id":"tsc", "name":"TypeScript", "status":"failed", "cached":false},
+            {"id":"tests", "name":"Vitest", "status":"failed", "cached":false},
+            {"id":"custom_lint", "name":"Custom lint", "status":"failed", "cached":false},
+            {"id":"pytest", "name":"Pytest", "status":"skipped", "cached":null}
         ]);
         std::fs::write(
             root.join("00_summary/MERGE_GATE.json"),
-            serde_json::json!({"checks":gate_rows}).to_string(),
+            serde_json::json!({"checks":gate_rows.clone()}).to_string(),
         )
         .unwrap();
         let original = serde_json::json!([
@@ -1293,6 +1328,15 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         let mut duplicate = original.clone();
         duplicate.as_array_mut().unwrap().push(original[3].clone());
         assert_eq!(warning_fields(&verify(duplicate)), ["pr_checklist"]);
+
+        let mut malformed_gate = gate_rows;
+        malformed_gate[0]["status"] = "FAIL".into();
+        std::fs::write(
+            root.join("00_summary/MERGE_GATE.json"),
+            serde_json::json!({"checks":malformed_gate}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(warning_fields(&verify(original)), ["pr_checklist"]);
     }
 
     #[test]
@@ -1332,7 +1376,7 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         }
         std::fs::write(
             root.join("00_summary/MERGE_GATE.json"),
-            r#"{"checks":[{"id":"cargo","name":"Cargo check","status":"FAIL","cached":false}]}"#,
+            r#"{"checks":[{"id":"cargo","name":"Cargo check","status":"failed","cached":false}]}"#,
         )
         .unwrap();
         let (unreadable, report) = raw_report();

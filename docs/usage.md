@@ -1284,7 +1284,8 @@ quality, policy, and permission axes beside that explanation.
   vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`) withhold the comparison behind one `pr_checklist`
   warning. The executed rows must also match the complete check set in a readable
   `MERGE_GATE.json`; a missing or damaged gate cannot certify the checklist. This compares
-  `(id, name, status, cached)` values. This catches alias collisions that preserve
+  `(id, name, status, cached)` values after mapping the gate's lowercase raw
+  status vocabulary to the report's uppercase display vocabulary. This catches alias collisions that preserve
   an id but change checklist category, altered outcomes, duplicates, and omitted failures while
   allowing custom check names. An existing `report.json` that cannot be decoded also withholds the comparison and warns; an
   absent report is expected while the pack is being built. An existing `PR_REVIEW.md` that cannot

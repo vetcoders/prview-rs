@@ -3792,7 +3792,8 @@ an `id` matching that name's canonical check ID, boolean `cached`, and status
 from the serialized vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`)
 withhold the comparison behind one `pr_checklist` warning. A missing or
 unreadable gate likewise withholds it. The disk reader compares the complete executed-row multiset
-of `(id, name, status, cached)` against `MERGE_GATE.json`. Canonical ids alone
+of `(id, name, status, cached)` against `MERGE_GATE.json`, using an explicit
+five-value mapping from gate raw statuses to report display statuses. Canonical ids alone
 cannot prove identity because distinct names can share an id; this comparison
 also detects a missing failed row without restricting custom check names. A present but
 unreadable `report.json` does the same; only an absent report is skipped while

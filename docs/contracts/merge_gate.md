@@ -670,6 +670,8 @@ checklist line or serialized check entry whose name, canonical id, status or cac
 `pr_checklist` warning. The consistency reader requires this gate's check rows
 to be readable and every executed `(id, name, status, cached)` row to match the
 complete set in `report.json`; alias collisions, omissions and duplicates warn.
+The comparison maps this gate's lowercase raw statuses to the report's uppercase
+display statuses through a closed five-value vocabulary.
 `CONSISTENCY_CHECK.json` is written after this file, so
 none of its warnings changes the gate decision.
 
