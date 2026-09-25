@@ -151,11 +151,12 @@ pub(crate) fn derive_pr_checklist(
 ///
 /// Only lines inside the PR Template's `## Checklist` section count: the
 /// `## Checklist` heading inside the ```` ```markdown ```` block that follows
-/// the `## PR Template` heading, up to the next level-2 heading or the block's
-/// closing fence. A `## Checklist` anywhere else — check-derived text above
+/// the generated `## PR Template` heading and its fixed introduction, up to
+/// the next level-2 heading or the block's closing fence. A `## Checklist`
+/// anywhere else — check-derived text above
 /// the template, or anything appended after its closing fence — is not the
-/// template's checklist and cannot stand in for it. A file with more than one
-/// `## PR Template` heading, or a template with more than one `## Checklist`,
+/// template's checklist and cannot stand in for it. A second complete PR
+/// Template, or a template with more than one `## Checklist`,
 /// is ambiguous and yields no section.
 ///
 /// Within the section, every line that names an item's label is a claim about
@@ -201,7 +202,21 @@ fn pr_checklist_mark(line: &str, item: PrChecklistItem) -> Option<bool> {
 /// ambiguous.
 fn pr_template_checklist(pr_review: &str) -> Option<Vec<&str>> {
     let lines: Vec<&str> = pr_review.lines().collect();
-    let mut templates = (0..lines.len()).filter(|&i| lines[i] == "## PR Template");
+    // Diagnostic excerpts above the generated tail can quote a heading-shaped
+    // line. Only the generator's full heading + introduction names a template.
+    let mut templates = (0..lines.len()).filter(|&i| {
+        lines.get(i..i + 5)
+            == Some(
+                [
+                    "## PR Template",
+                    "",
+                    "_Copy below for GitHub PR description:_",
+                    "",
+                    "```markdown",
+                ]
+                .as_slice(),
+            )
+    });
     let heading = templates.next()?;
     if templates.next().is_some() {
         return None;

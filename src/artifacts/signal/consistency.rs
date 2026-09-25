@@ -74,7 +74,8 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
             .map(Vec::len);
     }
 
-    if let Some(report) = load_json(pack_root.join("report.json")) {
+    let report_path = pack_root.join("report.json");
+    if let Some(report) = load_json(report_path.clone()) {
         out.verdict_report = string_at(&report, "/gate/verdict");
         out.files_changed_report = usize_at(&report, "/diff/stats/files_changed");
         out.findings_count_report = usize_at(&report, "/quality/sarif/findings_count");
@@ -99,6 +100,11 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
             None => out.check_entries_unreadable += 1,
         }
         out.check_outcomes_report = Some(outcomes);
+    } else if std::fs::symlink_metadata(&report_path).is_ok() {
+        // An absent report is expected while the pack is being built. A report
+        // that exists but cannot be read or decoded has lost its check evidence.
+        out.check_entries_unreadable = 1;
+        out.check_outcomes_report = Some(Vec::new());
     }
 
     out.pr_checklist = std::fs::read_to_string(pack_root.join("PR_REVIEW.md"))
@@ -896,6 +902,26 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         assert_eq!(report.checked_fields, 3);
     }
 
+    /// A failed check may quote Markdown in its multiline evidence above the
+    /// generated template. A heading alone does not create a second template.
+    #[test]
+    fn diagnostic_pr_template_heading_does_not_ambiguate_generated_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
+        let honest = INCIDENT_PR_TEMPLATE.replace("- [x] No lint errors", "- [ ] No lint errors");
+        std::fs::write(
+            root.join("PR_REVIEW.md"),
+            format!(
+                "# PR Review\n\n## Review Findings\n\nPytest assertion:\n## PR Template\nquoted failure line\n\n---\n\n{honest}"
+            ),
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert!(report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 3);
+    }
+
     /// One item, one line. With a failed ESLint, an honest `- [ ] No lint
     /// errors` followed by a false `- [x] No lint errors` used to read as
     /// consistent: the parser took the first readable line and never saw the
@@ -1006,6 +1032,30 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
                 report.warnings[0].message.contains("not verifiable"),
                 "{report:?}"
             );
+        }
+    }
+
+    /// The report file may exist but fail before `/checks` can be inspected.
+    /// That loss of serialized evidence must fail closed just like a malformed
+    /// check row; only an absent file is legitimately unchecked mid-build.
+    #[test]
+    fn unreadable_report_json_withholds_the_checklist_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("PR_REVIEW.md"),
+            format!("# R\n\n{INCIDENT_PR_TEMPLATE}"),
+        )
+        .unwrap();
+        for damaged in [b"{\"checks\":".as_slice(), b"\xff\xfe".as_slice()] {
+            std::fs::write(root.join("report.json"), damaged).unwrap();
+            let disk = read_disk_artifact_counters(root);
+            assert_eq!(disk.check_entries_unreadable, 1);
+            assert_eq!(disk.check_outcomes_report, Some(Vec::new()));
+            let report = checklist_report(root);
+            assert!(!report.consistent, "{report:?}");
+            assert_eq!(report.checked_fields, 1);
+            assert_eq!(warning_fields(&report), ["pr_checklist"]);
         }
     }
 
