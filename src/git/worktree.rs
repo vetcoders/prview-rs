@@ -186,6 +186,15 @@ pub(crate) enum ClosureProof {
     Unproven,
 }
 
+#[cfg(unix)]
+fn snapshot_borrow_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// What resolving `relative_path` in this snapshot proves about the bytes it
 /// consumes.
 ///
@@ -214,13 +223,21 @@ pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path
     let Some(parent) = snapshot_root.parent() else {
         return ClosureProof::TargetOnly;
     };
-    let encoded = std::fs::read(parent.join(BORROWED_LINKS_MANIFEST)).unwrap_or_default();
-    use std::os::unix::ffi::OsStringExt as _;
-    let borrowed: Vec<PathBuf> = encoded
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
-        .collect();
+    let borrowed = match snapshot_borrow_registry().lock() {
+        Ok(registry) => registry.get(snapshot_root).cloned(),
+        Err(_) => return ClosureProof::Unproven,
+    };
+    let borrowed = borrowed.unwrap_or_else(|| {
+        // Standalone proof callers and fixtures can still use a sidecar. Real
+        // snapshots use the process-owned copy captured before any check runs.
+        use std::os::unix::ffi::OsStringExt as _;
+        std::fs::read(parent.join(BORROWED_LINKS_MANIFEST))
+            .unwrap_or_default()
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+            .collect()
+    });
     if borrowed
         .iter()
         .any(|created| relative_path.starts_with(created) || created.starts_with(relative_path))
@@ -1044,7 +1061,19 @@ fn link_missing_entries(
         let borrowed = entry.path();
         let exposed = snapshot.join(entry.file_name());
         match std::fs::symlink_metadata(&exposed) {
-            Ok(_) => continue,
+            Ok(metadata) => {
+                // A scoped package directory is a namespace, not one package.
+                // Keep every target-owned child and expose only missing ambient
+                // packages within that namespace.
+                if entry.file_name().to_string_lossy().starts_with('@')
+                    && metadata.is_dir()
+                    && std::fs::symlink_metadata(&borrowed)?.is_dir()
+                    && matches!(dependency_root(&exposed)?, DependencyRoot::TargetDirectory)
+                {
+                    link_missing_entries(&borrowed, &exposed, snapshot_root, borrowed_links)?;
+                }
+                continue;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -1152,6 +1181,10 @@ pub struct WorktreeSnapshot {
 
 impl Drop for WorktreeSnapshot {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Ok(mut registry) = snapshot_borrow_registry().lock() {
+            registry.remove(&self.worktree_path);
+        }
         // Drop can run while unwinding an async stage. Never start or wait for a
         // child here: the explicit success path owns governed `git worktree
         // remove`, while this backstop only prunes this exact registration in
@@ -1226,9 +1259,9 @@ impl WorktreeSnapshot {
     }
 }
 
-/// Inspect the pinned tree before extracting its archive. Git trees cannot
-/// contain children below a symlink, but checking that invariant before tar
-/// runs keeps extraction fail-closed even for malformed imported objects.
+/// Inspect the pinned tree before writing raw blobs. Git trees cannot
+/// contain children below a symlink, but checking that invariant before writes
+/// keeps materialization fail-closed even for malformed imported objects.
 fn pinned_gitlinks(
     source_repo: &git2::Repository,
     commit: git2::Oid,
@@ -1288,6 +1321,63 @@ fn pinned_gitlinks(
         );
     }
     Ok(links)
+}
+
+/// Write the pinned tree's raw blobs. `git archive` is unsuitable here:
+/// committed export-ignore/export-subst attributes can omit or alter bytes.
+fn materialize_pinned_tree(
+    repo: &git2::Repository,
+    tree: &git2::Tree<'_>,
+    destination: &Path,
+) -> Result<()> {
+    for entry in tree {
+        let name = entry.name().context("non-UTF-8 submodule path")?;
+        crate::paths::validate_repo_relative_str(name)?;
+        anyhow::ensure!(
+            name != ".git",
+            "submodule tree contains Git administrative path"
+        );
+        let path = destination.join(name);
+        match entry.filemode() {
+            0o040000 => {
+                std::fs::create_dir(&path)?;
+                let child = repo.find_tree(entry.id())?;
+                materialize_pinned_tree(repo, &child, &path)?;
+            }
+            0o100644 | 0o100755 => {
+                let blob = repo.find_blob(entry.id())?;
+                std::fs::write(&path, blob.content())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(if entry.filemode() == 0o100755 {
+                            0o755
+                        } else {
+                            0o644
+                        }),
+                    )?;
+                }
+            }
+            0o120000 => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    let blob = repo.find_blob(entry.id())?;
+                    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(blob.content()), &path)?;
+                }
+                #[cfg(not(unix))]
+                anyhow::bail!("cannot materialize submodule symlink on this platform");
+            }
+            0o160000 => {} // Nested gitlink is expanded from its own pinned object below.
+            mode => anyhow::bail!(
+                "unsupported submodule tree mode {mode:o} at {}",
+                path.display()
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Expand gitlinks from local object stores at their pinned commit IDs. This
@@ -1350,28 +1440,8 @@ fn materialize_pinned_gitlinks(
             "submodule destination is not empty in exact snapshot: {}",
             destination.display()
         );
-        let mut archive = git_cmd();
-        archive
-            .arg("--git-dir")
-            .arg(sub_repo.path())
-            .arg("archive")
-            .arg(pinned_oid.to_string());
-        let mut extract = std::process::Command::new("tar");
-        extract.arg("-x").arg("-C").arg(&destination);
-        let (archive_status, extract_status) = crate::proc::run_pipeline_governed(
-            archive,
-            extract,
-            "git archive pinned submodule",
-            "tar extract pinned submodule",
-        )?;
-        anyhow::ensure!(
-            archive_status.success() && extract_status.success(),
-            "failed to materialize pinned submodule {} at {} (archive: {:?}, extract: {:?})",
-            relative.display(),
-            pinned_oid,
-            archive_status.code(),
-            extract_status.code()
-        );
+        let tree = sub_repo.find_commit(pinned_oid)?.tree()?;
+        materialize_pinned_tree(&sub_repo, &tree, &destination)?;
         materialize_pinned_gitlinks(
             &sub_repo,
             &operator_submodule,
@@ -1495,6 +1565,10 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
             create_borrowed_link(&venv, &snapshot_venv, &worktree_path, &mut borrowed_links)?;
         }
         write_borrowed_links_manifest(tmp.path(), &mut borrowed_links)?;
+        snapshot_borrow_registry()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot borrow registry is unavailable"))?
+            .insert(worktree_path.clone(), borrowed_links);
     }
 
     registration_rollback.disarm();
@@ -2285,6 +2359,12 @@ mod tests {
         std::fs::create_dir(&sub_path).unwrap();
         let sub_repo = git2::Repository::init(&sub_path).unwrap();
         std::fs::write(sub_path.join("payload.txt"), "committed\n").unwrap();
+        std::fs::write(
+            sub_path.join(".gitattributes"),
+            "payload.txt export-ignore\nsubstituted.txt export-subst\n",
+        )
+        .unwrap();
+        std::fs::write(sub_path.join("substituted.txt"), "$Format:%H$\n").unwrap();
         #[cfg(unix)]
         let external = tempfile::tempdir().unwrap();
         #[cfg(unix)]
@@ -2294,7 +2374,9 @@ mod tests {
             symlink(external.path(), sub_path.join("escape")).unwrap();
         }
         let mut sub_index = sub_repo.index().unwrap();
+        sub_index.add_path(Path::new(".gitattributes")).unwrap();
         sub_index.add_path(Path::new("payload.txt")).unwrap();
+        sub_index.add_path(Path::new("substituted.txt")).unwrap();
         #[cfg(unix)]
         sub_index.add_path(Path::new("escape")).unwrap();
         let sub_tree_oid = sub_index.write_tree().unwrap();
@@ -2353,7 +2435,12 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(snapshot.worktree_path.join("module/payload.txt")).unwrap(),
             "committed\n",
-            "snapshot must archive pinned gitlink bytes, never the operator checkout"
+            "snapshot must write pinned gitlink bytes, never the operator checkout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshot.worktree_path.join("module/substituted.txt")).unwrap(),
+            "$Format:%H$\n",
+            "materialization must preserve the raw pinned blob despite export-subst"
         );
         #[cfg(unix)]
         assert_eq!(
@@ -2428,6 +2515,16 @@ mod tests {
         );
         let output = git_cmd()
             .args(["commit", "-qm", "gitlink"])
+            .current_dir(super_tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = git_cmd()
+            .args(["submodule", "absorbgitdirs"])
             .current_dir(super_tmp.path())
             .output()
             .unwrap();
@@ -2614,6 +2711,71 @@ mod tests {
             .parent()
             .expect("snapshot temp root")
             .join(BORROWED_LINKS_MANIFEST)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_merges_missing_scoped_packages_without_replacing_target_package() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        let scope = repo_tmp.path().join("node_modules/@scope");
+        std::fs::create_dir_all(scope.join("owned")).unwrap();
+        std::fs::write(scope.join("owned/index.js"), "target\n").unwrap();
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns one scoped package",
+            &["node_modules/@scope/owned/index.js"],
+        );
+        std::fs::create_dir_all(scope.join("borrowed")).unwrap();
+        std::fs::write(scope.join("borrowed/index.js"), "ambient\n").unwrap();
+
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head).unwrap();
+        let snap_scope = snapshot.worktree_path.join("node_modules/@scope");
+        assert_eq!(
+            std::fs::read_to_string(snap_scope.join("owned/index.js")).unwrap(),
+            "target\n"
+        );
+        assert!(snap_scope.join("borrowed").is_symlink());
+        assert_eq!(
+            path_uses_prview_borrow(
+                &snapshot.worktree_path,
+                Path::new("node_modules/@scope/borrowed/index.js"),
+            ),
+            ClosureProof::Borrowed,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_borrowed_link_and_sidecar_cannot_erase_creator_evidence() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        let node_modules = repo_tmp.path().join("node_modules");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::write(node_modules.join("owned"), "target\n").unwrap();
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns node_modules",
+            &["node_modules/owned"],
+        );
+        std::fs::create_dir_all(node_modules.join(".bin")).unwrap();
+        std::fs::write(node_modules.join(".bin/eslint"), "#!/bin/sh\nexit 0\n").unwrap();
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head).unwrap();
+        let borrowed_dir = snapshot.worktree_path.join("node_modules/.bin");
+        assert_eq!(
+            path_uses_prview_borrow(
+                &snapshot.worktree_path,
+                Path::new("node_modules/.bin/eslint")
+            ),
+            ClosureProof::Borrowed,
+        );
+        std::fs::remove_file(&borrowed_dir).unwrap();
+        std::fs::remove_file(borrowed_links_manifest(&snapshot)).unwrap();
+        assert_eq!(
+            path_uses_prview_borrow(
+                &snapshot.worktree_path,
+                Path::new("node_modules/.bin/eslint")
+            ),
+            ClosureProof::Borrowed,
+        );
     }
 
     /// The reviewed commit owns `node_modules` as a symlink to a writable

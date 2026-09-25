@@ -1068,7 +1068,8 @@ and not followed:
 - the target committed **nothing** at `node_modules`/`.venv` — the operator's
   whole directory is exposed as one borrowed link;
 - the target committed a **real directory** — only the top-level entries it does
-  not own are linked inside it, and `.bin` likewise when the target owns it as a
+  not own are linked inside it, including missing packages under target-owned
+  `@scope` directories; `.bin` entries are merged when the target owns `.bin` as a
   real directory too. The top-level merge is independent of whether the operator
   has a `.bin` at all: packages are what a shim resolves (`../<package>`), and
   when the target owns no `.bin`, `.bin` is simply one of the entries this merge
@@ -1086,6 +1087,9 @@ parent, canonicalized, must stay inside the canonical snapshot root — so a
 future caller cannot reintroduce a write that leaves the snapshot through a path
 the reviewed commit chose. `strip_prefix` alone compares spelling, not identity,
 and does not catch that.
+Borrowed-link paths are also captured in process-owned memory before checks run.
+Provenance uses that copy even if a check deletes a borrowed link or its sidecar;
+the sidecar remains a diagnostic record, not mutable authority for a live run.
 
 A proved-direct target-owned shell script does not become borrowed merely
 because unrelated ambient packages were exposed elsewhere in `node_modules`; an
@@ -1374,6 +1378,9 @@ snapshot of this repo can never contain it. Off-`HEAD` runs then **skip** the
 cargo checks with a reason naming the unreachable root
 (`unreachable_reviewed_cargo_root()`), instead of quietly analysing the
 operator's unrelated checkout and filing the result under the reviewed commit.
+The rebase rejects `..` components even if the unnormalized path starts with
+the repository spelling, so a programmatic root such as `repo/../outside`
+cannot escape the snapshot through `Path::join`.
 No verdict is the honest answer where a foreign tree's verdict was the bug.
 
 That refusal is lexical, and the reviewed commit controls the tree: it can turn
@@ -1484,11 +1491,13 @@ on every review of a workspace member. The same encoding removes the colon these
 keys carried, which is an illegal file-name character on Windows.
 
 **Pinned submodules.** After `git worktree add`, an exact snapshot expands each
-gitlink at its committed object ID with `git archive` from an initialized local
+gitlink at its committed object ID by writing raw Git blobs from an initialized local
 submodule or its local module store. Nested gitlinks use the same rule, with a
 depth bound. It never fetches or copies uncommitted submodule worktree bytes.
-Before extraction, archive entries must be repository-relative and cannot
-descend through a symlink or write Git administrative paths. Each recursive
+Before writing, tree entries must be repository-relative and cannot
+descend through a symlink or write Git administrative paths. Raw blobs preserve
+committed files even when `export-ignore` or `export-subst` attributes would alter
+an archive. Each recursive
 layer uses that layer's pinned gitlink object ID, never its symbolic `HEAD`.
 If a pinned object is unavailable locally, snapshot creation fails with the
 submodule path and object ID instead of publishing an empty directory as the
@@ -2096,6 +2105,9 @@ an explicit same-`HEAD` review resolves to a snapshot instead. Cargo context
 commands resolve their directory through `checks::planned_cargo_cwd`, the same
 resolution the cargo gates use, so a workspace member is not collapsed to the
 snapshot root.
+Headless same-`HEAD` heuristic scans use this same `scan_dir_override` and record
+the selected target SHA; otherwise a dirty operator checkout would produce
+heuristic signals for different bytes than checks and context.
 
 ### governor/mod.rs
 

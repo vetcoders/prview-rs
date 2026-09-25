@@ -1219,6 +1219,15 @@ fn a_cargo_root_outside_the_repository_escalates_rather_than_guessing() {
         ),
         CargoRoot::Unlocatable
     );
+    assert_eq!(
+        rebase_cargo_root(
+            Path::new("/repo/../outside"),
+            Path::new("/repo"),
+            Path::new("/snap")
+        ),
+        CargoRoot::Unlocatable,
+        "a lexical prefix cannot permit traversal outside the reviewed tree"
+    );
     let unlocatable: Result<CargoWorkspace, WorkspaceError> = Err(WorkspaceError::UnlocatableRoot);
     let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
     let decisions = decide_with(Some(&set), &profile(true, true), Some(&unlocatable));

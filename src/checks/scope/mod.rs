@@ -1598,7 +1598,16 @@ fn reviewed_cargo_root(config: &crate::config::Config, reviewed_root: &Path) -> 
 /// inside the repository has no reviewed counterpart to compute.
 fn rebase_cargo_root(detected: &Path, repo_root: &Path, reviewed_root: &Path) -> CargoRoot {
     match detected.strip_prefix(repo_root) {
-        Ok(relative) => CargoRoot::Reviewed(reviewed_root.join(relative)),
+        Ok(relative)
+            if relative.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            }) =>
+        {
+            CargoRoot::Reviewed(reviewed_root.join(relative))
+        }
         Err(_) => CargoRoot::Unlocatable,
     }
 }

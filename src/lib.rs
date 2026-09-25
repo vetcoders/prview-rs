@@ -53,6 +53,18 @@ fn run_headless_sync_stage<T>(
     result
 }
 
+/// Use the selected check/context tree for a local or exact-target run.
+async fn run_local_heuristics(
+    config: &Config,
+    target_commit: &str,
+) -> Result<heuristics::HeuristicsResult> {
+    let mut result = heuristics::run_all(config, config.scan_dir_override.as_deref()).await?;
+    if config.scan_dir_override.is_some() {
+        result.analysis_sha = Some(target_commit.to_owned());
+    }
+    Ok(result)
+}
+
 /// Select one project profile from the tree this run reviews, before choosing
 /// checks or writing profile-dependent artifacts. The ledger keeps an exact
 /// target snapshot alive through both stages.
@@ -305,7 +317,7 @@ impl App {
             self.run_heuristics_with_snapshots(&run_config, &target, &diff_bases)
                 .await?
         } else {
-            heuristics::run_all(&run_config, None).await?
+            run_local_heuristics(&run_config, &target.commit_id).await?
         };
         self.ensure_not_cancelled()?;
 
@@ -1233,6 +1245,25 @@ mod tests {
         let target_tree = remote.scan_dir_override.clone().expect("target snapshot");
         remote.refresh_profile_from_tree(&target_tree).unwrap();
         assert_eq!(remote.profile.kind, crate::config::ProfileKind::Rust);
+    }
+
+    #[tokio::test]
+    async fn same_head_heuristics_name_the_selected_snapshot() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(repo.path(), out.path());
+        let target_sha = rev_parse(repo.path(), "HEAD");
+        config.target = Some("HEAD".to_owned());
+        config.pinned_target = Some(resolved(&target_sha));
+        config.run_heuristics = false;
+        let ledger = crate::ledger::TaskLedger::new();
+        prepare_review_profile(&mut config, &ledger).unwrap();
+        let selected = config.scan_dir_override.clone().expect("exact snapshot");
+        assert_ne!(selected, config.repo_root);
+
+        let result = run_local_heuristics(&config, &target_sha).await.unwrap();
+        assert_eq!(result.analysis_root, Some(selected.display().to_string()));
+        assert_eq!(result.analysis_sha, Some(target_sha));
     }
 
     #[cfg(unix)]
