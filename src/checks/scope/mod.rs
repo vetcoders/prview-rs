@@ -1608,7 +1608,7 @@ fn rebase_cargo_root(detected: &Path, repo_root: &Path, reviewed_root: &Path) ->
         {
             CargoRoot::Reviewed(reviewed_root.join(relative))
         }
-        Err(_) => CargoRoot::Unlocatable,
+        _ => CargoRoot::Unlocatable,
     }
 }
 

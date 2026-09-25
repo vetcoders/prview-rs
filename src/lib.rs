@@ -1261,7 +1261,9 @@ mod tests {
         let selected = config.scan_dir_override.clone().expect("exact snapshot");
         assert_ne!(selected, config.repo_root);
 
-        let result = run_local_heuristics(&config, &target_sha).await.unwrap();
+        let result = super::run_local_heuristics(&config, &target_sha)
+            .await
+            .unwrap();
         assert_eq!(result.analysis_root, Some(selected.display().to_string()));
         assert_eq!(result.analysis_sha, Some(target_sha));
     }
