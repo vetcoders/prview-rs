@@ -3413,16 +3413,47 @@ filenames back to original source paths.
 #### signal/ghost_refs.rs — dangling references to deleted files
 
 Detects references to files that were deleted in the PR but are still mentioned in
-the remaining working tree (imports, requires, documentation links, etc.):
+the rest of the reviewed tree (imports, requires, documentation links, etc.):
 
-- `GhostRef` struct — path of the referencing file, line number, and the deleted path it references
-- `detect_ghost_refs(diffs, repo_root)` — collects all deleted file paths from the diff,
-  then scans the working tree for lines that reference them. Produces `GHOST_REFS.json`
-  if any dangling references are found.
+- `GhostRef` struct — referencing file path, line number, matched line, and the noise
+  category the referencing file falls into
+- `generate_ghost_refs(dir, diffs, scan_root)` — collects all deleted file paths from
+  the diff, then scans `scan_root` for lines that reference them. Produces
+  `GHOST_REFERENCES.json` and `GHOST_REFERENCES.md`; returns a `Warnings` check only
+  when at least one finding survives the noise filter.
 
-Covers common reference patterns: Rust `mod foo;` / `use crate::foo`, JS/TS `import … from`,
-Python `from … import`, and generic string literals. Only source files are scanned
-(config, assets, and generated paths are skipped).
+`scan_root` is the **reviewed tree**, not the operator's checkout: for an off-`HEAD`
+target it is the shared target snapshot the rest of `30_context/` is planned from
+(`PRV-CONTEXT-SNAPSHOT-PROVENANCE`), and it coincides with `repo_root` only for a
+local review where `target == HEAD`. Scanning the ambient checkout instead made the
+audit describe a revision nobody reviewed — local untracked or dirty files surfaced
+as ghost findings belonging to no PR, and a file deleted by the PR but still present
+locally looked like a relocation survivor, so the relocation guard suppressed a real
+deletion.
+
+A relocation guard runs before the scan: if the exact deleted path still exists in
+`scan_root` the deletion is audited anyway (a same-basename file elsewhere is a mere
+name collision), while a surviving basename with the exact path gone is treated as a
+relocation and suppressed. Findings in build artifacts, logs and generated assets are
+counted as noise rather than reported, and each deleted file is capped at
+`MAX_GHOST_REFS_PER_DELETED_FILE` findings.
+
+The guard and the scan agree on what the reviewed tree is: both skip hidden path
+components and every `node_modules` dependency tree. A target snapshot links the
+operator's `node_modules` in as a symlink the walk does not follow, while a local
+review would walk the same directory for real, so without the skip a vendored
+`node_modules/pkg/util.js` could pass for a relocation survivor and silence a real
+`src/util.js` deletion in one review mode but not the other.
+
+A match counts only when the deleted file's stem appears as a standalone identifier
+in a module-path, import or file-path context: Rust `mod foo;` / `use crate::foo` /
+`foo::Bar`, JS/TS `import … from './foo'` / `require('foo')`, Python `from foo import`,
+and literal `foo.rs` / `foo/…` path references. Bare prose and identifier substrings
+(`high-signal`, `signals`, `signal_reasons`) are rejected. The `SKIP_EXTENSIONS` list
+is skipped outright — images, media and fonts (`png`, `jpg`, `gif`, `webp`, `avif`,
+`ico`, `svg`, `mp3`, `mp4`, `pdf`, `woff`, `woff2`, `ttf`, `eot`), plus `zip`, `lock`
+and the machine-report formats `json` and `sarif` — as are `logs/` and `archive/`
+paths and anything the PR itself touched.
 
 #### signal/risk.rs — per-file risk scoring
 

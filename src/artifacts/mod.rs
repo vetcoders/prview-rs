@@ -744,7 +744,10 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     if let Some(uns) = signal::generate_unsafe_audit(&context_dir, diffs, &repo)? {
         all_checks.push(uns);
     }
-    if let Some(ghr) = signal::generate_ghost_refs(&context_dir, diffs, &repo)? {
+    // The ghost audit judges the reviewed tree, like every other 30_context
+    // artifact: the ambient checkout may carry untracked noise that belongs to
+    // no PR, and may still hold a file this PR deletes.
+    if let Some(ghr) = signal::generate_ghost_refs(&context_dir, diffs, &context_scan_root)? {
         all_checks.push(ghr);
     }
     ensure_generation_active(
