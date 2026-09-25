@@ -1687,6 +1687,11 @@ impl Config {
             manifest.as_ref(),
         )?;
         let rebase = |path: &Path| -> Result<PathBuf> {
+            if tree_root == self.repo_root {
+                // Ambient local reviews can deliberately point cargo_root at an
+                // external directory. There is no snapshot path to translate.
+                return Ok(path.to_path_buf());
+            }
             Ok(self.repo_root.join(path.strip_prefix(tree_root)?))
         };
         profile.cargo_root = profile.cargo_root.as_deref().map(&rebase).transpose()?;

@@ -188,10 +188,11 @@ manifest and Cargo paths from regular entries and blobs in the pinned Git tree;
 they do not follow snapshot symlinks into the operator's filesystem. They also
 materialize one target snapshot, which the run ledger keeps alive through checks
 and artifact generation. The TUI uses the same preparation path. Ordinary target-less reviews
-refresh from the live checkout, including its uncommitted changes. The
+refresh from the live checkout, including its uncommitted changes; an external
+manifest-configured Cargo root keeps its original path there. The
 requested `--profile` kind remains explicit, while marker fields and detected
-Cargo paths come from the reviewed tree. Cargo paths are rebased to the logical
-repository root for consumers that map them into their own scan directory.
+Cargo paths come from the reviewed tree. Exact-target Cargo paths stay anchored
+to the logical repository root for consumers that map them into a scan directory.
 `Config::from_cli` records `Some(Auto)` or the explicit CLI selection to opt into
 that refresh. A programmatic `Config` passed to `App::from_config` starts with
 `requested_profile: None`, so its supplied `profile` remains authoritative;

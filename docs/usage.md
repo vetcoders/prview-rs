@@ -47,7 +47,8 @@ additions or deletions in the checkout cannot change that profile. The TUI
 uses the same profile selection as headless runs.
 An ordinary target-less local review uses the live checkout. `--profile` still
 chooses the requested profile kind; its project markers come from the reviewed
-tree.
+tree. An absolute `project.cargo_root` outside the repo remains valid for that
+ambient local review.
 For library callers, `App::from_config` keeps a supplied `Config.profile` when
 `requested_profile` is `None`. Set it to `Some(Profile::Auto)` to request the
 same target-derived detection used by the CLI.

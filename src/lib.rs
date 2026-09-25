@@ -1326,6 +1326,36 @@ mod tests {
         assert_eq!(gate["profile"], "Js", "{gate}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambient_review_keeps_external_manifest_cargo_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(
+            external.path().join("Cargo.toml"),
+            "[package]\nname = 'outside'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        let mut config = reviewable_repo(repo.path(), out.path());
+        std::fs::write(
+            repo.path().join("prview.toml"),
+            format!("[project]\ncargo_root = '{}'\n", external.path().display()),
+        )
+        .unwrap();
+        config.target = None;
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        config.run_lint = false;
+        config.run_tests = false;
+        let app = crate::App::from_config(config).unwrap();
+        let report = app.run_quick().await.unwrap();
+        let gate: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(report.artifacts_dir.join("00_summary/MERGE_GATE.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Rust", "{gate}");
+    }
+
     /// `--watch` reuses ONE `App` for every pack it emits, so worktree state
     /// frozen at construction describes the tree as it was when the watcher
     /// started — never the edit that triggered this iteration. Each quick run
