@@ -514,6 +514,17 @@ fn handle_tui_event(state: &mut TuiState, event: TuiEvent) {
         TuiEvent::Key(_) => {
             // Handled in event loop
         }
+        TuiEvent::ProfileReady {
+            profile,
+            cli_detection,
+        } => {
+            state.config.profile = profile.clone();
+            state.config.profile_at_cli_detection = cli_detection;
+            let check_names = state.config.profile.get_check_names();
+            state.init_checks(&check_names);
+            state.checks_state.selected = 0;
+            state.checks_state.scroll_offset = 0;
+        }
         TuiEvent::CheckQueued { name } => {
             state.update_check(&name, types::CheckLifecycle::Pending);
         }
@@ -649,6 +660,7 @@ pub async fn run_analysis(
     governor: Arc<crate::governor::ResourceGovernor>,
 ) -> Result<()> {
     let t_start = std::time::Instant::now();
+    let ledger = crate::ledger::TaskLedger::new();
 
     // --- Sync phase: all git2 (non-Send) work happens here ---
     // `blocking_stage` keeps a one-worker runtime able to poll q/Escape while
@@ -713,6 +725,7 @@ pub async fn run_analysis(
             .and_then(|base| app.repo.changed_paths(base, &target).ok())
             .map(|paths| crate::checks::scope::ChangeSet::new(paths, diff_bases.len() == 1));
         config.pinned_diff_bases = Some(diff_bases);
+        crate::prepare_review_profile(&mut config, &ledger)?;
         // app (with git2::Repository) is dropped here
         Ok((
             config,
@@ -732,13 +745,16 @@ pub async fn run_analysis(
 
     ensure_analysis_active(&governor)?;
 
+    let _ = tx.send(TuiEvent::ProfileReady {
+        profile: config.profile.clone(),
+        cli_detection: config.profile_at_cli_detection.clone(),
+    });
     let _ = tx.send(TuiEvent::DiffsReady {
         diffs: diffs.clone(),
     });
 
     // Run all checks with event callbacks for real-time updates
     let tx_checks = tx.clone();
-    let ledger = crate::ledger::TaskLedger::new();
     let (check_results, skipped_checks) =
         crate::checks::run_all_with_events(&config, &ledger, &governor, move |event| {
             let tx = tx_checks.clone();
@@ -845,6 +861,91 @@ mod tests {
 
     fn default_config() -> Config {
         test_config()
+    }
+
+    #[test]
+    fn profile_event_replaces_visible_checks_and_allows_next_run_refresh() {
+        let mut config = default_config();
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        config.profile_at_cli_detection = Some(config.profile.clone());
+        let mut state = TuiState::new(config);
+        state.init_checks(&state.config.profile.get_check_names());
+
+        let js = crate::config::test_js_profile(true);
+        handle_tui_event(
+            &mut state,
+            TuiEvent::ProfileReady {
+                profile: js.clone(),
+                cli_detection: Some(js.clone()),
+            },
+        );
+        assert_eq!(state.config.profile, js);
+        assert_eq!(state.config.profile_at_cli_detection, Some(js));
+        assert!(
+            state
+                .checks_state
+                .entries
+                .iter()
+                .any(|entry| entry.name == "ESLint")
+        );
+        state.update_check("ESLint", CheckLifecycle::Running);
+        assert_eq!(
+            state
+                .checks_state
+                .entries
+                .iter()
+                .find(|entry| entry.name == "ESLint")
+                .unwrap()
+                .status,
+            CheckLifecycle::Running
+        );
+
+        let rust = crate::config::test_rust_profile(true);
+        handle_tui_event(
+            &mut state,
+            TuiEvent::ProfileReady {
+                profile: rust.clone(),
+                cli_detection: Some(rust.clone()),
+            },
+        );
+        assert_eq!(state.config.profile, rust);
+        assert_eq!(state.config.profile_at_cli_detection, Some(rust));
+        assert!(
+            state
+                .checks_state
+                .entries
+                .iter()
+                .any(|entry| entry.name == "Clippy")
+        );
+        assert!(
+            !state
+                .checks_state
+                .entries
+                .iter()
+                .any(|entry| entry.name == "ESLint")
+        );
+        assert!(
+            state
+                .checks_state
+                .entries
+                .iter()
+                .all(|entry| entry.status == CheckLifecycle::Pending)
+        );
+
+        let manual = crate::config::test_js_profile(true);
+        let original_detection = crate::config::test_generic_profile();
+        handle_tui_event(
+            &mut state,
+            TuiEvent::ProfileReady {
+                profile: manual.clone(),
+                cli_detection: Some(original_detection.clone()),
+            },
+        );
+        assert_eq!(state.config.profile, manual);
+        assert_eq!(
+            state.config.profile_at_cli_detection,
+            Some(original_detection)
+        );
     }
 
     #[test]

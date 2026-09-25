@@ -891,9 +891,9 @@ fn manifest_dependency_paths(manifest: &toml::Table) -> Vec<(String, String)> {
 
 /// Validate the mapped cargo root against the reviewed snapshot.
 ///
-/// `config.profile.cargo_root` describes the LOCAL checkout. When the reviewed
-/// branch moved the crate (a root crate pushed into `backend/`, a member renamed)
-/// that path does not exist in the snapshot, and projecting it blindly makes
+/// `config.profile.cargo_root` is a logical repository path. A programmatic
+/// caller can still supply a root from a different tree; when the reviewed
+/// branch moved the crate, that path does not exist in the snapshot and projecting it blindly makes
 /// cargo fail on a missing manifest — an execution error reported as the reviewed
 /// crate's verdict. Fall back to the snapshot root when it carries a manifest of
 /// its own: a workspace root still checks its members, and provenance records the
@@ -1155,11 +1155,11 @@ fn manifest_identity(content: &str) -> Option<ManifestIdentity> {
 /// `examples/demo`, a test fixture crate — left this arm running every cargo
 /// gate against the demo and filing a green verdict for a project the reviewed
 /// commit no longer contains. Checked out normally that commit would not even be
-/// detected as a Rust project, because local profile detection never looks at
+/// detected as a Rust project, because profile detection never looks at
 /// `examples/`.
 ///
-/// The identity being matched is the CONFIGURED project's, read from the local
-/// checkout — the same source the mapped candidate came from, and the only
+/// The identity being matched is the CONFIGURED project's, read from the
+/// configured profile root — the same source the mapped candidate came from, and the only
 /// statement anywhere of which crate this review is about. Without it (no local
 /// manifest, one that does not parse, one that defines neither a package nor a
 /// workspace) there is nothing to compare, and an unproven guess is refused:

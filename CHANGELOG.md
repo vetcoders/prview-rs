@@ -301,6 +301,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Exact reviews now derive their check set and reported project profile from
+  the pinned target tree. A dirty operator checkout can no longer hide JS,
+  Python, or Rust checks by removing local project markers; ordinary local
+  reviews continue to reflect the live checkout. Programmatic `App::from_config`
+  callers keep a supplied `Config.profile` unless they set
+  `requested_profile: Some(Profile::Auto)` to opt into target-derived detection.
+  Changing the public profile after `Config::from_cli` also preserves that
+  explicit programmatic override.
+
 - **A snapshot never writes through an entry the reviewed commit owns.** The
   dependency merge decided whether the target already had `node_modules` /
   `.venv` with `Path::exists()`, which follows symlinks. A commit carrying

@@ -1988,7 +1988,13 @@ fn share_target_snapshot_with(
         run_wide.clone(),
     );
     ledger.set_substrate_keyed(run_wide, &per_tool);
-    ledger.set_shared_snapshot(plan._snapshot);
+    // App::run may already have materialised this exact snapshot to detect
+    // the reviewed profile before check selection. A reused plan owns no new
+    // snapshot; replacing the ledger's owner with None would remove the tree
+    // while checks and artifacts still read it.
+    if let Some(snapshot) = plan._snapshot {
+        ledger.set_shared_snapshot(Some(snapshot));
+    }
     Ok(())
 }
 

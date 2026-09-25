@@ -39,6 +39,27 @@ Automatically:
 - in standard mode, generates the full artifact pack
 - runs tests and lint by default, unless you pick a lighter mode (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*`
 
+The profile is detected from the tree being reviewed. An explicit target
+(`--pr`, `--target-sha`, `--remote`, or even `HEAD`) derives markers from regular
+files in the pinned Git tree. A committed symlink to a marker or source path
+does not make the operator's files part of the target profile. Uncommitted
+additions or deletions in the checkout cannot change that profile. The TUI
+uses the same profile selection as headless runs.
+Its header and check list refresh before checks start, including when a later
+analysis in the same TUI session selects a different target.
+An ordinary target-less local review uses the live checkout. `--profile` still
+chooses the requested profile kind; its project markers come from the reviewed
+tree. An absolute `project.cargo_root` outside the repo remains valid for that
+ambient local review.
+For an exact target, relative manifest Cargo roots such as `backend`,
+`./backend`, and `backend/` resolve to the same tracked directory. Paths that
+escape the pinned tree do not select Cargo checks.
+For library callers, `App::from_config` keeps a supplied `Config.profile` when
+`requested_profile` is `None`. Set it to `Some(Profile::Auto)` to request the
+same target-derived detection used by the CLI.
+A caller that edits `Config.profile` after `Config::from_cli` also keeps that
+manual choice when passing the config to `App::from_config`.
+
 The `prview` tool can analyze repositories that use any base branch
 (`develop`, `main`, `master`, etc.); by default it resolves the first of
 `develop`, `main`, `master` that exists.

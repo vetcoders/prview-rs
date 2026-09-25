@@ -25,9 +25,9 @@ const MAX_PYTHON_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Skip reason when the REVIEWED commit is not a Python project.
 ///
-/// `config.profile` describes the local checkout. When a target removes the last
-/// Python project and source files, the checkout still says "Python" and the
-/// checks were still scheduled — into a snapshot that has no Python in it.
+/// A directly supplied Config can still carry a profile from a different tree.
+/// When a target removes the last Python project and source files, that profile
+/// might schedule checks into a snapshot that has no Python in it.
 /// Pytest is where that hurts: it exits 5 for "no tests collected", a blocking
 /// failure attributed to a target the check no longer applies to. Ruff and Mypy
 /// pass vacuously, which is a green signal for something never examined; both
