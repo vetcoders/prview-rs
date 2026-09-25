@@ -1566,6 +1566,39 @@ fn one_line_js_class_members_and_ambient_return_types_are_contract() {
 }
 
 #[test]
+fn a_binding_dropped_after_an_arrow_declarator_is_not_paired_away() {
+    // `legacy` is exported by the same declaration as `handler`: dropping it
+    // is a change importers see, although `handler`'s arrow is unchanged.
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1 +1 @@\n-export const handler = (x) => x, legacy = 1;\n+export const handler = (x) => x;\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert_eq!(public.changed.len(), 1, "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(
+        breaking.iter().any(|finding| matches!(
+            &finding.kind,
+            BreakingKind::ChangedSignature { after, .. } if after == "export const handler = (x) => x;"
+        )),
+        "{breaking:?}"
+    );
+}
+
+#[test]
+fn a_comment_after_dividing_an_object_literal_is_not_contract() {
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1 +1 @@\n-export const VALUE = {} / 2; // old\n+export const VALUE = {} / 2; // new\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert!(
+        public.changed.is_empty() && public.added.is_empty() && public.removed.is_empty(),
+        "{:?}",
+        public.changed
+    );
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(breaking.is_empty(), "{breaking:?}");
+}
+
+#[test]
 fn a_bare_export_default_line_is_still_an_export() {
     // `export default` with its value on the next line has no trailing space.
     let removed = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1 @@\n-export default\n-  createStore();\n+const unused = 1;\n".to_owned();

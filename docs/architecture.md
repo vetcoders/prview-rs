@@ -2925,13 +2925,16 @@ vbl-190 review) reported it removed. `common::js_ts_export` gives each line the
 binding importers use (the declared name or `default`), whether it lives in
 TypeScript's type namespace (`interface`, `type`), and a comparison form with
 formatting, comments and implementation removed: an arrow function up to its
-`=>`, a `function` without the body it opens or holds when that `{` follows the
+`=>` (a later declarator of the same binding, `f = (x) => x, legacy = 1`,
+stays, its own arrow body dropped the same way), a `function` without the body it opens or holds when that `{` follows the
 parameter list or a finished return type (a `{` after `:`, `=>`, `|` opens a
 return-type literal, which stays), a `class` without only the `{` that opens
 its body below (members written on the line stay). The form is built from a
 line lexer (`common::js_lex`) that reads string, template and
 regular-expression literals as opaque units and `//` / `/* */` comments as
-whitespace; a `/` is a division only after an operand, and whitespace survives
+whitespace; a `/` is a division only after an operand (a name, a literal, or a
+closing `)`, `]` or `}`: on an export line a `}` ends an object literal or a
+body, never a place a regular expression starts), and whitespace survives
 where it separates two identifier or two operator characters. A removal pairs
 with an addition in the same file with the same name and namespace, equal
 forms first. Equal forms report nothing; different forms are one

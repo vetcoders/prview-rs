@@ -1027,8 +1027,10 @@ formatting, comments and implementation are set aside, the export was only
 re-emitted, for example a formatter turning an arrow function's `=> {` block
 body into an `=>` expression body, and nothing is reported. When they differ,
 the pair is one signature change. Comments, string, template and
-regular-expression literals, a one-line class's members and a return-type
-literal are read for what they are, so they never hide a change. The
+regular-expression literals, a one-line class's members, a return-type
+literal and the declarators a binding lists after an arrow function
+(`f = (x) => x, legacy = 1`) are read for what they are, so they never hide a
+change. The
 comparison is a single-line heuristic: an export with no single declared name
 (`export { a } from`, `export *`), one moved to another file (the old path of
 a renamed module included), and one written indented inside a TypeScript

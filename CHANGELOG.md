@@ -244,8 +244,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature change in both artifacts instead of a removal. Comments (`//` and
   `/* */`, with or without surrounding spaces), string, template and
   regular-expression literals, a one-line class's members, a return-type
-  literal and whitespace that separates two operators are all kept apart from
-  formatting, so none of them can hide a real change. A re-export list, an
+  literal, whitespace that separates two operators, and a binding's later
+  declarators after an arrow function (`f = (x) => x, legacy = 1`) are all kept
+  apart from formatting, so none of them can hide a real change; a `/` after a
+  closing `}` divides, so a comment after it is still a comment. A re-export list, an
   export with no single name, an export moved to another file (including the old
   path of a renamed module), and an export written indented inside a TypeScript
   `namespace` or `declare module` block keep their removal.

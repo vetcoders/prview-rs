@@ -622,7 +622,9 @@ fn js_default_kind(value: &str) -> JsDeclKind {
 ///
 /// - An arrow function is compared up to its `=>`, so `=> {` and `=>` with the
 ///   body below, or a rewritten expression body, compare equal, and a single
-///   bare parameter compares equal with or without its parentheses.
+///   bare parameter compares equal with or without its parentheses. A later
+///   declarator of the same binding (`f = (x) => x, legacy = 1`) stays in the
+///   contract, its own arrow body dropped the same way.
 /// - A `function` body opened on the line, or written whole on it, is
 ///   dropped when its `{` follows the parameter list or a finished return
 ///   type; a `{` in type position (`(): {`) opens a return-type literal, and a
@@ -642,13 +644,14 @@ fn js_ts_export_contract(line: &str, kind: JsDeclKind) -> String {
         Some(head) => (head.trim_end(), true),
         None => (text, false),
     };
-    let arrow_end = match kind {
-        JsDeclKind::Binding => js_arrow_end(text, true),
-        JsDeclKind::Expression => js_arrow_end(text, false),
-        _ => None,
-    };
-    if let Some(end) = arrow_end {
-        return unwrap_js_arrow_parameter(compact_js(&text[..end]));
+    match kind {
+        JsDeclKind::Binding => return js_binding_contract(text),
+        JsDeclKind::Expression => {
+            if let Some(end) = js_arrow_end(text, false) {
+                return unwrap_js_arrow_parameter(compact_js(&text[..end]));
+            }
+        }
+        _ => {}
     }
     let text = match kind {
         JsDeclKind::Function => strip_js_function_body(text, !terminated),
@@ -656,6 +659,57 @@ fn js_ts_export_contract(line: &str, kind: JsDeclKind) -> String {
         _ => text,
     };
     compact_js(text)
+}
+
+/// A binding's comparison form: each declarator's arrow body dropped, and the
+/// declarators after an arrow body kept.
+fn js_binding_contract(text: &str) -> String {
+    let Some(end) = js_arrow_end(text, true) else {
+        return compact_js(text);
+    };
+    let head = unwrap_js_arrow_parameter(compact_js(&text[..end]));
+    match js_next_declarator(text, end) {
+        Some(next) => head + &js_binding_contract(&text[next..]),
+        None => head,
+    }
+}
+
+/// Byte offset of the top-level `,` after `from` that starts another
+/// declarator: one followed by a name and then `=`, `:`, `,` or the end, or
+/// by a destructuring pattern. A comma between type arguments
+/// (`create<A, B>()`) is not followed by that shape.
+fn js_next_declarator(text: &str, from: usize) -> Option<usize> {
+    let lexemes = js_lex(text);
+    (0..lexemes.len())
+        .filter(|&index| {
+            let lexeme = lexemes[index];
+            lexeme.start >= from && lexeme.depth == 0 && lexeme.kind == JsLexKind::Code(',')
+        })
+        .find(|&index| js_declarator_follows(text, &lexemes[index + 1..]))
+        .map(|index| lexemes[index].start)
+}
+
+fn js_declarator_follows(text: &str, after: &[JsLexeme]) -> bool {
+    let mut tokens = after.iter().filter(|lexeme| !lexeme.is_gap());
+    match tokens.next().map(|lexeme| lexeme.kind) {
+        Some(JsLexKind::Code('{' | '[')) => true,
+        Some(JsLexKind::Code(first)) if is_js_identifier_char(first) && !first.is_ascii_digit() => {
+            let mut after_name = tokens.skip_while(
+                |lexeme| matches!(lexeme.kind, JsLexKind::Code(ch) if is_js_identifier_char(ch)),
+            );
+            match after_name.next() {
+                None => true,
+                Some(lexeme) => match lexeme.kind {
+                    JsLexKind::Code(':' | ',') => true,
+                    JsLexKind::Code('=') => {
+                        !matches!(text.as_bytes().get(lexeme.start + 1), Some(b'=' | b'>'))
+                    }
+                    _ => false,
+                },
+            }
+        }
+        _ => false,
+    }
 }
 
 /// One lexical unit of a JS/TS line, as a byte range of it.
@@ -712,11 +766,11 @@ const JS_KEYWORDS_BEFORE_OPERAND: &[&str] = &[
 /// Strings and templates end at their unescaped closing quote. A `/` followed
 /// by `/` or `*` opens a comment. Any other `/` is a division after an
 /// operand (an identifier or number that is not a keyword such as `return`, a
-/// closing `)` or `]`, a literal) and opens a regular expression everywhere
-/// else, `}` included: reading a division as a literal keeps its text
-/// verbatim, while reading a regular expression as code could find a comment
-/// or an arrow inside it. A literal or comment the line leaves open runs to
-/// its end.
+/// closing bracket, a literal) and opens a regular expression everywhere
+/// else. On an export line a `}` closes an object literal or a body, and a
+/// regular expression is not written straight after a body, so a `/` there
+/// divides (`{} / 2; // old`). A literal or comment the line leaves open runs
+/// to its end.
 fn js_lex(text: &str) -> Vec<JsLexeme> {
     let bytes = text.as_bytes();
     let mut lexemes: Vec<JsLexeme> = Vec::new();
@@ -759,7 +813,7 @@ fn js_operand_ends_before(text: &str, lexemes: &[JsLexeme]) -> bool {
         return false;
     };
     match last.kind {
-        JsLexKind::Literal | JsLexKind::Code(')' | ']') => true,
+        JsLexKind::Literal | JsLexKind::Code(')' | ']' | '}') => true,
         JsLexKind::Code(ch) if is_js_identifier_char(ch) => {
             !JS_KEYWORDS_BEFORE_OPERAND.contains(&js_word_ending_at(text, lexemes, last))
         }
@@ -1581,6 +1635,25 @@ mod tests {
             r"export const SLASH = /a\//; // old",
             r"export const SLASH = /a\//;"
         ));
+        // A `/` after a closing brace divides, so the comment stays a comment.
+        assert!(same(
+            "export const VALUE = {} / 2; // old",
+            "export const VALUE = {} / 2; // new"
+        ));
+        // A later declarator's own arrow body is implementation too, and a
+        // comma between type arguments does not start a declarator.
+        assert!(same(
+            "export const f = (x) => x, legacy = 1;",
+            "export const f = (x) => y, legacy = 1;"
+        ));
+        assert!(same(
+            "export const a = (x) => x, b = (y) => y;",
+            "export const a = (x) => 1, b = y => 2;"
+        ));
+        assert!(same(
+            "export const make = () => create<A, B>();",
+            "export const make = () => create<A, B>(1);"
+        ));
 
         // What importers see still differs.
         assert!(!same(
@@ -1641,6 +1714,15 @@ mod tests {
         assert!(!same(
             "export const VALUE = a + ++b",
             "export const VALUE = a++ + b"
+        ));
+        // The declarators after an arrow body are exported bindings.
+        assert!(!same(
+            "export const handler = (x) => x, legacy = 1;",
+            "export const handler = (x) => x;"
+        ));
+        assert!(!same(
+            "export const a = (x) => x, b = (y) => y;",
+            "export const a = (x) => x, c = (y) => y;"
         ));
         // Members written on a class's line are its API; a class whose body
         // opens on the line is not the empty class.
