@@ -663,6 +663,7 @@ pub async fn run_analysis(
         base_snap,
         worktree_clean,
         worktree_status_digest,
+        worktree_dirty_paths,
         worktree_head_sha,
     ) = crate::governor::blocking_stage(|| -> Result<_> {
         let app = App::from_config(config)?;
@@ -672,6 +673,7 @@ pub async fn run_analysis(
         let worktree = crate::artifacts::capture_worktree_provenance(&app.config.repo_root);
         let worktree_clean = worktree.clean;
         let worktree_status_digest = worktree.status_digest;
+        let worktree_dirty_paths = worktree.dirty_paths;
         let worktree_head_sha = worktree.head_sha;
         app.repo.prepare_refs(&app.config)?;
         let target = app.repo.resolve_target(&app.config)?;
@@ -721,6 +723,7 @@ pub async fn run_analysis(
             base_snap,
             worktree_clean,
             worktree_status_digest,
+            worktree_dirty_paths,
             worktree_head_sha,
         ))
     })?;
@@ -800,6 +803,7 @@ pub async fn run_analysis(
             skipped_checks,
             worktree_clean,
             worktree_status_digest,
+            worktree_dirty_paths,
             worktree_head_sha,
             governor: &governor,
         })

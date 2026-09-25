@@ -32,11 +32,11 @@ mod semgrep;
 pub(crate) mod snapshot_integrity;
 mod typescript;
 
-pub(crate) use cargo::planned_cargo_cwd;
-pub(crate) use cargo::validated_cargo_audit_vulnerability_list;
 pub use cargo::{
     CargoAuditCheck, CargoCheck, CargoGeigerCheck, CargoTestCheck, ClippyCheck, RustfmtCheck,
 };
+pub(crate) use cargo::{cargo_operator_home, planned_cargo_cwd, reviewed_cargo_root_relocated};
+pub(crate) use cargo::{count_cargo_audit_warning_items, validated_cargo_audit_vulnerability_list};
 pub use python::{MypyCheck, PytestCheck, RuffCheck};
 pub use semgrep::SemgrepCheck;
 pub(crate) use semgrep::output_reports_scan_errors as semgrep_output_reports_scan_errors;
@@ -431,6 +431,13 @@ pub trait Check: Send + Sync {
     /// Get cache key (None = not cacheable)
     fn cache_key(&self, _config: &Config) -> Option<String> {
         None
+    }
+
+    /// Whether a result with `status` may be stored and replayed under
+    /// [`Check::cache_key`]. Both the write and the lookup ask, so an entry this
+    /// declines is never replayed, whichever run or version wrote it.
+    fn replays_cached(&self, _status: CheckStatus) -> bool {
+        true
     }
 
     /// How much of the machine this check wants, for the run's resource
@@ -1388,6 +1395,9 @@ fn load_cached_result(
     if matches!(status, CheckStatus::Passed | CheckStatus::Warnings) && has_tool_crash(&output) {
         status = CheckStatus::Error;
     }
+    if !check.replays_cached(status) {
+        return None;
+    }
 
     Some((
         CheckResult {
@@ -1607,6 +1617,7 @@ async fn execute_live_check(
             // the tool present still reports Skipped (PR #12 review #14).
             if source_stable
                 && result.status != CheckStatus::Skipped
+                && check.replays_cached(result.status)
                 && let Some(key) = cache_key.clone()
             {
                 // Store the provenance next to the result so a later cache hit
@@ -5682,6 +5693,83 @@ test result: ok. 2 passed; 0 failed
         assert_eq!(hit_prov.started_at, live_prov.started_at);
         assert_eq!(hit_prov.exit_code, live_prov.exit_code);
         assert_eq!(hit_prov.cache_key, live_prov.cache_key);
+    }
+
+    #[tokio::test]
+    async fn a_check_that_declines_a_status_neither_stores_nor_replays_it() {
+        // A cache key can miss an input the result depends on (cargo audit's
+        // key has no audit config). A check that declines a status keeps that
+        // status out of the cache in both directions: the live run does not
+        // write it, and an entry already on disk — written before the rule, or
+        // by an older prview — is not replayed.
+        use async_trait::async_trait;
+
+        struct FailingCheck;
+
+        #[async_trait]
+        impl Check for FailingCheck {
+            fn name(&self) -> &str {
+                "Mock"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                Ok(CheckResult {
+                    name: "Mock".to_string(),
+                    status: CheckStatus::Failed,
+                    duration: Duration::from_secs(0),
+                    output: "1 vulnerability".to_string(),
+                    cached: false,
+                    provenance: None,
+                })
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                Some("mock-key".to_string())
+            }
+            fn replays_cached(&self, status: CheckStatus) -> bool {
+                status == CheckStatus::Passed
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = rust_config(true, true, true);
+        let cache = Cache::with_dir(tmp.path().to_path_buf(), true);
+
+        let live = execute_live_check(Box::new(FailingCheck), &config, &cache, None).await;
+        assert_eq!(live.status, CheckStatus::Failed);
+        assert!(
+            cache.get("Mock", "mock-key").is_none(),
+            "a declined status must not be written",
+        );
+
+        cache
+            .set(
+                "Mock",
+                "mock-key",
+                CheckStatus::Failed.as_str(),
+                Some("old"),
+                None,
+            )
+            .expect("seed a pre-existing entry");
+        assert!(
+            load_cached_result(&FailingCheck, &config, &cache).is_none(),
+            "a declined status already on disk must not be replayed",
+        );
+
+        cache
+            .set(
+                "Mock",
+                "mock-key",
+                CheckStatus::Passed.as_str(),
+                Some("ok"),
+                None,
+            )
+            .expect("seed a passing entry");
+        let (hit, _) = load_cached_result(&FailingCheck, &config, &cache)
+            .expect("an accepted status is still replayed");
+        assert_eq!(hit.status, CheckStatus::Passed);
+        assert!(hit.cached);
     }
 
     #[test]

@@ -86,7 +86,7 @@ fn clean_path(p: &Path) -> String {
     if s.is_empty() { ".".to_string() } else { s }
 }
 
-fn clean_path_buf(p: &Path) -> PathBuf {
+pub(crate) fn clean_path_buf(p: &Path) -> PathBuf {
     let mut parts: Vec<Component> = Vec::new();
     for c in p.components() {
         match c {
