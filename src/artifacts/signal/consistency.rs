@@ -75,7 +75,22 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
     }
 
     let report_path = pack_root.join("report.json");
-    if let Some(report) = load_json(report_path.clone()) {
+    let (report, unreadable_report) = match std::fs::read(&report_path) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(report) => (Some(report), false),
+            Err(_) => (None, true),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A broken symlink is present even though following it yields ENOENT.
+            let absent = matches!(
+                std::fs::symlink_metadata(&report_path),
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound
+            );
+            (None, !absent)
+        }
+        Err(_) => (None, true),
+    };
+    if let Some(report) = report {
         out.verdict_report = string_at(&report, "/gate/verdict");
         out.files_changed_report = usize_at(&report, "/diff/stats/files_changed");
         out.findings_count_report = usize_at(&report, "/quality/sarif/findings_count");
@@ -100,7 +115,7 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
             None => out.check_entries_unreadable += 1,
         }
         out.check_outcomes_report = Some(outcomes);
-    } else if std::fs::symlink_metadata(&report_path).is_ok() {
+    } else if unreadable_report {
         // An absent report is expected while the pack is being built. A report
         // that exists but cannot be read or decoded has lost its check evidence.
         out.check_entries_unreadable = 1;
@@ -1055,6 +1070,18 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
             let report = checklist_report(root);
             assert!(!report.consistent, "{report:?}");
             assert_eq!(report.checked_fields, 1);
+            assert_eq!(warning_fields(&report), ["pr_checklist"]);
+        }
+
+        // Following this path yields ENOENT, but the report entry exists and
+        // therefore cannot be mistaken for an absent mid-build artifact.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(root.join("report.json")).unwrap();
+            std::os::unix::fs::symlink("missing-report.json", root.join("report.json")).unwrap();
+            let disk = read_disk_artifact_counters(root);
+            assert_eq!(disk.check_entries_unreadable, 1);
+            let report = checklist_report(root);
             assert_eq!(warning_fields(&report), ["pr_checklist"]);
         }
     }
