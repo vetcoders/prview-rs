@@ -2161,14 +2161,21 @@ mod tests {
                 ),
                 "{file}"
             );
-            // JSX is not the string of its text.
-            assert!(
-                !same(
+            // JSX is not the string of its text, with or without the `;` the
+            // opaque literal keeps.
+            for (jsx, string) in [
+                (
                     "export const label = <p/>;",
-                    "export const label = \"<p/>\";"
+                    "export const label = \"<p/>\";",
                 ),
-                "{file}"
-            );
+                ("export const label = <p/>", "export const label = \"<p/>\""),
+                (
+                    "export const label = <p/>;",
+                    "export const label = \"<p/>;\";",
+                ),
+            ] {
+                assert!(!same(jsx, string), "{file}: {jsx}");
+            }
             // An arrow body written in JSX is still implementation.
             assert!(
                 same(
