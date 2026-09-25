@@ -535,7 +535,7 @@ fn api_pair_key(file: &str, sym_type: &str, sig: &str, nested: bool) -> Option<A
         if nested {
             return None;
         }
-        let export = js_ts_export(sig)?;
+        let export = js_ts_export(file, sig)?;
         (export.type_only, export.name, export.contract)
     };
     Some(ApiPairKey {

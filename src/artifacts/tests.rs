@@ -1598,6 +1598,78 @@ fn a_comment_after_dividing_an_object_literal_is_not_contract() {
     assert!(breaking.is_empty(), "{breaking:?}");
 }
 
+/// A changed export line whose change the pairing must still report, in both
+/// the public API and the breaking-change view.
+fn assert_js_ts_export_changed(file: &str, before: &str, after: &str) {
+    let patch = format!(
+        "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-{before}\n+{after}\n"
+    );
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert_eq!(public.changed.len(), 1, "{:?}", public.changed);
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(
+        breaking.iter().any(|finding| matches!(
+            &finding.kind,
+            BreakingKind::ChangedSignature { after: reported, .. } if reported == after
+        )),
+        "{breaking:?}"
+    );
+}
+
+/// A re-emitted export line the pairing must leave out of both views.
+fn assert_js_ts_export_reemitted(file: &str, before: &str, after: &str) {
+    let patch = format!(
+        "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-{before}\n+{after}\n"
+    );
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert!(
+        public.changed.is_empty() && public.added.is_empty() && public.removed.is_empty(),
+        "{:?}",
+        public.changed
+    );
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(breaking.is_empty(), "{breaking:?}");
+}
+
+#[test]
+fn a_template_nested_in_an_interpolation_is_contract() {
+    // The inner template's backticks do not close the outer one, so its `=>`
+    // is no arrow to cut the contract at.
+    assert_js_ts_export_changed(
+        "src/api.ts",
+        "export const T = `outer ${`=>old`}`;",
+        "export const T = `outer ${`=>new`}`;",
+    );
+}
+
+#[test]
+fn jsx_text_is_contract_where_jsx_may_be_written() {
+    // The `//` of a URL in JSX text opens no comment.
+    assert_js_ts_export_changed(
+        "src/view.tsx",
+        "export const footer = <p>See https://a.com</p>;",
+        "export const footer = <p>See https://b.com</p>;",
+    );
+}
+
+#[test]
+fn a_comment_after_a_postfix_update_and_a_division_is_not_contract() {
+    assert_js_ts_export_reemitted(
+        "src/api.ts",
+        "export const NEXT = i++ / 2; // old",
+        "export const NEXT = i++ / 2; // new",
+    );
+}
+
+#[test]
+fn a_grouped_arrow_initializer_is_paired_as_the_arrow() {
+    assert_js_ts_export_reemitted(
+        "src/api.ts",
+        "export const f = ((x) => x);",
+        "export const f = (x) => {",
+    );
+}
+
 #[test]
 fn a_bare_export_default_line_is_still_an_export() {
     // `export default` with its value on the next line has no trailing space.

@@ -2926,19 +2926,32 @@ binding importers use (the declared name or `default`), whether it lives in
 TypeScript's type namespace (`interface`, `type`), and a comparison form with
 formatting, comments and implementation removed: an arrow function up to its
 `=>` (a later declarator of the same binding, `f = (x) => x, legacy = 1`,
-stays, its own arrow body dropped the same way), a `function` without the body it opens or holds when that `{` follows the
-parameter list or a finished return type (a `{` after `:`, `=>`, `|` opens a
-return-type literal, which stays), a `class` without only the `{` that opens
-its body below (members written on the line stay). The form is built from a
-line lexer (`common::js_lex`) that reads string, template and
-regular-expression literals as opaque units and `//` / `/* */` comments as
-whitespace; a `/` is a division only after an operand (a name, a literal, or a
-closing `)`, `]` or `}`: on an export line a `}` ends an object literal or a
-body, never a place a regular expression starts), and whitespace survives
-where it separates two identifier or two operator characters. A removal pairs
-with an addition in the same file with the same name and namespace, equal
-forms first. Equal forms report nothing; different forms are one
-`ChangedSignature`.
+stays, its own arrow body dropped the same way), a `function` without the body
+it opens or holds, `;` after it or not, when that `{` follows the parameter
+list or a finished return type (a `{` after `:`, `=>`, `|` opens a return-type
+literal, which stays), a `class` without only the `{` that opens its body below
+(members written on the line stay), and an initializer without parentheses
+that group it whole (`= ((x) => x)`; a comma expression `(a, b)` and a called
+group `((x) => x)(1)` keep theirs). An arrow in a conditional's branch
+(`c ? (x) => 1 : (y) => 2`) is no body to cut at, since the other branch
+follows it, so that line compares whole. The form is built from a line lexer
+(`common::js_lex`) that reads string, template and regular-expression literals
+as opaque units (a template's `${…}` is lexed as code, so a template nested in
+it is part of the outer one) and `//` / `/* */` comments as whitespace. A `/`
+is a division only after an operand: a name that is not a keyword such as
+`return` or `default` (or is one read as a property, `mod.default`), a
+literal, a closing `)`, `]` or `}` (on an export line a `}` ends an object
+literal or a body, never a place a regular expression starts), a postfix `++`
+or `--`, or TypeScript's non-null `!`. Whitespace survives only where the
+characters on both sides would join into another token (`+ +`, `= >`, `/ /`,
+but not `+ -`). Where the file may write JSX (any JavaScript file, and `.tsx`),
+the line from the JSX it writes on is one opaque unit too
+(`common::opaque_js_jsx`): a `<` where an operand starts, followed by a tag
+name or a fragment's `>`, and not a generic arrow's `<T,>`, `<T extends U>` or
+`<T = U>`. JSX text such as a URL's `//` is then no comment, and the unit never
+equals a string literal of the same text. A removal pairs with an addition in
+the same file with the same name and namespace, equal forms first. Equal forms
+report nothing; different forms are one `ChangedSignature`.
 
 Each side of a section has its own file (`common::LegacyPatchSides`): removed
 lines take the `--- a/…` path and added lines the `+++ b/…` path read before

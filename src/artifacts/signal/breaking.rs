@@ -958,7 +958,7 @@ fn pair_js_ts_exports(
     findings: &mut Vec<BreakingFinding>,
 ) {
     let identity = |(file, line, nested): &(String, String, bool)| {
-        js_ts_export(line)
+        js_ts_export(file, line)
             .filter(|_| !nested)
             .map(|export| (file.clone(), export))
     };

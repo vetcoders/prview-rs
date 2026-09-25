@@ -242,15 +242,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace. Lines that agree once formatting, comments and implementation are
   set aside report nothing; lines that differ, such as a new parameter, are one
   signature change in both artifacts instead of a removal. Comments (`//` and
-  `/* */`, with or without surrounding spaces), string, template and
-  regular-expression literals, a one-line class's members, a return-type
-  literal, whitespace that separates two operators, and a binding's later
+  `/* */`, with or without surrounding spaces), string, template (a template
+  nested in a `${…}` included) and regular-expression literals, JSX in
+  JavaScript and `.tsx` files, a one-line class's members, a return-type
+  literal, whitespace that separates two operators into different tokens, a
+  conditional whose branches are arrow functions, and a binding's later
   declarators after an arrow function (`f = (x) => x, legacy = 1`) are all kept
-  apart from formatting, so none of them can hide a real change; a `/` after a
-  closing `}` divides, so a comment after it is still a comment. A re-export list, an
-  export with no single name, an export moved to another file (including the old
-  path of a renamed module), and an export written indented inside a TypeScript
-  `namespace` or `declare module` block keep their removal.
+  apart from formatting, so none of them can hide a real change. A `/` after a
+  closing `}`, a postfix `++` or `--`, or a non-null `!` divides, so a comment
+  after it is still a comment, while parentheses around a whole initializer,
+  spacing that joins no token (`a + -b`) and a `;` after a one-line function
+  body are formatting. A re-export list, an export with no single name, an
+  export moved to another file (including the old path of a renamed module),
+  and an export written indented inside a TypeScript `namespace` or `declare
+  module` block keep their removal.
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch
