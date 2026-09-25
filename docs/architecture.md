@@ -2108,6 +2108,9 @@ snapshot root.
 Headless same-`HEAD` heuristic scans use this same `scan_dir_override` and record
 the selected target SHA; otherwise a dirty operator checkout would produce
 heuristic signals for different bytes than checks and context.
+The TUI's non-remote explicit-target path uses the same selection on every
+analysis run. Its remote path continues to use its dedicated target/base
+`AnalysisSnapshot`s for regression comparisons.
 
 ### governor/mod.rs
 

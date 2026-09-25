@@ -794,7 +794,7 @@ pub async fn run_analysis(
         }
         result
     } else {
-        crate::heuristics::run_all(&config, None).await?
+        run_tui_local_heuristics(&config, &target.commit_id).await?
     };
     ensure_analysis_active(&governor)?;
     let _ = tx.send(TuiEvent::HeuristicsReady {
@@ -845,6 +845,15 @@ pub async fn run_analysis(
     Ok(())
 }
 
+/// Non-remote TUI runs still have an exact snapshot for explicit targets.
+/// Reuse the headless selection so checks, context and heuristics read one tree.
+async fn run_tui_local_heuristics(
+    config: &Config,
+    target_commit: &str,
+) -> Result<crate::heuristics::HeuristicsResult> {
+    crate::run_local_heuristics(config, target_commit).await
+}
+
 fn ensure_analysis_active(governor: &crate::governor::ResourceGovernor) -> Result<()> {
     if governor.is_cancelled() {
         return Err(governor.cancellation_error());
@@ -861,6 +870,27 @@ mod tests {
 
     fn default_config() -> Config {
         test_config()
+    }
+
+    #[tokio::test]
+    async fn exact_target_tui_heuristics_use_prepared_scan_tree() {
+        let operator = tempfile::tempdir().unwrap();
+        let selected = tempfile::tempdir().unwrap();
+        std::fs::write(operator.path().join("dirty.js"), "const broken = ;\n").unwrap();
+        let mut config = default_config();
+        config.repo_root = operator.path().to_path_buf();
+        config.scan_dir_override = Some(selected.path().to_path_buf());
+        config.run_heuristics = false;
+
+        let result = run_tui_local_heuristics(&config, "target-commit")
+            .await
+            .unwrap();
+        assert_eq!(
+            result.analysis_root,
+            Some(selected.path().display().to_string()),
+            "the TUI must name the prepared target tree, not the dirty operator tree"
+        );
+        assert_eq!(result.analysis_sha.as_deref(), Some("target-commit"));
     }
 
     #[test]
