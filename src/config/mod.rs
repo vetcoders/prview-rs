@@ -175,9 +175,15 @@ pub struct Config {
     pub required_base_exact: bool,
     pub bases: Vec<String>,
     pub profile: DetectedProfile,
-    /// The caller's profile choice, retained so an exact run can detect the
-    /// project from its reviewed tree after resolving the target.
-    pub requested_profile: crate::cli::Profile,
+    /// `Some` opts into deriving the run profile from the reviewed tree after
+    /// target resolution; `None` keeps a programmatically supplied `profile`.
+    /// The CLI always records its request here, including `Auto`.
+    pub requested_profile: Option<crate::cli::Profile>,
+    /// Startup observation used only to distinguish a later public-field
+    /// `profile` override from the CLI-detected value. This is provenance,
+    /// not another profile-selection request.
+    #[doc(hidden)]
+    pub profile_at_cli_detection: Option<DetectedProfile>,
 
     // Modes
     pub execution_mode: ExecutionMode,
@@ -431,7 +437,7 @@ impl OutputConfig {
 }
 
 /// Detected project profile with paths
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedProfile {
     pub kind: ProfileKind,
     pub has_package_json: bool,
@@ -890,7 +896,8 @@ impl Config {
             required_base_exact: false,
             bases: vec![],
             profile,
-            requested_profile: crate::cli::Profile::Auto,
+            requested_profile: None,
+            profile_at_cli_detection: None,
             execution_mode: ExecutionMode::Standard,
             enforcement_mode: EnforcementMode::Advisory,
             update_mode: false,
@@ -1064,7 +1071,8 @@ impl Config {
             ))
             .with_fetch_config(FetchConfig::from_cli(cli))
             .with_output_config(OutputConfig::from_cli(cli));
-        config.requested_profile = cli.profile;
+        config.requested_profile = Some(cli.profile);
+        config.profile_at_cli_detection = Some(config.profile.clone());
 
         config.target = target;
         config.bases = bases;
@@ -1498,10 +1506,23 @@ impl Config {
     /// anchored to the logical repository root: consumers rebase cargo roots
     /// onto their own reviewed snapshot when they execute a check.
     pub(crate) fn refresh_profile_from_tree(&mut self, tree_root: &Path) -> Result<()> {
+        let Some(requested_profile) = self.requested_profile else {
+            return Ok(());
+        };
+        if self
+            .profile_at_cli_detection
+            .as_ref()
+            .is_some_and(|initial| initial != &self.profile)
+        {
+            // App::from_config accepts a public Config. A caller may override
+            // its public profile field after Config::from_cli; preserve that
+            // explicit choice just as we preserve a directly supplied Config.
+            return Ok(());
+        }
         let manifest = PrviewManifest::load_from(tree_root);
         let mut profile = detect_profile(
             &tree_root.to_path_buf(),
-            self.requested_profile,
+            requested_profile,
             manifest.as_ref(),
         )?;
         let rebase = |path: &Path| -> Result<PathBuf> {
@@ -1514,6 +1535,9 @@ impl Config {
             .map(|path| rebase(path))
             .collect::<Result<Vec<_>>>()?;
         self.profile = profile;
+        if self.profile_at_cli_detection.is_some() {
+            self.profile_at_cli_detection = Some(self.profile.clone());
+        }
         Ok(())
     }
 }

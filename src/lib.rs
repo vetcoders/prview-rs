@@ -1191,6 +1191,7 @@ mod tests {
         // Exact same-HEAD must not let a local deletion remove JS checks.
         std::fs::remove_file(repo.join("package.json")).unwrap();
         let mut exact = test_config();
+        exact.requested_profile = Some(crate::cli::Profile::Auto);
         exact.repo_root = repo.to_path_buf();
         exact.target = Some("HEAD".to_owned());
         exact.pinned_target = Some(resolved(&js_target));
@@ -1206,6 +1207,7 @@ mod tests {
 
         // A normal local review remains about the live, dirty checkout.
         let mut ambient = test_config();
+        ambient.requested_profile = Some(crate::cli::Profile::Auto);
         ambient.repo_root = repo.to_path_buf();
         ambient.pinned_target = Some(resolved(&js_target));
         prepare_review_profile(&mut ambient, &crate::ledger::TaskLedger::new()).unwrap();
@@ -1214,6 +1216,7 @@ mod tests {
         git_run(repo, &["add", "-u"]);
         git_run(repo, &["commit", "-q", "-m", "remove JS marker"]);
         let mut remote = test_config();
+        remote.requested_profile = Some(crate::cli::Profile::Auto);
         remote.repo_root = repo.to_path_buf();
         remote.remote_mode = true;
         remote.pinned_target = Some(resolved(&js_target));
@@ -1223,7 +1226,7 @@ mod tests {
         assert!(remote.profile.has_package_json);
 
         // An explicit --profile still selects its requested kind.
-        remote.requested_profile = crate::cli::Profile::Rust;
+        remote.requested_profile = Some(crate::cli::Profile::Rust);
         let target_tree = remote.scan_dir_override.clone().expect("target snapshot");
         remote.refresh_profile_from_tree(&target_tree).unwrap();
         assert_eq!(remote.profile.kind, crate::config::ProfileKind::Rust);
@@ -1317,6 +1320,55 @@ mod tests {
         config.quiet = true;
         config.create_zip = false;
         config
+    }
+
+    /// A programmatic Config may supply its own profile through the public
+    /// App::from_config entrypoint. Only CLI/opt-in Configs re-detect markers
+    /// from the target tree; both paths still review the same exact target.
+    #[tokio::test]
+    async fn from_config_preserves_supplied_profile_unless_refresh_is_requested() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut supplied = reviewable_repo(repo.path(), out.path());
+        supplied.profile = crate::config::test_js_profile(true);
+        assert_eq!(supplied.requested_profile, None);
+
+        let app = crate::App::from_config(supplied.clone()).unwrap();
+        let report = app.run_quick().await.unwrap();
+        let gate: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.artifacts_dir.join("00_summary/MERGE_GATE.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Js", "{gate}");
+
+        let mut automatic = supplied.clone();
+        automatic.requested_profile = Some(crate::cli::Profile::Auto);
+        automatic.output_dir = Some(out.path().join("auto-pack"));
+        let app = crate::App::from_config(automatic).unwrap();
+        let report = app.run_quick().await.unwrap();
+        let gate: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.artifacts_dir.join("00_summary/MERGE_GATE.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Generic", "{gate}");
+
+        // Config::from_cli also exposes `profile` for callers to change before
+        // handing the Config to App::from_config. A changed value is an override
+        // even though the original CLI request was Auto.
+        let mut overridden_cli = supplied;
+        overridden_cli.requested_profile = Some(crate::cli::Profile::Auto);
+        overridden_cli.profile_at_cli_detection = Some(crate::config::test_generic_profile());
+        overridden_cli.output_dir = Some(out.path().join("overridden-cli-pack"));
+        let app = crate::App::from_config(overridden_cli).unwrap();
+        let report = app.run_quick().await.unwrap();
+        let gate: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.artifacts_dir.join("00_summary/MERGE_GATE.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Js", "{gate}");
     }
 
     /// A one-worker production runtime used to enter synchronous ref/diff work

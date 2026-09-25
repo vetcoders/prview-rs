@@ -46,6 +46,11 @@ operator checkout cannot add or remove checks or change the pack's profile.
 An ordinary target-less local review uses the live checkout. `--profile` still
 chooses the requested profile kind; its project markers come from the reviewed
 tree.
+For library callers, `App::from_config` keeps a supplied `Config.profile` when
+`requested_profile` is `None`. Set it to `Some(Profile::Auto)` to request the
+same target-derived detection used by the CLI.
+A caller that edits `Config.profile` after `Config::from_cli` also keeps that
+manual choice when passing the config to `App::from_config`.
 
 The `prview` tool can analyze repositories that use any base branch
 (`develop`, `main`, `master`, etc.); by default it resolves the first of

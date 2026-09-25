@@ -151,7 +151,7 @@ Converts CLI → Config and detects the project profile:
 pub struct Config {
     pub repo_root: PathBuf,
     pub profile: DetectedProfile,
-    pub requested_profile: Profile,
+    pub requested_profile: Option<Profile>,
     pub execution_mode: ExecutionMode,
     pub run_tests: bool,
     pub run_lint: bool,
@@ -190,6 +190,13 @@ refresh from the live checkout, including its uncommitted changes. The
 requested `--profile` kind remains explicit, while marker fields and detected
 Cargo paths come from the reviewed tree. Cargo paths are rebased to the logical
 repository root for consumers that map them into their own scan directory.
+`Config::from_cli` records `Some(Auto)` or the explicit CLI selection to opt into
+that refresh. A programmatic `Config` passed to `App::from_config` starts with
+`requested_profile: None`, so its supplied `profile` remains authoritative;
+callers can opt into target-derived detection with `Some(Profile::Auto)`.
+If a caller changes the public `profile` field after `Config::from_cli`, that
+override also remains authoritative: the startup profile is retained only to
+recognize this edit before the run refreshes its profile.
 
 ### git/mod.rs
 
