@@ -3790,7 +3790,9 @@ is a warning for its item, and `/checks` entries without a readable `name` and a
 status from the serialized vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`)
 withhold the comparison behind one `pr_checklist` warning. A present but
 unreadable `report.json` does the same; only an absent report is skipped while
-the pack is being built. Because both sides share the derivation, the checker catches the
+the pack is being built. A present but unreadable `PR_REVIEW.md` likewise
+withholds the comparison with a `pr_checklist` warning, rather than being
+treated as an absent checklist. Because both sides share the derivation, the checker catches the
 rendered text drifting from the statuses; the derivation's own semantics
 (all-of, not any-of, and which check belongs to which item) are pinned by the
 `artifacts::tests` checklist tests.

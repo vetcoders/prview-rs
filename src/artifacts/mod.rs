@@ -1582,6 +1582,7 @@ fn generate_consistency_check(
     // the check statuses report.json serialized.
     report.merge_pr_checklist(
         disk.pr_checklist.as_deref(),
+        disk.pr_checklist_unreadable,
         disk.check_outcomes_report.as_deref(),
         disk.check_entries_unreadable,
         "report.json",

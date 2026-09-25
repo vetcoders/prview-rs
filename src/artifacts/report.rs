@@ -1171,6 +1171,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
                 .collect();
             consistency.merge_pr_checklist(
                 disk.pr_checklist.as_deref(),
+                disk.pr_checklist_unreadable,
                 Some(&check_outcomes),
                 0,
                 "report.json",

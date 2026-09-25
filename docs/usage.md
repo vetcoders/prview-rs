@@ -1281,7 +1281,9 @@ quality, policy, and permission axes beside that explanation.
   and `report.json` `/checks` entries without a readable `name` and a `status` from the serialized
   vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`) withhold the comparison behind one `pr_checklist`
   warning. An existing `report.json` that cannot be decoded also withholds the comparison and warns; an
-  absent report is expected while the pack is being built. Only the checklist inside the generated PR
+  absent report is expected while the pack is being built. An existing `PR_REVIEW.md` that cannot
+  be read as UTF-8 likewise emits a `pr_checklist` warning, including a broken symlink. Only the
+  checklist inside the generated PR
   Template's fenced block is read; a heading-shaped line in earlier diagnostic text is ignored. A second
   complete PR Template makes every item unreadable, as does a second line naming the same item for that
   item. Only without `PR_REVIEW.md` or `report.json` is nothing compared. In a normal

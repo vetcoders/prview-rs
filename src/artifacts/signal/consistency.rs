@@ -29,6 +29,8 @@ pub struct DiskArtifactCounters {
     /// Checklist marks rendered in `PR_REVIEW.md` (pack root); `None` only when
     /// the file itself is absent or unreadable.
     pub pr_checklist: Option<Vec<(PrChecklistItem, Option<bool>)>>,
+    /// The file exists but cannot be read as UTF-8 (including a broken link).
+    pub pr_checklist_unreadable: bool,
     /// `(name, outcome)` per readable check serialized in report.json `/checks`.
     pub check_outcomes_report: Option<Vec<(String, ChecklistCheckOutcome)>>,
     /// How much of report.json `/checks` could not be read: one per entry
@@ -122,9 +124,18 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
         out.check_outcomes_report = Some(Vec::new());
     }
 
-    out.pr_checklist = std::fs::read_to_string(pack_root.join("PR_REVIEW.md"))
-        .ok()
-        .map(|text| crate::artifacts::parse_pr_checklist(&text));
+    let checklist_path = pack_root.join("PR_REVIEW.md");
+    match std::fs::read_to_string(&checklist_path) {
+        Ok(text) => out.pr_checklist = Some(crate::artifacts::parse_pr_checklist(&text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A broken symlink has an entry even though following it yields ENOENT.
+            out.pr_checklist_unreadable = !matches!(
+                std::fs::symlink_metadata(&checklist_path),
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound
+            );
+        }
+        Err(_) => out.pr_checklist_unreadable = true,
+    }
 
     out
 }
@@ -188,16 +199,32 @@ impl ConsistencyReport {
     ///
     /// Fail-closed on unreadable evidence: an item whose line is missing or
     /// carries an unknown mark is compared and reported, and `unreadable_checks`
-    /// entries in `checks_artifact` withhold the whole comparison behind one
-    /// warning rather than re-deriving the claims from a subset. Only an absent
+    /// entries in `checks_artifact` or an unreadable `PR_REVIEW.md` withhold the
+    /// comparison behind one warning rather than using incomplete evidence. Only an absent
     /// side — no `PR_REVIEW.md`, or no serialized checks — is not compared.
     pub fn merge_pr_checklist(
         &mut self,
         rendered: Option<&[(PrChecklistItem, Option<bool>)]>,
+        unreadable_rendered: bool,
         checks: Option<&[(String, ChecklistCheckOutcome)]>,
         unreadable_checks: usize,
         checks_artifact: &str,
     ) {
+        if unreadable_rendered {
+            self.checked_fields += 1;
+            self.warnings.push(ConsistencyWarning {
+                field: "pr_checklist".to_string(),
+                sources: vec![ConsistencySource {
+                    artifact: "PR_REVIEW.md".to_string(),
+                    value: "unreadable file".to_string(),
+                }],
+                message:
+                    "PR checklist not verifiable: PR_REVIEW.md exists but cannot be read as UTF-8"
+                        .to_string(),
+            });
+            self.consistent = self.warnings.is_empty();
+            return;
+        }
         let (Some(rendered), Some(checks)) = (rendered, checks) else {
             return;
         };
@@ -691,6 +718,7 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         let mut report = ArtifactCounters::default().check_consistency();
         report.merge_pr_checklist(
             disk.pr_checklist.as_deref(),
+            disk.pr_checklist_unreadable,
             disk.check_outcomes_report.as_deref(),
             disk.check_entries_unreadable,
             "report.json",
@@ -1082,6 +1110,36 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
             let disk = read_disk_artifact_counters(root);
             assert_eq!(disk.check_entries_unreadable, 1);
             let report = checklist_report(root);
+            assert_eq!(warning_fields(&report), ["pr_checklist"]);
+        }
+    }
+
+    /// A damaged rendered side is not an absent mid-build artifact. Both the
+    /// on-disk summary and report.json's in-memory fold use this same warning.
+    #[test]
+    fn unreadable_pr_review_withholds_the_checklist_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
+
+        std::fs::write(root.join("PR_REVIEW.md"), b"\xff\xfe").unwrap();
+        let disk = read_disk_artifact_counters(root);
+        assert!(disk.pr_checklist.is_none());
+        assert!(disk.pr_checklist_unreadable);
+        let report = checklist_report(root);
+        assert!(!report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 1);
+        assert_eq!(warning_fields(&report), ["pr_checklist"]);
+        assert_eq!(report.warnings[0].sources[0].artifact, "PR_REVIEW.md");
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(root.join("PR_REVIEW.md")).unwrap();
+            std::os::unix::fs::symlink("missing-review.md", root.join("PR_REVIEW.md")).unwrap();
+            let disk = read_disk_artifact_counters(root);
+            assert!(disk.pr_checklist_unreadable);
+            let report = checklist_report(root);
+            assert!(!report.consistent, "{report:?}");
             assert_eq!(warning_fields(&report), ["pr_checklist"]);
         }
     }
