@@ -1098,6 +1098,118 @@ impl Repository {
         Ok(changes)
     }
 
+    /// Whether one tracked path differs between an exact target commit and the
+    /// current index / working directory.
+    ///
+    /// The diff is narrowed to `path` at construction time (a literal path,
+    /// never a glob) and needs no rename detection, so the caller does not pay
+    /// for a whole tree to ask about one file. Untracked content is excluded.
+    ///
+    /// The target-to-index and index-to-working-tree axes are read apart, as
+    /// the snapshot-integrity check does: a change staged and then reverted in
+    /// the working file cancels out in one combined tree-to-workdir diff. Both
+    /// diffs load the index from disk rather than a copy cached before the
+    /// checks ran.
+    ///
+    /// The target is also read against the working directory with no index
+    /// in between. An index entry flagged `--skip-worktree` or
+    /// `--assume-unchanged` reads as unchanged on the index-to-working-tree
+    /// axis whatever the working file holds (libgit2's `maybe_modified` trusts
+    /// both flags, as the status read does), yet a tool reads the working file.
+    /// A tree entry carries no flags, and the working file is hashed through
+    /// libgit2's built-in filters, so a line-ending conversion is not a change.
+    /// Those are `crlf` and `ident` alone: libgit2 runs no clean driver a
+    /// repository configures. `ident` folds whatever lies between `$Id` and the
+    /// next `$` into `$Id$`, so bytes placed there on purpose read as unchanged;
+    /// only code running during the checks writes such bytes, and that code can
+    /// edit the Cargo home's configuration just as well, which no comparison of
+    /// the reviewed tree can speak for.
+    pub(crate) fn tracked_path_differs_from_oid(
+        &self,
+        target_oid: &str,
+        path: &str,
+    ) -> Result<bool> {
+        let tree = self.exact_commit_tree(target_oid)?;
+        let mut options = DiffOptions::new();
+        options
+            .include_untracked(false)
+            .include_typechange(true)
+            .include_unreadable(true)
+            .disable_pathspec_match(true)
+            .pathspec(path);
+        let staged = self
+            .inner
+            .diff_tree_to_index(Some(&tree), None, Some(&mut options))?;
+        if staged.deltas().next().is_some() {
+            return Ok(true);
+        }
+        let working = self.inner.diff_index_to_workdir(None, Some(&mut options))?;
+        if working.deltas().next().is_some() {
+            return Ok(true);
+        }
+        let on_disk = self
+            .inner
+            .diff_tree_to_workdir(Some(&tree), Some(&mut options))?;
+        Ok(on_disk.deltas().next().is_some())
+    }
+
+    /// Whether an exact commit holds an entry that names `file_path` only
+    /// under ASCII case folding: the path, or the path through a parent,
+    /// spelled in another case, such as `.cargo/Audit.toml` or
+    /// `.Cargo/audit.toml`.
+    ///
+    /// A checkout on a case-insensitive filesystem, the default on macOS and
+    /// Windows, resolves such an entry where a tool asks for `file_path`. An
+    /// exact tree lookup that finds nothing there therefore does not show the
+    /// tool read nothing. A symlink or submodule spelled in another case on
+    /// the way counts too, since it resolves to content the tree does not
+    /// describe.
+    pub(crate) fn case_variant_at_commit(&self, commit_oid: &str, file_path: &str) -> Result<bool> {
+        let safe_path = crate::paths::validate_repo_relative_str(file_path)?;
+        let components = safe_path
+            .components()
+            .map(|component| component.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>()
+            .with_context(|| format!("Path is not UTF-8: {file_path}"))?;
+        let tree = self.exact_commit_tree(commit_oid)?;
+        self.case_variant_below(&tree, &components, false)
+    }
+
+    fn case_variant_below(
+        &self,
+        tree: &git2::Tree<'_>,
+        components: &[&str],
+        varied: bool,
+    ) -> Result<bool> {
+        let Some((first, rest)) = components.split_first() else {
+            return Ok(false);
+        };
+        for entry in tree.iter() {
+            let Some(name) = entry.name() else {
+                continue;
+            };
+            if !name.eq_ignore_ascii_case(first) {
+                continue;
+            }
+            let varied = varied || name != *first;
+            if rest.is_empty() {
+                if varied {
+                    return Ok(true);
+                }
+                continue;
+            }
+            if entry.kind() == Some(git2::ObjectType::Tree) {
+                let subtree = self.inner.find_tree(entry.id())?;
+                if self.case_variant_below(&subtree, rest, varied)? {
+                    return Ok(true);
+                }
+            } else if varied {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn exact_commit_tree(&self, commit_oid: &str) -> Result<git2::Tree<'_>> {
         if commit_oid.len() != 40 {
             anyhow::bail!("Expected a full 40-character commit OID: {commit_oid}");
@@ -1136,6 +1248,49 @@ impl Repository {
         };
         Ok(entry.kind() == Some(git2::ObjectType::Blob)
             && entry.filemode() != i32::from(git2::FileMode::Link))
+    }
+
+    /// The blob an exact commit holds as a regular file at `file_path`, or
+    /// `None` when the commit has no entry there. This is the identity of what
+    /// a checkout of the commit would let a tool read at that path.
+    ///
+    /// Anything else is an error, not an absence. That covers a symlink or
+    /// submodule at the path, and a nearest existing parent that is not a
+    /// directory, such as a symlinked `.cargo`. A checkout resolves those to
+    /// content this tree does not describe. Callers that compare two commits
+    /// must therefore treat an error as "may differ".
+    pub(crate) fn regular_blob_at_commit(
+        &self,
+        commit_oid: &str,
+        file_path: &str,
+    ) -> Result<Option<git2::Oid>> {
+        let safe_path = crate::paths::validate_repo_relative_str(file_path)?;
+        let tree = self.exact_commit_tree(commit_oid)?;
+        match tree.get_path(safe_path) {
+            Ok(entry)
+                if entry.kind() == Some(git2::ObjectType::Blob)
+                    && entry.filemode() != i32::from(git2::FileMode::Link) =>
+            {
+                return Ok(Some(entry.id()));
+            }
+            Ok(_) => anyhow::bail!("{file_path} is not a regular file in {commit_oid}"),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        for parent in safe_path.ancestors().skip(1) {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            if let Ok(entry) = tree.get_path(parent) {
+                anyhow::ensure!(
+                    entry.kind() == Some(git2::ObjectType::Tree),
+                    "{} is not a directory in {commit_oid}",
+                    parent.display()
+                );
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// Directories of `commit_ref` that contain `file_name`, repo-relative and
@@ -1662,6 +1817,228 @@ mod tests {
         let github_base_oid = write_commit(tmp.path(), "base.txt", "github base\n");
         assert_ne!(local_base_oid, github_base_oid);
         (tmp, head_oid, github_base_oid)
+    }
+
+    /// One exact path: `a[1].lock` is a file name, not a pattern matching
+    /// `a1.lock`. Untracked content and other paths do not count; a change to
+    /// the asked path does, restoring it clears it, and deleting it counts.
+    #[test]
+    fn tracked_path_differs_from_oid_asks_about_one_literal_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        write_commit(tmp.path(), "a1.lock", "one\n");
+        write_commit(tmp.path(), "a[1].lock", "bracket\n");
+        let target = write_commit(tmp.path(), "other.txt", "other\n");
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let differs = |path: &str| {
+            repo.tracked_path_differs_from_oid(&target, path)
+                .expect("status")
+        };
+
+        assert!(!differs("a1.lock"));
+        fs::write(tmp.path().join("untracked.lock"), "new\n").expect("untracked");
+        fs::write(tmp.path().join("other.txt"), "edited\n").expect("edit other");
+        assert!(
+            !differs("a1.lock"),
+            "untracked and other paths do not count"
+        );
+
+        fs::write(tmp.path().join("a1.lock"), "one\ntwo\n").expect("edit lock");
+        assert!(differs("a1.lock"));
+        assert!(
+            !differs("a[1].lock"),
+            "the asked path is literal, never a glob"
+        );
+
+        fs::write(tmp.path().join("a1.lock"), "one\n").expect("restore lock");
+        assert!(!differs("a1.lock"));
+        fs::remove_file(tmp.path().join("a1.lock")).expect("delete lock");
+        assert!(differs("a1.lock"), "a deleted lock differs too");
+    }
+
+    /// A lock rewritten and staged, then restored in the working file: the
+    /// combined tree-to-workdir diff is empty (`git diff HEAD` shows nothing),
+    /// but the index still differs from the target, so the path differs. The
+    /// handle is opened before the index changes, so this also proves the index
+    /// is read from disk, not from a copy cached when the handle was opened.
+    #[test]
+    fn tracked_path_differs_from_oid_keeps_a_staged_change_the_worktree_restored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let target = write_commit(tmp.path(), "Cargo.lock", "target\n");
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        assert!(
+            !repo
+                .tracked_path_differs_from_oid(&target, "Cargo.lock")
+                .expect("status")
+        );
+
+        fs::write(tmp.path().join("Cargo.lock"), "rewritten\n").expect("rewrite lock");
+        run_git(tmp.path(), &["add", "Cargo.lock"]);
+        fs::write(tmp.path().join("Cargo.lock"), "target\n").expect("restore lock");
+
+        assert!(
+            repo.tracked_path_differs_from_oid(&target, "Cargo.lock")
+                .expect("status"),
+            "a staged rewrite hidden by restored working bytes still differs"
+        );
+    }
+
+    /// A lock flagged `--skip-worktree` or `--assume-unchanged`, then rewritten
+    /// on disk as cargo rewrites a lock its manifest outgrew. The status read
+    /// and the index-to-worktree diff both trust the flag and see nothing, yet
+    /// cargo reads the working file. The target-to-worktree read carries no
+    /// index flags.
+    #[test]
+    fn tracked_path_differs_from_oid_sees_through_index_skip_flags() {
+        for flag in ["--skip-worktree", "--assume-unchanged"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+            let target = write_commit(tmp.path(), "Cargo.lock", "target\n");
+            run_git(tmp.path(), &["update-index", flag, "Cargo.lock"]);
+            fs::write(tmp.path().join("Cargo.lock"), "rewritten by cargo\n").expect("rewrite lock");
+            let repo = Repository::open(tmp.path()).expect("open repo");
+            assert!(
+                repo.inner.statuses(None).expect("status").is_empty(),
+                "{flag} hides the rewrite from the status read"
+            );
+            assert!(
+                repo.tracked_path_differs_from_oid(&target, "Cargo.lock")
+                    .expect("status"),
+                "{flag} does not hide the rewrite from the target-to-worktree read"
+            );
+
+            fs::write(tmp.path().join("Cargo.lock"), "target\n").expect("restore lock");
+            assert!(
+                !repo
+                    .tracked_path_differs_from_oid(&target, "Cargo.lock")
+                    .expect("status"),
+                "{flag}: restoring the target's bytes clears it"
+            );
+        }
+    }
+
+    /// A clean filter driver the repository configures is Git's, not
+    /// libgit2's. libgit2 registers only its built-in `crlf` and `ident`
+    /// filters (`filter.c`) and runs no `filter.<name>.clean` command, so a
+    /// driver that cleans a rewritten lock back to the target's bytes, and
+    /// hides the rewrite from `git status`, hides nothing from this read.
+    #[cfg(unix)]
+    #[test]
+    fn tracked_path_differs_from_oid_runs_no_configured_clean_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let target = write_commit(tmp.path(), "Cargo.lock", "target\n");
+        let git_dir = tmp.path().join(".git");
+        fs::write(git_dir.join("pristine.lock"), "target\n").expect("pristine copy");
+        fs::create_dir_all(git_dir.join("info")).expect("info dir");
+        fs::write(
+            git_dir.join("info").join("attributes"),
+            "Cargo.lock filter=pristine\n",
+        )
+        .expect("attributes");
+        run_git(
+            tmp.path(),
+            &[
+                "config",
+                "filter.pristine.clean",
+                "cat >/dev/null; cat .git/pristine.lock",
+            ],
+        );
+        // The same size as the target's bytes: Git trusts a size change in
+        // the index without running the driver, so only an equal-size
+        // rewrite reaches it.
+        fs::write(tmp.path().join("Cargo.lock"), "hidden\n").expect("rewrite lock");
+
+        let status = git_cmd()
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git status");
+        assert!(status.status.success(), "git status failed");
+        assert!(
+            status.stdout.is_empty(),
+            "Git's driver cleans the rewrite away: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        assert!(
+            repo.tracked_path_differs_from_oid(&target, "Cargo.lock")
+                .expect("status"),
+            "libgit2 runs no configured driver, so the rewrite still differs"
+        );
+    }
+
+    /// Commit a tree built in the object database, with each file's path as
+    /// its content. Entries that a case-insensitive filesystem would merge
+    /// stay apart here.
+    fn object_commit(repo: &git2::Repository, entries: &[(&str, git2::FileMode)]) -> String {
+        let empty = repo
+            .find_tree(
+                repo.treebuilder(None)
+                    .expect("builder")
+                    .write()
+                    .expect("empty tree"),
+            )
+            .expect("find empty tree");
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        for (path, mode) in entries {
+            let blob = repo.blob(path.as_bytes()).expect("blob");
+            update.upsert(*path, blob, *mode);
+        }
+        let tree = repo
+            .find_tree(update.create_updated(repo, &empty).expect("tree"))
+            .expect("find tree");
+        let signature = git2::Signature::now("Test", "test@example.com").expect("signature");
+        repo.commit(None, &signature, &signature, "tree", &tree, &[])
+            .expect("commit")
+            .to_string()
+    }
+
+    /// On a case-insensitive filesystem, `.cargo/Audit.toml` or
+    /// `.Cargo/audit.toml` is the file a tool asking for `.cargo/audit.toml`
+    /// reads. Every component is folded. A differently cased parent that does
+    /// not lead to the file, and neighbours that only share a prefix, are not
+    /// variants.
+    #[test]
+    fn case_variant_at_commit_folds_every_component() {
+        use git2::FileMode::{Blob, Link};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let raw = git2::Repository::init(tmp.path()).expect("init");
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let variant = |entries: &[(&str, git2::FileMode)]| {
+            repo.case_variant_at_commit(&object_commit(&raw, entries), ".cargo/audit.toml")
+                .expect("tree")
+        };
+
+        assert!(!variant(&[]), "an empty tree has no variant");
+        assert!(
+            !variant(&[(".cargo/audit.toml", Blob)]),
+            "the exact spelling is not a variant"
+        );
+        assert!(
+            !variant(&[
+                (".cargo/audit.toml.off", Blob),
+                (".cargo/config.toml", Blob),
+                ("audit.toml", Blob),
+            ]),
+            "neighbours are not variants"
+        );
+        assert!(
+            !variant(&[(".Cargo/config.toml", Blob)]),
+            "a differently cased parent without the file is not one"
+        );
+        assert!(variant(&[(".cargo/Audit.toml", Blob)]));
+        assert!(variant(&[(".CARGO/audit.toml", Blob)]));
+        assert!(
+            variant(&[(".cargo/audit.toml", Blob), (".Cargo/AUDIT.TOML", Blob)]),
+            "a variant beside the exact file still counts"
+        );
+        assert!(
+            variant(&[(".Cargo", Link)]),
+            "a differently cased symlink on the way counts"
+        );
+        assert!(variant(&[(".cargo/AUDIT.toml", Link)]));
     }
 
     fn init_repo_with_advanced_base() -> (tempfile::TempDir, String, String, String) {

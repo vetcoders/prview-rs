@@ -329,6 +329,7 @@ impl App {
                 skipped_checks,
                 worktree_clean: worktree.clean,
                 worktree_status_digest: worktree.status_digest.clone(),
+                worktree_dirty_paths: worktree.dirty_paths.clone(),
                 worktree_head_sha: worktree.head_sha.clone(),
                 governor: &self.governor,
             })
@@ -664,6 +665,7 @@ impl App {
                 skipped_checks: vec![],
                 worktree_clean: worktree.clean,
                 worktree_status_digest: worktree.status_digest.clone(),
+                worktree_dirty_paths: worktree.dirty_paths.clone(),
                 worktree_head_sha: worktree.head_sha.clone(),
                 governor: &self.governor,
             })

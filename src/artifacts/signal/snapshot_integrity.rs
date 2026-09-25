@@ -80,6 +80,12 @@ impl SnapshotIntegrity {
         self.status != SnapshotIntegrityStatus::Clean
     }
 
+    /// Every tracked path any check boundary observed changed against the
+    /// reviewed target, or `None` when some boundary could not be read.
+    pub(crate) fn tracked_changes(&self) -> Option<&[String]> {
+        self.changed_paths.as_deref()
+    }
+
     pub(crate) fn apply_review(
         &self,
         confidence: &mut AnalysisStatus,
@@ -152,7 +158,7 @@ impl SnapshotIntegrity {
             serde_json::to_vec_pretty(self)?,
         )?;
         let md = format!(
-            "# Shared snapshot integrity\n\n{}\n\nExpected target: `{}`\n\nObserved HEAD: `{}`\n\n## Tracked paths\n\n```json\n{}\n```\n\nObservations are taken before and after each live check and once after checks, before context generation. Earlier non-clean observations remain even when later checks restore the tree. Check names identify observation boundaries, not the writer: concurrent tools may share the snapshot. Newly untracked files, including a generated Cargo.lock, are excluded; changes to an already tracked lockfile are included. Index and worktree differences are both retained. Check statuses and exit codes are unchanged. Endpoint observations cannot detect a change restored between observations. Results overlapping an observed change are not written to cache. The JSON retains each non-clean boundary and the final observation.\n",
+            "# Shared snapshot integrity\n\n{}\n\nExpected target: `{}`\n\nObserved HEAD: `{}`\n\n## Tracked paths\n\n```json\n{}\n```\n\nObservations are taken before and after each live check and once after checks, before context generation. Earlier non-clean observations remain even when later checks restore the tree. Check names identify observation boundaries, not the writer: concurrent tools may share the snapshot. Newly untracked files, including a generated Cargo.lock, are excluded; changes to an already tracked lockfile are included. Index and worktree differences are both retained, and an entry marked skip-worktree or assume-unchanged is also compared on disk against the target, past the index. Check statuses and exit codes are unchanged. Endpoint observations cannot detect a change restored between observations. Results overlapping an observed change are not written to cache. The JSON retains each non-clean boundary and the final observation.\n",
             self.review_caveat(),
             self.expected_target_sha,
             self.observed_head_sha.as_deref().unwrap_or("unknown"),
@@ -253,6 +259,43 @@ mod tests {
         let evidence = SnapshotIntegrity::observe(cwd, repo.path(), &target);
         assert_eq!(evidence.status, SnapshotIntegrityStatus::Modified);
         assert_eq!(evidence.changed_paths, Some(vec!["Cargo.lock".to_owned()]));
+    }
+
+    /// A check that marks the lock skip-worktree or assume-unchanged before
+    /// rewriting it hides the rewrite from both index diffs, since libgit2
+    /// trusts the flags. The observation must still see the bytes on disk.
+    #[test]
+    fn snapshot_integrity_reads_flagged_entries_on_disk_past_the_index() {
+        for flag in ["--skip-worktree", "--assume-unchanged"] {
+            let (owner, snapshot, target) = fixture();
+            let cwd = &snapshot.worktree_path;
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(["update-index", flag, "Cargo.lock"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "{flag}");
+            std::fs::write(cwd.join("Cargo.lock"), "rewritten behind the flag\n").unwrap();
+            let evidence = SnapshotIntegrity::observe(cwd, owner.path(), &target);
+            assert_eq!(
+                evidence.changed_paths,
+                Some(vec!["Cargo.lock".to_owned()]),
+                "{flag}"
+            );
+            std::fs::write(cwd.join("Cargo.lock"), "tracked lock\n").unwrap();
+            assert!(
+                !SnapshotIntegrity::observe(cwd, owner.path(), &target).requires_review(),
+                "{flag}: the target's bytes behind the flag are no change"
+            );
+            std::fs::remove_file(cwd.join("Cargo.lock")).unwrap();
+            let evidence = SnapshotIntegrity::observe(cwd, owner.path(), &target);
+            assert_eq!(
+                evidence.changed_paths,
+                Some(vec!["Cargo.lock".to_owned()]),
+                "{flag}: a removed flagged entry"
+            );
+        }
     }
 
     #[test]

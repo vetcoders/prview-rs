@@ -14,6 +14,268 @@ use super::*;
 /// quality signal.
 pub(crate) const REWRITTEN_RANGE_NOTE: &str = "Force-push detected: the file set reflects the pre-push \u{2192} current tree difference, so it may contain changes not attributable to any commit in the displayed commit list.";
 
+/// One auto-derived line of the PR template checklist.
+///
+/// Each line is a UNIVERSAL claim ("No lint errors", not "some linter
+/// passed"), so it is ticked only when at least one check of its category
+/// executed in this review and every executed check of that category passed.
+/// Cached PASS replays do not count as execution; cached failures still veto
+/// a universal success claim. Anything else —
+/// a failed, errored or warnings-only check, or no executed check at all —
+/// renders `[ ]`: the pack does not claim what it did not prove. The failing
+/// check is named in the same file's Check Status table, so the template line
+/// itself stays in its copy-paste shape.
+///
+/// This is the single derivation of the claim. `PR_REVIEW.md` renders it, and
+/// the consistency checker re-derives it to prove the rendered marks still
+/// match: `CONSISTENCY_CHECK.json` from the statuses serialized in
+/// `report.json`, and `report.json`'s own `quality.consistency` from the
+/// in-memory statuses it is about to serialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrChecklistItem {
+    Compiles,
+    TestsPass,
+    NoLintErrors,
+}
+
+impl PrChecklistItem {
+    pub(crate) const ALL: [Self; 3] = [Self::Compiles, Self::TestsPass, Self::NoLintErrors];
+
+    /// The text rendered after the checkbox.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Compiles => "Compiles / type-checks",
+            Self::TestsPass => "Tests pass",
+            Self::NoLintErrors => "No lint errors",
+        }
+    }
+
+    /// Stable field key used by the consistency checker.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Compiles => "compiles",
+            Self::TestsPass => "tests_pass",
+            Self::NoLintErrors => "no_lint_errors",
+        }
+    }
+
+    /// Whether a check (by display name) belongs to this item's category.
+    fn covers(self, check_name: &str) -> bool {
+        let name = check_name.to_lowercase();
+        match self {
+            Self::Compiles => {
+                name.contains("typescript") || name == "cargo check" || name == "mypy"
+            }
+            Self::TestsPass => name.contains("test") || name == "vitest" || name == "pytest",
+            Self::NoLintErrors => name.contains("lint") || name == "clippy" || name == "ruff",
+        }
+    }
+}
+
+/// What a check contributes to a checklist claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChecklistCheckOutcome {
+    Passed,
+    /// Ran and did not pass: failed, errored, or finished with warnings.
+    NotPassed,
+    /// A replay did not execute in this review and cannot earn a claim.
+    CachedPassed,
+    /// A replayed failure still vetoes a universal success claim.
+    CachedNotPassed,
+    /// Did not execute; neither supports nor vetoes the claim.
+    Skipped,
+}
+
+impl ChecklistCheckOutcome {
+    pub(crate) fn from_status(status: crate::checks::CheckStatus, cached: bool) -> Self {
+        use crate::checks::CheckStatus;
+        match (status, cached) {
+            (CheckStatus::Passed, false) => Self::Passed,
+            (CheckStatus::Passed, true) => Self::CachedPassed,
+            (CheckStatus::Skipped, _) => Self::Skipped,
+            (CheckStatus::Failed | CheckStatus::Warnings | CheckStatus::Error, false) => {
+                Self::NotPassed
+            }
+            (CheckStatus::Failed | CheckStatus::Warnings | CheckStatus::Error, true) => {
+                Self::CachedNotPassed
+            }
+        }
+    }
+
+    /// The status token `report.json` serializes (`PASS`/`FAIL`/`ERROR`/`SKIP`/
+    /// `WARN`, a closed vocabulary). Any other token is evidence of neither
+    /// outcome: `None`, which the consistency checker reports as an unreadable
+    /// entry instead of reading it as a failure that might happen to agree.
+    pub(crate) fn from_report_status(status: &str, cached: bool) -> Option<Self> {
+        match (status, cached) {
+            ("PASS", false) => Some(Self::Passed),
+            ("PASS", true) => Some(Self::CachedPassed),
+            ("SKIP", _) => Some(Self::Skipped),
+            ("FAIL" | "ERROR" | "WARN", false) => Some(Self::NotPassed),
+            ("FAIL" | "ERROR" | "WARN", true) => Some(Self::CachedNotPassed),
+            _ => None,
+        }
+    }
+}
+
+/// A derived checklist claim and the checks behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrChecklistClaim {
+    pub(crate) item: PrChecklistItem,
+    /// Executed checks of this category.
+    pub(crate) executed: Vec<String>,
+    /// Executed checks of this category that did not pass.
+    pub(crate) not_passed: Vec<String>,
+}
+
+impl PrChecklistClaim {
+    pub(crate) fn ticked(&self) -> bool {
+        !self.executed.is_empty() && self.not_passed.is_empty()
+    }
+}
+
+/// Derive every checklist claim from `(check name, outcome)` pairs.
+pub(crate) fn derive_pr_checklist(
+    checks: &[(&str, ChecklistCheckOutcome)],
+) -> Vec<PrChecklistClaim> {
+    PrChecklistItem::ALL
+        .into_iter()
+        .map(|item| {
+            let mut claim = PrChecklistClaim {
+                item,
+                executed: Vec::new(),
+                not_passed: Vec::new(),
+            };
+            for (name, outcome) in checks.iter().filter(|(name, _)| item.covers(name)) {
+                match outcome {
+                    ChecklistCheckOutcome::Skipped => {}
+                    ChecklistCheckOutcome::Passed => claim.executed.push((*name).to_string()),
+                    ChecklistCheckOutcome::CachedPassed => {}
+                    ChecklistCheckOutcome::NotPassed => {
+                        claim.executed.push((*name).to_string());
+                        claim.not_passed.push((*name).to_string());
+                    }
+                    ChecklistCheckOutcome::CachedNotPassed => {
+                        claim.not_passed.push((*name).to_string());
+                    }
+                }
+            }
+            claim
+        })
+        .collect()
+}
+
+/// Read the rendered checklist marks back from a `PR_REVIEW.md`.
+///
+/// Only lines inside the PR Template's `## Checklist` section count: the
+/// `## Checklist` heading inside the ```` ```markdown ```` block that follows
+/// the final generated `## PR Template` heading and its preceding separator, up to
+/// the next level-2 heading or the block's closing fence. A `## Checklist`
+/// anywhere else — check-derived text above
+/// the template, or anything appended after its closing fence — is not the
+/// template's checklist and cannot stand in for it. A second complete PR
+/// Template, or a template with more than one `## Checklist`,
+/// is ambiguous and yields no section.
+///
+/// Within the section, every line that names an item's label is a claim about
+/// that item, whatever its shape, and exactly one may exist: `- [x] <label>`
+/// or `- [ ] <label>`. A second line naming the same item — a duplicate, a
+/// contradicting copy, or a variant such as `* [x] <label>` — is ambiguous in
+/// the same way a second template is, so no copy wins; reading the first one
+/// let an honest `- [ ]` hide a false `- [x]` beneath it. `None` per item means
+/// no single readable line for it — missing, ambiguous, or a mark that is
+/// neither `x` nor a space — never a guessed mark; with no readable section
+/// every item is `None`.
+pub(crate) fn parse_pr_checklist(pr_review: &str) -> Vec<(PrChecklistItem, Option<bool>)> {
+    let section = pr_template_checklist(pr_review).unwrap_or_default();
+    PrChecklistItem::ALL
+        .into_iter()
+        .map(|item| {
+            let mut claims = section.iter().filter(|line| line.contains(item.label()));
+            let mark = match (claims.next(), claims.next()) {
+                (Some(line), None) => pr_checklist_mark(line, item),
+                _ => None,
+            };
+            (item, mark)
+        })
+        .collect()
+}
+
+/// The mark on the one line that claims `item`, when that line has exactly the
+/// rendered shape.
+fn pr_checklist_mark(line: &str, item: PrChecklistItem) -> Option<bool> {
+    let (mark, label) = line.strip_prefix("- [")?.split_once("] ")?;
+    if label != item.label() {
+        return None;
+    }
+    match mark {
+        "x" | "X" => Some(true),
+        " " => Some(false),
+        _ => None,
+    }
+}
+
+/// The lines of the generated tail's `## Checklist` section (see
+/// [`parse_pr_checklist`]), or `None` when there is no such section or it is
+/// ambiguous.
+fn pr_template_checklist(pr_review: &str) -> Option<Vec<&str>> {
+    let lines: Vec<&str> = pr_review.lines().collect();
+    // The generator appends a separator and then its template. An earlier
+    // diagnostic can quote the signature, but without a complete checklist it
+    // is not a template. File paths are escaped before rendering, and two
+    // complete templates remain ambiguous.
+    let signature = [
+        "## PR Template",
+        "",
+        "_Copy below for GitHub PR description:_",
+        "",
+        "```markdown",
+    ];
+    let candidates: Vec<_> = (2..lines.len())
+        .filter(|&i| {
+            lines[i - 2] == "---"
+                && lines[i - 1].is_empty()
+                && lines.get(i..i + signature.len()) == Some(signature.as_slice())
+        })
+        .filter_map(|heading| {
+            let after = &lines[heading + 1..];
+            let open = after
+                .iter()
+                .take_while(|line| !line.starts_with("## "))
+                .position(|line| *line == "```markdown")?;
+            let body = &after[open + 1..];
+            let close = body.iter().position(|line| line.starts_with("```"))?;
+            let block = &body[..close];
+            block
+                .contains(&"## Checklist")
+                .then_some((block, heading + open + close + 2))
+        })
+        .collect();
+    let [(block, close_line)] = candidates.as_slice() else {
+        return None;
+    };
+    // An unanchored complete template appended after the real tail is also
+    // ambiguous; ordinary trailing narrative cannot provide checklist lines.
+    if lines[*close_line + 1..]
+        .windows(signature.len())
+        .any(|window| window == signature.as_slice())
+    {
+        return None;
+    }
+    let mut checklists = (0..block.len()).filter(|&i| block[i] == "## Checklist");
+    let start = checklists.next()? + 1;
+    if checklists.next().is_some() {
+        return None;
+    }
+    Some(
+        block[start..]
+            .iter()
+            .take_while(|line| !line.starts_with("## "))
+            .copied()
+            .collect(),
+    )
+}
+
 /// Whether this run actually reviewed a rewritten range: `--exact-base` is in
 /// force for this very base, and the pinned base is not an ancestor of the
 /// target.
@@ -175,7 +437,13 @@ pub(crate) fn generate_pr_review(
             .iter()
             .filter(|file| file.additions + file.deletions >= 80)
             .take(3)
-            .map(|file| format!("`{}` ({})", file.path, file.additions + file.deletions))
+            .map(|file| {
+                format!(
+                    "`{}` ({})",
+                    file.path.escape_debug(),
+                    file.additions + file.deletions
+                )
+            })
             .collect();
         if !top_hotspots.is_empty() {
             writeln!(md, "- Top hotspots: {}", top_hotspots.join(", "))?;
@@ -195,7 +463,12 @@ pub(crate) fn generate_pr_review(
             writeln!(md)?;
             writeln!(md, "  **Twin pairs (potential duplication):**")?;
             for twin in loctree.twins.exact_twins.iter().take(5) {
-                writeln!(md, "  - `{}` and `{}`", twin.file_a, twin.file_b)?;
+                writeln!(
+                    md,
+                    "  - `{}` and `{}`",
+                    twin.file_a.escape_debug(),
+                    twin.file_b.escape_debug()
+                )?;
             }
             if loctree.twins.exact_twins.len() > 5 {
                 writeln!(
@@ -227,7 +500,10 @@ pub(crate) fn generate_pr_review(
             crate::git::FileStatus::Renamed => 'R',
             crate::git::FileStatus::Copied => 'C',
         };
-        writeln!(md, "{}\t{}", status_char, f.path)?;
+        // Git paths may contain newlines and even a whole Markdown template.
+        // Keep each path on one visible line so it cannot create artifact
+        // headings, fences or checklist claims of its own.
+        writeln!(md, "{}\t{}", status_char, f.path.escape_debug())?;
     }
     writeln!(md, "```")?;
     writeln!(md, "</details>")?;
@@ -568,36 +844,26 @@ pub(crate) fn generate_pr_review(
     writeln!(md, "- [ ] Refactoring")?;
     writeln!(md, "## Checklist")?;
 
-    // Auto-check based on check results
-    let has_tsc = checks.iter().any(|c| {
-        c.name.to_lowercase().contains("typescript") || c.name.to_lowercase() == "cargo check"
-    });
-    let tsc_pass = checks.iter().any(|c| {
-        (c.name.to_lowercase().contains("typescript") || c.name.to_lowercase() == "cargo check")
-            && matches!(c.status, crate::checks::CheckStatus::Passed)
-    });
-    let tests_pass = checks.iter().any(|c| {
-        (c.name.to_lowercase().contains("test")
-            || c.name.to_lowercase() == "vitest"
-            || c.name.to_lowercase() == "pytest")
-            && matches!(c.status, crate::checks::CheckStatus::Passed)
-    });
-    let lint_pass = checks.iter().any(|c| {
-        (c.name.to_lowercase().contains("lint")
-            || c.name.to_lowercase() == "clippy"
-            || c.name.to_lowercase() == "ruff")
-            && matches!(c.status, crate::checks::CheckStatus::Passed)
-    });
-
-    let check_mark = |pass: bool| if pass { "x" } else { " " };
-
-    writeln!(
-        md,
-        "- [{}] Compiles / type-checks",
-        check_mark(tsc_pass || (!has_tsc && checks.is_empty()))
-    )?;
-    writeln!(md, "- [{}] Tests pass", check_mark(tests_pass))?;
-    writeln!(md, "- [{}] No lint errors", check_mark(lint_pass))?;
+    // Auto-check from check results. Each universal claim is earned only when
+    // EVERY check of its category that ran passed (see `derive_pr_checklist`);
+    // the consistency checker re-derives the same claims from report.json.
+    let outcomes: Vec<_> = checks
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                ChecklistCheckOutcome::from_status(c.status, c.cached),
+            )
+        })
+        .collect();
+    for claim in derive_pr_checklist(&outcomes) {
+        writeln!(
+            md,
+            "- [{}] {}",
+            if claim.ticked() { "x" } else { " " },
+            claim.item.label()
+        )?;
+    }
     writeln!(md, "- [ ] Manually tested")?;
     writeln!(md, "```")?;
 

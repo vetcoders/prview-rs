@@ -176,7 +176,9 @@ fn cargo_home_path(
     })
 }
 
-fn cargo_operator_home() -> Option<PathBuf> {
+/// The account home Cargo's `home` crate reads, whose `.cargo` is the Cargo
+/// home when `CARGO_HOME` is unset or empty.
+pub(crate) fn cargo_operator_home() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         std::env::var_os("USERPROFILE")
@@ -1018,10 +1020,16 @@ const CARGO_ROOT_DISCOVERY_DEPTH: usize = 2;
 /// resolving it would let cargo read foreign code under the reviewed commit's
 /// cache key.
 fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
-    let (Some(commit), Some(relative)) = (
-        exact_target_commit(config).ok().flatten(),
-        repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root),
-    ) else {
+    match exact_target_commit(config).ok().flatten() {
+        Some(commit) => resolve_reviewed_cargo_root_at(config, &commit),
+        None => ReviewedCargoRoot::Unknown,
+    }
+}
+
+/// [`resolve_reviewed_cargo_root`] for an already-resolved reviewed commit.
+fn resolve_reviewed_cargo_root_at(config: &Config, commit: &str) -> ReviewedCargoRoot {
+    let Some(relative) = repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root)
+    else {
         return ReviewedCargoRoot::Unknown;
     };
     let Ok(repo) = crate::git::Repository::open(&config.repo_root) else {
@@ -1035,7 +1043,7 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
         } else {
             format!("{candidate}/Cargo.toml")
         };
-        match repo.regular_file_at_commit(&commit, &path) {
+        match repo.regular_file_at_commit(commit, &path) {
             Ok(true) => return ReviewedCargoRoot::Resolved(candidate.to_string()),
             Ok(false) => {}
             // The question could not be asked — do not answer it.
@@ -1044,7 +1052,7 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
     }
 
     let Ok(moved) =
-        repo.dirs_containing_at_commit(&commit, "Cargo.toml", CARGO_ROOT_DISCOVERY_DEPTH)
+        repo.dirs_containing_at_commit(commit, "Cargo.toml", CARGO_ROOT_DISCOVERY_DEPTH)
     else {
         return ReviewedCargoRoot::Unknown;
     };
@@ -1055,7 +1063,7 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
         mapped
     };
     match moved.as_slice() {
-        [only] => match moved_manifest_is_configured_project(config, &repo, &commit, only) {
+        [only] => match moved_manifest_is_configured_project(config, &repo, commit, only) {
             Ok(()) => ReviewedCargoRoot::Resolved(only.clone()),
             Err(why) => ReviewedCargoRoot::Unavailable(format!(
                 "commit {short} has no Cargo.toml at {aimed_at}; the only one elsewhere ({only}) \
@@ -1071,6 +1079,32 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
             many.join(", "),
         )),
     }
+}
+
+/// Whether the reviewed commit keeps its cargo project somewhere other than the
+/// configured cargo root — the moved-manifest case [`plan_cargo_run`] follows.
+///
+/// Cargo checks of such a commit run in the directory the manifest moved to,
+/// while every artifact-side question about the cargo project (which
+/// `Cargo.lock` the audit read, whether that lock changed) is still asked of
+/// the configured root. The two disagree exactly here, and a proof about the
+/// configured root's lockfile says nothing about the lockfile cargo read. The
+/// resolution is the one `plan_cargo_run` makes, not a re-derivation, so this
+/// answers for the directory the checks actually ran in.
+///
+/// `false` whenever no relocation is established: the commit keeps the manifest
+/// where the configured root maps to, the configured root lies outside the
+/// repository, or git cannot answer. Callers use a `true` to withhold a claim,
+/// so the unanswerable cases stay with whatever the caller already concluded.
+pub(crate) fn reviewed_cargo_root_relocated(config: &Config, commit: &str) -> bool {
+    let Some(relative) = repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root)
+    else {
+        return false;
+    };
+    matches!(
+        resolve_reviewed_cargo_root_at(config, commit),
+        ReviewedCargoRoot::Resolved(resolved) if resolved != cargo_root_path(&relative)
+    )
 }
 
 /// What a manifest says it IS, so a manifest found somewhere else in the
@@ -2026,6 +2060,16 @@ impl Check for CargoAuditCheck {
         Some(format!("audit-{lock}-{day}"))
     }
 
+    fn replays_cached(&self, status: CheckStatus) -> bool {
+        // Only a clean report is replayed. A failing or warning report is what
+        // the pre-existing downgrade reads, and the lock proof it rests on is
+        // taken from the files as they are now — but the key above does not
+        // bind the audit config, so a replay can be a report an earlier config
+        // produced. A clean report needs no downgrade, so it cannot mislead
+        // one; everything else runs live.
+        status == CheckStatus::Passed
+    }
+
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
@@ -2134,7 +2178,11 @@ fn cargo_audit_warning_count(stdout: &str) -> Option<usize> {
     Some(count_cargo_audit_warning_items(warnings))
 }
 
-fn count_cargo_audit_warning_items(value: &serde_json::Value) -> usize {
+/// How many advisory-like items one `warnings` value carries, as the check
+/// status counts them. The baseline key builder holds itself to this same
+/// count, so an item that makes the check report warnings can never be one the
+/// pre-existing comparison silently cannot see.
+pub(crate) fn count_cargo_audit_warning_items(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Array(items) => items.len(),
         serde_json::Value::Object(map) => {
@@ -3330,6 +3378,24 @@ mod tests {
     }
 
     #[test]
+    fn cargo_audit_replays_only_a_clean_report_from_cache() {
+        // The pre-existing downgrade reads a failing or warning report against
+        // a lock proof taken from the files as they are now, and the audit key
+        // does not bind `.cargo/audit.toml`. Only a report that needs no
+        // downgrade may come back from cache.
+        let check = CargoAuditCheck;
+        assert!(check.replays_cached(CheckStatus::Passed));
+        for status in [
+            CheckStatus::Failed,
+            CheckStatus::Warnings,
+            CheckStatus::Error,
+            CheckStatus::Skipped,
+        ] {
+            assert!(!check.replays_cached(status), "{status:?} must run live");
+        }
+    }
+
+    #[test]
     fn test_cargo_audit_cache_key_follows_cargo_root_not_repo_root() {
         // PR #12 review #22: the audit runs in cargo_root (which may be a
         // workspace member), so the cache key must hash THAT directory's
@@ -4188,6 +4254,36 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             resolve_reviewed_cargo_root(&config),
             ReviewedCargoRoot::Resolved("backend".to_string()),
             "the same workspace one level down is still the project under review",
+        );
+    }
+
+    /// The lockfile proof withholds itself on a `true` here, so the answer must
+    /// be the plan's own resolution: relocated for the moved commit, not for a
+    /// commit that keeps the manifest where the configured root maps to.
+    #[test]
+    fn a_relocated_cargo_root_is_reported_for_the_moved_commit_only() {
+        let workspace = "[workspace]\nmembers=[\"core\"]\nresolver=\"2\"\n";
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        std::fs::write(root.join("backend/Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root moved into backend");
+        let moved = head_sha(root);
+        std::fs::remove_file(root.join("backend/Cargo.toml")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root back at the top");
+        let stayed = head_sha(root);
+
+        let config = test_config_builder()
+            .repo_root(root)
+            .profile(test_rust_profile(true))
+            .target(Some(&moved))
+            .build();
+
+        assert!(reviewed_cargo_root_relocated(&config, &moved));
+        assert!(
+            !reviewed_cargo_root_relocated(&config, &stayed),
+            "a manifest still at the configured root is no relocation",
         );
     }
 

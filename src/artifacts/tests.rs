@@ -38,6 +38,16 @@ fn generate_fixture_pack_with_ledger(
 struct FixturePackOptions<'a> {
     diffs: &'a [Diff],
     worktree_head: FixtureWorktreeHead<'a>,
+    /// Executed checks the pack must judge. Empty is the historical shape: a
+    /// pack whose verdict rests on structure alone.
+    checks: &'a [CheckResult],
+    /// The operator worktree's dirty paths, frozen before the checks (R4-19).
+    /// `Some(empty)` — a clean tree — is the default so existing fixtures keep
+    /// their meaning.
+    worktree_dirty_paths: Option<std::collections::BTreeSet<String>>,
+    /// `None` keeps the builder's default (`warn`). A fixture that needs a
+    /// failing check to actually hold the merge says so here.
+    policy_mode: Option<crate::policy::PolicyMode>,
 }
 
 /// What a fixture pack captured about the operator checkout. The default is the
@@ -79,6 +89,10 @@ fn generate_fixture_pack_with_ledger_and_diffs(
     config.create_dashboard = true;
     config.quiet = true;
     config.output_dir = Some(output_dir.to_path_buf());
+    if let Some(mode) = options.policy_mode {
+        config.policy.mode = mode;
+    }
+    let fixture_dirty_paths = options.worktree_dirty_paths.clone().unwrap_or_default();
 
     let resolved_target = ResolvedRef {
         name: "feature".to_string(),
@@ -96,14 +110,19 @@ fn generate_fixture_pack_with_ledger_and_diffs(
         ledger,
         scope: None,
         diffs: options.diffs,
-        checks: &[],
+        checks: options.checks,
         heuristics: None,
         resolved_target: &resolved_target,
         resolved_bases: &resolved_bases,
         run_start: Instant::now(),
         skipped_checks: Vec::new(),
-        worktree_clean: Some(true),
+        // One status read, two derived facts — exactly as
+        // `capture_worktree_provenance` produces them. Deriving cleanliness
+        // from the path set keeps a fixture from claiming a clean tree beside a
+        // list of dirty files.
+        worktree_clean: Some(fixture_dirty_paths.is_empty()),
         worktree_status_digest: None,
+        worktree_dirty_paths: Some(fixture_dirty_paths),
         worktree_head_sha: match options.worktree_head {
             FixtureWorktreeHead::IsTarget => Some(target_sha.to_owned()),
             FixtureWorktreeHead::Sha(sha) => Some(sha.to_owned()),
@@ -1507,8 +1526,31 @@ fn write_commit_fixture(repo: &Path, name: &str, body: &str) -> String {
 }
 
 fn init_advanced_base_fixture() -> (tempfile::TempDir, String, String) {
+    init_advanced_base_fixture_inner(true)
+}
+
+/// The shared base fixture, with or without a committed `Cargo.lock`.
+///
+/// Cargo audit's provenance proof asks the target COMMIT whether a lockfile
+/// exists there, so a fixture that asserts `pre-existing: Cargo.lock unchanged
+/// by this PR` has to actually HAVE that file — otherwise it pins a sentence
+/// about a world the pack never describes. The manifest and lock are committed
+/// before the branch point, so every diff in this fixture stays source-only.
+fn init_advanced_base_fixture_inner(with_lock: bool) -> (tempfile::TempDir, String, String) {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_git_fixture(tmp.path(), &["init", "-q", "-b", "main"]);
+    if with_lock {
+        write_commit_fixture(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_commit_fixture(
+            tmp.path(),
+            "Cargo.lock",
+            "version = 3\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        );
+    }
     let merge_base = write_commit_fixture(tmp.path(), "own.rs", "pub fn own() -> u8 { 1 }\n");
     run_git_fixture(tmp.path(), &["checkout", "-q", "-b", "feature"]);
     let target = write_commit_fixture(tmp.path(), "own.rs", "pub fn own() -> u8 { 2 }\n");
@@ -1724,6 +1766,7 @@ fn merge_gate_blocks_failed_cargo_audit_in_warn_mode_when_severity_is_block() {
         provenance: None,
     }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -1804,6 +1847,7 @@ fn merge_gate_executed_cargo_check_carries_real_evidence_and_log() {
         provenance: None,
     }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -2908,6 +2952,7 @@ fn synthetic_heuristics_check_skips_zero_file_scan() {
 fn merge_gate_marks_heuristics_disabled_as_not_run() {
     let config = create_test_config(PolicyConfig::default());
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -2975,6 +3020,7 @@ fn merge_gate_marks_heuristics_disabled_as_not_run() {
 fn merge_gate_files_field_omits_inline_findings_path_when_no_findings() {
     let config = create_test_config(PolicyConfig::default());
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3032,6 +3078,7 @@ fn merge_gate_files_field_omits_inline_findings_path_when_no_findings() {
 fn merge_gate_includes_inline_findings_path_when_sarif_exists() {
     let config = create_test_config(PolicyConfig::default());
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 1,
         dashboard_findings: vec![],
@@ -3101,6 +3148,7 @@ fn merge_gate_surfaces_review_caveats_when_merge_needs_review() {
         },
     ];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 1,
         dashboard_findings: vec![DashboardFinding {
@@ -3219,6 +3267,7 @@ fn merge_gate_splits_introduced_and_preexisting_inline_findings() {
         in_diff: Some(in_diff),
     };
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 5,
         dashboard_findings: vec![mk(true), mk(false), mk(false), mk(false), mk(false)],
@@ -3406,6 +3455,7 @@ fn merge_gate_reason_mentions_preexisting_failures_under_merge_with_review() {
         provenance: None,
     }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 1,
         dashboard_findings: vec![DashboardFinding {
@@ -3484,6 +3534,7 @@ fn merge_gate_marks_skipped_rust_quality_signals_as_review_caveats() {
     let config = create_test_config(PolicyConfig::default());
 
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3558,6 +3609,7 @@ fn merge_gate_surfaces_skipped_cargo_geiger_when_security_was_requested() {
     config.run_security = true;
 
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3627,6 +3679,7 @@ fn merge_gate_surfaces_runtime_skipped_cargo_geiger() {
         config.run_security = true;
 
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".to_string(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -3704,6 +3757,7 @@ fn merge_gate_surfaces_cargo_audit_informational_warnings_as_review_caveat() {
             provenance: None,
         }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3810,6 +3864,7 @@ fn merge_gate_names_the_origin_of_every_quality_failure_entry() {
         },
     ];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3893,6 +3948,7 @@ fn merge_gate_does_not_fail_fast_remote_only_for_expected_rust_gaps() {
     config.remote_only = true;
 
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3964,6 +4020,7 @@ fn merge_gate_blocks_missing_rust_quality_signal_when_policy_sets_block() {
     let config = create_test_config(policy);
 
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -4032,6 +4089,7 @@ fn merge_gate_skipped_cargo_geiger_with_ignore_severity_produces_no_caveat() {
     let config = create_test_config(policy);
     let tmp = tempfile::tempdir().expect("tempdir");
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -5586,6 +5644,134 @@ fn static_tauri_commands_follow_the_shared_reviewed_tree() {
     );
 }
 
+/// PRV-CONTEXT-SNAPSHOT-PROVENANCE, the call site. `generate_ghost_refs` takes
+/// the tree to audit as an argument and its own unit tests prove it honours
+/// whatever it is handed — which is exactly why they cannot see this defect:
+/// reverting the caller in `generate()` to the ambient `repo.path()` reproduces
+/// the original incident with the whole suite still green. This test guards the
+/// seam instead of the function, through the real `generate()` call site.
+///
+/// The fixture makes the two trees disagree about the audit: the reviewed
+/// snapshot carries the tracked ghost (`src/consumer.rs` still imports the
+/// deleted module), while the operator's off-`HEAD` checkout additionally holds
+/// an untracked scratch file that belongs to no PR. A pack anchored on the
+/// reviewed tree names the first and cannot see the second.
+#[test]
+fn ghost_audit_in_the_pack_follows_the_shared_reviewed_tree() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let repo = tempfile::tempdir().expect("repo");
+    run_git_fixture(repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo.path().join("src")).expect("src dir");
+    write_commit_fixture(repo.path(), "src/legacy_widget.rs", "pub fn render() {}\n");
+    let base_sha = write_commit_fixture(
+        repo.path(),
+        "src/consumer.rs",
+        "use crate::legacy_widget::render;\npub fn call() {\n    render();\n}\n",
+    );
+
+    run_git_fixture(repo.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::remove_file(repo.path().join("src/legacy_widget.rs")).expect("delete the module");
+    run_git_fixture(repo.path(), &["add", "-A"]);
+    run_git_fixture(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=prview test",
+            "-c",
+            "user.email=prview@example.test",
+            "commit",
+            "-q",
+            "-m",
+            "drop the legacy widget",
+        ],
+    );
+    let target_sha = String::from_utf8(
+        git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .expect("target rev-parse")
+            .stdout,
+    )
+    .expect("UTF-8 target sha")
+    .trim()
+    .to_owned();
+
+    // The operator never checks the target out: they stay on `main` and keep an
+    // untracked scratch file of their own. Both facts are invisible to the PR.
+    run_git_fixture(repo.path(), &["checkout", "-q", "main"]);
+    std::fs::write(
+        repo.path().join("src/scratch_local.rs"),
+        "use crate::legacy_widget::render;\n",
+    )
+    .expect("untracked local scratch");
+
+    let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target_sha)
+        .expect("shared reviewed snapshot");
+    let ledger = crate::ledger::TaskLedger::new();
+    ledger.set_shared_snapshot(Some(snapshot));
+    let diffs = [Diff {
+        base: "main".to_string(),
+        target: "feature".to_string(),
+        base_commit_id: base_sha.clone(),
+        target_commit_id: target_sha.clone(),
+        files: vec![FileChange {
+            path: "src/legacy_widget.rs".to_string(),
+            status: FileStatus::Deleted,
+            additions: 0,
+            deletions: 1,
+        }],
+        stats: DiffStats {
+            files_changed: 1,
+            additions: 0,
+            deletions: 1,
+            copied: 0,
+        },
+        commits: vec![],
+    }];
+    let output = tempfile::tempdir().expect("output");
+    let pack = output.path().join("pack");
+    // Spelled without an exhaustive literal, like every other fixture here, so
+    // a new `FixturePackOptions` field does not break this call site.
+    let options = FixturePackOptions {
+        diffs: &diffs,
+        ..Default::default()
+    };
+
+    generate_fixture_pack_with_ledger_and_diffs(
+        repo.path(),
+        &pack,
+        &target_sha,
+        &base_sha,
+        &crate::governor::ResourceGovernor::new(),
+        &ledger,
+        FixturePackOptions {
+            worktree_head: FixtureWorktreeHead::Sha(&base_sha),
+            ..options
+        },
+    )
+    .expect("reviewed-tree pack");
+
+    let audit = std::fs::read_to_string(pack.join("30_context/GHOST_REFERENCES.json"))
+        .expect("the reviewed tree still references the deleted module, so the audit must exist");
+    assert!(
+        audit.contains("src/consumer.rs"),
+        "the reviewed tree's own dangling reference is missing from the audit: {audit}",
+    );
+    assert!(
+        !audit.contains("scratch_local"),
+        "the operator's untracked file leaked into the reviewed pack's ghost audit: {audit}",
+    );
+    let report = std::fs::read_to_string(pack.join("30_context/GHOST_REFERENCES.md"))
+        .expect("ghost audit narrative");
+    assert!(
+        !report.contains("scratch_local"),
+        "the operator's untracked file leaked into the ghost narrative: {report}",
+    );
+}
+
 // ---- PRV-203: Ownership Map ----
 
 #[test]
@@ -6265,6 +6451,7 @@ fn preexisting_failures_do_not_block_gate() {
     ];
     // All findings are outside the diff
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 2,
         dashboard_findings: vec![
@@ -6385,6 +6572,7 @@ fn introduced_failures_still_block_gate() {
     }];
     // Finding is IN the diff (introduced)
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 1,
         dashboard_findings: vec![DashboardFinding {
@@ -6491,6 +6679,7 @@ fn mixed_failures_include_both_preexisting_and_introduced_in_output() {
     // ESLint has findings both in and out of diff (mixed)
     // Prettier has findings only out of diff (pre-existing)
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 3,
         dashboard_findings: vec![
@@ -7767,6 +7956,7 @@ fn informational_notes_keep_current_and_historical_counts_comparable() {
         in_diff: Some(false),
     };
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 1,
         dashboard_findings: vec![baseline_note],
@@ -7926,6 +8116,7 @@ fn snapshot_integrity_gate_preserves_check_results_and_dashboard_parity() {
         is_remote: false,
     }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_owned(),
         findings_count: 0,
         dashboard_findings: Vec::new(),
@@ -8015,4 +8206,815 @@ fn snapshot_integrity_gate_preserves_check_results_and_dashboard_parity() {
         assert_eq!(gate_caveats, dashboard_caveats);
         assert_eq!(gate_caveats.len(), usize::from(integrity.requires_review()));
     }
+}
+
+/// The vbl-190 incident vector (run 20260918-180535-08716c4): ESLint failed with
+/// 1042 problems while Clippy and Stylelint passed. Every other check of that
+/// run is carried with its real status so the pack sees the same mix.
+fn incident_vbl190_checks() -> Vec<CheckResult> {
+    [
+        ("TypeScript", CheckStatus::Passed),
+        ("ESLint", CheckStatus::Failed),
+        ("Stylelint", CheckStatus::Passed),
+        ("Vitest", CheckStatus::Passed),
+        ("Cargo check", CheckStatus::Passed),
+        ("Clippy", CheckStatus::Passed),
+        ("Rustfmt", CheckStatus::Passed),
+        ("Cargo test", CheckStatus::Passed),
+        ("Cargo audit", CheckStatus::Failed),
+    ]
+    .into_iter()
+    .map(|(name, status)| lint_check(name, status))
+    .collect()
+}
+
+fn checklist_section(pr_review: &str) -> &str {
+    let start = pr_review
+        .find("## Checklist")
+        .expect("PR_REVIEW.md checklist");
+    &pr_review[start..]
+}
+
+/// Defects #5 and #6 of vbl-190 through the real `generate()`: a pack carrying
+/// a failed AND a passed lint check must not tick the universal "No lint
+/// errors", and the consistency checker must see the contradiction when a
+/// pack's rendered checklist disagrees with its serialized check statuses.
+#[test]
+fn a_failed_lint_check_is_not_hidden_by_a_passed_one_and_the_checker_sees_the_lie() {
+    let publication_home = tempfile::tempdir().unwrap();
+    let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base, target) = init_advanced_base_fixture();
+    let governor = crate::governor::ResourceGovernor::new();
+    let checks = incident_vbl190_checks();
+    let output = publication_home.path().join("incident-pack");
+    let pack = generate_fixture_pack_with_ledger_and_diffs(
+        repo.path(),
+        &output,
+        &target,
+        &base,
+        &governor,
+        &TaskLedger::new(),
+        FixturePackOptions {
+            checks: &checks,
+            ..Default::default()
+        },
+    )
+    .expect("incident pack");
+
+    let pr_review = fs::read_to_string(pack.join("PR_REVIEW.md")).expect("PR_REVIEW.md");
+    let consistency_md =
+        fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.md")).expect("check md");
+    let checklist = checklist_section(&pr_review);
+    assert!(
+        checklist.contains("- [ ] No lint errors") && !checklist.contains("- [x] No lint errors"),
+        "ESLint failed, so 'No lint errors' must stay unticked:\n{checklist}\n{consistency_md}"
+    );
+    // The other two items have only passing checks in this vector.
+    assert!(
+        checklist.contains("- [x] Compiles / type-checks"),
+        "{checklist}"
+    );
+    assert!(checklist.contains("- [x] Tests pass"), "{checklist}");
+
+    // Healthy side: the renderer and the checker derive from one function, so the
+    // honest pack is consistent in BOTH consistency surfaces.
+    let summary: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.json")).expect("check json"),
+    )
+    .expect("parse check json");
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("report.json")).expect("report"))
+            .expect("parse report");
+    assert_eq!(summary["consistent"], true, "{summary}");
+    assert_eq!(
+        report["quality"]["consistency"]["consistent"], true,
+        "{}",
+        report["quality"]["consistency"]
+    );
+    let checked_honest = summary["checked_fields"].as_u64().expect("checked_fields");
+    assert!(
+        checked_honest >= 3,
+        "the three checklist items are compared in a real pack: {summary}"
+    );
+
+    // Needle: put the incident's rendered line back into this pack's
+    // PR_REVIEW.md and re-run the on-disk checker. It must name the lie.
+    let lying = pr_review.replace("- [ ] No lint errors", "- [x] No lint errors");
+    assert_ne!(lying, pr_review);
+    fs::write(pack.join("PR_REVIEW.md"), lying).expect("plant needle");
+    generate_consistency_check(
+        &pack.join("00_summary"),
+        &pack,
+        &[],
+        &ProvenanceConsistency::default(),
+    )
+    .expect("re-run checker");
+    let summary: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.json")).expect("check json"),
+    )
+    .expect("parse check json");
+    assert_eq!(summary["consistent"], false, "{summary}");
+    let warnings = summary["warnings"].as_array().expect("warnings");
+    let lint = warnings
+        .iter()
+        .find(|w| w["field"] == "pr_checklist.no_lint_errors")
+        .unwrap_or_else(|| panic!("named checklist warning: {summary}"));
+    let message = lint["message"].as_str().expect("message");
+    assert!(message.contains("ESLint"), "{message}");
+    // Same comparisons as the honest run: only the rendered mark changed.
+    assert_eq!(
+        summary["checked_fields"].as_u64(),
+        Some(checked_honest),
+        "{summary}"
+    );
+    let md = fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.md")).expect("md");
+    assert!(md.contains("- Consistent: `false`"), "{md}");
+    assert!(md.contains("pr_checklist.no_lint_errors"), "{md}");
+
+    // The full pack writes gate and report rows through separate generators.
+    // A changed report name can keep its canonical id yet lose its compile
+    // category; the gate row must expose that corruption in the real path.
+    fs::write(pack.join("PR_REVIEW.md"), pr_review).expect("restore checklist");
+    let gate: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(pack.join("00_summary/MERGE_GATE.json")).expect("gate"),
+    )
+    .expect("parse gate");
+    assert!(
+        gate["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "cargo" && row["name"] == "Cargo check")
+    );
+    let mut damaged_report = report;
+    let cargo = damaged_report["checks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["name"] == "Cargo check")
+        .expect("cargo report row");
+    cargo["name"] = "cargo".into();
+    fs::write(pack.join("report.json"), damaged_report.to_string()).expect("damage report");
+    generate_consistency_check(
+        &pack.join("00_summary"),
+        &pack,
+        &[],
+        &ProvenanceConsistency::default(),
+    )
+    .expect("re-run checker after alias corruption");
+    let summary: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.json")).expect("check json"),
+    )
+    .expect("parse check json");
+    assert_eq!(summary["consistent"], false, "{summary}");
+    assert!(
+        summary["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| { warning["field"] == "pr_checklist" }),
+        "{summary}"
+    );
+}
+
+fn rendered_checklist(checks: &[CheckResult]) -> String {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = create_test_config(PolicyConfig::default());
+    generate_pr_review(
+        tmp.path(),
+        &config,
+        &[],
+        checks,
+        &[],
+        &CoverageDelta {
+            total_source: 0,
+            covered_count: 0,
+            pct: None,
+            uncovered: vec![],
+            covered: vec![],
+            non_code_count: 0,
+            ghost_tests: vec![],
+        },
+        None,
+    )
+    .expect("pr review");
+    let content = std::fs::read_to_string(tmp.path().join("PR_REVIEW.md")).expect("read");
+    checklist_section(&content).to_string()
+}
+
+/// Defect #5 is a class, not one line: every universal checklist claim was
+/// derived with `any()`, so one passing check hid a failing sibling in the same
+/// category. Each category is exercised with a failed + passed pair.
+#[test]
+fn every_checklist_claim_needs_every_check_of_its_category_to_pass() {
+    use CheckStatus::{Failed, Passed};
+    let cases: [(&str, &[(&str, CheckStatus)]); 4] = [
+        (
+            "Compiles / type-checks",
+            &[("TypeScript", Failed), ("Cargo check", Passed)],
+        ),
+        // Mypy is the Python type-checker: a polyglot run's failing Mypy must
+        // not hide behind a passing `cargo check`.
+        (
+            "Compiles / type-checks",
+            &[("Mypy", Failed), ("Cargo check", Passed)],
+        ),
+        ("Tests pass", &[("Cargo test", Failed), ("Vitest", Passed)]),
+        ("No lint errors", &[("ESLint", Failed), ("Clippy", Passed)]),
+    ];
+    for (label, vector) in cases {
+        let checks: Vec<_> = vector.iter().map(|(n, s)| lint_check(n, *s)).collect();
+        let checklist = rendered_checklist(&checks);
+        assert!(
+            checklist.contains(&format!("- [ ] {label}")),
+            "{label} must stay unticked when a check of its category failed:\n{checklist}"
+        );
+    }
+
+    // All checks of every category passed: every claim is earned.
+    let healthy: Vec<_> = incident_vbl190_checks()
+        .into_iter()
+        .map(|mut c| {
+            c.status = Passed;
+            c
+        })
+        .collect();
+    let checklist = rendered_checklist(&healthy);
+    for label in ["Compiles / type-checks", "Tests pass", "No lint errors"] {
+        assert!(checklist.contains(&format!("- [x] {label}")), "{checklist}");
+    }
+
+    // A Python-only run earns the type-check claim from Mypy alone.
+    let checklist = rendered_checklist(&[lint_check("Mypy", Passed)]);
+    assert!(
+        checklist.contains("- [x] Compiles / type-checks"),
+        "{checklist}"
+    );
+}
+
+/// A claim with no executed check behind it is not evidence: a run with no
+/// checks at all used to tick "Compiles / type-checks". Skipped checks did not
+/// run, and a lint that only produced warnings is not "No lint errors".
+#[test]
+fn checklist_claims_without_an_executed_passing_check_stay_unticked() {
+    let checklist = rendered_checklist(&[]);
+    assert!(
+        checklist.contains("- [ ] Compiles / type-checks"),
+        "{checklist}"
+    );
+    assert!(checklist.contains("- [ ] Tests pass"), "{checklist}");
+    assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
+
+    let checklist = rendered_checklist(&[
+        lint_check("Clippy", CheckStatus::Skipped),
+        lint_check("Cargo check", CheckStatus::Skipped),
+    ]);
+    assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
+    assert!(
+        checklist.contains("- [ ] Compiles / type-checks"),
+        "{checklist}"
+    );
+
+    // A skipped sibling does not veto a category whose executed checks passed.
+    let checklist = rendered_checklist(&[
+        lint_check("Clippy", CheckStatus::Passed),
+        lint_check("ESLint", CheckStatus::Skipped),
+    ]);
+    assert!(checklist.contains("- [x] No lint errors"), "{checklist}");
+
+    let checklist = rendered_checklist(&[
+        lint_check("Clippy", CheckStatus::Warnings),
+        lint_check("ESLint", CheckStatus::Passed),
+    ]);
+    assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
+}
+
+/// A cached PASS is a replay, not an executed check in this review. A cached
+/// failure remains known negative evidence and cannot be hidden by a live PASS.
+#[test]
+fn cached_check_results_do_not_earn_executed_check_claims() {
+    for (name, label) in [
+        ("Cargo check", "Compiles / type-checks"),
+        ("Cargo test", "Tests pass"),
+        ("Clippy", "No lint errors"),
+    ] {
+        let mut replay = lint_check(name, CheckStatus::Passed);
+        replay.cached = true;
+        let checklist = rendered_checklist(&[replay]);
+        assert!(checklist.contains(&format!("- [ ] {label}")), "{checklist}");
+    }
+
+    let mut replayed_failure = lint_check("ESLint", CheckStatus::Failed);
+    replayed_failure.cached = true;
+    let checklist =
+        rendered_checklist(&[lint_check("Clippy", CheckStatus::Passed), replayed_failure]);
+    assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
+}
+
+/// A Git filename can contain a complete Markdown template and appear in both
+/// the diff and loctree's twin pairs. Render every copy on one escaped line.
+#[test]
+fn multiline_git_path_cannot_create_another_pr_template() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = create_test_config(PolicyConfig::default());
+    let mut diff = source_only_diff("base", "target");
+    let path = "x\n---\n\n## PR Template\n\n_Copy below for GitHub PR description:_\n\n```markdown\n## Checklist\n- [x] No lint errors\n```";
+    diff.files[0].path = path.to_string();
+    let loctree: crate::heuristics::LoctreeAnalysis = serde_json::from_value(serde_json::json!({
+        "stats": {"total_files": 0, "total_loc": 0, "by_language": {}},
+        "dead_exports": [],
+        "cycles": [],
+        "twins": {
+            "dead_parrots": [],
+            "exact_twins": [{"file_a": path, "file_b": "other.rs", "symbol": "same"}],
+            "total_symbols": 0
+        },
+        "available": true
+    }))
+    .unwrap();
+    let heuristics = crate::heuristics::HeuristicsResult {
+        loctree: Some(loctree),
+        ..Default::default()
+    };
+    generate_pr_review(
+        tmp.path(),
+        &config,
+        &[diff],
+        &[],
+        &[],
+        &CoverageDelta {
+            total_source: 0,
+            covered_count: 0,
+            pct: None,
+            uncovered: vec![],
+            covered: vec![],
+            non_code_count: 0,
+            ghost_tests: vec![],
+        },
+        Some(&heuristics),
+    )
+    .unwrap();
+    let content = fs::read_to_string(tmp.path().join("PR_REVIEW.md")).unwrap();
+    assert_eq!(
+        content
+            .lines()
+            .filter(|line| *line == "## PR Template")
+            .count(),
+        1,
+        "{content}"
+    );
+    assert!(content.contains("x\\n---\\n\\n## PR Template"), "{content}");
+    assert!(
+        parse_pr_checklist(&content)
+            .iter()
+            .all(|(_, mark)| mark.is_some())
+    );
+}
+
+// --- Cargo audit lock-based pre-existing proof, through the real pack path ---
+
+fn cargo_audit_pack_check() -> CheckResult {
+    CheckResult {
+        name: "Cargo audit".to_string(),
+        status: crate::checks::CheckStatus::Failed,
+        duration: std::time::Duration::from_millis(900),
+        output: r#"{
+            "vulnerabilities": {
+                "found": true,
+                "count": 2,
+                "list": [
+                    {
+                        "advisory": {"id": "RUSTSEC-2026-0001", "title": "first advisory"},
+                        "package": {"name": "alpha", "version": "1.0.0"},
+                        "versions": {"patched": [">=1.0.1"]}
+                    },
+                    {
+                        "advisory": {"id": "RUSTSEC-2026-0002", "title": "second advisory"},
+                        "package": {"name": "beta", "version": "2.0.0"},
+                        "versions": {"patched": [">=2.0.1"]}
+                    }
+                ]
+            },
+            "warnings": {}
+        }"#
+        .to_string(),
+        cached: false,
+        provenance: None,
+    }
+}
+
+fn source_only_diff(base_sha: &str, target_sha: &str) -> Diff {
+    Diff {
+        target: "feature".to_string(),
+        base: "main".to_string(),
+        target_commit_id: target_sha.to_string(),
+        base_commit_id: base_sha.to_string(),
+        files: vec![FileChange {
+            path: "own.rs".to_string(),
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
+        }],
+        stats: DiffStats {
+            files_changed: 1,
+            additions: 1,
+            deletions: 1,
+            copied: 0,
+        },
+        commits: vec![],
+    }
+}
+
+fn cargo_audit_pack(
+    dirty: &[&str],
+    pack_name: &str,
+) -> (
+    tempfile::TempDir,
+    serde_json::Value,
+    serde_json::Value,
+    String,
+    PathBuf,
+) {
+    cargo_audit_pack_inner(dirty, pack_name, true, cargo_audit_pack_check())
+}
+
+fn cargo_audit_pack_inner(
+    dirty: &[&str],
+    pack_name: &str,
+    with_lock: bool,
+    audit: CheckResult,
+) -> (
+    tempfile::TempDir,
+    serde_json::Value,
+    serde_json::Value,
+    String,
+    PathBuf,
+) {
+    let publication_home = tempfile::tempdir().unwrap();
+    let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base, target) = init_advanced_base_fixture_inner(with_lock);
+    let governor = crate::governor::ResourceGovernor::new();
+    let output = publication_home.path().join(pack_name);
+    let diffs = [source_only_diff(&base, &target)];
+    let checks = [audit];
+    let pack = generate_fixture_pack_with_ledger_and_diffs(
+        repo.path(),
+        &output,
+        &target,
+        &base,
+        &governor,
+        &TaskLedger::new(),
+        FixturePackOptions {
+            diffs: &diffs,
+            checks: &checks,
+            worktree_dirty_paths: Some(dirty.iter().map(|p| p.to_string()).collect()),
+            // The incident ran under a blocking policy; a warn-mode pack would
+            // not reproduce the BLOCK it produced.
+            policy_mode: Some(crate::policy::PolicyMode::Block),
+            ..Default::default()
+        },
+    )
+    .expect("pack");
+
+    let gate: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("00_summary/MERGE_GATE.json")).unwrap())
+            .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("report.json")).unwrap()).unwrap();
+    let dashboard = fs::read_to_string(pack.join("dashboard.html")).unwrap();
+    (publication_home, gate, report, dashboard, pack)
+}
+
+/// Every published file in a pack, as text.
+///
+/// Compressed and binary members decode to lossy text rather than being
+/// skipped: a sweep that quietly drops files it cannot read would report
+/// "nothing claims X" about a pack it never finished reading.
+fn pack_text_files(pack: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![pack.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("pack dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = fs::read(&path) {
+                out.push((path, String::from_utf8_lossy(&bytes).into_owned()));
+            }
+        }
+    }
+    assert!(!out.is_empty(), "an empty pack sweep proves nothing");
+    out
+}
+
+/// The one baseline caveat the gate publishes, as the reader sees it.
+///
+/// `cargo_audit_baseline_review_caveats` clones a single dashboard note into
+/// `review_caveats`, so exactly one caveat may carry this prefix; asserting on
+/// a `contains` over the whole list would let a second, contradicting copy
+/// slip in unnoticed.
+fn cargo_audit_baseline_caveat(decision: &serde_json::Value) -> String {
+    let matching: Vec<&str> = decision["review_caveats"]
+        .as_array()
+        .expect("review_caveats")
+        .iter()
+        .filter_map(|c| c.as_str())
+        .filter(|c| c.starts_with("Cargo audit baseline:"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly one baseline caveat states the counts: {matching:?}"
+    );
+    matching[0].to_string()
+}
+
+/// The incident, end to end: a diff that touches no dependency, an operator
+/// tree dirty somewhere unrelated, and two advisories the baseline already
+/// knows are pre-existing. The pack used to carry `new=0, pre-existing=2` in
+/// its caveat and `BLOCK … Cargo audit (Failed)` in its decision, with nothing
+/// bridging the two. Now one classification produces both, and it says why.
+#[test]
+fn an_untouched_lock_keeps_cargo_audit_off_the_blocking_list() {
+    let (_home, gate, report, dashboard, _pack) = cargo_audit_pack(&["notes.md"], "untouched-lock");
+
+    let decision = &gate["decision"];
+    let blocking = decision["blocking_issues"].as_array().unwrap();
+    assert!(
+        !blocking
+            .iter()
+            .any(|issue| issue.as_str().is_some_and(|s| s.contains("Cargo audit"))),
+        "an advisory in an untouched lock is not this diff's blocker: {blocking:?}"
+    );
+    assert_eq!(
+        decision["preexisting_quality_failures"][0].as_str(),
+        Some("Cargo audit")
+    );
+    assert!(
+        decision["unclassified_quality_failures"]
+            .as_array()
+            .is_none_or(|arr| arr.is_empty()),
+        "the classification is established, not unknown"
+    );
+    assert_eq!(decision["quality_pass"].as_bool(), Some(true));
+
+    // The row states the proof rather than leaving the reader to infer it.
+    let audit_row = gate["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Cargo audit")
+        .expect("cargo audit row");
+    assert_eq!(audit_row["blocking"].as_bool(), Some(false));
+    assert_eq!(audit_row["policy_conclusion"], "advisory");
+    assert_eq!(
+        audit_row["reason"].as_str(),
+        Some("pre-existing: Cargo.lock unchanged by this PR (2 advisories)")
+    );
+
+    // The caveat and the decision now agree, and both artifacts plus the
+    // dashboard carry the same verdict (THREAD 5 parity).
+    // The proof held here, so the counts stand unqualified: the honesty
+    // clause is owed to a revoked proof and must not leak onto a sound one.
+    assert_eq!(
+        cargo_audit_baseline_caveat(decision),
+        "Cargo audit baseline: status=not-required, new=0, pre-existing=2, \
+         resolved=0, unknown-baseline=0"
+    );
+    assert_eq!(report["gate"]["status"], decision["verdict"]);
+    assert_eq!(report["gate"]["allow_merge"], decision["allow_merge"]);
+    assert_eq!(report["gate"]["quality_pass"], decision["quality_pass"]);
+    assert_eq!(report["gate"]["summary"], decision["decision_reason"]);
+    assert_eq!(
+        report["gate"]["preexisting_quality_failures"][0].as_str(),
+        Some("Cargo audit")
+    );
+    let verdict = decision["verdict"].as_str().unwrap();
+    assert_dashboard_verdict(&dashboard, verdict);
+}
+
+/// The dashboard's one machine-readable statement of the gate verdict.
+///
+/// `dashboard.contains(verdict)` asserted nothing: the hero renders a localized
+/// ALLOW/HOLD/BLOCK label, while PASS/CONDITIONAL/BLOCK appear all over the
+/// document in legends, check rows and status chips — measured on one pack,
+/// `PASS` x6, `CONDITIONAL` x9, `BLOCK` x8, so the assertion passed for every
+/// possible verdict. THREAD 5 parity is only a test when it has an anchor.
+fn assert_dashboard_verdict(dashboard: &str, verdict: &str) {
+    let marker = format!(r#"data-merge-verdict="{verdict}""#);
+    assert!(
+        dashboard.contains(&marker),
+        "dashboard must carry the gate verdict as {marker}"
+    );
+    assert_eq!(
+        dashboard.matches("data-merge-verdict=").count(),
+        1,
+        "exactly one element states the verdict, so the assertion cannot match a second one"
+    );
+    for other in ["PASS", "CONDITIONAL", "BLOCK"] {
+        if other == verdict {
+            continue;
+        }
+        assert!(
+            !dashboard.contains(&format!(r#"data-merge-verdict="{other}""#)),
+            "the dashboard must not claim {other} beside a {verdict} gate"
+        );
+    }
+}
+
+/// PR #58 round six: the same untouched lock and the same proof, with an audit
+/// that reports only a warnings-category advisory. Its classification rows came
+/// from the vulnerability list alone, so it had none: the check read
+/// `Unclassified` and held the gate at CONDITIONAL, while the identical debt
+/// reported as a vulnerability was downgraded. The counts call the advisory
+/// pre-existing, and now the classifier reads that same origin.
+#[test]
+fn a_preexisting_warnings_only_audit_takes_the_same_downgrade() {
+    let audit = CheckResult {
+        name: "Cargo audit".to_string(),
+        status: crate::checks::CheckStatus::Warnings,
+        duration: std::time::Duration::from_millis(900),
+        output: r#"{
+            "vulnerabilities": {"found": false, "count": 0, "list": []},
+            "warnings": {
+                "unmaintained": [{
+                    "kind": "unmaintained",
+                    "advisory": {"id": "RUSTSEC-2024-0436"},
+                    "package": {"name": "paste", "version": "1.0.15"}
+                }]
+            }
+        }"#
+        .to_string(),
+        cached: false,
+        provenance: None,
+    };
+    let (_home, gate, _report, _dashboard, _pack) =
+        cargo_audit_pack_inner(&["notes.md"], "warnings-only", true, audit);
+
+    let decision = &gate["decision"];
+    assert_eq!(
+        decision["preexisting_quality_failures"][0].as_str(),
+        Some("Cargo audit"),
+        "{decision}"
+    );
+    assert!(
+        decision["unclassified_quality_failures"]
+            .as_array()
+            .is_none_or(|arr| arr.is_empty()),
+        "the counts established the origin, so the check is not unclassified"
+    );
+    let audit_row = gate["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Cargo audit")
+        .expect("cargo audit row");
+    assert_eq!(audit_row["policy_conclusion"], "advisory");
+    assert_eq!(
+        audit_row["reason"].as_str(),
+        Some("pre-existing: Cargo.lock unchanged by this PR (1 advisory)")
+    );
+}
+
+/// The one edit that revokes the proof. Same diff, same advisories, but the
+/// lockfile the audit read carried uncommitted changes — so it is not provably
+/// the target's, and the audit keeps gating.
+#[test]
+fn a_dirty_lockfile_puts_cargo_audit_back_on_the_blocking_list() {
+    let (_home, gate, report, _dashboard, _pack) = cargo_audit_pack(&["Cargo.lock"], "dirty-lock");
+
+    let decision = &gate["decision"];
+    assert!(
+        decision["blocking_issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue.as_str().is_some_and(|s| s.contains("Cargo audit"))),
+        "an unproven lockfile must keep the audit blocking"
+    );
+    assert_eq!(
+        decision["unclassified_quality_failures"][0].as_str(),
+        Some("Cargo audit")
+    );
+    assert!(
+        decision["preexisting_quality_failures"]
+            .as_array()
+            .is_none_or(|arr| arr.is_empty()),
+        "nothing was proven pre-existing"
+    );
+    assert_eq!(decision["quality_pass"].as_bool(), Some(false));
+    assert_eq!(report["gate"]["status"], decision["verdict"]);
+    assert_eq!(report["gate"]["allow_merge"], decision["allow_merge"]);
+    assert_eq!(report["gate"]["quality_pass"], decision["quality_pass"]);
+    assert_eq!(
+        report["gate"]["summary"], decision["decision_reason"],
+        "the narrative and the gate state one decision"
+    );
+
+    // P2-2: the pack used to reproduce the incident signature in the revoke
+    // direction — `reason: null`, a bare `Cargo audit (Failed)`, and a caveat
+    // announcing `new=0, pre-existing=2` right beside it. A withheld proof is a
+    // fact, not an absence, and the blocker says which one was withheld.
+    let audit_blocker = decision["blocking_issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|issue| issue.as_str())
+        .find(|issue| issue.contains("Cargo audit"))
+        .expect("cargo audit blocker");
+    assert_eq!(
+        audit_blocker,
+        "Cargo audit (Failed): provenance proof unavailable: Cargo.lock dirty or \
+         rewritten in the scanned tree (2 advisories not shown to predate this change)",
+        "a blocker for want of a proof names the proof it wanted"
+    );
+    // The counts the blocker is reconciled with — and, since the proof was
+    // revoked, the caveat may not offer `pre-existing=2` as an established
+    // fact while the blocker beside it says the opposite.
+    assert_eq!(
+        cargo_audit_baseline_caveat(decision),
+        "Cargo audit baseline: status=not-required, new=0, pre-existing=2, \
+         resolved=0, unknown-baseline=0 (provenance proof unavailable: \
+         Cargo.lock dirty or rewritten in the scanned tree; pre-existing=2 is not shown to \
+         predate this change)"
+    );
+    assert_dashboard_verdict(&_dashboard, decision["verdict"].as_str().unwrap());
+}
+
+/// P1, at pack level: a target tree that carries no `Cargo.lock` at all.
+///
+/// `cargo audit` resolves a lockfile from the registry when the crate has none,
+/// audits it and exits non-zero on a hit, so this run produces real advisories
+/// about a file no commit contains. The proof used to be granted regardless —
+/// the pack then approved a failing security gate with the sentence
+/// `pre-existing: Cargo.lock unchanged by this PR`, about a `Cargo.lock` the
+/// repository does not have. Same diff, same advisories, same spotless tree as
+/// `an_untouched_lock_keeps_cargo_audit_off_the_blocking_list`; only the file
+/// is gone, and only the file was ever the premise.
+#[test]
+fn a_target_without_a_lockfile_keeps_cargo_audit_on_the_blocking_list() {
+    let (_home, gate, report, dashboard, pack) =
+        cargo_audit_pack_inner(&["notes.md"], "no-lock", false, cargo_audit_pack_check());
+
+    let decision = &gate["decision"];
+    let audit_blocker = decision["blocking_issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|issue| issue.as_str())
+        .find(|issue| issue.contains("Cargo audit"))
+        .expect("an audit with no target lockfile must keep gating");
+    assert_eq!(
+        audit_blocker,
+        "Cargo audit (Failed): provenance proof unavailable: no Cargo.lock in \
+         the target tree (2 advisories not shown to predate this change)"
+    );
+    assert_eq!(
+        decision["unclassified_quality_failures"][0].as_str(),
+        Some("Cargo audit")
+    );
+    assert!(
+        decision["preexisting_quality_failures"]
+            .as_array()
+            .is_none_or(|arr| arr.is_empty()),
+        "nothing can be pre-existing against a lockfile that does not exist"
+    );
+    assert_eq!(decision["quality_pass"].as_bool(), Some(false));
+
+    let audit_row = gate["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Cargo audit")
+        .expect("cargo audit row");
+    assert_eq!(audit_row["blocking"].as_bool(), Some(true));
+
+    // The caveat may not hand the reader `pre-existing=2` as a settled fact
+    // next to a blocker that refuses to settle it. `status=not-required` reads
+    // as "the lock did not change", which is how a missing file is mistaken for
+    // an untouched one, so the clause names the absent lockfile outright.
+    assert_eq!(
+        cargo_audit_baseline_caveat(decision),
+        "Cargo audit baseline: status=not-required, new=0, pre-existing=2, \
+         resolved=0, unknown-baseline=0 (provenance proof unavailable: no \
+         Cargo.lock in the target tree; pre-existing=2 is not shown to predate \
+         this change)"
+    );
+
+    // No artifact ANYWHERE in the pack claims the file is unchanged, because no
+    // artifact may claim anything about a file the target does not carry. The
+    // assertion sweeps every file the pack published rather than the one JSON
+    // field it used to read, so the claim the comment makes is the claim the
+    // test measures.
+    for (path, text) in pack_text_files(&pack) {
+        assert!(
+            !text.contains("Cargo.lock unchanged"),
+            "a lock-less target cannot report an unchanged lockfile, but {} does",
+            path.display()
+        );
+    }
+
+    assert_eq!(report["gate"]["status"], decision["verdict"]);
+    assert_eq!(report["gate"]["quality_pass"], decision["quality_pass"]);
+    assert_dashboard_verdict(&dashboard, decision["verdict"].as_str().unwrap());
 }
