@@ -40,9 +40,11 @@ Automatically:
 - runs tests and lint by default, unless you pick a lighter mode (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*`
 
 The profile is detected from the tree being reviewed. An explicit target
-(`--pr`, `--target-sha`, `--remote`, or even `HEAD`) uses the pinned target
-snapshot, so uncommitted additions or deletions of project markers in the
-operator checkout cannot add or remove checks or change the pack's profile.
+(`--pr`, `--target-sha`, `--remote`, or even `HEAD`) derives markers from regular
+files in the pinned Git tree. A committed symlink to a marker or source path
+does not make the operator's files part of the target profile. Uncommitted
+additions or deletions in the checkout cannot change that profile. The TUI
+uses the same profile selection as headless runs.
 An ordinary target-less local review uses the live checkout. `--profile` still
 chooses the requested profile kind; its project markers come from the reviewed
 tree.

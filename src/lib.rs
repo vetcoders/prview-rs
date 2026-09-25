@@ -56,11 +56,14 @@ fn run_headless_sync_stage<T>(
 /// Select one project profile from the tree this run reviews, before choosing
 /// checks or writing profile-dependent artifacts. The ledger keeps an exact
 /// target snapshot alive through both stages.
-fn prepare_review_profile(config: &mut Config, ledger: &ledger::TaskLedger) -> Result<()> {
+pub(crate) fn prepare_review_profile(
+    config: &mut Config,
+    ledger: &ledger::TaskLedger,
+) -> Result<()> {
     match checks::review_substrate(config)? {
-        checks::ReviewSubstrate::ExactTarget(_) => {
+        checks::ReviewSubstrate::ExactTarget(target) => {
             let plan = checks::plan_check_run(config)?;
-            config.refresh_profile_from_tree(&plan.scan_dir)?;
+            config.refresh_profile_from_target(&target.commit_id)?;
             config.scan_dir_override = Some(plan.scan_dir);
             ledger.set_shared_snapshot(plan._snapshot);
         }
@@ -1230,6 +1233,97 @@ mod tests {
         let target_tree = remote.scan_dir_override.clone().expect("target snapshot");
         remote.refresh_profile_from_tree(&target_tree).unwrap();
         assert_eq!(remote.profile.kind, crate::config::ProfileKind::Rust);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_profile_ignores_committed_symlinks_into_operator_files() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let operator = tmp.path().join("operator");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::write(operator.join("package.json"), "{}\n").unwrap();
+        std::fs::write(operator.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            operator.join("prview.toml"),
+            "[project]\ncargo_root = 'backend'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            operator.join("pyproject.toml"),
+            "[project]\nname = 'outside'\n",
+        )
+        .unwrap();
+        std::fs::write(operator.join("tsconfig.json"), "{}\n").unwrap();
+        std::fs::create_dir(operator.join("src")).unwrap();
+        std::fs::write(operator.join("src/main.ts"), "export {};\n").unwrap();
+        std::fs::write(operator.join("src/main.py"), "print('outside')\n").unwrap();
+        git_run(&repo, &["init", "-q", "-b", "main"]);
+        git_run(&repo, &["config", "user.email", "t@t.t"]);
+        git_run(&repo, &["config", "user.name", "T"]);
+        git_run(&repo, &["config", "commit.gpgsign", "false"]);
+        for name in [
+            "package.json",
+            "Cargo.toml",
+            "prview.toml",
+            "pyproject.toml",
+            "tsconfig.json",
+        ] {
+            symlink(operator.join(name), repo.join(name)).unwrap();
+        }
+        symlink(operator.join("src"), repo.join("src")).unwrap();
+        std::fs::create_dir(repo.join("backend")).unwrap();
+        symlink(operator.join("Cargo.toml"), repo.join("backend/Cargo.toml")).unwrap();
+        std::fs::write(repo.join("README.md"), "target\n").unwrap();
+        git_run(&repo, &["add", "."]);
+        git_run(&repo, &["commit", "-q", "-m", "symlink target"]);
+        let target = rev_parse(&repo, "HEAD");
+        let mut config = test_config();
+        config.repo_root = repo;
+        config.target = Some("HEAD".to_owned());
+        config.pinned_target = Some(resolved(&target));
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        prepare_review_profile(&mut config, &crate::ledger::TaskLedger::new()).unwrap();
+        assert_eq!(config.profile.kind, crate::config::ProfileKind::Generic);
+        assert_eq!(config.profile.cargo_root, None);
+        assert!(config.profile.rust_dirs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tui_exact_profile_uses_target_commit_instead_of_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(repo.path(), out.path());
+        std::fs::write(repo.path().join("package.json"), "{}\n").unwrap();
+        git_run(repo.path(), &["add", "package.json"]);
+        git_run(repo.path(), &["commit", "-q", "-m", "js target"]);
+        let target = rev_parse(repo.path(), "HEAD");
+        git_run(repo.path(), &["rm", "-q", "package.json"]);
+        git_run(repo.path(), &["commit", "-q", "-m", "remove JS marker"]);
+        config.target = Some(target);
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        config.run_lint = false;
+        config.run_tests = false;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::from_plan(
+            config.resource_plan,
+        ));
+        crate::tui::run_analysis(config, tx, governor)
+            .await
+            .unwrap();
+        let mut pack = None;
+        while let Ok(event) = rx.try_recv() {
+            if let crate::tui::TuiEvent::AnalysisComplete { report } = event {
+                pack = Some(report.artifacts_dir);
+            }
+        }
+        let gate: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(pack.expect("TUI report").join("00_summary/MERGE_GATE.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Js", "{gate}");
     }
 
     /// `--watch` reuses ONE `App` for every pack it emits, so worktree state

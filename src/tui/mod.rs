@@ -649,6 +649,7 @@ pub async fn run_analysis(
     governor: Arc<crate::governor::ResourceGovernor>,
 ) -> Result<()> {
     let t_start = std::time::Instant::now();
+    let ledger = crate::ledger::TaskLedger::new();
 
     // --- Sync phase: all git2 (non-Send) work happens here ---
     // `blocking_stage` keeps a one-worker runtime able to poll q/Escape while
@@ -713,6 +714,7 @@ pub async fn run_analysis(
             .and_then(|base| app.repo.changed_paths(base, &target).ok())
             .map(|paths| crate::checks::scope::ChangeSet::new(paths, diff_bases.len() == 1));
         config.pinned_diff_bases = Some(diff_bases);
+        crate::prepare_review_profile(&mut config, &ledger)?;
         // app (with git2::Repository) is dropped here
         Ok((
             config,
@@ -738,7 +740,6 @@ pub async fn run_analysis(
 
     // Run all checks with event callbacks for real-time updates
     let tx_checks = tx.clone();
-    let ledger = crate::ledger::TaskLedger::new();
     let (check_results, skipped_checks) =
         crate::checks::run_all_with_events(&config, &ledger, &governor, move |event| {
             let tx = tx_checks.clone();

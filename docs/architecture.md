@@ -182,10 +182,12 @@ A Rust project with a `package.json` for tooling (e.g. pnpm for dev tools) is
 detected as `Rust`, not `Mixed`.
 
 `Config::from_cli` first detects the operator checkout for startup. After the
-target ref is pinned, the review refreshes one profile from its actual scan
-tree before selecting checks or building profile-dependent artifacts. Exact
-reviews materialize one target snapshot at that point; the run ledger keeps it
-alive through checks and artifact generation. Ordinary target-less reviews
+target ref is pinned, the review refreshes one profile before selecting checks
+or building profile-dependent artifacts. Exact reviews derive markers, the
+manifest and Cargo paths from regular entries and blobs in the pinned Git tree;
+they do not follow snapshot symlinks into the operator's filesystem. They also
+materialize one target snapshot, which the run ledger keeps alive through checks
+and artifact generation. The TUI uses the same preparation path. Ordinary target-less reviews
 refresh from the live checkout, including its uncommitted changes. The
 requested `--profile` kind remains explicit, while marker fields and detected
 Cargo paths come from the reviewed tree. Cargo paths are rebased to the logical

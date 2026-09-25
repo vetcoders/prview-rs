@@ -867,6 +867,158 @@ fn run_id_taken_in_repo(repo_runs_root: &Path, run_id: &str) -> bool {
 }
 
 impl Config {
+    /// Detect an exact review profile from regular blobs in the pinned Git
+    /// tree. A materialized snapshot may contain symlinks into the operator's
+    /// filesystem, so filesystem marker probes cannot establish this profile.
+    pub(crate) fn refresh_profile_from_target(&mut self, commit_id: &str) -> Result<()> {
+        let Some(requested_profile) = self.requested_profile else {
+            return Ok(());
+        };
+        if self
+            .profile_at_cli_detection
+            .as_ref()
+            .is_some_and(|initial| initial != &self.profile)
+        {
+            return Ok(());
+        }
+        let repo = crate::git::Repository::open(&self.repo_root)?;
+        let entries = repo.tree_entries_at_oid(commit_id)?;
+        let files: std::collections::BTreeSet<&str> = entries
+            .iter()
+            .filter(|entry| entry.kind == crate::git::GitTreeEntryKind::RegularFile)
+            .map(|entry| entry.path.as_str())
+            .collect();
+        let has = |path: &str| files.contains(path);
+        let manifest = if has("prview.toml") {
+            repo.regular_blob_bytes_at_oid(commit_id, "prview.toml")?
+        } else {
+            None
+        }
+        .and_then(|bytes| {
+            std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|s| toml::from_str::<PrviewManifest>(s).ok())
+        });
+        let configured_cargo = manifest
+            .as_ref()
+            .and_then(|m| m.project.cargo_root.as_deref())
+            .filter(|root| {
+                !root.is_empty()
+                    && !root
+                        .split('/')
+                        .any(|part| part == "." || part == ".." || part.is_empty())
+            })
+            .filter(|root| has(&format!("{root}/Cargo.toml")));
+        let root_cargo = has("Cargo.toml");
+        let mut rust_dirs: Vec<String> = Vec::new();
+        if let Some(root) = configured_cargo {
+            rust_dirs.push(root.to_owned());
+        }
+        if root_cargo {
+            rust_dirs.push(String::new());
+        }
+        let mut cargo_root = configured_cargo
+            .map(str::to_owned)
+            .or_else(|| root_cargo.then(String::new));
+        if cargo_root.is_none() {
+            for dir in ["src-tauri", "rust", "crates"] {
+                if has(&format!("{dir}/Cargo.toml")) {
+                    rust_dirs.push(dir.to_owned());
+                    if cargo_root.is_none() {
+                        cargo_root = Some(dir.to_owned());
+                    }
+                }
+            }
+            for entry in &entries {
+                if entry.kind != crate::git::GitTreeEntryKind::Tree || entry.path.contains('/') {
+                    continue;
+                }
+                let dir = entry.path.as_str();
+                if (dir.ends_with("_rs") || dir.ends_with("-rs"))
+                    && has(&format!("{dir}/Cargo.toml"))
+                {
+                    if !rust_dirs.iter().any(|existing| existing == dir) {
+                        rust_dirs.push(dir.to_owned());
+                    }
+                    if cargo_root.is_none() {
+                        cargo_root = Some(dir.to_owned());
+                    }
+                }
+            }
+        }
+        let has_cargo = !rust_dirs.is_empty();
+        let has_package_json = has("package.json");
+        let has_tsconfig = files.iter().any(|path| {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            (name == "tsconfig.json" || (name.starts_with("tsconfig") && name.ends_with(".json")))
+                && !path.split('/').any(|part| {
+                    matches!(
+                        part,
+                        "fixture" | "fixtures" | "node_modules" | "target" | "vendor"
+                    )
+                })
+        });
+        let has_pyproject = has("pyproject.toml");
+        let has_python_source = files
+            .iter()
+            .any(|path| is_runtime_python_path(Path::new(path)));
+        let has_js_source = files.iter().any(|path| {
+            let source = path.starts_with("src/") || !path.contains('/');
+            let ext = path.rsplit('.').next().unwrap_or("");
+            let valid = if path.starts_with("src/") {
+                matches!(ext, "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
+            } else {
+                matches!(ext, "ts" | "tsx" | "js" | "jsx")
+                    && !path.contains(".config.")
+                    && !path.contains("eslint")
+                    && !path.contains("prettier")
+            };
+            source && valid
+        });
+        let has_js_project = has_js_source || has_tsconfig || has_package_json;
+        let has_python_project = has_python_source || (has_pyproject && !has_cargo);
+        let kind = profile_kind(
+            requested_profile,
+            has_js_project,
+            has_cargo,
+            has_python_project,
+        );
+        let is_workspace = if root_cargo {
+            repo.regular_blob_bytes_at_oid(commit_id, "Cargo.toml")?
+                .as_deref()
+                .is_some_and(|bytes| {
+                    bytes
+                        .windows(b"[workspace]".len())
+                        .any(|window| window == b"[workspace]")
+                })
+        } else {
+            false
+        };
+        let path = |dir: &str| {
+            if dir.is_empty() {
+                self.repo_root.clone()
+            } else {
+                self.repo_root.join(dir)
+            }
+        };
+        self.profile = DetectedProfile {
+            kind,
+            has_package_json,
+            has_tsconfig,
+            has_cargo,
+            has_pyproject,
+            has_python_source,
+            has_js_source,
+            cargo_root: cargo_root.as_deref().map(&path),
+            rust_dirs: rust_dirs.iter().map(|dir| path(dir)).collect(),
+            is_workspace,
+        };
+        if self.profile_at_cli_detection.is_some() {
+            self.profile_at_cli_detection = Some(self.profile.clone());
+        }
+        Ok(())
+    }
+
     pub(crate) fn base(
         repo_root: PathBuf,
         profile: DetectedProfile,
@@ -1467,7 +1619,29 @@ fn detect_profile(
 
     let has_python_project = has_python_source || (has_pyproject && !has_cargo);
 
-    let kind = match requested {
+    let kind = profile_kind(requested, has_js_project, has_cargo, has_python_project);
+
+    Ok(DetectedProfile {
+        kind,
+        has_package_json,
+        has_tsconfig,
+        has_cargo,
+        has_pyproject,
+        has_python_source,
+        has_js_source,
+        cargo_root,
+        rust_dirs,
+        is_workspace,
+    })
+}
+
+fn profile_kind(
+    requested: Profile,
+    has_js_project: bool,
+    has_cargo: bool,
+    has_python_project: bool,
+) -> ProfileKind {
+    match requested {
         Profile::Auto => {
             // Auto-detect based on what exists
             match (has_js_project, has_cargo, has_python_project) {
@@ -1485,20 +1659,7 @@ fn detect_profile(
         Profile::Python => ProfileKind::Python,
         Profile::Mixed => ProfileKind::Mixed,
         Profile::Generic => ProfileKind::Generic,
-    };
-
-    Ok(DetectedProfile {
-        kind,
-        has_package_json,
-        has_tsconfig,
-        has_cargo,
-        has_pyproject,
-        has_python_source,
-        has_js_source,
-        cargo_root,
-        rust_dirs,
-        is_workspace,
-    })
+    }
 }
 
 impl Config {
