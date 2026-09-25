@@ -39,6 +39,14 @@ Automatically:
 - in standard mode, generates the full artifact pack
 - runs tests and lint by default, unless you pick a lighter mode (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*`
 
+The profile is detected from the tree being reviewed. An explicit target
+(`--pr`, `--target-sha`, `--remote`, or even `HEAD`) uses the pinned target
+snapshot, so uncommitted additions or deletions of project markers in the
+operator checkout cannot add or remove checks or change the pack's profile.
+An ordinary target-less local review uses the live checkout. `--profile` still
+chooses the requested profile kind; its project markers come from the reviewed
+tree.
+
 The `prview` tool can analyze repositories that use any base branch
 (`develop`, `main`, `master`, etc.); by default it resolves the first of
 `develop`, `main`, `master` that exists.

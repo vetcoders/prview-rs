@@ -175,6 +175,9 @@ pub struct Config {
     pub required_base_exact: bool,
     pub bases: Vec<String>,
     pub profile: DetectedProfile,
+    /// The caller's profile choice, retained so an exact run can detect the
+    /// project from its reviewed tree after resolving the target.
+    pub requested_profile: crate::cli::Profile,
 
     // Modes
     pub execution_mode: ExecutionMode,
@@ -887,6 +890,7 @@ impl Config {
             required_base_exact: false,
             bases: vec![],
             profile,
+            requested_profile: crate::cli::Profile::Auto,
             execution_mode: ExecutionMode::Standard,
             enforcement_mode: EnforcementMode::Advisory,
             update_mode: false,
@@ -1060,6 +1064,7 @@ impl Config {
             ))
             .with_fetch_config(FetchConfig::from_cli(cli))
             .with_output_config(OutputConfig::from_cli(cli));
+        config.requested_profile = cli.profile;
 
         config.target = target;
         config.bases = bases;
@@ -1486,6 +1491,31 @@ fn detect_profile(
         rust_dirs,
         is_workspace,
     })
+}
+
+impl Config {
+    /// Detect the run's profile from the tree it actually reviews. Keep paths
+    /// anchored to the logical repository root: consumers rebase cargo roots
+    /// onto their own reviewed snapshot when they execute a check.
+    pub(crate) fn refresh_profile_from_tree(&mut self, tree_root: &Path) -> Result<()> {
+        let manifest = PrviewManifest::load_from(tree_root);
+        let mut profile = detect_profile(
+            &tree_root.to_path_buf(),
+            self.requested_profile,
+            manifest.as_ref(),
+        )?;
+        let rebase = |path: &Path| -> Result<PathBuf> {
+            Ok(self.repo_root.join(path.strip_prefix(tree_root)?))
+        };
+        profile.cargo_root = profile.cargo_root.as_deref().map(&rebase).transpose()?;
+        profile.rust_dirs = profile
+            .rust_dirs
+            .iter()
+            .map(|path| rebase(path))
+            .collect::<Result<Vec<_>>>()?;
+        self.profile = profile;
+        Ok(())
+    }
 }
 
 fn has_product_tsconfig(repo_root: &Path) -> bool {
