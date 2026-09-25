@@ -1315,7 +1315,7 @@ mod tests {
             .unwrap();
         let mut pack = None;
         while let Ok(event) = rx.try_recv() {
-            if let crate::tui::TuiEvent::AnalysisComplete { report } = event {
+            if let crate::tui::types::TuiEvent::AnalysisComplete { report } = event {
                 pack = Some(report.artifacts_dir);
             }
         }
