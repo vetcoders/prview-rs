@@ -694,7 +694,7 @@ mod tests {
     use super::*;
 
     /// The PR Template tail of the vbl-190 incident pack
-    /// (run 20260918-180535-08716c4, PR_REVIEW.md:147-164), verbatim.
+    /// (run 20260918-180535-08716c4), with its generated separator.
     const INCIDENT_PR_TEMPLATE: &str = "---\n\n## PR Template\n\n\
 _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
 <!-- Describe your changes -->\n## Type of Change\n- [ ] Bug fix\n- [ ] New feature\n\
