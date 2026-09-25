@@ -642,10 +642,10 @@ impl App {
             Ok((worktree, target, bases, diffs))
         })?;
 
-        // Skip checks and heuristics in quick mode. No checks run, so no shared
-        // snapshot is ever materialised: an empty ledger is the honest input,
-        // and the context generators read the working tree — which is exactly
-        // what `--watch` is watching.
+        // Quick mode skips checks and heuristics, but profile-dependent context
+        // still needs the reviewed tree. An exact target keeps its snapshot in
+        // the ledger through artifact generation; an ambient watch iteration
+        // reads the live working tree it is watching.
         let ledger = ledger::TaskLedger::new();
         let mut run_config = self.config.clone();
         run_config.pinned_target = Some(target.clone());
