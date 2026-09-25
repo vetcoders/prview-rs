@@ -5644,6 +5644,134 @@ fn static_tauri_commands_follow_the_shared_reviewed_tree() {
     );
 }
 
+/// PRV-CONTEXT-SNAPSHOT-PROVENANCE, the call site. `generate_ghost_refs` takes
+/// the tree to audit as an argument and its own unit tests prove it honours
+/// whatever it is handed — which is exactly why they cannot see this defect:
+/// reverting the caller in `generate()` to the ambient `repo.path()` reproduces
+/// the original incident with the whole suite still green. This test guards the
+/// seam instead of the function, through the real `generate()` call site.
+///
+/// The fixture makes the two trees disagree about the audit: the reviewed
+/// snapshot carries the tracked ghost (`src/consumer.rs` still imports the
+/// deleted module), while the operator's off-`HEAD` checkout additionally holds
+/// an untracked scratch file that belongs to no PR. A pack anchored on the
+/// reviewed tree names the first and cannot see the second.
+#[test]
+fn ghost_audit_in_the_pack_follows_the_shared_reviewed_tree() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let repo = tempfile::tempdir().expect("repo");
+    run_git_fixture(repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo.path().join("src")).expect("src dir");
+    write_commit_fixture(repo.path(), "src/legacy_widget.rs", "pub fn render() {}\n");
+    let base_sha = write_commit_fixture(
+        repo.path(),
+        "src/consumer.rs",
+        "use crate::legacy_widget::render;\npub fn call() {\n    render();\n}\n",
+    );
+
+    run_git_fixture(repo.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::remove_file(repo.path().join("src/legacy_widget.rs")).expect("delete the module");
+    run_git_fixture(repo.path(), &["add", "-A"]);
+    run_git_fixture(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=prview test",
+            "-c",
+            "user.email=prview@example.test",
+            "commit",
+            "-q",
+            "-m",
+            "drop the legacy widget",
+        ],
+    );
+    let target_sha = String::from_utf8(
+        git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .expect("target rev-parse")
+            .stdout,
+    )
+    .expect("UTF-8 target sha")
+    .trim()
+    .to_owned();
+
+    // The operator never checks the target out: they stay on `main` and keep an
+    // untracked scratch file of their own. Both facts are invisible to the PR.
+    run_git_fixture(repo.path(), &["checkout", "-q", "main"]);
+    std::fs::write(
+        repo.path().join("src/scratch_local.rs"),
+        "use crate::legacy_widget::render;\n",
+    )
+    .expect("untracked local scratch");
+
+    let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target_sha)
+        .expect("shared reviewed snapshot");
+    let ledger = crate::ledger::TaskLedger::new();
+    ledger.set_shared_snapshot(Some(snapshot));
+    let diffs = [Diff {
+        base: "main".to_string(),
+        target: "feature".to_string(),
+        base_commit_id: base_sha.clone(),
+        target_commit_id: target_sha.clone(),
+        files: vec![FileChange {
+            path: "src/legacy_widget.rs".to_string(),
+            status: FileStatus::Deleted,
+            additions: 0,
+            deletions: 1,
+        }],
+        stats: DiffStats {
+            files_changed: 1,
+            additions: 0,
+            deletions: 1,
+            copied: 0,
+        },
+        commits: vec![],
+    }];
+    let output = tempfile::tempdir().expect("output");
+    let pack = output.path().join("pack");
+    // Spelled without an exhaustive literal, like every other fixture here, so
+    // a new `FixturePackOptions` field does not break this call site.
+    let options = FixturePackOptions {
+        diffs: &diffs,
+        ..Default::default()
+    };
+
+    generate_fixture_pack_with_ledger_and_diffs(
+        repo.path(),
+        &pack,
+        &target_sha,
+        &base_sha,
+        &crate::governor::ResourceGovernor::new(),
+        &ledger,
+        FixturePackOptions {
+            worktree_head: FixtureWorktreeHead::Sha(&base_sha),
+            ..options
+        },
+    )
+    .expect("reviewed-tree pack");
+
+    let audit = std::fs::read_to_string(pack.join("30_context/GHOST_REFERENCES.json"))
+        .expect("the reviewed tree still references the deleted module, so the audit must exist");
+    assert!(
+        audit.contains("src/consumer.rs"),
+        "the reviewed tree's own dangling reference is missing from the audit: {audit}",
+    );
+    assert!(
+        !audit.contains("scratch_local"),
+        "the operator's untracked file leaked into the reviewed pack's ghost audit: {audit}",
+    );
+    let report = std::fs::read_to_string(pack.join("30_context/GHOST_REFERENCES.md"))
+        .expect("ghost audit narrative");
+    assert!(
+        !report.contains("scratch_local"),
+        "the operator's untracked file leaked into the ghost narrative: {report}",
+    );
+}
+
 // ---- PRV-203: Ownership Map ----
 
 #[test]

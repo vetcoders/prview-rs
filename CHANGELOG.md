@@ -334,6 +334,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bind `.cargo/audit.toml`.
   `docs/contracts/merge_gate.md` and `docs/architecture.md` carry the rule.
 
+- `30_context/GHOST_REFERENCES.*` now audits the reviewed tree instead of the
+  operator's checkout. For an off-`HEAD` target the scan walks the shared target
+  snapshot the rest of `30_context/` is planned from, so untracked or dirty
+  local files no longer surface as ghost findings that belong to no PR, and a
+  file the PR deletes but the checkout still holds no longer passes for a
+  relocation survivor that suppressed the real deletion. Only a local review
+  (`target == HEAD`) scans the checkout, because there it is the reviewed tree.
+  Both the relocation guard and the scan also skip `node_modules`: a snapshot
+  links it in as a symlink the walk does not follow while a local review walked
+  it for real, so a vendored file with the deleted file's name could silence a
+  real deletion in one mode only.
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch
