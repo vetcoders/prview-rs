@@ -2806,7 +2806,9 @@ overlap the identity's cfg region:
   in the re-exporting module and its unproven descendants. A glob may bind any
   name there. A named use leaf binds exactly one name, its rename if it has
   one, which the snapshot records as a `bound-name:` evidence line, so the
-  leaf hides only that name and what lies below it.
+  leaf hides only that name and what lies below it, and it reaches an ancestor
+  only through a re-export whose origin lies below that name or is the leaf's
+  own module.
 - A region reaches an ancestor only through a proven re-export of a name whose
   origin lies inside it, and it covers its module under every public module
   alias.

@@ -1931,10 +1931,20 @@ fn region_may_cover(
         return true;
     }
     let bound_name = identity.name.split("::").next().unwrap_or_default();
+    // A named leaf's hidden content lies below its one name. An origin that
+    // is the region module itself stays covered: the origin key does not
+    // say which of its names was re-exported.
     regions
         .reexport_origins
         .get(&(crate_name, identity.module_path.as_slice(), bound_name))
-        .is_some_and(|origins| origins.iter().any(|origin| origin.starts_with(region)))
+        .is_some_and(|origins| {
+            origins.iter().any(|origin| {
+                origin.starts_with(region)
+                    && origin
+                        .get(region.len())
+                        .is_none_or(|child| leaf_name.is_none_or(|name| child.as_str() == name))
+            })
+        })
 }
 
 fn transform_scope_may_cover(unknown: &RustApiUnknown, identity: &ApiIdentity) -> bool {
@@ -9825,6 +9835,27 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
             assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
         }
+    }
+
+    #[test]
+    fn an_unresolved_named_reexport_reaches_ancestors_only_below_its_name() {
+        // `outer::Moved` re-exports an item whose origin lies inside the root
+        // region, but not below the one name the unresolved root leaf binds.
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::Thing;\npub mod outer { mod hidden { pub struct Moved; } pub use hidden::Moved; }\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::Thing;\npub mod outer { mod hidden { pub struct Moved(pub u8); } pub use hidden::Moved; }\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&delta.changed, &["outer"], "type", "Moved").is_some(),
+            "{:?}",
+            delta.findings()
+        );
     }
 
     #[test]
