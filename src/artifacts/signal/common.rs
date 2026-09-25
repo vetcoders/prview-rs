@@ -240,6 +240,61 @@ fn flush_js_ts_section(output: &mut String, section: &str, header_paths: Option<
     }
 }
 
+/// The file each side of one legacy diff section belongs to.
+///
+/// `diff --git` opens a section, and the `--- a/…` and `+++ b/…` markers
+/// before its first hunk name its old and its new side. The two differ in a
+/// rename: a removed line belongs to the old path and an added line to the
+/// new one, so an export the old module loses is not paired away with its
+/// re-addition under the new path. A section without markers keeps the two
+/// paths of its header, and a `/dev/null` side keeps them too: it has no
+/// lines.
+#[derive(Debug, Default)]
+pub(crate) struct LegacyPatchSides {
+    pub(crate) old: String,
+    pub(crate) new: String,
+    in_hunk: bool,
+}
+
+/// A header line [`LegacyPatchSides::read`] took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyPatchHeader {
+    /// A `diff --git` line: a new section starts.
+    Section,
+    /// A `---` or `+++` side marker of the current section.
+    Marker,
+}
+
+impl LegacyPatchSides {
+    /// Take a section's header lines. Any other line, a hunk's content
+    /// included, returns `None` and is left to the caller.
+    pub(crate) fn read(&mut self, line: &str) -> Option<LegacyPatchHeader> {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some(space_idx) = rest.find(" b/") {
+                self.old = rest[..space_idx].to_owned();
+                self.new = rest[space_idx + 3..].to_owned();
+            }
+            self.in_hunk = false;
+            return Some(LegacyPatchHeader::Section);
+        }
+        if line.starts_with("@@") {
+            self.in_hunk = true;
+        }
+        if self.in_hunk {
+            return None;
+        }
+        let marker_path = |path: &str| path.split('\t').next().unwrap_or(path).to_owned();
+        if let Some(path) = line.strip_prefix("--- a/") {
+            self.old = marker_path(path);
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
+            self.new = marker_path(path);
+        } else if !line.starts_with("--- ") && !line.starts_with("+++ ") {
+            return None;
+        }
+        Some(LegacyPatchHeader::Marker)
+    }
+}
+
 fn legacy_safe_patch_path(path: &str) -> String {
     path.replace('\n', "\\n")
         .replace('\r', "\\r")
@@ -428,6 +483,548 @@ fn is_js_ts_path(path: &str) -> bool {
     [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"]
         .iter()
         .any(|extension| lower.ends_with(extension))
+}
+
+/// One exported JS/TS declaration, as far as a single diff line shows it.
+///
+/// The legacy JS/TS analyzers read declarations line by line, so a formatter
+/// rewriting an export whose contract did not change (an arrow function's
+/// `=> {` block body turned into an `=>` expression body, a re-spaced
+/// parameter list, a trailing comma) surfaced as the removal of the export plus
+/// the addition of a "new" one. Pairing the two sides needs what importers bind
+/// to, the name in its namespace, and a form of the declaration that leaves
+/// formatting and implementation out of the comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JsTsExport {
+    /// The binding importers use: the declared name, or `default`.
+    pub(crate) name: String,
+    /// `interface` and `type` declarations live in TypeScript's type
+    /// namespace, where a value export may carry the same name.
+    pub(crate) type_only: bool,
+    /// The declaration without formatting, comments or implementation. Two
+    /// sides with equal forms export the same contract as far as the line
+    /// shows; the reported text stays the line as written.
+    pub(crate) contract: String,
+}
+
+/// Recognize an exported declaration on one JS/TS line.
+///
+/// Re-export lists (`export { a } from`, `export * from`), `export =` and
+/// destructured bindings have no single declared name and return `None`, so
+/// they keep their unpaired treatment.
+pub(crate) fn js_ts_export(line: &str) -> Option<JsTsExport> {
+    let line = line.trim();
+    let declaration = strip_js_keyword(line, "export")?;
+    if let Some(value) = strip_js_keyword(declaration, "default") {
+        return Some(JsTsExport {
+            name: "default".to_owned(),
+            type_only: false,
+            contract: js_ts_export_contract(line, js_default_kind(value)),
+        });
+    }
+    let (kind, name) = js_ts_declaration(declaration)?;
+    Some(JsTsExport {
+        name,
+        type_only: kind == JsDeclKind::Type,
+        contract: js_ts_export_contract(line, kind),
+    })
+}
+
+/// Whether a JS/TS export line, as the diff shows it, is written indented.
+///
+/// A module's `export` statements sit at its top level, so an indented one is
+/// a member of a TypeScript `namespace` or ambient `module` block. What
+/// importers bind then includes the enclosing name (`A.value`), which the line
+/// does not show and a hunk may not either: moving `export const value = 1`
+/// from `namespace A` to `namespace B` is an unchanged line that breaks every
+/// consumer of `A.value`. Such a line is never paired with the other side.
+/// An unindented member of such a block still pairs: that is the bound of this
+/// line heuristic.
+pub(crate) fn js_ts_export_is_nested(content: &str) -> bool {
+    content.starts_with(char::is_whitespace)
+}
+
+/// What part of a declaration line is its contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsDeclKind {
+    /// `const` / `let` / `var`: an arrow-function initializer's parameters are
+    /// the contract, and its body is implementation.
+    Binding,
+    /// `function`: a body opened or written whole on the line is
+    /// implementation; a return-type literal is contract.
+    Function,
+    /// `class`: members written on the line are the class's API. Only the `{`
+    /// that opens a body continued on the next lines is dropped.
+    Class,
+    /// `interface` / `type`: a body written on the same line IS the contract.
+    Type,
+    /// A default-exported expression: an arrow function's body is
+    /// implementation.
+    Expression,
+    /// `enum` and `namespace`: the whole line is contract.
+    Other,
+}
+
+fn js_ts_declaration(declaration: &str) -> Option<(JsDeclKind, String)> {
+    let rest = strip_js_modifiers(declaration, &["declare", "abstract", "async"]);
+    let (kind, rest) = if let Some(after) = strip_js_keyword(rest, "const") {
+        match strip_js_keyword(after, "enum") {
+            Some(name) => (JsDeclKind::Other, name),
+            None => (JsDeclKind::Binding, after),
+        }
+    } else if let Some(after) =
+        strip_js_keyword(rest, "let").or_else(|| strip_js_keyword(rest, "var"))
+    {
+        (JsDeclKind::Binding, after)
+    } else if let Some(after) = strip_js_keyword(rest, "function") {
+        let after = after.strip_prefix('*').unwrap_or(after).trim_start();
+        (JsDeclKind::Function, after)
+    } else if let Some(after) = strip_js_keyword(rest, "class") {
+        (JsDeclKind::Class, after)
+    } else if let Some(after) =
+        strip_js_keyword(rest, "interface").or_else(|| strip_js_keyword(rest, "type"))
+    {
+        (JsDeclKind::Type, after)
+    } else if let Some(after) = ["enum", "namespace", "module"]
+        .iter()
+        .find_map(|keyword| strip_js_keyword(rest, keyword))
+    {
+        (JsDeclKind::Other, after)
+    } else {
+        return None;
+    };
+    let name: String = rest
+        .chars()
+        .take_while(|ch| is_js_identifier_char(*ch))
+        .collect();
+    let starts_like_identifier = name
+        .chars()
+        .next()
+        .is_some_and(|first| !first.is_ascii_digit());
+    starts_like_identifier.then_some((kind, name))
+}
+
+fn js_default_kind(value: &str) -> JsDeclKind {
+    let rest = strip_js_modifiers(value, &["abstract", "async"]);
+    if strip_js_keyword(rest, "function").is_some() {
+        JsDeclKind::Function
+    } else if strip_js_keyword(rest, "class").is_some() {
+        JsDeclKind::Class
+    } else if strip_js_keyword(rest, "interface").is_some() {
+        JsDeclKind::Type
+    } else {
+        JsDeclKind::Expression
+    }
+}
+
+/// The comparison form of an export line: comments, formatting and the parts
+/// of the line that are implementation rather than contract removed.
+///
+/// - An arrow function is compared up to its `=>`, so `=> {` and `=>` with the
+///   body below, or a rewritten expression body, compare equal, and a single
+///   bare parameter compares equal with or without its parentheses.
+/// - A `function` body opened on the line, or written whole on it, is
+///   dropped when its `{` follows the parameter list or a finished return
+///   type; a `{` in type position (`(): {`) opens a return-type literal, and a
+///   declaration ending in `;` (an overload) has no body to drop. A `class`
+///   line drops only the `{` that opens its body on the next lines.
+/// - `//` and `/* */` comments read as whitespace. Whitespace survives as one
+///   space only where it separates two identifier characters or two operator
+///   characters (`a + ++b` against `a++ + b`), and a comma before a closing
+///   bracket is dropped. String, template and regular-expression literals are
+///   kept verbatim, and no arrow, body or comment is found inside them.
+///
+/// The form is a bounded line heuristic: a signature spread over several lines
+/// is compared on the line the diff shows.
+fn js_ts_export_contract(line: &str, kind: JsDeclKind) -> String {
+    let text = strip_js_trailing_comments(line).trim_end();
+    let (text, terminated) = match text.strip_suffix(';') {
+        Some(head) => (head.trim_end(), true),
+        None => (text, false),
+    };
+    let arrow_end = match kind {
+        JsDeclKind::Binding => js_arrow_end(text, true),
+        JsDeclKind::Expression => js_arrow_end(text, false),
+        _ => None,
+    };
+    if let Some(end) = arrow_end {
+        return unwrap_js_arrow_parameter(compact_js(&text[..end]));
+    }
+    let text = match kind {
+        JsDeclKind::Function => strip_js_function_body(text, !terminated),
+        JsDeclKind::Class => strip_js_body_opener(text),
+        _ => text,
+    };
+    compact_js(text)
+}
+
+/// One lexical unit of a JS/TS line, as a byte range of it.
+#[derive(Debug, Clone, Copy)]
+struct JsLexeme {
+    start: usize,
+    end: usize,
+    kind: JsLexKind,
+    /// The bracket depth in force before the unit.
+    depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsLexKind {
+    /// A character outside every literal and comment.
+    Code(char),
+    /// A whole string, template or regular-expression literal.
+    Literal,
+    /// A `//` or `/* */` comment.
+    Comment,
+}
+
+impl JsLexeme {
+    /// Whitespace or a comment: what separates tokens without being one.
+    fn is_gap(&self) -> bool {
+        match self.kind {
+            JsLexKind::Code(ch) => ch.is_whitespace(),
+            JsLexKind::Literal => false,
+            JsLexKind::Comment => true,
+        }
+    }
+}
+
+/// Keywords after which a `/` starts a regular expression, not a division.
+const JS_KEYWORDS_BEFORE_OPERAND: &[&str] = &[
+    "await",
+    "case",
+    "delete",
+    "do",
+    "else",
+    "in",
+    "instanceof",
+    "new",
+    "of",
+    "return",
+    "throw",
+    "typeof",
+    "void",
+    "yield",
+];
+
+/// Split one JS/TS line into code characters, literals and comments.
+///
+/// Strings and templates end at their unescaped closing quote. A `/` followed
+/// by `/` or `*` opens a comment. Any other `/` is a division after an
+/// operand (an identifier or number that is not a keyword such as `return`, a
+/// closing `)` or `]`, a literal) and opens a regular expression everywhere
+/// else, `}` included: reading a division as a literal keeps its text
+/// verbatim, while reading a regular expression as code could find a comment
+/// or an arrow inside it. A literal or comment the line leaves open runs to
+/// its end.
+fn js_lex(text: &str) -> Vec<JsLexeme> {
+    let bytes = text.as_bytes();
+    let mut lexemes: Vec<JsLexeme> = Vec::new();
+    let mut depth = 0_usize;
+    let mut at = 0_usize;
+    while let Some(ch) = text[at..].chars().next() {
+        let next = bytes.get(at + 1).copied();
+        let (kind, end) = match ch {
+            '\'' | '"' | '`' => (JsLexKind::Literal, js_quoted_end(bytes, at)),
+            '/' if next == Some(b'/') => (JsLexKind::Comment, text.len()),
+            '/' if next == Some(b'*') => (
+                JsLexKind::Comment,
+                text[at + 2..]
+                    .find("*/")
+                    .map_or(text.len(), |close| at + 2 + close + 2),
+            ),
+            '/' if js_operand_ends_before(text, &lexemes) => (JsLexKind::Code('/'), at + 1),
+            '/' => (JsLexKind::Literal, js_regex_end(bytes, at)),
+            _ => (JsLexKind::Code(ch), at + ch.len_utf8()),
+        };
+        lexemes.push(JsLexeme {
+            start: at,
+            end,
+            kind,
+            depth,
+        });
+        match kind {
+            JsLexKind::Code('(' | '[' | '{') => depth += 1,
+            JsLexKind::Code(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        at = end;
+    }
+    lexemes
+}
+
+/// Whether the tokens before a `/` end an operand, making it a division.
+fn js_operand_ends_before(text: &str, lexemes: &[JsLexeme]) -> bool {
+    let Some(last) = lexemes.iter().rev().find(|lexeme| !lexeme.is_gap()) else {
+        return false;
+    };
+    match last.kind {
+        JsLexKind::Literal | JsLexKind::Code(')' | ']') => true,
+        JsLexKind::Code(ch) if is_js_identifier_char(ch) => {
+            !JS_KEYWORDS_BEFORE_OPERAND.contains(&js_word_ending_at(text, lexemes, last))
+        }
+        _ => false,
+    }
+}
+
+/// The identifier or number whose last character is `last`.
+fn js_word_ending_at<'a>(text: &'a str, lexemes: &[JsLexeme], last: &JsLexeme) -> &'a str {
+    let start = lexemes
+        .iter()
+        .rev()
+        .skip_while(|lexeme| lexeme.start > last.start)
+        .take_while(
+            |lexeme| matches!(lexeme.kind, JsLexKind::Code(ch) if is_js_identifier_char(ch)),
+        )
+        .last()
+        .map_or(last.start, |lexeme| lexeme.start);
+    &text[start..last.end]
+}
+
+/// End of the string or template literal opened at `start`.
+fn js_quoted_end(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut at = start + 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            byte if byte == quote => return at + 1,
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// End of the regular-expression literal opened at `start`, flags included.
+/// A `/` inside a character class does not close it.
+fn js_regex_end(bytes: &[u8], start: usize) -> usize {
+    let mut at = start + 1;
+    let mut in_class = false;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'[' => {
+                in_class = true;
+                at += 1;
+            }
+            b']' => {
+                in_class = false;
+                at += 1;
+            }
+            b'/' if !in_class => {
+                at += 1;
+                while bytes.get(at).is_some_and(u8::is_ascii_alphanumeric) {
+                    at += 1;
+                }
+                return at;
+            }
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// A character outside literals and comments, with its byte offset and the
+/// bracket depth in force before it.
+struct JsCodeChar {
+    at: usize,
+    ch: char,
+    depth: usize,
+}
+
+fn js_code_chars(text: &str) -> Vec<JsCodeChar> {
+    js_lex(text)
+        .into_iter()
+        .filter_map(|lexeme| match lexeme.kind {
+            JsLexKind::Code(ch) => Some(JsCodeChar {
+                at: lexeme.start,
+                ch,
+                depth: lexeme.depth,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The line without the comments that end it, so `10;// old` and `10;` both
+/// end in their `;`.
+fn strip_js_trailing_comments(text: &str) -> &str {
+    let end = js_lex(text)
+        .iter()
+        .rev()
+        .find(|lexeme| !lexeme.is_gap())
+        .map_or(0, |lexeme| lexeme.end);
+    &text[..end]
+}
+
+/// Byte offset just past the top-level `=>` of an arrow function. For a
+/// binding the search starts after the initializer's `=`, so an arrow inside
+/// the type annotation (`const f: (a: A) => void = …`) is not taken for it.
+fn js_arrow_end(text: &str, after_initializer: bool) -> Option<usize> {
+    let chars = js_code_chars(text);
+    let bytes = text.as_bytes();
+    let next_byte = |at: usize| bytes.get(at + 1).copied();
+    let start = if after_initializer {
+        chars.iter().position(|c| {
+            c.ch == '='
+                && c.depth == 0
+                && !matches!(next_byte(c.at), Some(b'=' | b'>'))
+                && (c.at == 0 || !matches!(bytes[c.at - 1], b'=' | b'!' | b'<' | b'>'))
+        })? + 1
+    } else {
+        0
+    };
+    chars[start..]
+        .iter()
+        .find(|c| c.ch == '=' && c.depth == 0 && next_byte(c.at) == Some(b'>'))
+        .map(|c| c.at + 2)
+}
+
+/// Drop the `{` a class line ends with: it opens a body continued below.
+fn strip_js_body_opener(text: &str) -> &str {
+    match js_code_chars(text).last() {
+        Some(last) if last.ch == '{' && last.depth == 0 && last.at + 1 == text.len() => {
+            text[..last.at].trim_end()
+        }
+        _ => text,
+    }
+}
+
+/// Drop the body a function line opens (`) {`) and, when `whole_group` is
+/// set, a body written whole on it (`{ return x; }`). Only the last top-level
+/// `{` is a body candidate, and only when it follows the parameter list or a
+/// finished return type: a `{` after `:`, `=>`, `|` or another type operator
+/// opens a return-type literal, which is contract.
+fn strip_js_function_body(text: &str, whole_group: bool) -> &str {
+    let lexemes = js_lex(text);
+    let code: Vec<usize> = (0..lexemes.len())
+        .filter(|&index| matches!(lexemes[index].kind, JsLexKind::Code(_)))
+        .collect();
+    let Some(&last) = code.last() else {
+        return text;
+    };
+    let last = lexemes[last];
+    if last.end != text.len() {
+        return text;
+    }
+    let opener = match last.kind {
+        JsLexKind::Code('{') if last.depth == 0 => code.last().copied(),
+        JsLexKind::Code('}') if whole_group && last.depth == 1 => code
+            .iter()
+            .copied()
+            .rfind(|&index| {
+                lexemes[index].depth == 0
+                    && matches!(lexemes[index].kind, JsLexKind::Code('(' | '[' | '{'))
+            })
+            .filter(|&index| lexemes[index].kind == JsLexKind::Code('{')),
+        _ => None,
+    };
+    let Some(opener) = opener else {
+        return text;
+    };
+    if js_type_position_before(text, &lexemes[..opener]) {
+        return text;
+    }
+    text[..lexemes[opener].start].trim_end()
+}
+
+/// Whether a `{` after these lexemes opens a type literal rather than a body.
+fn js_type_position_before(text: &str, before: &[JsLexeme]) -> bool {
+    let Some(last) = before.iter().rev().find(|lexeme| !lexeme.is_gap()) else {
+        return false;
+    };
+    match last.kind {
+        JsLexKind::Code(':' | '|' | '&' | '<' | ',' | '(' | '[' | '=' | '?') => true,
+        JsLexKind::Code('>') => last.start > 0 && text.as_bytes()[last.start - 1] == b'=',
+        JsLexKind::Code(ch) if is_js_identifier_char(ch) => matches!(
+            js_word_ending_at(text, before, last),
+            "is" | "extends" | "keyof"
+        ),
+        _ => false,
+    }
+}
+
+/// Rebuild a line with its comments and whitespace reduced to what separates
+/// tokens. Literals are kept verbatim; a gap survives as one space where the
+/// characters on both sides would otherwise join into another token.
+fn compact_js(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut gap = false;
+    for lexeme in js_lex(text) {
+        if lexeme.is_gap() {
+            gap = true;
+            continue;
+        }
+        let piece = &text[lexeme.start..lexeme.end];
+        if matches!(lexeme.kind, JsLexKind::Code(')' | ']' | '}')) && out.ends_with(',') {
+            out.pop();
+        }
+        if gap
+            && let (Some(left), Some(right)) = (out.chars().next_back(), piece.chars().next())
+            && js_chars_join(left, right)
+        {
+            out.push(' ');
+        }
+        gap = false;
+        out.push_str(piece);
+    }
+    out
+}
+
+/// Whether two characters written without a gap would read as one token.
+fn js_chars_join(left: char, right: char) -> bool {
+    (is_js_identifier_char(left) && is_js_identifier_char(right))
+        || (is_js_operator_char(left) && is_js_operator_char(right))
+}
+
+fn is_js_operator_char(ch: char) -> bool {
+    "+-*/%=<>!&|^~?.:".contains(ch)
+}
+
+/// `(x)=>` and `x=>` declare the same single parameter.
+fn unwrap_js_arrow_parameter(compact: String) -> String {
+    let Some(head) = compact.strip_suffix(")=>") else {
+        return compact;
+    };
+    let Some(open) = head.rfind('(') else {
+        return compact;
+    };
+    let parameter = &head[open + 1..];
+    let bare = parameter
+        .chars()
+        .next()
+        .is_some_and(|first| !first.is_ascii_digit())
+        && parameter.chars().all(is_js_identifier_char);
+    if !bare {
+        return compact;
+    }
+    let before = &head[..open];
+    let joiner = if before.ends_with(is_js_identifier_char) {
+        " "
+    } else {
+        ""
+    };
+    format!("{before}{joiner}{parameter}=>")
+}
+
+fn strip_js_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(keyword)?;
+    (!rest.starts_with(is_js_identifier_char)).then_some(rest.trim_start())
+}
+
+fn strip_js_modifiers<'a>(text: &'a str, modifiers: &[&str]) -> &'a str {
+    let mut rest = text;
+    while let Some(after) = modifiers
+        .iter()
+        .find_map(|modifier| strip_js_keyword(rest, modifier))
+    {
+        rest = after;
+    }
+    rest
+}
+
+fn is_js_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
 }
 
 /// Check if a path is a non-code file (assets, i18n, config, docs, scripts, metadata).
@@ -884,5 +1481,242 @@ mod tests {
         let out2 = strip_rust_non_code(&close, &mut state, false);
         assert_eq!(out2.code, " ;");
         assert!(state.raw_string_hashes.is_none());
+    }
+
+    #[test]
+    fn js_ts_export_names_the_binding_importers_use() {
+        for (line, name, type_only) in [
+            (
+                "export const listTrackedSources = async (cwd) => {",
+                "listTrackedSources",
+                false,
+            ),
+            ("  export let counter = 0;", "counter", false),
+            ("export async function load(path) {", "load", false),
+            ("export function* walk(root) {", "walk", false),
+            ("export declare function f(): void;", "f", false),
+            ("export abstract class Base<T> {", "Base", false),
+            ("export const enum Mode { A, B }", "Mode", false),
+            ("export interface Props {", "Props", true),
+            ("export type Id = string;", "Id", true),
+            ("export default function main() {}", "default", false),
+            ("export default {", "default", false),
+        ] {
+            let export = js_ts_export(line).unwrap_or_else(|| panic!("{line}"));
+            assert_eq!(
+                (export.name.as_str(), export.type_only),
+                (name, type_only),
+                "{line}"
+            );
+        }
+        for line in [
+            "export { a, b } from './x';",
+            "export * from './x';",
+            "export type { A } from './x';",
+            "export = foo;",
+            "export const { a, b } = obj;",
+            "exports.foo = 1;",
+            "exportFoo();",
+        ] {
+            assert_eq!(js_ts_export(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn js_ts_export_contract_ignores_formatting_and_implementation() {
+        let same = |before: &str, after: &str| {
+            let before = js_ts_export(before).unwrap_or_else(|| panic!("{before}"));
+            let after = js_ts_export(after).unwrap_or_else(|| panic!("{after}"));
+            before.contract == after.contract
+        };
+
+        // The vbl-190 vector: a block body became an expression body.
+        assert!(same(
+            "export const listTrackedSources = async (cwd) => {",
+            "export const listTrackedSources = async (cwd) =>"
+        ));
+        assert!(same(
+            "export const f = (a) => a + 1;",
+            "export const f = (a) => {"
+        ));
+        assert!(same(
+            "export const f = x => x.id",
+            "export const f = (x) => x.name"
+        ));
+        assert!(same(
+            "export const f = ( a,b, ) => {",
+            "export const f = (a, b) =>"
+        ));
+        assert!(same(
+            "export function f(a, b) {",
+            "export function f(a, b) { return a + b; }"
+        ));
+        assert!(same(
+            "export function f(): Promise<void> {",
+            "export function f(): Promise<void> { await g(); }"
+        ));
+        assert!(same(
+            "export default async (req) => {",
+            "export default async req =>"
+        ));
+        assert!(same(
+            "export const LIMIT = 10; // per page",
+            "export const LIMIT = 10;"
+        ));
+        // Comments are comments wherever they stand.
+        assert!(same(
+            "export const LIMIT = 10;// old",
+            "export const LIMIT = 10;// new"
+        ));
+        assert!(same(
+            "export const LIMIT = 1 /* old */;",
+            "export const LIMIT = 1 /* new */;"
+        ));
+        assert!(same(
+            "export const HALF = TOTAL / 2; // old",
+            "export const HALF = TOTAL / 2;"
+        ));
+        // The `//` closing an escaped-slash regular expression is not one.
+        assert!(same(
+            r"export const SLASH = /a\//; // old",
+            r"export const SLASH = /a\//;"
+        ));
+
+        // What importers see still differs.
+        assert!(!same(
+            "export const f = async (cwd) => {",
+            "export const f = async (cwd, options) =>"
+        ));
+        assert!(!same(
+            "export function f(a: number): number {",
+            "export function f(a: string): string {"
+        ));
+        assert!(!same(
+            "export const LIMIT = 10;",
+            "export const LIMIT = 20;"
+        ));
+        // A body written on an interface's line is its contract.
+        assert!(!same(
+            "export interface Props { id: number }",
+            "export interface Props { id: string }"
+        ));
+        // An overload has no body: its return-type literal stays.
+        assert!(!same(
+            "export function f(): { a: number };",
+            "export function f(): { a: string };"
+        ));
+        // An arrow in the type annotation is not the initializer's arrow.
+        assert!(!same(
+            "export const f: (a: A) => void = (a) => {",
+            "export const f: (a: B) => void = (a) => {"
+        ));
+        // Strings are opaque: no arrow or comment is found inside them.
+        assert!(!same(
+            "export const SEP = 'a => b';",
+            "export const SEP = 'a => c';"
+        ));
+        assert!(!same(
+            "export const URL = 'http://a';",
+            "export const URL = 'http://b';"
+        ));
+        // So are regular expressions, character classes included.
+        assert!(!same(
+            "export const r = /a => b/;",
+            "export const r = /a => c/;"
+        ));
+        assert!(!same(
+            "export const PATTERN = /=>old/;",
+            "export const PATTERN = /=>new/;"
+        ));
+        assert!(!same(
+            "export const RE = /[/]=>old/;",
+            "export const RE = /[/]=>new/;"
+        ));
+        // A division is not a regular expression.
+        assert!(!same(
+            "export const HALF = TOTAL / 2; // old",
+            "export const HALF = TOTAL / 3; // old"
+        ));
+        // Whitespace between two operators separates two tokens.
+        assert!(!same(
+            "export const VALUE = a + ++b",
+            "export const VALUE = a++ + b"
+        ));
+        // Members written on a class's line are its API; a class whose body
+        // opens on the line is not the empty class.
+        assert!(!same(
+            "export class Client { oldMethod() {} }",
+            "export class Client { newMethod() {} }"
+        ));
+        assert!(!same(
+            "export default class { oldMethod() {} }",
+            "export default class { newMethod() {} }"
+        ));
+        assert!(!same(
+            "export class Store extends Base {",
+            "export class Store extends Base {}"
+        ));
+        // A return-type literal is contract, with or without `;`, ambient or
+        // not: a `{` after `:` or `|` is in type position.
+        assert!(!same(
+            "export declare function load(): { old: string }",
+            "export declare function load(): { new: string }"
+        ));
+        assert!(!same(
+            "export function load(): { old: string }",
+            "export function load(): { new: string }"
+        ));
+        assert!(!same(
+            "export function load(): Result | { old: string }",
+            "export function load(): Result | { new: string }"
+        ));
+    }
+
+    #[test]
+    fn js_ts_export_is_nested_only_when_indented() {
+        assert!(!js_ts_export_is_nested("export const value = 1;"));
+        assert!(js_ts_export_is_nested("  export const value = 1;"));
+        assert!(js_ts_export_is_nested("\texport function f() {"));
+    }
+
+    #[test]
+    fn legacy_patch_sides_name_each_side_from_markers_before_the_first_hunk() {
+        let mut sides = LegacyPatchSides::default();
+        assert_eq!(
+            sides.read("diff --git a/src/new.ts b/src/new.ts"),
+            Some(LegacyPatchHeader::Section)
+        );
+        assert_eq!(
+            sides.read("--- a/src/old.ts"),
+            Some(LegacyPatchHeader::Marker)
+        );
+        assert_eq!(
+            sides.read("+++ b/src/new.ts"),
+            Some(LegacyPatchHeader::Marker)
+        );
+        assert_eq!(
+            (sides.old.as_str(), sides.new.as_str()),
+            ("src/old.ts", "src/new.ts")
+        );
+
+        // Inside a hunk, `--- a/…` is a removed line's content.
+        assert_eq!(sides.read("@@ -1 +1 @@"), None);
+        assert_eq!(sides.read("--- a/src/other.ts"), None);
+        assert_eq!(sides.old, "src/old.ts");
+
+        // A new section starts from its own header, `/dev/null` keeping it.
+        assert_eq!(
+            sides.read("diff --git a/src/added.ts b/src/added.ts"),
+            Some(LegacyPatchHeader::Section)
+        );
+        assert_eq!(sides.read("--- /dev/null"), Some(LegacyPatchHeader::Marker));
+        assert_eq!(
+            sides.read("+++ b/src/added.ts\t"),
+            Some(LegacyPatchHeader::Marker)
+        );
+        assert_eq!(
+            (sides.old.as_str(), sides.new.as_str()),
+            ("src/added.ts", "src/added.ts")
+        );
     }
 }

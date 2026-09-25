@@ -1,7 +1,10 @@
 //! Breaking changes manifest — heuristic scan for API-breaking changes.
 
 use super::api_delta::{ApiArtifactView, ApiDeltaConfidence, ApiDeltaKind};
-use super::common::{ReviewFileCategory, classify_review_file, js_ts_patch_sections};
+use super::common::{
+    LegacyPatchHeader, LegacyPatchSides, ReviewFileCategory, classify_review_file, js_ts_export,
+    js_ts_export_is_nested, js_ts_patch_sections,
+};
 use anyhow::Result;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -674,14 +677,21 @@ fn compute_breaking_risk(path: &str) -> BreakingRisk {
 /// Analyze a unified diff patch for breaking changes.
 fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     let mut findings = Vec::new();
-    let mut current_file = String::new();
-    let mut should_scan_current_file = false;
+    // Removed lines belong to the section's old path and added lines to its new
+    // one, so a rename section's two sides are two files.
+    let mut sides = LegacyPatchSides::default();
+    let mut scan_old = false;
+    let mut scan_new = false;
 
     // Track removed/added public symbol declarations (ALL kinds in
     // `PUB_SYMBOL_TYPES`, not just `pub fn`) for remove+re-add pairing and
     // signature change detection.
     let mut removed_syms: Vec<SymbolDecl> = Vec::new();
     let mut added_syms: Vec<SymbolDecl> = Vec::new();
+
+    // JS/TS `export` lines per side, as (file, trimmed line, nested).
+    let mut removed_exports: Vec<(String, String, bool)> = Vec::new();
+    let mut added_exports: Vec<(String, String, bool)> = Vec::new();
 
     // A public declaration may span several diff lines — `pub fn name(` with the
     // parameters below it (BUG-4 / TOOLING-15), but equally `pub struct Name<`
@@ -702,22 +712,22 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     let mut after_cfg = CfgGuard::default();
 
     for line in patch.lines() {
-        // Track current file from diff headers
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            finalize_decl(&mut pending_removed, &mut removed_syms, &mut findings);
-            finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
-            before_scope.reset();
-            after_scope.reset();
-            before_cfg.reset();
-            after_cfg.reset();
-            if let Some(space_idx) = rest.find(" b/") {
-                current_file = rest[space_idx + 3..].to_string();
-                should_scan_current_file = should_scan_for_breaking_changes(&current_file);
+        // Track each side's file from the section's header lines.
+        if let Some(header) = sides.read(line) {
+            if header == LegacyPatchHeader::Section {
+                finalize_decl(&mut pending_removed, &mut removed_syms, &mut findings);
+                finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
+                before_scope.reset();
+                after_scope.reset();
+                before_cfg.reset();
+                after_cfg.reset();
             }
+            scan_old = should_scan_for_breaking_changes(&sides.old);
+            scan_new = should_scan_for_breaking_changes(&sides.new);
             continue;
         }
 
-        if !should_scan_current_file {
+        if !scan_old && !scan_new {
             continue;
         }
 
@@ -746,6 +756,9 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
 
         // Removed lines
         if let Some(content) = removed_content {
+            if !scan_old {
+                continue;
+            }
             // A `-` line is absent from the after text, so it neither extends
             // nor ends whatever the added side has open: the two accumulators
             // reconstruct two independent texts out of one interleaved hunk.
@@ -760,7 +773,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                 &mut findings,
                 content,
                 &DeclSite {
-                    file: &current_file,
+                    file: &sides.old,
                     scope: &before_scope,
                     cfg_guard: before_cfg.guard(),
                     side: DiffSide::Removed,
@@ -768,16 +781,13 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             );
             before_cfg.feed(content);
 
-            // JS/TS exports
-            if trimmed.starts_with("export ") || trimmed.starts_with("export default") {
-                findings.push(BreakingFinding {
-                    file: current_file.clone(),
-                    kind: BreakingKind::RemovedSymbol {
-                        symbol_type: "export".to_string(),
-                    },
-                    line: trimmed.to_string(),
-                    risk_level: compute_breaking_risk(&current_file),
-                });
+            // JS/TS exports, paired with the added side once the patch is read.
+            if is_export_line(trimmed) {
+                removed_exports.push((
+                    sides.old.clone(),
+                    trimmed.to_string(),
+                    js_ts_export_is_nested(content),
+                ));
             }
 
             before_scope.feed(content);
@@ -786,6 +796,9 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
 
         // Added lines — track public declarations for signature comparison + env requirements
         if let Some(content) = added_content {
+            if !scan_new {
+                continue;
+            }
             let trimmed = content.trim();
 
             accumulate_decl(
@@ -794,7 +807,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                 &mut findings,
                 content,
                 &DeclSite {
-                    file: &current_file,
+                    file: &sides.new,
                     scope: &after_scope,
                     cfg_guard: after_cfg.guard(),
                     side: DiffSide::Added,
@@ -804,7 +817,15 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
 
             after_scope.feed(content);
 
-            findings.extend(new_env_requirement_findings(&current_file, trimmed));
+            if is_export_line(trimmed) {
+                added_exports.push((
+                    sides.new.clone(),
+                    trimmed.to_string(),
+                    js_ts_export_is_nested(content),
+                ));
+            }
+
+            findings.extend(new_env_requirement_findings(&sides.new, trimmed));
             continue;
         }
 
@@ -903,7 +924,94 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
         }
     }
 
+    pair_js_ts_exports(&removed_exports, &added_exports, &mut findings);
+
     findings
+}
+
+/// Whether a trimmed diff line is an `export` statement, including a bare
+/// `export default` whose value starts on the next line.
+fn is_export_line(trimmed: &str) -> bool {
+    trimmed.starts_with("export ") || trimmed.starts_with("export default")
+}
+
+/// Report the removed JS/TS `export` lines of one patch against its added ones.
+///
+/// Every removed export line used to be a `RemovedSymbol`, so a formatter
+/// rewriting an unchanged export (`=> {` block body to `=>` expression body)
+/// reported the export as removed although importers see the same binding.
+/// A removal now pairs with an addition in the same file that exports the same
+/// name in the same namespace ([`js_ts_export`]), in the same two passes as the
+/// Rust declarations above:
+///   - equal comparison forms -> the export was re-emitted: no finding
+///   - different forms -> a `ChangedSignature`
+///
+/// A removal that pairs with nothing, or has no single exported name
+/// (`export { a } from`, `export * from`), stays a `RemovedSymbol`. An export
+/// moved to another file, a rename section's old path included, is not paired
+/// here: its importers still break. Neither is an export written indented
+/// inside a block whose name the line does not show
+/// ([`js_ts_export_is_nested`]).
+fn pair_js_ts_exports(
+    removed: &[(String, String, bool)],
+    added: &[(String, String, bool)],
+    findings: &mut Vec<BreakingFinding>,
+) {
+    let identity = |(file, line, nested): &(String, String, bool)| {
+        js_ts_export(line)
+            .filter(|_| !nested)
+            .map(|export| (file.clone(), export))
+    };
+    let removed_ids: Vec<_> = removed.iter().map(identity).collect();
+    let added_ids: Vec<_> = added.iter().map(identity).collect();
+    let mut removed_paired = vec![false; removed.len()];
+    let mut added_used = vec![false; added.len()];
+
+    for require_equal_contract in [true, false] {
+        for (r_index, r_id) in removed_ids.iter().enumerate() {
+            let Some((r_file, r_export)) = r_id.as_ref().filter(|_| !removed_paired[r_index])
+            else {
+                continue;
+            };
+            let Some(a_index) = added_ids.iter().enumerate().position(|(a_index, a_id)| {
+                !added_used[a_index]
+                    && a_id.as_ref().is_some_and(|(a_file, a_export)| {
+                        a_file == r_file
+                            && a_export.name == r_export.name
+                            && a_export.type_only == r_export.type_only
+                            && (!require_equal_contract || a_export.contract == r_export.contract)
+                    })
+            }) else {
+                continue;
+            };
+            removed_paired[r_index] = true;
+            added_used[a_index] = true;
+            if !require_equal_contract {
+                findings.push(BreakingFinding {
+                    file: r_file.clone(),
+                    kind: BreakingKind::ChangedSignature {
+                        before: removed[r_index].1.clone(),
+                        after: added[a_index].1.clone(),
+                    },
+                    line: String::new(),
+                    risk_level: compute_breaking_risk(r_file),
+                });
+            }
+        }
+    }
+
+    for ((file, line, _), paired) in removed.iter().zip(removed_paired) {
+        if !paired {
+            findings.push(BreakingFinding {
+                file: file.clone(),
+                kind: BreakingKind::RemovedSymbol {
+                    symbol_type: "export".to_string(),
+                },
+                line: line.clone(),
+                risk_level: compute_breaking_risk(file),
+            });
+        }
+    }
 }
 
 /// Index of the first not-yet-consumed addition that may pair with `removed`.
