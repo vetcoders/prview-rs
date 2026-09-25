@@ -69,8 +69,8 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
 
     let gate = load_json(pack_root.join("00_summary").join("MERGE_GATE.json"));
     if let Some(gate) = gate.as_ref() {
-        out.verdict_gate = string_at(&gate, "/decision/verdict");
-        out.findings_count_gate = usize_at(&gate, "/inline_findings/findings_count");
+        out.verdict_gate = string_at(gate, "/decision/verdict");
+        out.findings_count_gate = usize_at(gate, "/inline_findings/findings_count");
     }
     // The gate independently serializes every evaluated check. Compare the
     // complete set of executed rows, including name, status and cache state:
@@ -177,8 +177,15 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
                         _ => out.check_entries_unreadable += 1,
                     }
                 }
-                if let Some(gate_checks) = gate_checks {
-                    out.check_entries_unreadable += gate_checks.map_or(1, |rows| rows.len());
+                match gate_checks {
+                    Some(Some(rows)) => out.check_entries_unreadable += rows.len(),
+                    Some(None) | None if out.check_entries_unreadable == 0 => {
+                        // A report without a readable gate has no independent
+                        // identity evidence, even when every row is locally
+                        // well formed and the rendered marks happen to agree.
+                        out.check_entries_unreadable = 1;
+                    }
+                    _ => {}
                 }
             }
             None => out.check_entries_unreadable += 1,
@@ -788,7 +795,27 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
     }
 
     fn checklist_report(root: &Path) -> ConsistencyReport {
+        // Older focused checklist fixtures supply only report.json. Give them
+        // an independently readable gate with their current rows for this
+        // invocation; production always writes the real gate first. Tests
+        // that supply an explicit gate retain it for adversarial comparisons.
+        let gate_path = root.join("00_summary/MERGE_GATE.json");
+        let synthetic_gate = (!gate_path.exists())
+            .then(|| root.join("report.json"))
+            .and_then(|report_path| {
+                std::fs::read(report_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|report| report.get("checks").and_then(|v| v.as_array()).cloned())
+            });
+        if let Some(rows) = synthetic_gate.as_ref() {
+            std::fs::create_dir_all(root.join("00_summary")).unwrap();
+            std::fs::write(&gate_path, serde_json::json!({"checks":rows}).to_string()).unwrap();
+        }
         let disk = read_disk_artifact_counters(root);
+        if synthetic_gate.is_some() {
+            std::fs::remove_file(gate_path).unwrap();
+        }
         let mut report = ArtifactCounters::default().check_consistency();
         report.merge_pr_checklist(
             disk.pr_checklist.as_deref(),
@@ -1266,6 +1293,51 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         let mut duplicate = original.clone();
         duplicate.as_array_mut().unwrap().push(original[3].clone());
         assert_eq!(warning_fields(&verify(duplicate)), ["pr_checklist"]);
+    }
+
+    #[test]
+    fn missing_or_unreadable_gate_cannot_certify_report_checklist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let unticked = INCIDENT_PR_TEMPLATE
+            .replace("- [x] Compiles", "- [ ] Compiles")
+            .replace("- [x] Tests pass", "- [ ] Tests pass")
+            .replace("- [x] No lint errors", "- [ ] No lint errors");
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{unticked}")).unwrap();
+        std::fs::write(
+            root.join("report.json"),
+            r#"{"checks":[{"id":"cargo","name":"Cargo check","status":"FAIL","cached":false}]}"#,
+        )
+        .unwrap();
+        let raw_report = || {
+            let disk = read_disk_artifact_counters(root);
+            let mut report = ArtifactCounters::default().check_consistency();
+            report.merge_pr_checklist(
+                disk.pr_checklist.as_deref(),
+                disk.pr_checklist_unreadable,
+                disk.check_outcomes_report.as_deref(),
+                disk.check_entries_unreadable,
+                "report.json",
+            );
+            (disk.check_entries_unreadable, report)
+        };
+        for gate in [None, Some("not JSON"), Some(r#"{}"#)] {
+            if let Some(gate) = gate {
+                std::fs::create_dir_all(root.join("00_summary")).unwrap();
+                std::fs::write(root.join("00_summary/MERGE_GATE.json"), gate).unwrap();
+            }
+            let (unreadable, report) = raw_report();
+            assert_eq!(unreadable, 1, "gate {gate:?}");
+            assert_eq!(warning_fields(&report), ["pr_checklist"], "gate {gate:?}");
+        }
+        std::fs::write(
+            root.join("00_summary/MERGE_GATE.json"),
+            r#"{"checks":[{"id":"cargo","name":"Cargo check","status":"FAIL","cached":false}]}"#,
+        )
+        .unwrap();
+        let (unreadable, report) = raw_report();
+        assert_eq!(unreadable, 0);
+        assert!(report.consistent, "{report:?}");
     }
 
     /// report.json always serializes every check with a string name and a

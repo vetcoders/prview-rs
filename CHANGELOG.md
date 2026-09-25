@@ -260,7 +260,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their serialized `cached` flags are checked alongside statuses. Serialized
   check names are also matched to their canonical IDs and to the complete
   executed check set in `MERGE_GATE.json` (name, status and cache state), so an
-  alias collision or omitted failed row cannot silently change a checklist
+  alias collision, omitted failed row, or missing gate cannot silently change a checklist
   claim. Custom check names remain valid when both artifacts agree.
 - A `Cargo audit` failure whose advisories the baseline already proved
   pre-existing no longer blocks the merge because of unrelated uncommitted

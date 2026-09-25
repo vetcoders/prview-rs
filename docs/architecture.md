@@ -3790,8 +3790,8 @@ unreadable instead of letting the first copy win. The fold fails closed: a missi
 is a warning for its item, and `/checks` entries without a readable `name`,
 an `id` matching that name's canonical check ID, boolean `cached`, and status
 from the serialized vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`)
-withhold the comparison behind one `pr_checklist` warning. When the gate has
-check rows, the disk reader also compares the complete executed-row multiset
+withhold the comparison behind one `pr_checklist` warning. A missing or
+unreadable gate likewise withholds it. The disk reader compares the complete executed-row multiset
 of `(id, name, status, cached)` against `MERGE_GATE.json`. Canonical ids alone
 cannot prove identity because distinct names can share an id; this comparison
 also detects a missing failed row without restricting custom check names. A present but
