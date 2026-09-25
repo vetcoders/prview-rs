@@ -2808,7 +2808,14 @@ overlap the identity's cfg region:
   one, which the snapshot records as a `bound-name:` evidence line, so the
   leaf hides only that name and what lies below it, and it reaches an ancestor
   only through a re-export whose origin lies below that name or is the leaf's
-  own module.
+  own module. A leaf whose path passes through a name that an unresolved leaf
+  binds resolves, under that leaf's guard, into the hidden content, even when
+  another cfg variant of the name resolves. The snapshot records such a leaf's
+  own named unknown under both guards combined, and so for every leaf whose
+  path passes through it in turn: with `ali` bound to `real` under `unix` and
+  unresolved under `windows`, `pub use crate::ali::Thing` leaves `crate::Thing`
+  unknown under `windows` rather than letting a later `windows` addition pair
+  as confirmed.
 - A region reaches an ancestor only through a proven re-export of a name whose
   origin lies inside it, and it covers its module under every public module
   alias.

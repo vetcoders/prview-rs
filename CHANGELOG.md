@@ -326,7 +326,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its unproven children, so one unresolved leaf in `lib.rs` no longer blocks
   new top-level modules. Its unknown records that name as a `bound-name:`
   evidence line, so renaming an unresolved re-export is now reported instead of
-  cancelling out as an unchanged proof.
+  cancelling out as an unchanged proof. A leaf whose path passes through such a
+  name (`pub use crate::ali::Thing` with `ali` unresolved under `windows`) is
+  itself unknown under that guard, even when another cfg variant of `ali`
+  resolves, so the narrower block cannot confirm an addition the hidden variant
+  may already provide.
 
 ## [0.8.0] - 2026-09-13
 

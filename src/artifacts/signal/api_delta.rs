@@ -1861,9 +1861,11 @@ fn blocking_region<'a>(
 /// Hidden content binds names only in its own module, below it only through
 /// modules the snapshot does not prove, and above it only through a
 /// re-export of a name that originates inside it. An unresolved named use
-/// leaf hides only the one name it binds. Inherent members and
-/// `#[macro_export]` macros are the exception: any module of the crate may
-/// contribute them.
+/// leaf hides only the one name it binds; a leaf that reaches that name
+/// through another cfg variant carries its own unknown from the snapshot.
+/// For unread or unexpanded source (`RegionReach::Items`), inherent members
+/// and crate-root `#[macro_export]` macros are the exception: any module of
+/// the crate may contribute them.
 fn region_may_cover(
     regions: &SnapshotRegions<'_>,
     unknown: &RustApiUnknown,
@@ -9856,6 +9858,58 @@ mod tests {
             "{:?}",
             delta.findings()
         );
+    }
+
+    #[test]
+    fn a_reexport_through_an_unresolved_alias_variant_stays_unknown() {
+        // Under `windows` the base binds `ali` to content it cannot resolve,
+        // so what `crate::Thing` names there is hidden, although the `unix`
+        // variant resolves `ali` and records `real` as the origin.
+        let base = "#[cfg(unix)] pub mod real { pub struct Thing; }\n\
+            #[cfg(unix)] pub use crate::real as ali;\n\
+            #[cfg(windows)] pub use crate::nowhere as ali;\n\
+            pub use crate::ali::Thing;\n";
+        let resolved = "#[cfg(unix)] pub mod real { pub struct Thing; }\n\
+            #[cfg(windows)] pub mod alt { pub struct Thing; }\n\
+            #[cfg(unix)] pub use crate::real as ali;\n\
+            #[cfg(windows)] pub use crate::alt as ali;\n\
+            pub use crate::ali::Thing;\n";
+        // The review's pair keeps the unresolved variant beside the new one.
+        let beside = "#[cfg(unix)] pub mod real { pub struct Thing; }\n\
+            #[cfg(windows)] pub mod alt { pub struct Thing; }\n\
+            #[cfg(unix)] pub use crate::real as ali;\n\
+            #[cfg(windows)] pub use crate::nowhere as ali;\n\
+            #[cfg(windows)] pub use crate::alt as ali;\n\
+            pub use crate::ali::Thing;\n";
+        for target in [resolved, beside] {
+            let delta = compare_rust_api(
+                &snapshot_rust_api(&MemorySource::source(base, "base")),
+                &snapshot_rust_api(&MemorySource::source(target, "target")),
+            );
+            let under_windows = |finding: &&ApiDeltaFinding| {
+                finding.identity.module_path.is_empty()
+                    && finding.identity.namespace == "type"
+                    && finding.identity.name == "Thing"
+                    && finding
+                        .identity
+                        .cfg_region
+                        .iter()
+                        .any(|guard| guard.contains("windows"))
+            };
+            assert!(
+                !delta.added.iter().any(|finding| under_windows(&finding)),
+                "{:?}",
+                delta.findings()
+            );
+            let finding = delta
+                .unknown
+                .iter()
+                .find(under_windows)
+                .unwrap_or_else(|| panic!("{:?}", delta.findings()));
+            if target == resolved {
+                assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+            }
+        }
     }
 
     #[test]

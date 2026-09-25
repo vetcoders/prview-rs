@@ -4038,6 +4038,8 @@ impl<'a> SnapshotBuilder<'a> {
                                     let suffix = &blocked_path[target_module_path.len()..];
                                     let mut blocked_external_path = external_module_path.clone();
                                     blocked_external_path.extend_from_slice(suffix);
+                                    // No `bound-name:` line: the overlap hides the
+                                    // whole module at that path, not one name.
                                     self.unknown_guarded(
                                         RustApiUnknownKind::AmbiguousReexport,
                                         Some(&edge.crate_name),
@@ -4428,15 +4430,19 @@ impl<'a> SnapshotBuilder<'a> {
             );
             return;
         }
-        for edge in self.uses.clone() {
-            for leaf in &edge.leaves {
+        let uses = self.uses.clone();
+        // What each unresolved leaf binds, as (crate, bound path, cfg guard).
+        let mut hidden: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+        let mut unresolved: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for (edge_index, edge) in uses.iter().enumerate() {
+            for (leaf_index, leaf) in edge.leaves.iter().enumerate() {
                 if !leaf.glob
-                    && self.resolve_use_leaf(&edge, leaf, &aliases).is_empty()
-                    && self.resolve_module_leaf(&edge, leaf).is_empty()
+                    && self.resolve_use_leaf(edge, leaf, &aliases).is_empty()
+                    && self.resolve_module_leaf(edge, leaf).is_empty()
                 {
-                    let kind = if self.looks_like_reexport_cycle(&edge, leaf) {
+                    let kind = if self.looks_like_reexport_cycle(edge, leaf) {
                         RustApiUnknownKind::ReexportCycle
-                    } else if self.looks_like_external_resolution(&edge, leaf) {
+                    } else if self.looks_like_external_resolution(edge, leaf) {
                         RustApiUnknownKind::UnsupportedExternResolution
                     } else {
                         RustApiUnknownKind::UnresolvedReexport
@@ -4449,6 +4455,58 @@ impl<'a> SnapshotBuilder<'a> {
                         &edge.cfg_guard,
                         with_bound_name(leaf.segments.join("::"), leaf),
                     );
+                    hidden.push((
+                        edge.crate_name.clone(),
+                        leaf_bound_path(edge, leaf),
+                        edge.cfg_guard.clone(),
+                    ));
+                    unresolved.insert((edge_index, leaf_index));
+                }
+            }
+        }
+        // A leaf that resolves through one variant of a name still passes,
+        // under an unresolved variant's guard, into whatever that variant
+        // binds. Its own binding is unknown there, and so is every leaf whose
+        // path passes through it in turn.
+        let mut passed: BTreeSet<(usize, usize, Vec<String>)> = BTreeSet::new();
+        let mut next = 0;
+        while let Some((crate_name, hidden_path, hidden_guard)) = hidden.get(next).cloned() {
+            next += 1;
+            for (edge_index, edge) in uses.iter().enumerate() {
+                if edge.crate_name != crate_name
+                    || guards_proven_disjoint(&hidden_guard, &edge.cfg_guard)
+                {
+                    continue;
+                }
+                for (leaf_index, leaf) in edge.leaves.iter().enumerate() {
+                    if leaf.glob
+                        || unresolved.contains(&(edge_index, leaf_index))
+                        || !use_candidate_paths(&edge.module_path, &leaf.segments)
+                            .iter()
+                            .any(|path| path.starts_with(&hidden_path))
+                    {
+                        continue;
+                    }
+                    let guard = combined_guards(&hidden_guard, &edge.cfg_guard);
+                    if !passed.insert((edge_index, leaf_index, guard.clone())) {
+                        continue;
+                    }
+                    self.unknown_guarded(
+                        RustApiUnknownKind::UnresolvedReexport,
+                        Some(&edge.crate_name),
+                        &edge.module_path,
+                        &edge.source_path,
+                        &guard,
+                        with_bound_name(
+                            format!(
+                                "{} passes through unresolved {}",
+                                leaf.segments.join("::"),
+                                hidden_path.join("::")
+                            ),
+                            leaf,
+                        ),
+                    );
+                    hidden.push((edge.crate_name.clone(), leaf_bound_path(edge, leaf), guard));
                 }
             }
         }
@@ -7387,6 +7445,13 @@ fn with_bound_name(evidence: String, leaf: &UseLeaf) -> String {
         "{evidence}\nbound-name:{}",
         normalize_identifier(&leaf.alias)
     )
+}
+
+/// The path at which a named use leaf binds its one name.
+fn leaf_bound_path(edge: &UseEdge, leaf: &UseLeaf) -> Vec<String> {
+    let mut path = edge.module_path.clone();
+    path.push(normalize_identifier(&leaf.alias));
+    path
 }
 
 fn use_candidate_paths(current: &[String], segments: &[String]) -> Vec<Vec<String>> {
@@ -17936,6 +18001,42 @@ mod tests {
                 .iter()
                 .any(|guard| guard.contains("generated"))
         );
+    }
+
+    #[test]
+    fn a_leaf_through_an_unresolved_variant_is_unknown_under_its_guard() {
+        let snapshot = snapshot_rust_api(&source(
+            "#[cfg(unix)] pub mod real { pub struct Thing; }\n\
+             #[cfg(unix)] pub use crate::real as ali;\n\
+             #[cfg(windows)] pub use crate::nowhere as ali;\n\
+             pub use crate::ali::Thing;\n\
+             pub use crate::ali as again;\n\
+             pub use crate::again::Thing as Twice;\n\
+             pub use crate::real::Thing as Direct;\n",
+        ));
+        let bound: Vec<_> = snapshot
+            .unknowns
+            .iter()
+            .filter(|unknown| unknown.kind == RustApiUnknownKind::UnresolvedReexport)
+            .filter_map(|unknown| {
+                let name = unknown
+                    .evidence
+                    .lines()
+                    .find_map(|line| line.strip_prefix("bound-name:"))?;
+                let windows = unknown
+                    .cfg_guard
+                    .iter()
+                    .any(|guard| guard.contains("windows"));
+                Some((name, windows))
+            })
+            .collect();
+        // The unresolved leaf, and every leaf whose path passes through it,
+        // directly or through another such leaf, under its guard.
+        for name in ["ali", "Thing", "again", "Twice"] {
+            assert!(bound.contains(&(name, true)), "{name}: {bound:?}");
+        }
+        // A leaf written through the resolved module does not pass through it.
+        assert!(bound.iter().all(|(name, _)| *name != "Direct"), "{bound:?}");
     }
 
     #[test]
