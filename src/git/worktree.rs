@@ -4,7 +4,6 @@
 //! local dependencies (node_modules, .venv) symlinked to preserve local caches.
 
 use super::cmd::git_cmd;
-#[cfg(unix)]
 use anyhow::Context;
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -565,9 +564,9 @@ const HOST_ELF_MACHINE: Option<u16> = None;
 /// kernel claims both.
 ///
 /// This branch models fewer fields than `binfmt_elf`'s full triage, and the
-/// gap is NOT uniformly conservative: one unmodelled exit is a real
-/// `-ENOEXEC`, hence a real `/bin/sh` path — a `PT_INTERP` whose `p_filesz`
-/// leaves `[2, PATH_MAX]`. An image with no `PT_LOAD` segment is NOT such a
+/// gap is NOT uniformly conservative: a malformed `PT_INTERP` can return
+/// `-ENOEXEC`, hence a real `/bin/sh` path. Its size, extent and terminating
+/// NUL are checked below. An image with no `PT_LOAD` segment is NOT such a
 /// path: the loader is already past `begin_new_exec()` by then, so it either
 /// execs and dies on its entry point or fails `-EINVAL`, and `execvp` retries
 /// only on `ENOEXEC`. One more real `-ENOEXEC` exit before that point of no
@@ -658,7 +657,39 @@ fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool 
     {
         return false;
     }
-    program_header_offset.saturating_add(table_bytes) <= length
+    if program_header_offset.saturating_add(table_bytes) > length {
+        return false;
+    }
+    const PT_INTERP: u32 = 3;
+    const PATH_MAX: u64 = 4096;
+    for index in 0..u64::from(program_headers) {
+        let offset = program_header_offset + index * u64::from(PROGRAM_HEADER_BYTES);
+        let mut program_header = [0u8; PROGRAM_HEADER_BYTES as usize];
+        if !read_header_at(file, offset, &mut program_header) {
+            return false;
+        }
+        if u32::from_le_bytes(program_header[..4].try_into().expect("four bytes")) != PT_INTERP {
+            continue;
+        }
+        let interpreter_offset =
+            u64::from_le_bytes(program_header[8..16].try_into().expect("eight bytes"));
+        let interpreter_bytes =
+            u64::from_le_bytes(program_header[32..40].try_into().expect("eight bytes"));
+        if !(2..=PATH_MAX).contains(&interpreter_bytes)
+            || interpreter_offset
+                .checked_add(interpreter_bytes)
+                .is_none_or(|end| end > length)
+        {
+            return false;
+        }
+        let mut last = [0u8; 1];
+        if !read_header_at(file, interpreter_offset + interpreter_bytes - 1, &mut last)
+            || last[0] != 0
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Every other Unix: no proof path, so no file is ever proved target-only by
@@ -1195,6 +1226,163 @@ impl WorktreeSnapshot {
     }
 }
 
+/// Inspect the pinned tree before extracting its archive. Git trees cannot
+/// contain children below a symlink, but checking that invariant before tar
+/// runs keeps extraction fail-closed even for malformed imported objects.
+fn pinned_gitlinks(
+    source_repo: &git2::Repository,
+    commit: git2::Oid,
+    validate_archive: bool,
+) -> Result<Vec<(PathBuf, git2::Oid)>> {
+    let tree = source_repo.find_commit(commit)?.tree()?;
+    let mut links = Vec::new();
+    let mut archive_paths = std::collections::BTreeSet::new();
+    let mut symlinks = Vec::new();
+    let mut unreadable_path = false;
+    tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+        let Some(name) = entry.name() else {
+            if entry.kind() == Some(git2::ObjectType::Tree)
+                || entry.kind() == Some(git2::ObjectType::Commit)
+                || validate_archive
+            {
+                unreadable_path = true;
+                return git2::TreeWalkResult::Abort;
+            }
+            return git2::TreeWalkResult::Ok;
+        };
+        let path = format!("{dir}{name}");
+        if validate_archive {
+            archive_paths.insert(path.clone());
+            if entry.filemode() == 0o120000 {
+                symlinks.push(path.clone());
+            }
+        }
+        if entry.kind() == Some(git2::ObjectType::Commit) {
+            links.push((PathBuf::from(path), entry.id()));
+        }
+        git2::TreeWalkResult::Ok
+    })
+    .or_else(|error| {
+        if unreadable_path {
+            anyhow::bail!("cannot materialize non-UTF-8 submodule path in exact snapshot")
+        }
+        Err(error.into())
+    })?;
+    for path in &archive_paths {
+        crate::paths::validate_repo_relative_str(path)?;
+        anyhow::ensure!(
+            !Path::new(path)
+                .components()
+                .any(|part| part.as_os_str() == ".git"),
+            "submodule archive contains Git administrative path: {path}"
+        );
+    }
+    for link in symlinks {
+        let prefix = format!("{link}/");
+        anyhow::ensure!(
+            !archive_paths
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|path| path.starts_with(&prefix)),
+            "submodule archive would extract through symlink: {link}"
+        );
+    }
+    Ok(links)
+}
+
+/// Expand gitlinks from local object stores at their pinned commit IDs. This
+/// never fetches or reads uncommitted submodule contents from the operator's
+/// checkout. Missing objects are a hard error: an empty gitlink directory is
+/// not the exact target tree.
+fn materialize_pinned_gitlinks(
+    source_repo: &git2::Repository,
+    operator_root: &Path,
+    commit: git2::Oid,
+    snapshot_root: &Path,
+    depth: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        depth < 16,
+        "nested submodule depth exceeds offline snapshot limit"
+    );
+    let links = pinned_gitlinks(source_repo, commit, false)?;
+
+    for (relative, pinned_oid) in links {
+        let relative_str = relative
+            .to_str()
+            .context("non-UTF-8 submodule path in exact snapshot")?;
+        crate::paths::validate_repo_relative_str(relative_str)?;
+        let operator_submodule = operator_root.join(&relative);
+        let module_store = source_repo.commondir().join("modules").join(&relative);
+        let sub_repo = git2::Repository::open(&operator_submodule)
+            .ok()
+            .filter(|repo| repo.find_commit(pinned_oid).is_ok())
+            .or_else(|| {
+                git2::Repository::open(&module_store)
+                    .ok()
+                    .filter(|repo| repo.find_commit(pinned_oid).is_ok())
+            })
+            .with_context(|| {
+                format!(
+                    "submodule {} has no local object store containing pinned commit {}; exact snapshot cannot fetch it",
+                    relative.display(), pinned_oid
+                )
+            })?;
+        pinned_gitlinks(&sub_repo, pinned_oid, true)?;
+
+        let mut destination = snapshot_root.to_path_buf();
+        for component in relative.components() {
+            destination.push(component);
+            match std::fs::symlink_metadata(&destination) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => anyhow::bail!(
+                    "submodule destination is not a directory in exact snapshot: {}",
+                    destination.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&destination)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::ensure!(
+            std::fs::read_dir(&destination)?.next().is_none(),
+            "submodule destination is not empty in exact snapshot: {}",
+            destination.display()
+        );
+        let mut archive = git_cmd();
+        archive
+            .arg("--git-dir")
+            .arg(sub_repo.path())
+            .arg("archive")
+            .arg(pinned_oid.to_string());
+        let mut extract = std::process::Command::new("tar");
+        extract.arg("-x").arg("-C").arg(&destination);
+        let (archive_status, extract_status) = crate::proc::run_pipeline_governed(
+            archive,
+            extract,
+            "git archive pinned submodule",
+            "tar extract pinned submodule",
+        )?;
+        anyhow::ensure!(
+            archive_status.success() && extract_status.success(),
+            "failed to materialize pinned submodule {} at {} (archive: {:?}, extract: {:?})",
+            relative.display(),
+            pinned_oid,
+            archive_status.code(),
+            extract_status.code()
+        );
+        materialize_pinned_gitlinks(
+            &sub_repo,
+            &operator_submodule,
+            pinned_oid,
+            &destination,
+            depth + 1,
+        )?;
+    }
+    Ok(())
+}
+
 /// Create an ephemeral detached worktree of `commit` under a fresh temp dir.
 pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<WorktreeSnapshot> {
     // Resolve symbolic inputs once, before creating the checkout. All later
@@ -1240,6 +1428,15 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("git worktree add failed: {}", stderr.trim());
     }
+
+    let source_repo = git2::Repository::discover(repo_root)?;
+    materialize_pinned_gitlinks(
+        &source_repo,
+        repo_root,
+        git2::Oid::from_str(&original_target_sha)?,
+        &worktree_path,
+        0,
+    )?;
 
     // Symlink untracked dependencies (node_modules and .venv) to bypass reinstall overhead.
     // A failed borrow is terminal instead of silently leaving a snapshot whose
@@ -1822,6 +2019,51 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_elf_interpreter_cannot_certify_a_snapshot_scan() {
+        let Some(host_machine) = HOST_ELF_MACHINE else {
+            return;
+        };
+        let relative = Path::new("node_modules/.bin/eslint");
+        let mut valid = synthetic_host_elf(host_machine, 3, 56, 9);
+        let interpreter_offset = 64 + 56 * 9;
+        valid[64..68].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        valid[72..80].copy_from_slice(&(interpreter_offset as u64).to_le_bytes());
+        valid[96..104].copy_from_slice(&2u64.to_le_bytes());
+        valid[interpreter_offset..interpreter_offset + 2].copy_from_slice(b"/\0");
+        let (_tmp, root) = snapshot_with_tool(&valid);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly
+        );
+
+        let mut too_short = valid.clone();
+        too_short[96..104].copy_from_slice(&1u64.to_le_bytes());
+        let (_tmp, root) = snapshot_with_tool(&too_short);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven
+        );
+
+        let mut not_terminated = valid.clone();
+        not_terminated[interpreter_offset + 1] = b'x';
+        let (_tmp, root) = snapshot_with_tool(&not_terminated);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven
+        );
+
+        let mut too_long = valid;
+        too_long.resize(interpreter_offset + 4097, 0);
+        too_long[96..104].copy_from_slice(&4097u64.to_le_bytes());
+        let (_tmp, root) = snapshot_with_tool(&too_long);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven
+        );
+    }
+
     /// `e_phnum` is bounded from ABOVE as well as from below: `load_elf_phdrs()`
     /// computes `sizeof(Elf64_Phdr) * e_phnum` and refuses the image when that
     /// product is `0` or greater than 65536 — the same `goto out`, the same
@@ -2034,6 +2276,173 @@ mod tests {
                     .to_path_buf()
             })
             .collect()
+    }
+
+    #[test]
+    fn exact_snapshot_materializes_pinned_local_submodule_bytes() {
+        let (super_tmp, super_repo) = repo_with_commit();
+        let sub_path = super_tmp.path().join("module");
+        std::fs::create_dir(&sub_path).unwrap();
+        let sub_repo = git2::Repository::init(&sub_path).unwrap();
+        std::fs::write(sub_path.join("payload.txt"), "committed\n").unwrap();
+        #[cfg(unix)]
+        let external = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            std::fs::write(external.path().join("sentinel.txt"), "operator-owned\n").unwrap();
+            symlink(external.path(), sub_path.join("escape")).unwrap();
+        }
+        let mut sub_index = sub_repo.index().unwrap();
+        sub_index.add_path(Path::new("payload.txt")).unwrap();
+        #[cfg(unix)]
+        sub_index.add_path(Path::new("escape")).unwrap();
+        let sub_tree_oid = sub_index.write_tree().unwrap();
+        let sub_tree = sub_repo.find_tree(sub_tree_oid).unwrap();
+        #[cfg(unix)]
+        assert_eq!(sub_tree.get_name("escape").unwrap().filemode(), 0o120000);
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let sub_oid = sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "submodule",
+                &sub_tree,
+                &[],
+            )
+            .unwrap();
+
+        let parent = super_repo.head().unwrap().peel_to_commit().unwrap();
+        let mut builder = super_repo
+            .treebuilder(Some(&parent.tree().unwrap()))
+            .unwrap();
+        builder.insert("module", sub_oid, 0o160000).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = super_repo.find_tree(tree_oid).unwrap();
+        super_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "gitlink",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        // Advance the submodule's own HEAD. The superproject still pins the
+        // earlier object, so archiving the symbolic submodule HEAD is wrong.
+        std::fs::write(sub_path.join("payload.txt"), "new submodule HEAD\n").unwrap();
+        sub_index.add_path(Path::new("payload.txt")).unwrap();
+        let next_tree_oid = sub_index.write_tree().unwrap();
+        let next_tree = sub_repo.find_tree(next_tree_oid).unwrap();
+        let sub_parent = sub_repo.find_commit(sub_oid).unwrap();
+        sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "submodule advanced",
+                &next_tree,
+                &[&sub_parent],
+            )
+            .unwrap();
+        std::fs::write(sub_path.join("payload.txt"), "operator dirty\n").unwrap();
+
+        let snapshot = create_worktree_snapshot(super_tmp.path(), "HEAD").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(snapshot.worktree_path.join("module/payload.txt")).unwrap(),
+            "committed\n",
+            "snapshot must archive pinned gitlink bytes, never the operator checkout"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_to_string(external.path().join("sentinel.txt")).unwrap(),
+            "operator-owned\n",
+            "a symlink in the archive must not redirect extraction outside the gitlink path"
+        );
+    }
+
+    #[test]
+    fn exact_snapshot_fails_when_pinned_submodule_objects_are_missing() {
+        let (super_tmp, super_repo) = repo_with_commit();
+        let parent = super_repo.head().unwrap().peel_to_commit().unwrap();
+        let absent = git2::Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let mut builder = super_repo
+            .treebuilder(Some(&parent.tree().unwrap()))
+            .unwrap();
+        builder.insert("module", absent, 0o160000).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = super_repo.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        super_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "missing gitlink",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let error = create_worktree_snapshot(super_tmp.path(), "HEAD")
+            .err()
+            .expect("missing local gitlink objects must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("submodule module"), "{message}");
+        assert!(message.contains("local object store"), "{message}");
+    }
+
+    #[test]
+    fn exact_snapshot_can_use_local_module_store_without_operator_checkout() {
+        let (super_tmp, _super_repo) = repo_with_commit();
+        let sub_tmp = tempfile::tempdir().unwrap();
+        let sub_repo = git2::Repository::init(sub_tmp.path()).unwrap();
+        std::fs::write(sub_tmp.path().join("payload.txt"), "pinned\n").unwrap();
+        let mut index = sub_repo.index().unwrap();
+        index.add_path(Path::new("payload.txt")).unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = sub_repo.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "submodule",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let output = git_cmd()
+            .args(["-c", "protocol.file.allow=always", "submodule", "add"])
+            .arg(sub_tmp.path())
+            .arg("module")
+            .current_dir(super_tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = git_cmd()
+            .args(["commit", "-qm", "gitlink"])
+            .current_dir(super_tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(super_tmp.path().join("module")).unwrap();
+
+        let snapshot = create_worktree_snapshot(super_tmp.path(), "HEAD").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(snapshot.worktree_path.join("module/payload.txt")).unwrap(),
+            "pinned\n"
+        );
     }
 
     #[test]

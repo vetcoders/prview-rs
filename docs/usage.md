@@ -45,6 +45,10 @@ files in the pinned Git tree. A committed symlink to a marker or source path
 does not make the operator's files part of the target profile. Uncommitted
 additions or deletions in the checkout cannot change that profile. The TUI
 uses the same profile selection as headless runs.
+Exact target snapshots expand committed submodules from local pinned Git
+objects without fetching. If the pinned submodule commit is unavailable
+locally, the review stops with its path and object ID rather than scanning an
+empty submodule directory.
 Its header and check list refresh before checks start, including when a later
 analysis in the same TUI session selects a different target.
 An ordinary target-less local review uses the live checkout. `--profile` still

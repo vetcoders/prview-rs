@@ -353,6 +353,9 @@ reason the local reading below gives; libgit2 also drops a deleted
 assume-unchanged entry from the index-to-worktree diff (`diff_delta__from_one`).
 The boundaries are unioned over the whole run rather than cut at the audit, so
 a rewrite by a later check withholds the proof too — deliberately conservative.
+A same-`HEAD` exact review also uses this snapshot observation. Equality between
+the operator's `HEAD` and target SHA does not make cargo-audit read the operator
+checkout when the run materialized a target snapshot.
 A local run reads the audited lock once more after the checks, with a diff
 narrowed to that one path against the target commit and untracked files excluded — the in-repo output and check caches
 R4-19 guards against cannot reach that one tracked file — and a lock that
@@ -947,9 +950,10 @@ but not executable, so they are the fallback vector rather than evidence:
   special case, because extended numbering exists only in the kernel's
   core-dump writer and the load path simply multiplies. This branch models
   fewer fields than `binfmt_elf`'s full triage, and the gap is **not**
-  uniformly conservative. A `PT_INTERP` whose `p_filesz` leaves
-  `[2, PATH_MAX]` is a real `ENOEXEC` exit, hence a real `/bin/sh` path, and so
-  is `!can_mmap_file()` — which is not a header field at all, so no header
+  uniformly conservative. The validator checks each `PT_INTERP` size against
+  `[2, PATH_MAX]`, its in-file extent and terminating NUL; malformed entries
+  return `ENOEXEC` and would reach `/bin/sh`. So does `!can_mmap_file()` — which
+  is not a header field at all, so no header
   validator models it. An image with **no `PT_LOAD` segment is not** such a
   path: by then the loader is already past `begin_new_exec()`, so it either
   execs and dies on its entry point or fails `EINVAL`, and `execvp` retries
@@ -1479,14 +1483,16 @@ failed, the lookup missed, and the most expensive gates in the tool recomputed
 on every review of a workspace member. The same encoding removes the colon these
 keys carried, which is an illegal file-name character on Windows.
 
-**Known limitation — submodules.** `create_worktree_snapshot()` runs
-`git worktree add` only, so gitlink directories stay empty. A Cargo workspace
-whose member or path dependency lives in a submodule therefore reports a missing
-manifest in an off-`HEAD` review, even though the reviewed commit builds in a
-checkout with its submodules initialised. Materialising them in the snapshot
-means a `git submodule update --init` per run — network-capable, unbounded, and
-writing into the superproject's module store while the operator works in it —
-so it is deliberately deferred rather than smuggled into a review path.
+**Pinned submodules.** After `git worktree add`, an exact snapshot expands each
+gitlink at its committed object ID with `git archive` from an initialized local
+submodule or its local module store. Nested gitlinks use the same rule, with a
+depth bound. It never fetches or copies uncommitted submodule worktree bytes.
+Before extraction, archive entries must be repository-relative and cannot
+descend through a symlink or write Git administrative paths. Each recursive
+layer uses that layer's pinned gitlink object ID, never its symbolic `HEAD`.
+If a pinned object is unavailable locally, snapshot creation fails with the
+submodule path and object ID instead of publishing an empty directory as the
+reviewed tree.
 
 #### Check provenance
 
