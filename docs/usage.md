@@ -1286,7 +1286,8 @@ quality, policy, and permission axes beside that explanation.
   be read as UTF-8 likewise emits a `pr_checklist` warning, including a broken symlink. Only the
   checklist inside the final generated PR Template's fenced block is read; the preceding separator anchors
   it even when earlier diagnostic text or a newline-containing Git path quotes the complete template
-  signature. An appended complete PR Template makes every item unreadable, as does a second line naming the same item for that
+  signature. File paths are escaped onto one line before rendering. A second complete PR Template
+  makes every item unreadable, as does a second line naming the same item for that
   item. Only without `PR_REVIEW.md` or `report.json` is nothing compared. In a normal
   run both sides come from the same check results, so this catches the rendered checklist diverging from
   the statuses (a rendering regression, or an artifact edited or damaged after the run), not a check filed

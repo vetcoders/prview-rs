@@ -3781,7 +3781,8 @@ reads only the checklist inside the PR Template's fenced block — the
 `## Checklist` heading under the final generated `## PR Template` heading and its
 preceding separator, up to the block's closing fence — so even a complete
 signature in an earlier newline-containing Git path cannot stand in for the
-template; an appended complete PR Template, or a second `## Checklist` inside it, leaves every
+template. Git paths are escaped onto one line before rendering; a second
+complete PR Template, or a second `## Checklist` inside it, leaves every
 item unreadable. Inside that section each item may be named by exactly one
 line, `- [x] <label>` or `- [ ] <label>`: a second line naming the same item (a
 duplicate, a contradicting copy, or a variant spelling) leaves that item

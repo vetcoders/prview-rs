@@ -8466,6 +8466,49 @@ fn cached_check_results_do_not_earn_executed_check_claims() {
     assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
 }
 
+/// A Git filename can contain a complete Markdown template. Render it on one
+/// escaped line so the real tail stays the only complete checklist candidate.
+#[test]
+fn multiline_git_path_cannot_create_another_pr_template() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = create_test_config(PolicyConfig::default());
+    let mut diff = source_only_diff("base", "target");
+    diff.files[0].path = "x\n---\n\n## PR Template\n\n_Copy below for GitHub PR description:_\n\n```markdown\n## Checklist\n- [x] No lint errors\n```".to_string();
+    generate_pr_review(
+        tmp.path(),
+        &config,
+        &[diff],
+        &[],
+        &[],
+        &CoverageDelta {
+            total_source: 0,
+            covered_count: 0,
+            pct: None,
+            uncovered: vec![],
+            covered: vec![],
+            non_code_count: 0,
+            ghost_tests: vec![],
+        },
+        None,
+    )
+    .unwrap();
+    let content = fs::read_to_string(tmp.path().join("PR_REVIEW.md")).unwrap();
+    assert_eq!(
+        content
+            .lines()
+            .filter(|line| *line == "## PR Template")
+            .count(),
+        1,
+        "{content}"
+    );
+    assert!(content.contains("x\\n---\\n\\n## PR Template"), "{content}");
+    assert!(
+        parse_pr_checklist(&content)
+            .iter()
+            .all(|(_, mark)| mark.is_some())
+    );
+}
+
 // --- Cargo audit lock-based pre-existing proof, through the real pack path ---
 
 fn cargo_audit_pack_check() -> CheckResult {

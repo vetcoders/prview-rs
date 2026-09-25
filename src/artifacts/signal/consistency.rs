@@ -908,8 +908,8 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
         assert_eq!(report.warnings[0].sources[0].value, "[x]", "{report:?}");
     }
 
-    /// A complete template appended after the generated tail without its
-    /// separator, or a second checklist inside the tail, is ambiguous.
+    /// A second complete generated template (with or without its separator),
+    /// or a second checklist inside the tail, remains ambiguous.
     #[test]
     fn an_ambiguous_pr_template_checklist_is_unreadable_not_guessed() {
         let dir = tempfile::tempdir().unwrap();
@@ -921,6 +921,8 @@ _Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
             "- [ ] Manually tested\n## Checklist\n- [ ] No lint errors\n",
         );
         for pr_review in [
+            format!("# R\n\n{INCIDENT_PR_TEMPLATE}\n{honest}"),
+            format!("# R\n\n{honest}\n{INCIDENT_PR_TEMPLATE}"),
             format!(
                 "# R\n\n{INCIDENT_PR_TEMPLATE}\n{}",
                 honest.trim_start_matches("---\n\n")

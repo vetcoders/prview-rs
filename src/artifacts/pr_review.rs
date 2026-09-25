@@ -173,7 +173,7 @@ pub(crate) fn derive_pr_checklist(
 /// the next level-2 heading or the block's closing fence. A `## Checklist`
 /// anywhere else — check-derived text above
 /// the template, or anything appended after its closing fence — is not the
-/// template's checklist and cannot stand in for it. An appended complete PR
+/// template's checklist and cannot stand in for it. A second complete PR
 /// Template, or a template with more than one `## Checklist`,
 /// is ambiguous and yields no section.
 ///
@@ -220,8 +220,10 @@ fn pr_checklist_mark(line: &str, item: PrChecklistItem) -> Option<bool> {
 /// ambiguous.
 fn pr_template_checklist(pr_review: &str) -> Option<Vec<&str>> {
     let lines: Vec<&str> = pr_review.lines().collect();
-    // The generator appends a separator and then its template. Text above it,
-    // including raw Git paths with newlines, may quote the entire signature.
+    // The generator appends a separator and then its template. An earlier
+    // diagnostic can quote the signature, but without a complete checklist it
+    // is not a template. File paths are escaped before rendering, and two
+    // complete templates remain ambiguous.
     let signature = [
         "## PR Template",
         "",
@@ -229,22 +231,32 @@ fn pr_template_checklist(pr_review: &str) -> Option<Vec<&str>> {
         "",
         "```markdown",
     ];
-    let heading = (2..lines.len()).rev().find(|&i| {
-        lines[i - 2] == "---"
-            && lines[i - 1].is_empty()
-            && lines.get(i..i + signature.len()) == Some(signature.as_slice())
-    })?;
-    let after = &lines[heading + 1..];
-    let open = after
-        .iter()
-        .take_while(|line| !line.starts_with("## "))
-        .position(|line| *line == "```markdown")?;
-    let body = &after[open + 1..];
-    let close = body.iter().position(|line| line.starts_with("```"))?;
-    let block = &body[..close];
-    // A later whole template is artifact tampering; a prior one may be a
-    // quoted diagnostic or filename, so only the generated tail is selected.
-    if body[close + 1..]
+    let candidates: Vec<_> = (2..lines.len())
+        .filter(|&i| {
+            lines[i - 2] == "---"
+                && lines[i - 1].is_empty()
+                && lines.get(i..i + signature.len()) == Some(signature.as_slice())
+        })
+        .filter_map(|heading| {
+            let after = &lines[heading + 1..];
+            let open = after
+                .iter()
+                .take_while(|line| !line.starts_with("## "))
+                .position(|line| *line == "```markdown")?;
+            let body = &after[open + 1..];
+            let close = body.iter().position(|line| line.starts_with("```"))?;
+            let block = &body[..close];
+            block
+                .contains(&"## Checklist")
+                .then_some((block, heading + open + close + 2))
+        })
+        .collect();
+    let [(block, close_line)] = candidates.as_slice() else {
+        return None;
+    };
+    // An unanchored complete template appended after the real tail is also
+    // ambiguous; ordinary trailing narrative cannot provide checklist lines.
+    if lines[*close_line + 1..]
         .windows(signature.len())
         .any(|window| window == signature.as_slice())
     {
@@ -425,7 +437,13 @@ pub(crate) fn generate_pr_review(
             .iter()
             .filter(|file| file.additions + file.deletions >= 80)
             .take(3)
-            .map(|file| format!("`{}` ({})", file.path, file.additions + file.deletions))
+            .map(|file| {
+                format!(
+                    "`{}` ({})",
+                    file.path.escape_debug(),
+                    file.additions + file.deletions
+                )
+            })
             .collect();
         if !top_hotspots.is_empty() {
             writeln!(md, "- Top hotspots: {}", top_hotspots.join(", "))?;
@@ -477,7 +495,10 @@ pub(crate) fn generate_pr_review(
             crate::git::FileStatus::Renamed => 'R',
             crate::git::FileStatus::Copied => 'C',
         };
-        writeln!(md, "{}\t{}", status_char, f.path)?;
+        // Git paths may contain newlines and even a whole Markdown template.
+        // Keep each path on one visible line so it cannot create artifact
+        // headings, fences or checklist claims of its own.
+        writeln!(md, "{}\t{}", status_char, f.path.escape_debug())?;
     }
     writeln!(md, "```")?;
     writeln!(md, "</details>")?;

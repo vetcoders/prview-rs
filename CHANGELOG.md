@@ -252,7 +252,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checklist comparison with an explicit warning. An unreadable `PR_REVIEW.md`
   does the same instead of passing as an absent checklist.
   Template parsing now anchors to the final generated separator, so a
-  newline-containing Git path cannot impersonate a second template. Cached
+  newline-containing Git path cannot impersonate a second template; paths are
+  rendered with escaped control characters on one line. A genuinely duplicated
+  complete template remains unreadable. Cached
   check replays no longer count as execution toward an auto-ticked claim;
   their serialized `cached` flags are checked alongside statuses.
 - A `Cargo audit` failure whose advisories the baseline already proved
