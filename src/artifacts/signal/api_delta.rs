@@ -1768,7 +1768,8 @@ fn consume_one_sided_ambiguities(
 enum RegionReach {
     /// Manifest- or crate-level uncertainty: anything in the crate.
     Crate,
-    /// Unresolved re-exports: names bound in the re-exporting module.
+    /// Unresolved re-exports: names bound in the re-exporting module, only
+    /// the recorded one for a named leaf.
     Names,
     /// Unread source or unexpanded output: items in its module, plus the
     /// inherent members and exported macros any module can contribute.
@@ -1859,7 +1860,8 @@ fn blocking_region<'a>(
 ///
 /// Hidden content binds names only in its own module, below it only through
 /// modules the snapshot does not prove, and above it only through a
-/// re-export of a name that originates inside it. Inherent members and
+/// re-export of a name that originates inside it. An unresolved named use
+/// leaf hides only the one name it binds. Inherent members and
 /// `#[macro_export]` macros are the exception: any module of the crate may
 /// contribute them.
 fn region_may_cover(
@@ -1897,11 +1899,33 @@ fn region_may_cover(
             candidates.push(projected);
         }
     }
+    // A named use leaf binds exactly one name in its module, which the
+    // snapshot records; its unknown hides that name and what lies below it.
+    // Only re-export evidence is read for it: that evidence is built from
+    // path identifiers, so no source text can forge the line.
+    let leaf_name = if reach == RegionReach::Names {
+        unknown
+            .evidence
+            .lines()
+            .find_map(|line| line.strip_prefix("bound-name:"))
+    } else {
+        None
+    };
     let within_region = candidates.iter().any(|path| {
-        path.starts_with(region)
-            && path
-                .get(region.len())
-                .is_none_or(|child| !regions.child_module_is_fixed(crate_name, region, child))
+        if !path.starts_with(region) {
+            return false;
+        }
+        match path.get(region.len()) {
+            Some(child) => {
+                leaf_name.is_none_or(|name| child.as_str() == name)
+                    && !regions.child_module_is_fixed(crate_name, region, child)
+            }
+            // Bound in the region module itself. A module identity here is
+            // that module, which no use leaf inside it declares.
+            None => leaf_name.is_none_or(|name| {
+                identity.namespace != "module" && identity.name.split("::").next() == Some(name)
+            }),
+        }
     });
     if within_region {
         return true;
@@ -9765,6 +9789,64 @@ mod tests {
         let finding = finding_at(&delta.unknown, &[], "value", "root_added")
             .unwrap_or_else(|| panic!("{:?}", delta.findings()));
         assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+    }
+
+    #[test]
+    fn an_unresolved_named_reexport_hides_only_the_name_it_binds() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::{Thing as Renamed, deep};\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub struct Renamed;\npub struct Thing;\npub mod deep { pub fn inside() {} }\npub mod fresh { pub fn inside() {} }\n",
+                "target",
+            )),
+        );
+        // A leaf binds its rename, not the last segment of its source path.
+        let root: &[&str] = &[];
+        for (module_path, namespace, name) in [
+            (root, "type", "Thing"),
+            (root, "module", "fresh"),
+            (&["fresh"][..], "value", "inside"),
+        ] {
+            assert!(
+                finding_at(&delta.added, module_path, namespace, name).is_some(),
+                "{name}: {:?}",
+                delta.findings()
+            );
+        }
+        for (module_path, namespace, name) in [
+            (root, "type", "Renamed"),
+            (root, "module", "deep"),
+            (&["deep"][..], "value", "inside"),
+        ] {
+            let finding = finding_at(&delta.unknown, module_path, namespace, name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn renaming_an_unresolved_reexport_is_not_neutralized() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::Thing as Before;\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::Thing as After;\n",
+                "target",
+            )),
+        );
+        assert!(
+            delta.unknown.iter().any(|finding| {
+                finding.identity.namespace == "unknown"
+                    && finding.identity.name == "UnresolvedReexport"
+            }),
+            "{:?}",
+            delta.findings()
+        );
     }
 
     #[test]

@@ -321,6 +321,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `include!` in `lib.rs` previously turned every added, removed, or changed fact
   of the crate into an unknown. Region-blocked unknowns now name the blocking
   region's kind, crate, and module and carry its `unknown_source`.
+- An unresolved, ambiguous, or cyclic named re-export (`pub use a::{B, C as D}`)
+  blocks only the one name it binds instead of every name of its module and
+  its unproven children, so one unresolved leaf in `lib.rs` no longer blocks
+  new top-level modules. Its unknown records that name as a `bound-name:`
+  evidence line, so renaming an unresolved re-export is now reported instead of
+  cancelling out as an unchanged proof.
 
 ## [0.8.0] - 2026-09-13
 

@@ -2803,7 +2803,10 @@ overlap the identity's cfg region:
   members and crate-root `#[macro_export]` macros anywhere in its crate,
   because any module can contribute them.
 - Unresolved re-exports (glob, unresolved, ambiguous, cyclic) bind names only
-  in the re-exporting module and its unproven descendants.
+  in the re-exporting module and its unproven descendants. A glob may bind any
+  name there. A named use leaf binds exactly one name, its rename if it has
+  one, which the snapshot records as a `bound-name:` evidence line, so the
+  leaf hides only that name and what lies below it.
 - A region reaches an ancestor only through a proven re-export of a name whose
   origin lies inside it, and it covers its module under every public module
   alias.
@@ -2825,6 +2828,8 @@ region's own proof was neutralized. Standalone unknown findings retain their sou
 provenance. Before those findings are emitted, identical one-to-one unknown
 proofs on base and target cancel out: kind, crate/module, cfg guard, evidence,
 and provenance class must match, and each proof must belong to its own snapshot.
+Because a named use leaf's evidence carries the name it binds, renaming an
+unresolved re-export changes its proof and never cancels out.
 An unresolved custom-cfg authority proof is structurally non-neutralizable even
 when its diagnostic text matches on both sides. A complete unchanged authority
 digest may neutralize; a changed digest remains review-required uncertainty.

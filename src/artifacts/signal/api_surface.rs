@@ -3890,9 +3890,12 @@ impl<'a> SnapshotBuilder<'a> {
                                 &edge.module_path,
                                 &edge.source_path,
                                 &edge.cfg_guard,
-                                format!(
-                                    "{} has conflicting relative/root module origins",
-                                    leaf.segments.join("::")
+                                with_bound_name(
+                                    format!(
+                                        "{} has conflicting relative/root module origins",
+                                        leaf.segments.join("::")
+                                    ),
+                                    leaf,
                                 ),
                             );
                             module_candidates.clear();
@@ -3928,7 +3931,7 @@ impl<'a> SnapshotBuilder<'a> {
                                         &edge.module_path,
                                         &edge.source_path,
                                         &target_guard,
-                                        evidence,
+                                        with_bound_name(evidence, leaf),
                                     );
                                 }
                                 continue;
@@ -4002,9 +4005,12 @@ impl<'a> SnapshotBuilder<'a> {
                                         &edge.module_path,
                                         &edge.source_path,
                                         &ambiguity_guard,
-                                        format!(
-                                            "module alias {} has conflicting origins",
-                                            alias.module_path.join("::")
+                                        with_bound_name(
+                                            format!(
+                                                "module alias {} has conflicting origins",
+                                                alias.module_path.join("::")
+                                            ),
+                                            leaf,
                                         ),
                                     );
                                 }
@@ -4298,7 +4304,13 @@ impl<'a> SnapshotBuilder<'a> {
                             &edge.module_path,
                             &edge.source_path,
                             guards,
-                            format!("{} is ambiguous in {namespace:?}", leaf.segments.join("::")),
+                            with_bound_name(
+                                format!(
+                                    "{} is ambiguous in {namespace:?}",
+                                    leaf.segments.join("::")
+                                ),
+                                leaf,
+                            ),
                         );
                     }
                     for raw in prepared {
@@ -4345,9 +4357,12 @@ impl<'a> SnapshotBuilder<'a> {
                                     &edge.module_path,
                                     &edge.source_path,
                                     &ambiguity_guard,
-                                    format!(
-                                        "symbol alias {alias_name} has conflicting origins in {:?}",
-                                        raw.key.namespace
+                                    with_bound_name(
+                                        format!(
+                                            "symbol alias {alias_name} has conflicting origins in {:?}",
+                                            raw.key.namespace
+                                        ),
+                                        leaf,
                                     ),
                                 );
                             }
@@ -4432,7 +4447,7 @@ impl<'a> SnapshotBuilder<'a> {
                         &edge.module_path,
                         &edge.source_path,
                         &edge.cfg_guard,
-                        leaf.segments.join("::"),
+                        with_bound_name(leaf.segments.join("::"), leaf),
                     );
                 }
             }
@@ -7362,6 +7377,16 @@ fn flatten_use_tree(tree: &UseTree, prefix: Vec<String>, output: &mut Vec<UseLea
             }
         }
     }
+}
+
+/// Records on a named use leaf's unknown the one name the leaf binds in its
+/// module (its rename, if any), so a consumer can bound what the unresolved
+/// or ambiguous leaf may hide. Globs bind every name and carry no such line.
+fn with_bound_name(evidence: String, leaf: &UseLeaf) -> String {
+    format!(
+        "{evidence}\nbound-name:{}",
+        normalize_identifier(&leaf.alias)
+    )
 }
 
 fn use_candidate_paths(current: &[String], segments: &[String]) -> Vec<Vec<String>> {
@@ -18923,7 +18948,8 @@ mod tests {
             .iter()
             .filter(|unknown| {
                 unknown.kind == RustApiUnknownKind::AmbiguousReexport
-                    && unknown.evidence == "module alias public has conflicting origins"
+                    && unknown.evidence
+                        == "module alias public has conflicting origins\nbound-name:public"
             })
             .map(|unknown| unknown.cfg_guard.clone())
             .collect();
