@@ -53,6 +53,40 @@ fn run_headless_sync_stage<T>(
     result
 }
 
+/// Use the selected check/context tree for a local or exact-target run.
+async fn run_local_heuristics(
+    config: &Config,
+    target_commit: &str,
+) -> Result<heuristics::HeuristicsResult> {
+    let mut result = heuristics::run_all(config, config.scan_dir_override.as_deref()).await?;
+    if config.scan_dir_override.is_some() {
+        result.analysis_sha = Some(target_commit.to_owned());
+    }
+    Ok(result)
+}
+
+/// Select one project profile from the tree this run reviews, before choosing
+/// checks or writing profile-dependent artifacts. The ledger keeps an exact
+/// target snapshot alive through both stages.
+pub(crate) fn prepare_review_profile(
+    config: &mut Config,
+    ledger: &ledger::TaskLedger,
+) -> Result<()> {
+    match checks::review_substrate(config)? {
+        checks::ReviewSubstrate::ExactTarget(target) => {
+            let plan = checks::plan_check_run(config)?;
+            config.refresh_profile_from_target(&target.commit_id)?;
+            config.scan_dir_override = Some(plan.scan_dir);
+            ledger.set_shared_snapshot(plan._snapshot);
+        }
+        checks::ReviewSubstrate::Ambient => {
+            let repo_root = config.repo_root.clone();
+            config.refresh_profile_from_tree(&repo_root)?;
+        }
+    }
+    Ok(())
+}
+
 /// Main application context holding all state
 pub struct App {
     pub config: Config,
@@ -172,10 +206,6 @@ impl App {
         })?;
         self.ensure_not_cancelled()?;
 
-        if emit_human_stdout {
-            output::print_config(&self.config, &target, &bases);
-        }
-
         // 3. Check for update mode
         self.ensure_not_cancelled()?;
         if self.config.update_mode
@@ -201,8 +231,18 @@ impl App {
         // resolved. It also OWNS the run's shared target snapshot, so it must
         // outlive artifact generation (step 7), which reads that snapshot.
         let ledger = ledger::TaskLedger::new();
-        let mut check_config = self.config.clone();
-        check_config.pinned_target = Some(target.clone());
+        let mut run_config = self.config.clone();
+        run_config.pinned_target = Some(target.clone());
+        // Profile detection at CLI startup sees the operator checkout. An
+        // exact review instead selects its checks and describes its pack from
+        // the same pinned target tree that the checks will consume.
+        run_headless_sync_stage(&self.governor, || {
+            prepare_review_profile(&mut run_config, &ledger)
+        })?;
+        if emit_human_stdout {
+            output::print_config(&run_config, &target, &bases);
+        }
+        let mut check_config = run_config.clone();
         // Pin the BASE alongside the target. Step 4 already resolved the review
         // range once; handing checks only the target would let a check that needs
         // a base range re-read a symbolic base ref that has since advanced (a
@@ -274,10 +314,10 @@ impl App {
         // must share one range.
         self.ensure_not_cancelled()?;
         let heuristics_result = if self.config.remote_mode || self.config.remote_only {
-            self.run_heuristics_with_snapshots(&target, &diff_bases)
+            self.run_heuristics_with_snapshots(&run_config, &target, &diff_bases)
                 .await?
         } else {
-            heuristics::run_all(&self.config, None).await?
+            run_local_heuristics(&run_config, &target.commit_id).await?
         };
         self.ensure_not_cancelled()?;
 
@@ -292,7 +332,7 @@ impl App {
         self.governor.enter_stage(governor::RunStage::Artifacts);
         let artifacts_dir = governor::blocking_stage(|| {
             artifacts::generate(artifacts::GenerateInput {
-                config: &self.config,
+                config: &run_config,
                 ledger: &ledger,
                 scope: run_scope.as_ref(),
                 diffs: &diffs,
@@ -340,10 +380,11 @@ impl App {
     /// and computes regression delta when both snapshots are available.
     pub(crate) async fn run_heuristics_with_snapshots(
         &self,
+        run_config: &Config,
         target: &git::ResolvedRef,
         bases: &[git::ResolvedRef],
     ) -> Result<heuristics::HeuristicsResult> {
-        if !self.config.run_heuristics {
+        if !run_config.run_heuristics {
             return Ok(heuristics::HeuristicsResult::default());
         }
 
@@ -351,7 +392,7 @@ impl App {
         let emit = self.should_emit_human_stdout();
         // Clone config so &self is not held across async await points,
         // keeping the future Send-compatible for tokio::spawn in TUI mode.
-        let config = self.config.clone();
+        let config = run_config.clone();
 
         // 1. Create target snapshot (required — fallback to cwd on failure)
         let target_snap = match run_headless_sync_stage(&self.governor, || {
@@ -393,7 +434,7 @@ impl App {
         result.analysis_sha = target_snap.as_ref().map(|snap| snap.sha.clone());
 
         // 3. Try base snapshot for regression detection in heavier modes only.
-        if should_compute_snapshot_regression(&self.config)
+        if should_compute_snapshot_regression(run_config)
             && let Some(base) = bases.first()
         {
             match run_headless_sync_stage(&self.governor, || {
@@ -613,14 +654,19 @@ impl App {
             Ok((worktree, target, bases, diffs))
         })?;
 
-        // Skip checks and heuristics in quick mode. No checks run, so no shared
-        // snapshot is ever materialised: an empty ledger is the honest input,
-        // and the context generators read the working tree — which is exactly
-        // what `--watch` is watching.
+        // Quick mode skips checks and heuristics, but profile-dependent context
+        // still needs the reviewed tree. An exact target keeps its snapshot in
+        // the ledger through artifact generation; an ambient watch iteration
+        // reads the live working tree it is watching.
         let ledger = ledger::TaskLedger::new();
+        let mut run_config = self.config.clone();
+        run_config.pinned_target = Some(target.clone());
+        run_headless_sync_stage(&self.governor, || {
+            prepare_review_profile(&mut run_config, &ledger)
+        })?;
         let artifacts_dir = governor::blocking_stage(|| {
             artifacts::generate(artifacts::GenerateInput {
-                config: &self.config,
+                config: &run_config,
                 ledger: &ledger,
                 // `--watch`/quick runs no checks at all, so there is no test
                 // scope to decide and nothing to report one on.
@@ -965,7 +1011,10 @@ fn should_ignore_watch_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{commit_ids_match, should_compute_snapshot_regression, should_ignore_watch_event};
+    use super::{
+        commit_ids_match, prepare_review_profile, should_compute_snapshot_regression,
+        should_ignore_watch_event,
+    };
     use crate::cli::ExecutionMode;
     use crate::config::test_config;
     use notify::EventKind;
@@ -1141,6 +1190,269 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exact_profile_uses_reviewed_markers_across_dirty_and_remote_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git_run(repo, &["init", "-q", "-b", "main"]);
+        git_run(repo, &["config", "user.email", "t@t.t"]);
+        git_run(repo, &["config", "user.name", "T"]);
+        git_run(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("package.json"), "{}\n").unwrap();
+        git_run(repo, &["add", "package.json"]);
+        git_run(repo, &["commit", "-q", "-m", "js target"]);
+        let js_target = rev_parse(repo, "HEAD");
+
+        // Exact same-HEAD must not let a local deletion remove JS checks.
+        std::fs::remove_file(repo.join("package.json")).unwrap();
+        let mut exact = test_config();
+        exact.requested_profile = Some(crate::cli::Profile::Auto);
+        exact.repo_root = repo.to_path_buf();
+        exact.target = Some("HEAD".to_owned());
+        exact.pinned_target = Some(resolved(&js_target));
+        let ledger = crate::ledger::TaskLedger::new();
+        prepare_review_profile(&mut exact, &ledger).unwrap();
+        assert_eq!(exact.profile.kind, crate::config::ProfileKind::Js);
+        assert!(exact.profile.has_package_json);
+        assert!(
+            crate::checks::get_checks_for_profile(&exact)
+                .iter()
+                .any(|check| check.name() == "ESLint")
+        );
+
+        // A normal local review remains about the live, dirty checkout.
+        let mut ambient = test_config();
+        ambient.requested_profile = Some(crate::cli::Profile::Auto);
+        ambient.repo_root = repo.to_path_buf();
+        ambient.pinned_target = Some(resolved(&js_target));
+        prepare_review_profile(&mut ambient, &crate::ledger::TaskLedger::new()).unwrap();
+        assert_eq!(ambient.profile.kind, crate::config::ProfileKind::Generic);
+
+        git_run(repo, &["add", "-u"]);
+        git_run(repo, &["commit", "-q", "-m", "remove JS marker"]);
+        let mut remote = test_config();
+        remote.requested_profile = Some(crate::cli::Profile::Auto);
+        remote.repo_root = repo.to_path_buf();
+        remote.remote_mode = true;
+        remote.pinned_target = Some(resolved(&js_target));
+        let remote_ledger = crate::ledger::TaskLedger::new();
+        prepare_review_profile(&mut remote, &remote_ledger).unwrap();
+        assert_eq!(remote.profile.kind, crate::config::ProfileKind::Js);
+        assert!(remote.profile.has_package_json);
+
+        // An explicit --profile still selects its requested kind.
+        remote.requested_profile = Some(crate::cli::Profile::Rust);
+        let target_tree = remote.scan_dir_override.clone().expect("target snapshot");
+        remote.refresh_profile_from_tree(&target_tree).unwrap();
+        assert_eq!(remote.profile.kind, crate::config::ProfileKind::Rust);
+    }
+
+    #[tokio::test]
+    async fn same_head_heuristics_name_the_selected_snapshot() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(repo.path(), out.path());
+        let target_sha = rev_parse(repo.path(), "HEAD");
+        config.target = Some("HEAD".to_owned());
+        config.pinned_target = Some(resolved(&target_sha));
+        config.run_heuristics = false;
+        let ledger = crate::ledger::TaskLedger::new();
+        prepare_review_profile(&mut config, &ledger).unwrap();
+        let selected = config.scan_dir_override.clone().expect("exact snapshot");
+        assert_ne!(selected, config.repo_root);
+
+        let result = super::run_local_heuristics(&config, &target_sha)
+            .await
+            .unwrap();
+        assert_eq!(result.analysis_root, Some(selected.display().to_string()));
+        assert_eq!(result.analysis_sha, Some(target_sha));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_profile_ignores_committed_symlinks_into_operator_files() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let operator = tmp.path().join("operator");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::write(operator.join("package.json"), "{}\n").unwrap();
+        std::fs::write(operator.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            operator.join("prview.toml"),
+            "[project]\ncargo_root = 'backend'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            operator.join("pyproject.toml"),
+            "[project]\nname = 'outside'\n",
+        )
+        .unwrap();
+        std::fs::write(operator.join("tsconfig.json"), "{}\n").unwrap();
+        std::fs::create_dir(operator.join("src")).unwrap();
+        std::fs::write(operator.join("src/main.ts"), "export {};\n").unwrap();
+        std::fs::write(operator.join("src/main.py"), "print('outside')\n").unwrap();
+        git_run(&repo, &["init", "-q", "-b", "main"]);
+        git_run(&repo, &["config", "user.email", "t@t.t"]);
+        git_run(&repo, &["config", "user.name", "T"]);
+        git_run(&repo, &["config", "commit.gpgsign", "false"]);
+        for name in [
+            "package.json",
+            "Cargo.toml",
+            "prview.toml",
+            "pyproject.toml",
+            "tsconfig.json",
+        ] {
+            symlink(operator.join(name), repo.join(name)).unwrap();
+        }
+        symlink(operator.join("src"), repo.join("src")).unwrap();
+        std::fs::create_dir(repo.join("backend")).unwrap();
+        symlink(operator.join("Cargo.toml"), repo.join("backend/Cargo.toml")).unwrap();
+        std::fs::write(repo.join("README.md"), "target\n").unwrap();
+        git_run(&repo, &["add", "."]);
+        git_run(&repo, &["commit", "-q", "-m", "symlink target"]);
+        let target = rev_parse(&repo, "HEAD");
+        let mut config = test_config();
+        config.repo_root = repo;
+        config.target = Some("HEAD".to_owned());
+        config.pinned_target = Some(resolved(&target));
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        prepare_review_profile(&mut config, &crate::ledger::TaskLedger::new()).unwrap();
+        assert_eq!(config.profile.kind, crate::config::ProfileKind::Generic);
+        assert_eq!(config.profile.cargo_root, None);
+        assert!(config.profile.rust_dirs.is_empty());
+    }
+
+    #[test]
+    fn exact_profile_normalizes_manifest_cargo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git_run(repo, &["init", "-q", "-b", "main"]);
+        git_run(repo, &["config", "user.email", "t@t.t"]);
+        git_run(repo, &["config", "user.name", "T"]);
+        git_run(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir(repo.join("backend")).unwrap();
+        std::fs::write(
+            repo.join("backend/Cargo.toml"),
+            "[package]\nname = 'backend'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        let mut config = test_config();
+        config.repo_root = repo.to_path_buf();
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        let backend = repo.join("backend");
+        for root in [
+            "backend",
+            "./backend",
+            "backend/",
+            "backend/../backend",
+            "../outside",
+        ] {
+            std::fs::write(
+                repo.join("prview.toml"),
+                format!("[project]\ncargo_root = '{root}'\n"),
+            )
+            .unwrap();
+            git_run(repo, &["add", "."]);
+            git_run(repo, &["commit", "-q", "-m", "manifest root"]);
+            config
+                .refresh_profile_from_target(&rev_parse(repo, "HEAD"))
+                .unwrap();
+            if root == "../outside" {
+                assert_eq!(config.profile.kind, crate::config::ProfileKind::Generic);
+                assert_eq!(config.profile.cargo_root, None);
+            } else {
+                assert_eq!(
+                    config.profile.kind,
+                    crate::config::ProfileKind::Rust,
+                    "{root}"
+                );
+                assert_eq!(
+                    config.profile.cargo_root.as_deref(),
+                    Some(backend.as_path()),
+                    "{root}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_exact_profile_uses_target_commit_instead_of_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(repo.path(), out.path());
+        std::fs::write(repo.path().join("package.json"), "{}\n").unwrap();
+        git_run(repo.path(), &["add", "package.json"]);
+        git_run(repo.path(), &["commit", "-q", "-m", "js target"]);
+        let target = rev_parse(repo.path(), "HEAD");
+        git_run(repo.path(), &["rm", "-q", "package.json"]);
+        git_run(repo.path(), &["commit", "-q", "-m", "remove JS marker"]);
+        config.target = Some(target);
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        config.run_lint = false;
+        config.run_tests = false;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::from_plan(
+            config.resource_plan,
+        ));
+        crate::tui::run_analysis(config, tx, governor)
+            .await
+            .unwrap();
+        let mut pack = None;
+        let mut saw_profile = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::tui::types::TuiEvent::ProfileReady { profile, .. } => {
+                    assert!(!saw_profile);
+                    assert_eq!(profile.kind, crate::config::ProfileKind::Js);
+                    saw_profile = true;
+                }
+                crate::tui::types::TuiEvent::AnalysisComplete { report } => {
+                    assert!(saw_profile, "visible profile must arrive before completion");
+                    pack = Some(report.artifacts_dir);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_profile);
+        let gate: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(pack.expect("TUI report").join("00_summary/MERGE_GATE.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Js", "{gate}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambient_review_keeps_external_manifest_cargo_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(
+            external.path().join("Cargo.toml"),
+            "[package]\nname = 'outside'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        let mut config = reviewable_repo(repo.path(), out.path());
+        std::fs::write(
+            repo.path().join("prview.toml"),
+            format!("[project]\ncargo_root = '{}'\n", external.path().display()),
+        )
+        .unwrap();
+        config.target = None;
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        config.run_lint = false;
+        config.run_tests = false;
+        let app = crate::App::from_config(config).unwrap();
+        let report = app.run_quick().await.unwrap();
+        let gate: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(report.artifacts_dir.join("00_summary/MERGE_GATE.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Rust", "{gate}");
+    }
+
     /// `--watch` reuses ONE `App` for every pack it emits, so worktree state
     /// frozen at construction describes the tree as it was when the watcher
     /// started — never the edit that triggered this iteration. Each quick run
@@ -1229,6 +1541,55 @@ mod tests {
         config.quiet = true;
         config.create_zip = false;
         config
+    }
+
+    /// A programmatic Config may supply its own profile through the public
+    /// App::from_config entrypoint. Only CLI/opt-in Configs re-detect markers
+    /// from the target tree; both paths still review the same exact target.
+    #[tokio::test]
+    async fn from_config_preserves_supplied_profile_unless_refresh_is_requested() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut supplied = reviewable_repo(repo.path(), out.path());
+        supplied.profile = crate::config::test_js_profile(true);
+        assert_eq!(supplied.requested_profile, None);
+
+        let app = crate::App::from_config(supplied.clone()).unwrap();
+        let report = app.run_quick().await.unwrap();
+        let gate: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.artifacts_dir.join("00_summary/MERGE_GATE.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Js", "{gate}");
+
+        let mut automatic = supplied.clone();
+        automatic.requested_profile = Some(crate::cli::Profile::Auto);
+        automatic.output_dir = Some(out.path().join("auto-pack"));
+        let app = crate::App::from_config(automatic).unwrap();
+        let report = app.run_quick().await.unwrap();
+        let gate: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.artifacts_dir.join("00_summary/MERGE_GATE.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Generic", "{gate}");
+
+        // Config::from_cli also exposes `profile` for callers to change before
+        // handing the Config to App::from_config. A changed value is an override
+        // even though the original CLI request was Auto.
+        let mut overridden_cli = supplied;
+        overridden_cli.requested_profile = Some(crate::cli::Profile::Auto);
+        overridden_cli.profile_at_cli_detection = Some(crate::config::test_generic_profile());
+        overridden_cli.output_dir = Some(out.path().join("overridden-cli-pack"));
+        let app = crate::App::from_config(overridden_cli).unwrap();
+        let report = app.run_quick().await.unwrap();
+        let gate: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.artifacts_dir.join("00_summary/MERGE_GATE.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate["profile"], "Js", "{gate}");
     }
 
     /// A one-worker production runtime used to enter synchronous ref/diff work
@@ -1435,7 +1796,7 @@ mod tests {
         let started = std::time::Instant::now();
 
         let error = crate::governor::with_cancellation(
-            app.run_heuristics_with_snapshots(&target, &[]),
+            app.run_heuristics_with_snapshots(&app.config, &target, &[]),
             &governor,
             InterruptWhenFileExists::new(pidfile.clone()),
         )
@@ -1631,7 +1992,7 @@ mod tests {
 
         // Handed the merge-base: regression anchors to it (what `run()` now does).
         let via_merge_base = app
-            .run_heuristics_with_snapshots(&target_ref, &[resolved(&merge_base)])
+            .run_heuristics_with_snapshots(&app.config, &target_ref, &[resolved(&merge_base)])
             .await
             .unwrap();
         let reg_mb = via_merge_base
@@ -1644,7 +2005,7 @@ mod tests {
 
         // Handed the base tip: it would anchor there instead — the pre-fix bug.
         let via_tip = app
-            .run_heuristics_with_snapshots(&target_ref, &[resolved(&base_tip)])
+            .run_heuristics_with_snapshots(&app.config, &target_ref, &[resolved(&base_tip)])
             .await
             .unwrap();
         let reg_tip = via_tip

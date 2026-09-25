@@ -132,6 +132,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`checks[].tree_state` has a third snapshot value: `snapshot-unproven-deps`.**
+  A JS gate's provenance used to have two answers for three facts, so
+  `snapshot-borrowed-deps` carried both "these bytes came from outside the
+  snapshot" and "this closure could not be read". Since prview recognises no
+  real `npm`/`pnpm`/`yarn` shim grammar, the second meaning swallowed the
+  ordinary case and a fully target-owned toolchain reported borrowed. The new
+  value says what is actually known — the reviewed source is exactly
+  `target_sha`, the dependency closure is unread — and `snapshot-borrowed-deps`
+  goes back to meaning a borrow that was positively observed. Read
+  `snapshot-unproven-deps` as cautiously as `snapshot-borrowed-deps`: it is not
+  an exact scan. Existing values are unchanged, and test/package selection
+  treats the new state exactly like the other two exact-source snapshots.
+- **A tool with no `#!` is no longer certified as an exact snapshot scan, and
+  neither is one that merely opens with an object-file magic.** "No shebang" was
+  standing in for "native binary, no indirection". It is the opposite: prview
+  spawns through `Command`, hence `execvp`, and POSIX requires `execvp` to retry
+  an `ENOEXEC` file through `/bin/sh` — so such a file is a shell script with
+  unbounded indirection. Deleting one `#!/bin/sh` line was enough to flip a run
+  that executed the operator's uncommitted bytes from `snapshot-borrowed-deps`
+  to `snapshot`. Recognising a four-byte magic does not close that hole, because
+  `ENOEXEC` is returned by the *loader*, after the whole header: prefixing the
+  same launcher with `\x7fELF` — or even with the host's own `CF FA ED FE` —
+  still reaches `/bin/sh`, and merely recognising the prefix turned silence into
+  a false positive claim. Target-only closure is now proved only by a **fully
+  validated platform header for the running kernel**: on macOS a complete
+  `mach_header` with the host `cputype` and `MH_EXECUTE`, or a 32-bit universal
+  binary in which **every** host-`cputype` slice is claimable; on Linux a
+  complete ELF header with the host `e_machine`, `ET_EXEC`/`ET_DYN`,
+  `e_phentsize` equal to `sizeof(Elf64_Phdr)` and a program-header table within
+  the kernel's `56 * e_phnum <= 65536` bound; on any other Unix, nothing. A
+  format this kernel has no loader for — ELF on macOS, Mach-O on Linux — is
+  recognisable but not executable, so it is the fallback vector rather than
+  evidence. The proof reads a bounded header window and so still runs before the
+  script size bound, leaving a large compiled tool able to prove its own kind
+  while an oversized file with no claimable header stays unproved.
+- **Validating a header is not the same as predicting the loader's verdict, and
+  the proof now says so.** An earlier draft of this change claimed a completely
+  validated header leaves "only two futures … with no shell in the path". That
+  was false where it mattered most: macOS grades fat slices (`arm64e` outranks
+  `arm64`, `x86_64h` outranks `x86_64`, under one `cputype`), so accepting
+  because *some* host slice validates certified images the kernel hands to
+  `/bin/sh` — measured on macOS/arm64, a real `arm64` binary beside a bogus
+  `arm64e` entry ran under the shell at exit 126, as did every `FAT_MAGIC_64`
+  image with a real, working slice inside it. Both shapes reported `snapshot`,
+  the state that promises the scanned bytes are exactly `target_sha`. So the
+  accepted set is narrowed to what a kernel probe measured with zero fallback:
+  all host slices claimable for fat, `FAT_MAGIC_64` recognised and refused, and
+  on Linux the whole of `load_elf_phdrs()`'s arithmetic reproduced rather than
+  half of it: `e_phentsize` matched for equality, and the program-header table
+  refused when `56 * e_phnum` is zero or above 65536, because every one of those
+  exits is the same `ENOEXEC`. Modelling only the lower half of that bound left
+  `e_phnum` = 1171 claimed here and dropped to `/bin/sh` there. One thing is
+  named rather than relied on: bash refuses a file carrying a NUL before its
+  first newline, and every
+  accepted macOS header happens to carry one, so no accepted file ran as a
+  script even before this fix — that is an accident of the binary formats, not
+  part of the contract, and `dash` makes no such promise.
 - **Every run is now bounded in time.** A local review, `--tui`, and a detached
   MCP `run_review deep` get 30 minutes; `--ci` and `prview gate` get 60. (An MCP
   `quick` review keeps its own, tighter 120-second server budget.) The numbers
@@ -230,9 +287,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0 ok, 1 tooling, 2 unsupported platform, 3 missing artifact, 4
   checksum/archive invalid, 5 macOS signature/notarization, 6 post-install
   verification. `docs/INSTALL.md` carries the full contract.
+- Library API: `prview::checks::run_js_command` and
+  `run_js_command_with_timeout` return `JsRun { program, output }` instead of a
+  bare `std::process::Output`. The recorded provenance of a JS check is now
+  built from `JsRun::command(&args)` — the program the OS was actually handed —
+  so a pack no longer reports `pnpm exec eslint …` for a run that executed
+  `node_modules/.bin/eslint` directly. The published command was previously
+  reconstructed from a second, independent `which::which("pnpm")` probe that the
+  runner never consulted, which could name a launcher the run did not use and,
+  under `--target-sha`, a launcher outside the snapshot. Callers that only need
+  the process result read `run.output`; this is source-incompatible for library
+  consumers.
 
 ### Fixed
 
+- Exact reviews now derive their check set and reported project profile from
+  the pinned target tree. A dirty operator checkout can no longer hide JS,
+  Python, or Rust checks by removing local project markers; ordinary local
+  reviews continue to reflect the live checkout. Programmatic `App::from_config`
+  callers keep a supplied `Config.profile` unless they set
+  `requested_profile: Some(Profile::Auto)` to opt into target-derived detection.
+  Changing the public profile after `Config::from_cli` also preserves that
+  explicit programmatic override.
+
+- **A snapshot never writes through an entry the reviewed commit owns.** The
+  dependency merge decided whether the target already had `node_modules` /
+  `.venv` with `Path::exists()`, which follows symlinks. A commit carrying
+  `node_modules -> /some/writable/path` therefore looked like a plain directory,
+  the merge opened, and every "missing" package was created **inside the
+  operator's own filesystem** — outside the snapshot, at a location the reviewed
+  branch chose. The decision now reads the commit's own entry with
+  `symlink_metadata`: only a real directory receives borrowed entries, an absent
+  entry receives one whole borrowed link, and anything else the commit spelled
+  (a symlink, resolving anywhere or nowhere, or a file) is left exactly as it
+  is — no merge, no borrow, no failure. `create_borrowed_link` additionally
+  re-proves per link that the parent it is about to write into canonicalizes
+  inside the snapshot root, because `strip_prefix` compares spelling, not
+  identity.
+- **A broken dependency symlink in the reviewed commit no longer aborts the
+  review.** `node_modules -> nowhere` made `exists()` report `false`, the borrow
+  was attempted anyway, and `symlink(2)` failed `EEXIST`, so snapshot creation —
+  and with it the whole run — died on a repository that is merely unusual. Such
+  a commit is now left alone and reviewed.
+- **The exposure of top-level packages no longer depends on the operator having
+  a `.bin`.** The merge was gated on `ambient_bin.exists()`, so an operator
+  install without `node_modules/.bin` suppressed the package merge as well, even
+  though what a shim resolves is `../<package>`. The two merges are now
+  independent, and `.bin` is simply one more entry the top-level merge can
+  expose.
+- **A `.bin` shim that resolves inside the tree to an entry the commit does not
+  contain is `Missing`, not `Unresolved`.** Following a repository-relative link
+  lands on another path in the *same* tree, so the tree can answer for it.
+  Reporting `Unresolved` made JS eligibility treat an absent tool as a target
+  candidate; the check was scheduled and then failed at execution time with
+  `resolved JS tool disappeared` instead of being skipped with a reason.
+- **The recognized pnpm wrapper grammar admits only a literal payload.** The
+  grammar accepted any text between the quotes of `exec node "$basedir/…" "$@"`,
+  while a second, looser scan extracted the closure path. A wrapper reading
+  `exec node "$basedir/$HOME/x" "$@"` therefore proved a closure whose contents
+  the shell picks at run time, and the two passes could disagree — the extractor
+  could record nothing while the closure stayed "proved". The payload must now
+  match `[A-Za-z0-9._@+/-]+` (nothing the shell expands, splits or globs) and is
+  taken from the very match that recognized the grammar, so the recognizer and
+  the recorded closure cannot diverge.
+- **On non-Unix, an invocation that exists is no longer certified as an exact
+  snapshot scan.** The non-Unix closure proof answered `TargetOnly` for every
+  path, so a Windows run published `tree_state: "snapshot"` — "the scanned bytes
+  are exactly `target_sha`" — for a launcher this build cannot read at all
+  (there is no header proof and no script grammar there). It now answers from
+  canonical identity alone: nothing at the invocation path is `TargetOnly`
+  (nothing will execute), an invocation resolving outside the snapshot root is
+  `Borrowed`, and everything else is `Unproven`. All three variants are
+  therefore constructed on every platform, which also removes the `dead_code`
+  asymmetry that broke the Windows build.
+- **Two claims about the proof were stated more broadly than the code
+  supports, and are corrected in place** (`ClosureProof::TargetOnly` docstring,
+  `docs/architecture.md`): `snapshot` never promised that "every statically
+  visible byte is target-owned" — the ambient `node` runtime is outside the
+  proof and always was, prview ships none; and the `/bin/sh` retry that
+  motivates the platform-header proof happens on the `fork`+`execvp` path, not
+  on Rust's default `posix_spawn`, which hands `ENOEXEC` straight back
+  (`Exec format error (os error 8)`, measured on Linux CI). The header proof is
+  justified by caution, not by a universal law. An unrecognized wrapper is
+  `snapshot-unproven-deps`, never "borrowed".
 - The `PR_REVIEW.md` PR Template checklist no longer claims what the checks did
   not prove. `Compiles / type-checks`, `Tests pass` and `No lint errors` were each
   ticked when ANY check of the category passed, so a failing ESLint hid behind a

@@ -72,6 +72,19 @@ pub enum TreeState {
     /// from the local checkout. A dependency-changing PR is precisely where the
     /// two differ, so this must not be reported as an exact snapshot scan.
     SnapshotBorrowedDeps,
+    /// The reviewed commit's tree, unmodified and materialised from exactly
+    /// `target_sha` — but the executable closure of the tool this check ran
+    /// could not be proved in either direction. The SOURCE is the reviewed
+    /// commit; which dependency bytes the tool actually executed is unknown.
+    ///
+    /// This is the honest third answer, and it exists so
+    /// [`Self::SnapshotBorrowedDeps`] can stay a CLAIM WITH EVIDENCE rather
+    /// than a bag for everything the static proof cannot read. Every real
+    /// `npm`/`pnpm`/`yarn` shim lands here: prview does not recognise their
+    /// grammar, and not recognising a wrapper is not the same as observing it
+    /// load the operator's dependencies. A reviewer must read this as "not
+    /// certified exact" — never as an exact snapshot scan.
+    SnapshotUnprovenDeps,
     /// The repo's own working tree with no uncommitted changes — the scanned
     /// bytes are exactly `target_sha`.
     LocalClean,
@@ -91,6 +104,7 @@ impl TreeState {
             Self::Snapshot => "snapshot",
             Self::SnapshotDirty => "snapshot-dirty",
             Self::SnapshotBorrowedDeps => "snapshot-borrowed-deps",
+            Self::SnapshotUnprovenDeps => "snapshot-unproven-deps",
             Self::LocalClean => "local-clean",
             Self::LocalDirty => "local-dirty",
             Self::Foreign => "foreign",
@@ -133,9 +147,10 @@ pub struct ScanSubstrate {
 /// not). In a snapshot the dependency symlinks prview itself creates
 /// ([`SNAPSHOT_SCAFFOLDING`]) are excluded: they are the tool's own scaffolding,
 /// not a modification of the reviewed tree. They are not free of consequence
-/// either — a snapshot is `snapshot-borrowed-deps` when it carries a link THIS
-/// command could actually consume, named by `consumable` (see
-/// [`consumable_scaffolding`]).
+/// either — a snapshot is `snapshot-borrowed-deps` when THIS command's closure
+/// is proved to cross one, named by its resolved path in `consumable` (see
+/// [`consumable_scaffolding`]), and `snapshot-unproven-deps` when that closure
+/// could be proved neither target-only nor borrowed.
 ///
 /// Best effort: a `cwd` that is not in a git repository yields `None` for both
 /// fields rather than a guess, and a status that cannot be read yields a `None`
@@ -168,10 +183,11 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path, consumable: &[&str])
     } else {
         working_tree_is_dirty(&repo, SNAPSHOT_SCAFFOLDING).map(|dirty| match dirty {
             true => TreeState::SnapshotDirty,
-            false if borrows_local_dependencies(&repo, consumable) => {
-                TreeState::SnapshotBorrowedDeps
-            }
-            false => TreeState::Snapshot,
+            false => match dependency_closure_proof(&repo, consumable) {
+                crate::git::ClosureProof::Borrowed => TreeState::SnapshotBorrowedDeps,
+                crate::git::ClosureProof::Unproven => TreeState::SnapshotUnprovenDeps,
+                crate::git::ClosureProof::TargetOnly => TreeState::Snapshot,
+            },
         })
     };
 
@@ -187,7 +203,7 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path, consumable: &[&str])
 /// and must not make the snapshot look modified.
 const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 
-/// Which scaffolding links a given check could actually READ.
+/// Which resolved paths a given check could actually READ.
 ///
 /// Presence of a link is not consumption of it, and the two must not be
 /// confused: a mixed repository has `node_modules` linked into every snapshot,
@@ -196,9 +212,11 @@ const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 /// same class of false claim, pointing the other way, as certifying an exact
 /// scan.
 ///
-/// The JS checks resolve their compiler, plugins, type definitions and runtime
-/// through `node_modules` (`local_js_bin` looks in `node_modules/.bin` first),
-/// so for them a linked tree is genuinely the operator's.
+/// JS checks name the concrete executable they run under `node_modules/.bin`.
+/// This distinction is load-bearing: a target may own `.bin` as a directory or
+/// symlink while prview borrows one missing tool inside it. Provenance follows
+/// the resolved tool path and counts a borrow only when that path crosses a link
+/// recorded by the snapshot builder.
 ///
 /// The Python checks return NOTHING, deliberately. The snapshot still links
 /// `.venv` — `create_worktree_snapshot` does not know who will run there — but
@@ -220,29 +238,51 @@ const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 /// only knew display names would answer "consumes nothing" for every one of them.
 pub(crate) fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
     match crate::check_id::check_id_from_name(check).as_str() {
-        // JS checks and context generators — as their canonical ids. The
-        // latter prefer local binaries or traverse the dependency tree too.
-        "tsc" | "eslint" | "tests" | "stylelint" | "tauri_info" | "esbuild_meta" | "npm_sbom" => {
-            &["node_modules"]
-        }
+        "tsc" => &["node_modules/.bin/tsc"],
+        "eslint" => &["node_modules/.bin/eslint"],
+        "tests" => &["node_modules/.bin/vitest"],
+        "stylelint" => &["node_modules/.bin/stylelint"],
+        "tauri_info" => &["node_modules/.bin/tauri"],
+        "esbuild_meta" => &["node_modules/.bin/esbuild"],
+        // The SBOM command traverses the dependency tree rather than resolving
+        // one executable from it, so its consumable path is intentionally broad.
+        "npm_sbom" => &["node_modules"],
         _ => &[],
     }
 }
 
-/// Whether the snapshot actually CARRIES a link this command could consume.
+/// What this command's resolved paths prove about the bytes it consumes.
 ///
-/// Presence, not policy: an off-HEAD review of a repo with no local
-/// `node_modules` installs nothing and links nothing, and stays an exact
-/// snapshot scan. Only a link that exists AND is consumable could have been
-/// followed.
+/// The sidecar is explicit creator provenance, not a symlink-shape heuristic.
+/// A target-owned `.bin -> bin-owned` therefore stays `snapshot`, while a
+/// missing `.bin/eslint` linked by prview is `snapshot-borrowed-deps` and a
+/// shim whose grammar nobody here can read is `snapshot-unproven-deps`.
+///
+/// Across several consumable paths the states do not average: one proved borrow
+/// settles the command, because a later path being fine cannot un-borrow bytes
+/// that were already shown to come from outside. Absent any proved borrow, one
+/// unproved path is enough to withhold the exact-snapshot claim for all of them.
 ///
 /// Checked at the WORKTREE ROOT, not at the check's `cwd` — a cargo member runs
 /// in a subdirectory while the scaffolding sits at the top of the snapshot.
-fn borrows_local_dependencies(repo: &git2::Repository, consumable: &[&str]) -> bool {
+fn dependency_closure_proof(
+    repo: &git2::Repository,
+    consumable: &[&str],
+) -> crate::git::ClosureProof {
+    use crate::git::ClosureProof;
+
     let Some(root) = repo.workdir() else {
-        return false;
+        return ClosureProof::TargetOnly;
     };
-    consumable.iter().any(|name| root.join(name).is_symlink())
+    let mut proof = ClosureProof::TargetOnly;
+    for path in consumable {
+        match crate::git::path_uses_prview_borrow(root, Path::new(path)) {
+            ClosureProof::Borrowed => return ClosureProof::Borrowed,
+            ClosureProof::Unproven => proof = ClosureProof::Unproven,
+            ClosureProof::TargetOnly => {}
+        }
+    }
+    proof
 }
 
 /// True when `repo` is the repository rooted at `repo_root` — its own working
@@ -1489,8 +1529,7 @@ fn errored_check_scan_dir(name: &str, config: &Config) -> Option<std::path::Path
     let scan_dir = if let Some(scan_dir) = &config.scan_dir_override {
         uses_shared_scan_dir(name).then(|| scan_dir.clone())?
     } else {
-        off_head_target_commit(config)
-            .is_none()
+        matches!(review_substrate(config).ok()?, ReviewSubstrate::Ambient)
             .then(|| config.repo_root.clone())?
     };
     Some(match is_cargo_target_check(name) {
@@ -1779,7 +1818,8 @@ fn is_cargo_target_check(name: &str) -> bool {
 /// The cargo checks are listed too: they analyse the reviewed snapshot like
 /// every other language check and only redirect their *build cache* away from
 /// it (see `plan_cargo_run` in `checks::cargo`). Semgrep is the single opt-out —
-/// it manages its own worktree because it also needs a baseline commit.
+/// it has an independent baseline planner, but exact-target runs still reuse the
+/// dispatcher-owned override when one is available.
 fn uses_shared_scan_dir(name: &str) -> bool {
     matches!(
         name,
@@ -1799,22 +1839,67 @@ fn uses_shared_scan_dir(name: &str) -> bool {
     )
 }
 
-/// Commit id of the reviewed target when it differs from the checked-out `HEAD`.
+/// The only discriminator for deciding which bytes a check must read.
 ///
-/// `None` for an ordinary local review (target == `HEAD`) and whenever the repo
-/// or its refs cannot be resolved — both keep the plain working-tree behaviour.
+/// `App::run` pins every resolved target, including the default local invocation,
+/// so `pinned_target` alone cannot distinguish an exact review from an ambient
+/// dirty-tree review. Entry intent can: explicit target, PR, remote, remote-only,
+/// and CI invocations all ask for an immutable commit; ordinary target-less CLI,
+/// TUI, and gate invocations ask for the live working tree.
+/// A pin from an internal caller with no entry flags is ambient only when it is
+/// verifiably the checked-out `HEAD`; a differing or unverifiable pin remains
+/// exact so the old fail-loud pinned-target contract cannot regress.
 ///
-/// Cache keys need this INDEPENDENTLY of `config.scan_dir_override`: the cached-
-/// result lookup runs in the dispatcher's first pass, BEFORE the shared snapshot
-/// is materialised. A key derived from the scan dir alone would therefore read a
-/// local-tree key and write a snapshot key — and, worse, a `--pr` run would hit
-/// the entry a previous local run stored under that same local-tree key, serving
-/// the local checkout's verdict as if it were the reviewed commit's.
-pub fn off_head_target_commit(config: &Config) -> Option<String> {
-    let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-    let target = repo.resolve_target(config).ok()?;
-    let head = repo.head_commit_id().ok()?;
-    (target.commit_id != head).then_some(target.commit_id)
+/// This decision is deliberately independent of `scan_dir_override`. Cache and
+/// eligibility run before the shared snapshot exists, while planners run after
+/// it may exist; both sides must still classify the run identically.
+#[derive(Debug, Clone)]
+pub(crate) enum ReviewSubstrate {
+    Ambient,
+    ExactTarget(crate::git::ResolvedRef),
+}
+
+pub(crate) fn review_substrate(config: &Config) -> Result<ReviewSubstrate> {
+    let exact_requested = config.target.is_some()
+        || config.pr_number.is_some()
+        || config.remote_mode
+        || config.remote_only
+        || matches!(config.execution_mode, crate::cli::ExecutionMode::Ci);
+
+    if exact_requested {
+        let target = match &config.pinned_target {
+            Some(target) => target.clone(),
+            None => crate::git::Repository::open(&config.repo_root)
+                .context("cannot open repository for exact review target")?
+                .resolve_target(config)
+                .context("cannot resolve exact review target")?,
+        };
+        return Ok(ReviewSubstrate::ExactTarget(target));
+    }
+
+    // A pinned target with no explicit entry intent is the ordinary ambient
+    // target only while it is verifiably the checked-out HEAD. A differing pin
+    // is an internal exact-target caller; an unreadable repository cannot prove
+    // ambient equivalence and therefore fails closed as exact too.
+    if let Some(target) = &config.pinned_target {
+        let is_head = crate::git::Repository::open(&config.repo_root)
+            .and_then(|repo| repo.head_commit_id())
+            .is_ok_and(|head| head == target.commit_id);
+        if !is_head {
+            return Ok(ReviewSubstrate::ExactTarget(target.clone()));
+        }
+    }
+
+    Ok(ReviewSubstrate::Ambient)
+}
+
+/// Commit id for exact-target reads, including exact reviews of checked-out
+/// `HEAD`. Ambient local reviews intentionally return `None`.
+pub(crate) fn exact_target_commit(config: &Config) -> Result<Option<String>> {
+    Ok(match review_substrate(config)? {
+        ReviewSubstrate::Ambient => None,
+        ReviewSubstrate::ExactTarget(target) => Some(target.commit_id),
+    })
 }
 
 /// Materialise ONE target snapshot for the whole run, point `config` at it and
@@ -1829,9 +1914,11 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
 /// giving it the handle makes ONE snapshot the substrate of every stage instead
 /// of just the gates.
 ///
-/// A snapshot is materialised when EITHER a runnable check needs one
-/// ([`uses_shared_scan_dir`]) OR the reviewed target is off-`HEAD`. The second
-/// arm is not redundant: the gates are not the only stage that reads the tree.
+/// A snapshot is materialised when a runnable check needs one or
+/// [`review_substrate`] classifies the review as exact-target. An exact target
+/// also requires planning even when no runnable gate needs the shared
+/// directory. That second arm is not redundant: the gates are not the only
+/// stage that reads the tree.
 /// The context stage plans and produces the whole of `30_context` from
 /// `ledger.scan_dir()`, so tying materialisation to the runnable set alone gave
 /// back `PRV-CONTEXT-SNAPSHOT-PROVENANCE` through a quieter door — a run whose
@@ -1844,11 +1931,13 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
 /// gates: a correct pack is worth more than a saved checkout.
 ///
 /// Nothing is installed (`scan_dir_override` stays unset, the ledger keeps no
-/// snapshot) when the target IS the checked-out `HEAD` and no runnable check
-/// wants one — there the repo root genuinely is the reviewed tree. Once a
-/// snapshot is required, creation failure is terminal: per-check snapshots do
-/// not give later artifact stages a verified tree and would permit one pack to
-/// mix the reviewed target with the operator's checkout.
+/// snapshot) only when the run is ambient and no runnable check
+/// wants a shared directory. An ambient local run that reaches the planner may
+/// install the repo root as its override; an exact same-`HEAD` run installs a
+/// snapshot. Once a snapshot is required, creation failure is terminal:
+/// per-check snapshots do not give later artifact stages a verified tree and
+/// would permit one pack to mix the reviewed target with the operator's
+/// checkout.
 fn share_target_snapshot(
     config: &mut Config,
     runnable_checks: &[Box<dyn Check>],
@@ -1866,10 +1955,7 @@ fn share_target_snapshot_with(
     let wanted_by_a_gate = runnable_checks
         .iter()
         .any(|c| uses_shared_scan_dir(c.name()));
-    if !wanted_by_a_gate
-        && config.pinned_target.is_none()
-        && off_head_target_commit(config).is_none()
-    {
+    if !wanted_by_a_gate && matches!(review_substrate(config)?, ReviewSubstrate::Ambient) {
         return Ok(());
     }
     let plan = planner(config).context("failed to materialize shared review snapshot")?;
@@ -1902,7 +1988,13 @@ fn share_target_snapshot_with(
         run_wide.clone(),
     );
     ledger.set_substrate_keyed(run_wide, &per_tool);
-    ledger.set_shared_snapshot(plan._snapshot);
+    // App::run may already have materialised this exact snapshot to detect
+    // the reviewed profile before check selection. A reused plan owns no new
+    // snapshot; replacing the ledger's owner with None would remove the tree
+    // while checks and artifacts still read it.
+    if let Some(snapshot) = plan._snapshot {
+        ledger.set_shared_snapshot(Some(snapshot));
+    }
     Ok(())
 }
 
@@ -1957,10 +2049,9 @@ async fn install_run_scope(
 /// How each tool reads `scan_dir`, for re-keying the entries decided before the
 /// run knew which tree it was reading.
 ///
-/// One `git status` per distinct consumable set, not per entry: there are only
-/// two sets in the table ([`consumable_scaffolding`] answers either nothing or
-/// `node_modules`), and the run-wide resolution seeds the first of them, so a
-/// whole adoption costs at most one status read more than it used to.
+/// One `git status` per distinct resolved path set, not per entry. The run-wide
+/// resolution seeds the empty set; repeated display-name/id aliases reuse the
+/// same static slice and therefore the same substrate result.
 fn adopted_substrate(
     scan_dir: PathBuf,
     repo_root: PathBuf,
@@ -2167,59 +2258,149 @@ pub async fn run_command_with_timeout_and_env(
     .await
 }
 
-/// Helper to run JS tools via pnpm or npx (with tool availability check)
-pub async fn run_js_command(tool: &str, args: &[&str], cwd: &Path) -> Result<Output> {
+/// One JS tool run, carrying the binary that was actually spawned.
+///
+/// The executed path is RETURNED rather than re-derived, because provenance
+/// used to be reconstructed from `which::which("pnpm")` at each call site while
+/// this runner had already stopped using a package-manager launcher. It
+/// executes `<cwd>/node_modules/.bin/<tool>` and nothing else, so every
+/// published `pnpm exec eslint …` / `npx eslint …` named a command that never
+/// ran — in the one change whose subject is truthful provenance.
+pub struct JsRun {
+    /// The program handed to the OS, exactly as it was spawned.
+    pub program: std::path::PathBuf,
+    pub output: Output,
+}
+
+impl JsRun {
+    /// The provenance `command` for this run: the executed binary, then the
+    /// arguments it received.
+    pub fn command(&self, args: &[&str]) -> String {
+        let mut command = self.program.display().to_string();
+        for arg in args {
+            command.push(' ');
+            command.push_str(arg);
+        }
+        command
+    }
+}
+
+/// Run the exact local JS binary selected by eligibility and snapshot overlay.
+pub async fn run_js_command(tool: &str, args: &[&str], cwd: &Path) -> Result<JsRun> {
     run_js_command_with_timeout(tool, args, cwd, CHECK_TIMEOUT_SECS).await
 }
 
-/// Helper to run JS tools with custom timeout (for tests)
+/// Run a resolved JS tool with a custom timeout (for tests).
+///
+/// A missing binary is rejected before spawn. Falling back to `pnpm exec` or
+/// `npx` here would create a second resolver after eligibility and could publish
+/// a launcher-level "command not found" as a check result.
 pub async fn run_js_command_with_timeout(
     tool: &str,
     args: &[&str],
     cwd: &Path,
     timeout_secs: u64,
-) -> Result<Output> {
-    // Build full args list
-    let pnpm_args: Vec<&str> = std::iter::once("exec")
-        .chain(std::iter::once(tool))
-        .chain(args.iter().copied())
-        .collect();
-
-    // --no-install: a missing tool must fail fast and parseably, never reach
-    // npm's interactive "Ok to proceed?" prompt (the --deep hang class).
-    let npx_args: Vec<&str> = ["--no-install", tool]
-        .into_iter()
-        .chain(args.iter().copied())
-        .collect();
-
-    // Prefer a resolved local binary: a direct exec with no launcher, no npm
-    // registry consult, and no prompt (PR #12 review #15/#17). Fall back to
-    // pnpm exec, then npx --no-install, only when the tool is not installed
-    // locally.
-    if let Some(bin) = local_js_bin(tool, cwd) {
-        let bin = bin.to_string_lossy().into_owned();
-        run_command_with_timeout(&bin, args, cwd, timeout_secs).await
-    } else if which::which("pnpm").is_ok() {
-        run_command_with_timeout("pnpm", &pnpm_args, cwd, timeout_secs).await
-    } else {
-        run_command_with_timeout("npx", &npx_args, cwd, timeout_secs).await
+) -> Result<JsRun> {
+    let bin_path = cwd.join("node_modules/.bin").join(tool);
+    #[cfg(unix)]
+    if std::fs::metadata(&bin_path).is_ok_and(|metadata| {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 == 0
+    }) {
+        anyhow::bail!(
+            "resolved JS tool is not executable before spawn: {}",
+            bin_path.display()
+        );
     }
+    let bin = local_js_bin(tool, cwd).with_context(|| {
+        format!(
+            "resolved JS tool disappeared before spawn: {}",
+            bin_path.display()
+        )
+    })?;
+    let program = bin.to_string_lossy().into_owned();
+    let output = run_command_with_timeout(&program, args, cwd, timeout_secs).await?;
+    Ok(JsRun {
+        program: bin,
+        output,
+    })
 }
 
 /// Resolve a JS tool to a directly-runnable local binary, bypassing npx.
 ///
-/// `npx --no-install` still consults npm and, on some npm versions, can prompt
-/// or hit the network; a resolved `node_modules/.bin/<tool>` is an unambiguous
-/// local exec with neither. Returns None when the tool is not installed locally
-/// (the caller then falls back to pnpm/npx) (PR #12 review #15/#17).
+/// A resolved `node_modules/.bin/<tool>` is an unambiguous local exec with no
+/// launcher, registry consult, or prompt. Returns `None` when that exact path
+/// cannot be executed (PR #12 review #15/#17).
 pub fn local_js_bin(tool: &str, cwd: &Path) -> Option<std::path::PathBuf> {
     let bin = cwd.join("node_modules/.bin").join(tool);
-    bin.exists().then_some(bin)
+    let metadata = std::fs::metadata(&bin).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(bin)
 }
 
 /// Check if a JS tool is available in node_modules
 pub fn js_tool_available(tool: &str, cwd: &Path) -> bool {
     local_js_bin(tool, cwd).is_some()
+}
+
+/// Why a JS tool cannot run on the substrate this review requested.
+///
+/// Exact eligibility first resolves the tool in the reviewed commit (following
+/// target-owned symlinks), then considers an ambient tool only as a borrow
+/// candidate. Ambient eligibility reads only the live checkout. Execution uses
+/// the same concrete `node_modules/.bin/<tool>` path and fails before spawn if
+/// that path disappears.
+pub(crate) fn js_tool_unavailable_reason(tool: &str, config: &Config) -> Option<String> {
+    let candidate_in_target = match review_substrate(config) {
+        Ok(ReviewSubstrate::ExactTarget(target)) => !matches!(
+            crate::git::commit_path_resolution(
+                &config.repo_root,
+                &target.commit_id,
+                &js_tool_relative_path(tool),
+            ),
+            crate::git::CommitPathResolution::Missing
+        ),
+        Ok(ReviewSubstrate::Ambient) | Err(_) => false,
+    };
+    js_tool_unavailable_reason_with(
+        tool,
+        config,
+        js_tool_available(tool, &config.repo_root),
+        candidate_in_target,
+        cfg!(unix),
+    )
+}
+
+fn js_tool_relative_path(tool: &str) -> PathBuf {
+    Path::new("node_modules/.bin").join(tool)
+}
+
+fn js_tool_unavailable_reason_with(
+    tool: &str,
+    config: &Config,
+    available_in_operator_checkout: bool,
+    candidate_in_target: bool,
+    snapshot_dependency_links_supported: bool,
+) -> Option<String> {
+    match review_substrate(config) {
+        Ok(ReviewSubstrate::Ambient) if available_in_operator_checkout => None,
+        Ok(ReviewSubstrate::Ambient) => Some(format!(
+            "tool not installed (node_modules/.bin/{tool} is missing)"
+        )),
+        Ok(ReviewSubstrate::ExactTarget(_)) if candidate_in_target => None,
+        Ok(ReviewSubstrate::ExactTarget(_)) if !available_in_operator_checkout => Some(format!(
+            "tool not installed in reviewed target or operator checkout (node_modules/.bin/{tool} is missing)"
+        )),
+        Ok(ReviewSubstrate::ExactTarget(_)) if !snapshot_dependency_links_supported => {
+            Some(format!(
+                "tool unavailable for exact-target snapshot: borrowing node_modules is unsupported on this platform ({tool})"
+            ))
+        }
+        Err(error) => Some(format!("exact review target unavailable: {error:#}")),
+        Ok(ReviewSubstrate::ExactTarget(_)) => None,
+    }
 }
 
 /// A resolved plan for running a check.
@@ -2230,9 +2411,9 @@ pub struct CheckPlan {
     pub _snapshot: Option<crate::git::WorktreeSnapshot>,
 }
 
-/// Plan check execution path: if we are in a remote/PR mode (meaning resolved target
-/// commit is different from the checked-out HEAD commit), create an ephemeral worktree
-/// snapshot of the target commit and run there. Otherwise, scan the working tree in place.
+/// Plan check execution path. Exact-target reviews use an ephemeral worktree
+/// snapshot even when the resolved commit equals checked-out `HEAD`; only the
+/// default target-less local review scans the working tree in place.
 ///
 /// When the dispatcher has already materialised ONE shared snapshot for the run
 /// (`config.scan_dir_override`), reuse its directory instead of creating a
@@ -2249,43 +2430,16 @@ pub fn plan_check_run(config: &Config) -> Result<CheckPlan> {
     }
 
     let repo_root = config.repo_root.clone();
-    let repo = match crate::git::Repository::open(&repo_root) {
-        Ok(repo) => repo,
-        Err(error) => {
-            if config.pinned_target.is_some() {
-                return Err(error.context("cannot open repository for pinned review target"));
-            }
+    let target = match review_substrate(config)? {
+        ReviewSubstrate::Ambient => {
             return Ok(CheckPlan {
                 scan_dir: repo_root,
                 _snapshot: None,
             });
         }
+        ReviewSubstrate::ExactTarget(target) => target,
     };
 
-    let resolution = repo
-        .resolve_target(config)
-        .and_then(|target| repo.head_commit_id().map(|head| (target, head)));
-    let (target, head) = match resolution {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            if config.pinned_target.is_some() {
-                return Err(error.context("cannot plan checks for pinned review target"));
-            }
-            return Ok(CheckPlan {
-                scan_dir: repo_root,
-                _snapshot: None,
-            });
-        }
-    };
-
-    if head == target.commit_id {
-        return Ok(CheckPlan {
-            scan_dir: repo_root,
-            _snapshot: None,
-        });
-    }
-
-    // Ephemeral worktree
     let snapshot = crate::git::create_worktree_snapshot(&repo_root, &target.commit_id)?;
     Ok(CheckPlan {
         scan_dir: snapshot.worktree_path.clone(),
@@ -2386,6 +2540,47 @@ mod tests {
         (tmp, sha)
     }
 
+    fn commit_fixture(root: &Path, message: &str, paths: &[&str]) -> String {
+        use crate::git::cmd::git_cmd;
+
+        let run_git = |args: &[&str]| {
+            let output = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        let mut add = vec!["add", "-f"];
+        add.extend_from_slice(paths);
+        run_git(&add);
+        run_git(&["commit", "-q", "-m", message]);
+        let output = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .expect("rev-parse");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("utf8 commit id")
+            .trim()
+            .to_string()
+    }
+
+    fn exact_js_config(root: &Path, target: &str) -> Config {
+        let mut config = test_config();
+        config.profile = crate::config::test_js_profile(false);
+        config.repo_root = root.to_path_buf();
+        config.target = Some(target.to_string());
+        config.pinned_target = Some(crate::git::ResolvedRef {
+            name: target.to_string(),
+            commit_id: target.to_string(),
+            is_remote: false,
+        });
+        config.run_lint = true;
+        config
+    }
+
     fn init_repo_with_one_commit(root: &Path) -> String {
         use crate::git::cmd::git_cmd;
 
@@ -2447,6 +2642,70 @@ mod tests {
         run_git(&["checkout", "-q", "main"]);
 
         (tmp, target)
+    }
+
+    #[test]
+    fn review_substrate_matrix_preserves_entrypoint_intent() {
+        let (repo, head) = repo_with_one_commit();
+        let pinned = crate::git::ResolvedRef {
+            name: "main".to_string(),
+            commit_id: head.clone(),
+            is_remote: false,
+        };
+        let base = || {
+            let mut config = test_config();
+            config.repo_root = repo.path().to_path_buf();
+            // Headless and TUI dispatchers pin even the ordinary local target.
+            // The discriminator must ignore that pin for ambient entrypoints.
+            config.pinned_target = Some(pinned.clone());
+            config
+        };
+
+        let mut rows = Vec::new();
+
+        let mut explicit = base();
+        explicit.target = Some("main".to_string());
+        rows.push(("explicit target", explicit, true));
+
+        let mut pr = base();
+        pr.pr_number = Some(42);
+        rows.push(("PR", pr, true));
+
+        let mut mcp = base();
+        mcp.target = Some(head.clone());
+        rows.push(("MCP explicit target", mcp, true));
+
+        let mut remote = base();
+        remote.remote_mode = true;
+        rows.push(("remote", remote, true));
+
+        let mut remote_only = base();
+        remote_only.remote_only = true;
+        rows.push(("remote-only", remote_only, true));
+
+        let mut ci = base();
+        ci.execution_mode = ExecutionMode::Ci;
+        rows.push(("CI", ci, true));
+
+        let mut tui = base();
+        tui.tui_mode = true;
+        tui.target = Some("main".to_string());
+        rows.push(("TUI explicit target", tui, true));
+
+        rows.push(("default CLI", base(), false));
+
+        let mut gate = base();
+        gate.enforcement_mode = crate::policy::engine::EnforcementMode::GateStrict;
+        rows.push(("target-less gate", gate, false));
+
+        for (name, config, expected_exact) in rows {
+            let substrate = review_substrate(&config).expect(name);
+            assert_eq!(
+                matches!(substrate, ReviewSubstrate::ExactTarget(_)),
+                expected_exact,
+                "entrypoint matrix row: {name}",
+            );
+        }
     }
 
     #[test]
@@ -2541,8 +2800,21 @@ mod tests {
     }
 
     #[test]
-    fn pinned_local_target_keeps_operator_checkout() {
+    fn same_head_exact_review_snapshots_target_and_excludes_ambient_worktrees() {
         let (repo, _) = repo_with_off_head_target();
+        let foreign = repo.path().join(".claude/worktrees/foreign-js");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(
+            foreign.join("package.json"),
+            r#"{"scripts":{"lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            foreign.join("broken.js"),
+            "const definitelyLintBreaking = ;\n",
+        )
+        .unwrap();
+
         let mut config = test_config();
         config.repo_root = repo.path().to_path_buf();
         config.target = Some("main".to_owned());
@@ -2553,9 +2825,75 @@ mod tests {
                 .unwrap(),
         );
         let ledger = TaskLedger::new();
-        share_target_snapshot(&mut config, &[], &ledger).unwrap();
+        let eslint: Vec<Box<dyn Check>> = vec![Box::new(typescript::ESLintCheck)];
+        share_target_snapshot(&mut config, &eslint, &ledger).unwrap();
+
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("an exact same-HEAD review must retain its snapshot");
+        assert_ne!(scan_dir, config.repo_root);
+        assert_eq!(config.scan_dir_override.as_ref(), Some(&scan_dir));
+        assert!(scan_dir.join("tracked.txt").is_file());
+        assert!(
+            !scan_dir.join(".claude/worktrees/foreign-js").exists(),
+            "untracked agent worktrees must not enter an exact-SHA scan",
+        );
+
+        let substrate = resolve_scan_substrate(&scan_dir, &config.repo_root, &[]);
+        assert_eq!(
+            substrate.target_sha.as_deref(),
+            config
+                .pinned_target
+                .as_ref()
+                .map(|target| target.commit_id.as_str()),
+        );
+        assert_eq!(substrate.tree_state, Some(TreeState::Snapshot));
+
+        let provenance = CheckProvenance {
+            command: "eslint .".to_owned(),
+            tool_version: None,
+            cwd: scan_dir.display().to_string(),
+            target_sha: None,
+            tree_state: None,
+            exit_code: Some(0),
+            executed_scope: None,
+            started_at: "start".to_owned(),
+            finished_at: "finish".to_owned(),
+            hard_fail_signatures: Vec::new(),
+            cache_key: None,
+        }
+        .with_scan_substrate("ESLint", &scan_dir, &config.repo_root);
+        assert_eq!(provenance.cwd, scan_dir.display().to_string());
+        assert_eq!(provenance.target_sha, substrate.target_sha);
+        assert_eq!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[test]
+    fn same_head_ambient_review_keeps_dirty_operator_checkout() {
+        let (repo, _) = repo_with_off_head_target();
+        let foreign = repo.path().join(".claude/worktrees/foreign-js");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("broken.js"), "const broken = ;\n").unwrap();
+
+        let mut config = test_config();
+        config.repo_root = repo.path().to_path_buf();
+        let owner = crate::git::Repository::open(repo.path()).unwrap();
+        config.pinned_target = Some(owner.resolve_target(&config).unwrap());
+
+        let ledger = TaskLedger::new();
+        let eslint: Vec<Box<dyn Check>> = vec![Box::new(typescript::ESLintCheck)];
+        share_target_snapshot(&mut config, &eslint, &ledger).unwrap();
+
         assert!(ledger.scan_dir().is_none());
         assert_eq!(config.scan_dir_override.as_ref(), Some(&config.repo_root));
+        assert!(
+            config
+                .repo_root
+                .join(".claude/worktrees/foreign-js")
+                .exists()
+        );
+        let substrate = resolve_scan_substrate(&config.repo_root, &config.repo_root, &[]);
+        assert_eq!(substrate.tree_state, Some(TreeState::LocalDirty));
     }
 
     #[test]
@@ -2970,19 +3308,19 @@ mod tests {
                 "{check} does not read prview's dependency links",
             );
         }
-        for check in [
-            "TypeScript",
-            "ESLint",
-            "Vitest",
-            "Stylelint",
-            "tauri_info",
-            "esbuild_meta",
-            "npm_sbom",
+        for (check, expected) in [
+            ("TypeScript", "node_modules/.bin/tsc"),
+            ("ESLint", "node_modules/.bin/eslint"),
+            ("Vitest", "node_modules/.bin/vitest"),
+            ("Stylelint", "node_modules/.bin/stylelint"),
+            ("tauri_info", "node_modules/.bin/tauri"),
+            ("esbuild_meta", "node_modules/.bin/esbuild"),
+            ("npm_sbom", "node_modules"),
         ] {
             assert_eq!(
                 consumable_scaffolding(check),
-                &["node_modules"],
-                "{check} resolves its toolchain through node_modules",
+                &[expected],
+                "{check} must name the concrete path it resolves",
             );
         }
     }
@@ -4128,11 +4466,11 @@ test result: ok. 2 passed; 0 failed
         // this freshly written executable, so execve races with "Text file busy"
         // (os error 26). Retry the spawn a few times; the racing child exec's and
         // drops the inherited fd almost immediately.
-        let mut output = None;
+        let mut run = None;
         for attempt in 0..8u32 {
             match run_js_command_with_timeout("faketool", &[], tmp.path(), 10).await {
                 Ok(o) => {
-                    output = Some(o);
+                    run = Some(o);
                     break;
                 }
                 Err(e) if attempt < 7 && e.to_string().contains("os error 26") => {
@@ -4141,11 +4479,929 @@ test result: ok. 2 passed; 0 failed
                 Err(e) => panic!("local bin should run: {e}"),
             }
         }
-        let output = output.expect("local bin should run within the ETXTBSY retry budget");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let run = run.expect("local bin should run within the ETXTBSY retry budget");
+        let stdout = String::from_utf8_lossy(&run.output.stdout);
         assert!(
             stdout.contains("LOCAL_BIN_RAN"),
             "run_js_command must exec the local bin directly, got: {stdout}"
+        );
+        assert_eq!(
+            run.program, toolpath,
+            "the runner must report the binary it spawned, so provenance cannot \
+             invent a launcher that never ran"
+        );
+    }
+
+    /// The runner executes `<cwd>/node_modules/.bin/<tool>` and nothing else,
+    /// so the published `command` must name that path. It used to be rebuilt
+    /// from `which::which("pnpm")` at each call site, so a successful direct run
+    /// published `pnpm exec eslint …` — a command no part of the run executed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eslint_provenance_reports_the_executed_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let tool = bin_dir.join("eslint");
+        std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").expect("target-owned eslint");
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("executable tool");
+        let target = commit_fixture(
+            root,
+            "target owns its own eslint",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        let provenance = result.provenance.expect("ESLint provenance");
+        let executed = format!("{}/node_modules/.bin/eslint", provenance.cwd);
+        assert!(
+            provenance.command.starts_with(&executed),
+            "provenance must name the binary that ran ({executed}), got: {}",
+            provenance.command,
+        );
+        assert!(
+            !provenance.command.contains("pnpm") && !provenance.command.contains("npx"),
+            "no package-manager launcher takes part in a resolved JS run: {}",
+            provenance.command,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_same_head_eslint_borrows_missing_tool_inside_target_owned_bin() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let node_modules = root.join("node_modules");
+        std::fs::create_dir(&node_modules).expect("target node_modules");
+        std::fs::write(
+            node_modules.join("committed-marker.txt"),
+            "owned by target commit\n",
+        )
+        .expect("target marker");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let bin_dir = node_modules.join(".bin");
+        std::fs::create_dir(&bin_dir).expect("target bin dir");
+        std::fs::write(bin_dir.join("target-tool"), "target-owned\n")
+            .expect("target-owned sibling tool");
+
+        let run_git = |args: &[&str]| {
+            let output = crate::git::cmd::git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        run_git(&[
+            "add",
+            "-f",
+            "package.json",
+            "node_modules/committed-marker.txt",
+            "node_modules/.bin/target-tool",
+        ]);
+        run_git(&["commit", "-q", "-m", "target owns partial bin"]);
+        let target = git2::Repository::open(root)
+            .expect("open fixture")
+            .head()
+            .expect("fixture head")
+            .peel_to_commit()
+            .expect("head commit")
+            .id()
+            .to_string();
+
+        let ambient_eslint = node_modules.join("eslint");
+        std::fs::create_dir(&ambient_eslint).expect("ambient eslint package");
+        std::fs::write(ambient_eslint.join("package-marker"), "ambient package\n")
+            .expect("ambient eslint package marker");
+        let eslint = bin_dir.join("eslint");
+        {
+            let mut executable = std::fs::File::create(&eslint).expect("ambient eslint");
+            executable
+                .write_all(
+                    b"#!/bin/sh\ntest -f node_modules/committed-marker.txt || exit 9\ntest -f node_modules/eslint/package-marker || exit 10\nprintf 'COLLISION_ESLINT_RAN\\n'\n",
+                )
+                .expect("write ambient eslint");
+            executable.sync_all().expect("sync ambient eslint");
+        }
+        let mut permissions = std::fs::metadata(&eslint)
+            .expect("eslint metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&eslint, permissions).expect("make eslint executable");
+
+        let mut config = test_config();
+        config.profile = crate::config::test_js_profile(false);
+        config.repo_root = root.to_path_buf();
+        config.target = Some(target.clone());
+        config.pinned_target = Some(crate::git::ResolvedRef {
+            name: target.clone(),
+            commit_id: target.clone(),
+            is_remote: false,
+        });
+        config.run_lint = true;
+
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(!result.cached);
+        assert!(result.output.contains("COLLISION_ESLINT_RAN"));
+        assert!(
+            !result.output.contains("Command \"eslint\" not found"),
+            "a resolved tool must not fall through to a launcher-level failure",
+        );
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_ne!(provenance.cwd, root.display().to_string());
+        assert_eq!(provenance.target_sha.as_deref(), Some(target.as_str()));
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "the concrete eslint path crosses a link created by prview",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_target_owned_bin_symlink_executes_target_as_snapshot() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let node_modules = root.join("node_modules");
+        let owned_bin = node_modules.join("bin-owned");
+        std::fs::create_dir_all(&owned_bin).expect("target-owned bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let eslint = owned_bin.join("eslint");
+        {
+            let mut executable = std::fs::File::create(&eslint).expect("target eslint");
+            executable
+                .write_all(b"#!/bin/sh\nprintf 'TARGET_SYMLINK_ESLINT_RAN\\n'\n")
+                .expect("write target eslint");
+            executable.sync_all().expect("sync target eslint");
+        }
+        let mut permissions = std::fs::metadata(&eslint)
+            .expect("target eslint metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&eslint, permissions).expect("make target eslint executable");
+        std::os::unix::fs::symlink("bin-owned", node_modules.join(".bin"))
+            .expect("target-owned .bin symlink");
+
+        let run_git = |args: &[&str]| {
+            let output = crate::git::cmd::git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        run_git(&[
+            "add",
+            "-f",
+            "package.json",
+            "node_modules/.bin",
+            "node_modules/bin-owned/eslint",
+        ]);
+        run_git(&["commit", "-q", "-m", "target owns symlinked bin"]);
+        let target = git2::Repository::open(root)
+            .expect("open fixture")
+            .head()
+            .expect("fixture head")
+            .peel_to_commit()
+            .expect("head commit")
+            .id()
+            .to_string();
+
+        // Make the operator checkout prove nothing about target eligibility.
+        // The exact target still contains the symlink and executable; HEAD does not.
+        run_git(&["rm", "-q", "-r", "node_modules"]);
+        run_git(&["commit", "-q", "-m", "operator head removes target tool"]);
+        assert!(!root.join("node_modules/.bin/eslint").exists());
+
+        let mut config = test_config();
+        config.profile = crate::config::test_js_profile(false);
+        config.repo_root = root.to_path_buf();
+        config.target = Some(target.clone());
+        config.pinned_target = Some(crate::git::ResolvedRef {
+            name: target.clone(),
+            commit_id: target.clone(),
+            is_remote: false,
+        });
+        config.run_lint = true;
+
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(!result.cached);
+        assert!(result.output.contains("TARGET_SYMLINK_ESLINT_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(provenance.target_sha.as_deref(), Some(target.as_str()));
+        assert_eq!(provenance.tree_state, Some(TreeState::Snapshot));
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "target-owned symlink shape must not impersonate a prview-created borrow",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_target_owned_pnpm_shim_reports_borrowed_payload() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let shim = bin_dir.join("eslint");
+        std::fs::write(
+            &shim,
+            b"#!/bin/sh\nbasedir=$(dirname \"$0\")\nexec node \"$basedir/../eslint/bin/eslint.js\" \"$@\"\n",
+        )
+        .expect("pnpm-style shim");
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).expect("executable shim");
+        let target = commit_fixture(
+            root,
+            "target owns pnpm shim",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&payload_dir).expect("ambient eslint package");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "console.log('PNPM_BORROWED_PAYLOAD_RAN')\n",
+        )
+        .expect("ambient eslint payload");
+
+        let config = exact_js_config(root, &target);
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("PNPM_BORROWED_PAYLOAD_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "the shim's executed sibling payload is prview-borrowed",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_unrecognized_wrapper_closure_is_unproven() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let wrapper = bin_dir.join("eslint");
+        std::fs::write(
+            &wrapper,
+            b"#!/bin/sh\ntool_dir=$(dirname \"$0\")\nexec node \"$tool_dir/../eslint/bin/eslint.js\" \"$@\"\n",
+        )
+        .expect("unrecognized wrapper");
+        let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions).expect("executable wrapper");
+        let target = commit_fixture(
+            root,
+            "target owns unrecognized wrapper",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&payload_dir).expect("ambient eslint package");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "console.log('UNRECOGNIZED_AMBIENT_PAYLOAD_RAN')\n",
+        )
+        .expect("ambient eslint payload");
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("UNRECOGNIZED_AMBIENT_PAYLOAD_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotUnprovenDeps),
+            "an unreadable wrapper grammar withholds the exact claim without \
+             inventing a borrow nobody observed",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "`borrowed` is a claim with evidence; this closure produced none",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_shebangless_launcher_is_unproven_not_an_exact_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let launcher = bin_dir.join("eslint");
+        // No `#!` at all. That is NOT a native binary: `Command` spawns through
+        // `execvp`, POSIX requires `execvp` to retry an `ENOEXEC` file through
+        // `/bin/sh`, and the shell then honours every indirection in the line
+        // below. Treating "no shebang" as proof of a bounded closure published
+        // `snapshot` for a run that executed the operator's uncommitted bytes.
+        std::fs::write(
+            &launcher,
+            b"exec node \"$(dirname \"$0\")/../eslint/bin/eslint.js\" \"$@\"\n",
+        )
+        .expect("shebangless launcher");
+        let mut permissions = std::fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&launcher, permissions).expect("executable launcher");
+        let target = commit_fixture(
+            root,
+            "target owns a shebangless launcher",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        // The payload the launcher executes exists ONLY in the operator's
+        // working tree — it is in no commit.
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&payload_dir).expect("ambient eslint package");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "console.log('SHEBANGLESS_AMBIENT_PAYLOAD_RAN')\n",
+        )
+        .expect("ambient eslint payload");
+
+        let config = exact_js_config(root, &target);
+        // An `ENOEXEC` launcher has two different futures, and which one a host
+        // gets is a property of the SPAWN PATH, not of this product. Where the
+        // spawn goes through `fork` + `execvp` (and on macOS, measured), POSIX
+        // requires the retry through `/bin/sh` and the ambient payload really
+        // runs; on Rust's default `posix_spawn` path glibc hands `ENOEXEC` back
+        // instead, so nothing runs at all — measured on Linux CI as
+        // `Exec format error (os error 8)`, which is what made this cell fail
+        // there while passing locally. Both worlds are acceptable and this
+        // pins what must hold in EITHER: an exact `Snapshot` is never claimed.
+        let result = match typescript::ESLintCheck.run(&config).await {
+            Ok(result) => result,
+            Err(error) => {
+                let reported = format!("{error:#}");
+                assert!(
+                    reported.contains("failed to spawn"),
+                    "the only acceptable failure here is the launcher refusing to \
+                     exec at all (fail-closed, nothing was scanned and nothing was \
+                     claimed), got: {reported}",
+                );
+                return;
+            }
+        };
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(
+            result.output.contains("SHEBANGLESS_AMBIENT_PAYLOAD_RAN"),
+            "the shebangless launcher must really reach the ambient payload, \
+             otherwise this fixture proves nothing: {}",
+            result.output,
+        );
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotUnprovenDeps),
+            "a missing interpreter directive leaves the closure unread, so the \
+             pack must say so instead of certifying the scan",
+        );
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::Snapshot),
+            "ambient bytes executed here; `snapshot` would be a false exact claim",
+        );
+    }
+
+    /// The bytes are a real pnpm shim taken from an actual installation, not a
+    /// shape reconstructed to fit the recognizer: ~18 active lines, a
+    /// `sed`-normalised `basedir`, a `case uname` block, a `NODE_PATH` export
+    /// and an `if [ -x "$basedir/node" ]` fork. Only two substitutions were made
+    /// — the payload package name, and the absolute store paths, replaced with a
+    /// neutral prefix so no operator path enters this repository.
+    ///
+    /// Everything here is target-owned: shim and payload are both in the commit
+    /// and no file is ambient. The honest answer is therefore neither `snapshot`
+    /// (prview cannot read this grammar, so it proved nothing) nor
+    /// `snapshot-borrowed-deps` (nothing borrowed was observed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_real_pnpm_shim_closure_is_unproven() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&payload_dir).expect("target eslint package");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "console.log('REAL_PNPM_SHIM_TARGET_PAYLOAD_RAN')\n",
+        )
+        .expect("target eslint payload");
+        let shim = bin_dir.join("eslint");
+        std::fs::write(
+            &shim,
+            br#"#!/bin/sh
+basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")
+
+case `uname` in
+    *CYGWIN*|*MINGW*|*MSYS*)
+        if command -v cygpath > /dev/null 2>&1; then
+            basedir=`cygpath -w "$basedir"`
+        fi
+    ;;
+esac
+
+if [ -z "$NODE_PATH" ]; then
+  export NODE_PATH="/opt/pnpm-store/.pnpm/eslint@9.0.0/node_modules/eslint/node_modules:/opt/pnpm-store/.pnpm/eslint@9.0.0/node_modules:/opt/pnpm-store/.pnpm/node_modules"
+else
+  export NODE_PATH="/opt/pnpm-store/.pnpm/eslint@9.0.0/node_modules/eslint/node_modules:/opt/pnpm-store/.pnpm/eslint@9.0.0/node_modules:/opt/pnpm-store/.pnpm/node_modules:$NODE_PATH"
+fi
+if [ -x "$basedir/node" ]; then
+  exec "$basedir/node"  "$basedir/../eslint/bin/eslint.js" "$@"
+else
+  exec node  "$basedir/../eslint/bin/eslint.js" "$@"
+fi
+"#,
+        )
+        .expect("real pnpm shim");
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).expect("executable shim");
+        let target = commit_fixture(
+            root,
+            "target owns a real pnpm shim and its payload",
+            &[
+                "package.json",
+                "node_modules/.bin/eslint",
+                "node_modules/eslint/bin/eslint.js",
+            ],
+        );
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(
+            result.output.contains("REAL_PNPM_SHIM_TARGET_PAYLOAD_RAN"),
+            "the real shim must execute its committed payload: {}",
+            result.output,
+        );
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotUnprovenDeps),
+            "prview recognises no real package-manager shim grammar, and not \
+             recognising one is not evidence of a borrow",
+        );
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "every byte in this closure is in the commit; calling it borrowed \
+             makes `borrowed` a bag for unread files",
+        );
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::Snapshot),
+            "the grammar was never read, so target-only was never proved",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_direct_node_shebang_closure_is_unproven() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let tool = bin_dir.join("eslint");
+        // A `node` interpreter directive with the whole program inline. Nothing
+        // is borrowed and nothing indirects, but the recognized grammars are
+        // shell grammars: prview cannot read a JS program's closure, so it must
+        // not pretend to have proved one either way.
+        std::fs::write(
+            &tool,
+            b"#!/usr/bin/env node\nconsole.log('DIRECT_NODE_INLINE_RAN')\n",
+        )
+        .expect("direct node tool");
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("executable tool");
+        let target = commit_fixture(
+            root,
+            "target owns a direct node tool",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(
+            result.output.contains("DIRECT_NODE_INLINE_RAN"),
+            "the direct node tool must run: {}",
+            result.output,
+        );
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotUnprovenDeps),
+            "a JS interpreter directive is outside every recognized grammar",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+        assert_ne!(provenance.tree_state, Some(TreeState::SnapshotBorrowedDeps));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_direct_script_ignores_wrapper_text_in_comments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let tool = bin_dir.join("eslint");
+        std::fs::write(
+            &tool,
+            b"#!/bin/sh\n# Documentation example only: require(\"never-loaded\")\nprintf 'DIRECT_TARGET_ONLY_RAN\\n'\n",
+        )
+        .expect("direct target tool");
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("executable target tool");
+        let target = commit_fixture(
+            root,
+            "target owns direct tool with wrapper-like comment",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let unrelated = root.join("node_modules/unrelated");
+        std::fs::create_dir_all(&unrelated).expect("ambient unrelated package");
+        std::fs::write(unrelated.join("index.js"), "console.log('UNRELATED')\n")
+            .expect("ambient unrelated payload");
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("DIRECT_TARGET_ONLY_RAN"));
+        assert!(!result.output.contains("UNRELATED"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::Snapshot),
+            "comments and string literals are not structural wrapper evidence",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_non_executable_file_fails_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let marker = root.join("nonexec-spawned");
+        let tool = bin_dir.join("eslint");
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+        )
+        .expect("non-executable target tool");
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&tool, permissions).expect("remove execute bits");
+        let target = commit_fixture(
+            root,
+            "target owns non-executable tool",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let error = check
+            .run(&config)
+            .await
+            .expect_err("a non-executable tool must fail before spawn");
+
+        assert!(
+            error.to_string().contains("not executable before spawn"),
+            "unexpected pre-spawn error: {error:#}",
+        );
+        assert!(
+            !error.to_string().contains("Permission denied"),
+            "the OS spawn boundary must not decide tool eligibility: {error:#}",
+        );
+        assert!(!marker.exists(), "the non-executable tool must never run");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_target_wrapper_reports_borrowed_transitive_dependency() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::create_dir_all(&payload_dir).expect("target eslint package");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let shim = bin_dir.join("eslint");
+        std::fs::write(
+            &shim,
+            b"#!/bin/sh\nbasedir=$(dirname \"$0\")\nexec node \"$basedir/../eslint/bin/eslint.js\" \"$@\"\n",
+        )
+        .expect("pnpm-style shim");
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).expect("executable shim");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "require('helper'); console.log('TARGET_PAYLOAD_RAN')\n",
+        )
+        .expect("target eslint payload");
+        let target = commit_fixture(
+            root,
+            "target owns wrapper and payload",
+            &[
+                "package.json",
+                "node_modules/.bin/eslint",
+                "node_modules/eslint/bin/eslint.js",
+            ],
+        );
+
+        let helper_dir = root.join("node_modules/helper");
+        std::fs::create_dir_all(&helper_dir).expect("ambient helper package");
+        std::fs::write(
+            helper_dir.join("index.js"),
+            "console.log('BORROWED_TRANSITIVE_DEP_RAN')\n",
+        )
+        .expect("ambient helper payload");
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("BORROWED_TRANSITIVE_DEP_RAN"));
+        assert!(result.output.contains("TARGET_PAYLOAD_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "a target wrapper can dynamically load a prview-borrowed transitive package",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_absolute_target_symlink_reports_external_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let external = tempfile::tempdir().expect("external tool dir");
+        let external_tool = external.path().join("eslint");
+        std::fs::write(
+            &external_tool,
+            b"#!/bin/sh\nprintf 'ABSOLUTE_EXTERNAL_ESLINT_RAN\\n'\n",
+        )
+        .expect("external eslint");
+        let mut permissions = std::fs::metadata(&external_tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&external_tool, permissions).expect("external executable");
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let node_modules = root.join("node_modules");
+        std::fs::create_dir(&node_modules).expect("target node_modules");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        std::os::unix::fs::symlink(external.path(), node_modules.join(".bin"))
+            .expect("absolute target bin symlink");
+        let target = commit_fixture(
+            root,
+            "target owns absolute bin symlink",
+            &["package.json", "node_modules/.bin"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("ABSOLUTE_EXTERNAL_ESLINT_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "host-local bytes behind a target-owned absolute symlink are not an exact snapshot",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn exact_eslint_casefolded_prview_link_reports_borrowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let external = tempfile::tempdir().expect("external tool dir");
+        let external_tool = external.path().join("eslint");
+        std::fs::write(
+            &external_tool,
+            b"#!/bin/sh\nprintf 'CASEFOLD_BORROWED_ESLINT_RAN\\n'\n",
+        )
+        .expect("external eslint");
+        let mut permissions = std::fs::metadata(&external_tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&external_tool, permissions).expect("external executable");
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        std::fs::write(bin_dir.join("target-tool"), "target-owned\n").expect("target tool");
+        let target = commit_fixture(
+            root,
+            "target owns partial bin",
+            &["package.json", "node_modules/.bin/target-tool"],
+        );
+        std::os::unix::fs::symlink(&external_tool, bin_dir.join("ESLint"))
+            .expect("case-variant ambient eslint");
+        assert!(
+            bin_dir.join("eslint").is_file(),
+            "this regression requires the case-insensitive APFS lookup exercised in F03",
+        );
+
+        let config = exact_js_config(root, &target);
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("CASEFOLD_BORROWED_ESLINT_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "case-folded lookup must retain creator provenance",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[tokio::test]
+    async fn exact_eslint_directory_entry_fails_before_spawn() {
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let directory = root.join("node_modules/.bin/eslint");
+        std::fs::create_dir_all(&directory).expect("directory-shaped tool entry");
+        std::fs::write(directory.join("not-an-executable"), "fixture\n").expect("fixture");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let target = commit_fixture(
+            root,
+            "target owns directory-shaped tool",
+            &["package.json", "node_modules/.bin/eslint/not-an-executable"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let eligibility = typescript::ESLintCheck.check_eligibility(&config);
+        assert!(
+            matches!(eligibility, CheckEligibility::Run),
+            "the target-owned entry is admitted for final snapshot resolution: {eligibility:?}",
+        );
+        assert!(!js_tool_available("eslint", root));
+        assert!(local_js_bin("eslint", root).is_none());
+        let error = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect_err("a directory-shaped tool must fail before spawn");
+        assert!(
+            error
+                .to_string()
+                .contains("resolved JS tool disappeared before spawn"),
+            "unexpected pre-spawn error: {error:#}",
+        );
+    }
+
+    #[test]
+    fn exact_js_review_skips_when_snapshot_cannot_borrow_node_modules() {
+        let (repo, head) = repo_with_one_commit();
+        let mut config = test_config();
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some(head.clone());
+        config.pinned_target = Some(crate::git::ResolvedRef {
+            name: head,
+            commit_id: config.target.clone().unwrap(),
+            is_remote: false,
+        });
+
+        let reason = js_tool_unavailable_reason_with("eslint", &config, true, false, false)
+            .expect("non-Unix exact snapshot must skip borrowed toolchain");
+        assert!(reason.contains("exact-target snapshot"), "{reason}");
+        assert!(reason.contains("unsupported on this platform"), "{reason}");
+
+        let mut ambient = config;
+        ambient.target = None;
+        assert_eq!(
+            js_tool_unavailable_reason_with("eslint", &ambient, true, false, false),
+            None,
+            "ambient local review executes the tool directly from its checkout",
         );
     }
 
@@ -4411,6 +5667,117 @@ test result: ok. 2 passed; 0 failed
         );
     }
 
+    #[tokio::test]
+    async fn ambient_cargo_cache_entry_never_replays_into_exact_same_head() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CargoKeyProbe {
+            executions: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Check for CargoKeyProbe {
+            fn name(&self) -> &str {
+                "Cargo check"
+            }
+
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+
+            fn cache_key(&self, config: &Config) -> Option<String> {
+                cargo::CargoCheck.cache_key(config)
+            }
+
+            async fn run(&self, config: &Config) -> Result<CheckResult> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                let plan = plan_check_run(config)?;
+                let observed = std::fs::read_to_string(plan.scan_dir.join("tracked.txt"))?;
+                Ok(CheckResult {
+                    name: self.name().to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(1),
+                    output: observed,
+                    cached: false,
+                    provenance: None,
+                })
+            }
+        }
+
+        let (repo, head) = repo_with_one_commit();
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname='probe'\nversion='0.0.0'\n",
+        )
+        .expect("ambient manifest");
+        std::fs::write(repo.path().join("tracked.txt"), "ambient dirty\n").expect("dirty checkout");
+
+        let mut ambient = rust_config(false, false, false);
+        ambient.repo_root = repo.path().to_path_buf();
+        ambient.profile.cargo_root = Some(repo.path().to_path_buf());
+        ambient.pinned_target = Some(crate::git::ResolvedRef {
+            name: "main".to_string(),
+            commit_id: head.clone(),
+            is_remote: false,
+        });
+        ambient.quiet = true;
+
+        let mut exact = ambient.clone();
+        exact.target = Some("main".to_string());
+
+        let ambient_key = cargo::CargoCheck
+            .cache_key(&ambient)
+            .expect("ambient Cargo key");
+        let exact_key = cargo::CargoCheck
+            .cache_key(&exact)
+            .expect("exact Cargo key");
+        assert_ne!(ambient_key, exact_key, "substrates must partition cache");
+
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let ambient_checks: Vec<Box<dyn Check>> = vec![Box::new(CargoKeyProbe {
+            executions: Arc::clone(&executions),
+        })];
+        let ambient_ledger = TaskLedger::new();
+        let ambient_governor = Arc::new(ResourceGovernor::new());
+        let (ambient_results, _) = run_all_checks(
+            ambient_checks,
+            Cache::with_dir(cache_dir.path().to_path_buf(), true),
+            &ambient,
+            &ambient_ledger,
+            &ambient_governor,
+        )
+        .await
+        .expect("ambient run");
+
+        let exact_checks: Vec<Box<dyn Check>> = vec![Box::new(CargoKeyProbe {
+            executions: Arc::clone(&executions),
+        })];
+        let exact_ledger = TaskLedger::new();
+        let exact_governor = Arc::new(ResourceGovernor::new());
+        let (exact_results, _) = run_all_checks(
+            exact_checks,
+            Cache::with_dir(cache_dir.path().to_path_buf(), true),
+            &exact,
+            &exact_ledger,
+            &exact_governor,
+        )
+        .await
+        .expect("exact run");
+
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert!(!ambient_results[0].cached);
+        assert!(
+            !exact_results[0].cached,
+            "exact run must execute, not replay"
+        );
+        assert_eq!(ambient_results[0].output, "ambient dirty\n");
+        assert_eq!(
+            exact_results[0].output, "one\n",
+            "exact run must observe the committed target bytes",
+        );
+    }
+
     /// The other way to end up with nothing snapshot-backed to run: the fast
     /// remote-only preset, where the snapshot-backed gates are ruled out at
     /// eligibility and the one runnable check is semgrep — which owns its own
@@ -4488,7 +5855,7 @@ test result: ok. 2 passed; 0 failed
         assert!(results[0].cached);
         assert!(
             ledger.scan_dir().is_none(),
-            "target == HEAD: the artifact stage's fallback to repo_root is the right answer",
+            "ambient target-less: the artifact fallback to repo_root is the right answer",
         );
         assert!(ledger.resolved_substrate().is_none());
     }

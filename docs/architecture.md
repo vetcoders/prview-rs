@@ -151,6 +151,7 @@ Converts CLI → Config and detects the project profile:
 pub struct Config {
     pub repo_root: PathBuf,
     pub profile: DetectedProfile,
+    pub requested_profile: Option<Profile>,
     pub execution_mode: ExecutionMode,
     pub run_tests: bool,
     pub run_lint: bool,
@@ -179,6 +180,31 @@ manifests:
 
 A Rust project with a `package.json` for tooling (e.g. pnpm for dev tools) is
 detected as `Rust`, not `Mixed`.
+
+`Config::from_cli` first detects the operator checkout for startup. After the
+target ref is pinned, the review refreshes one profile before selecting checks
+or building profile-dependent artifacts. Exact reviews derive markers, the
+manifest and Cargo paths from regular entries and blobs in the pinned Git tree;
+they do not follow snapshot symlinks into the operator's filesystem. They also
+materialize one target snapshot, which the run ledger keeps alive through checks
+and artifact generation. The TUI sends the refreshed profile to its display
+state before check events, replacing the header profile and check rows; it
+keeps the refresh baseline for another analysis in the same session. Ordinary target-less reviews
+refresh from the live checkout, including its uncommitted changes; an external
+manifest-configured Cargo root keeps its original path there. The
+requested `--profile` kind remains explicit, while marker fields and detected
+Cargo paths come from the reviewed tree. Exact-target Cargo paths stay anchored
+to the logical repository root for consumers that map them into a scan directory.
+Manifest Cargo roots in an exact review normalize harmless dot and trailing
+separator components before Git-tree lookup, while paths escaping the tree are
+rejected for profile detection.
+`Config::from_cli` records `Some(Auto)` or the explicit CLI selection to opt into
+that refresh. A programmatic `Config` passed to `App::from_config` starts with
+`requested_profile: None`, so its supplied `profile` remains authoritative;
+callers can opt into target-derived detection with `Some(Profile::Auto)`.
+If a caller changes the public `profile` field after `Config::from_cli`, that
+override also remains authoritative: the startup profile is retained only to
+recognize this edit before the run refreshes its profile.
 
 ### git/mod.rs
 
@@ -327,6 +353,9 @@ reason the local reading below gives; libgit2 also drops a deleted
 assume-unchanged entry from the index-to-worktree diff (`diff_delta__from_one`).
 The boundaries are unioned over the whole run rather than cut at the audit, so
 a rewrite by a later check withholds the proof too — deliberately conservative.
+A same-`HEAD` exact review also uses this snapshot observation. Equality between
+the operator's `HEAD` and target SHA does not make cargo-audit read the operator
+checkout when the run materialized a target snapshot.
 A local run reads the audited lock once more after the checks, with a diff
 narrowed to that one path against the target commit and untracked files excluded — the in-repo output and check caches
 R4-19 guards against cannot reach that one tracked file — and a lock that
@@ -512,9 +541,12 @@ exactly one diff base.
 
 **The substrate.** Whether a selection can be trusted also depends on which tree
 the checks actually read, and that is a separate fact decided later, inside
-`run_all` (`share_target_snapshot`). A pinned target does NOT always mean a
-snapshot: when the reviewed target is the checked-out `HEAD`, `plan_check_run`
-hands the gates the repository root itself. `ReviewedTree` names the four cases
+`run_all` (`share_target_snapshot`). An exact-target review uses a snapshot even
+when the reviewed commit equals the checked-out `HEAD`; target equality is not
+permission to read untracked operator files. The one exception is the ordinary
+local invocation with no explicit target or automation/remote mode: it
+intentionally reviews the live working tree so a developer can inspect
+uncommitted work. `ReviewedTree` names the four cases
 — `Snapshot`, `LocalClean`, `LocalDirty`, `Unknown` — and is resolved from what
 the ledger recorded plus the operator cleanliness frozen before the run. A
 snapshot the ledger reports as `SnapshotDirty`, or one whose substrate cannot be
@@ -560,8 +592,8 @@ snapshot*. A `--pr` review is about the pinned target and the canonical PR diff;
 the gates never open the operator's tree, so escalating on it would make the
 feature useless during exactly the work it exists for.
 
-The mirror of that rule: when the run reads the operator checkout itself — an
-on-`HEAD` review — the same uncommitted work IS what the tools compile, while
+The mirror of that rule: when an ambient local run reads the operator checkout
+itself, the same uncommitted work IS what the tools compile, while
 the commit-range change set cannot list it. Selecting from a set that is missing
 files the tools will read is the silent narrowing the contract forbids, so that
 case escalates. The fact that decides which of the two applies is never "is the
@@ -651,11 +683,10 @@ evidence, and buys no exception anywhere.
 
 **Rust workspace resolution.** One `cargo metadata --format-version 1 --no-deps
 --frozen` per run, with its own timeout, read from the cargo root **inside the
-reviewed tree**. `profile.cargo_root` is detected in the operator checkout,
-which on a `--pr` or `--remote` run is a different revision entirely; reading
-metadata there would describe another revision's members and path edges while
-the change set describes this one. The detected root is therefore expressed
-relative to the repository root and rebased onto the reviewed tree, and a root
+reviewed tree**. An exact review detects `profile.cargo_root` in the pinned
+target tree and expresses it relative to the logical repository root. Reading
+metadata from the operator checkout could describe another revision's members
+and path edges. The detected root is rebased onto the reviewed tree, and a root
 that cannot be placed inside it escalates with that stated reason. This is not
 the network-capable full resolve `cargo.rs` refuses: `--no-deps` returns the
 members' own manifests without resolving the dependency graph, and `--frozen`
@@ -788,27 +819,318 @@ preset, because naming the operator is the more specific truth.
 
 Checks must judge the *reviewed* commit, not whatever happens to be checked out
 locally. `plan_check_run()` resolves the working directory for every language
-check: when the resolved target equals `HEAD` (the ordinary local review) it
-returns `repo_root` unchanged; when they differ (`--pr`, `--remote`, or an
-explicit target) it materialises a detached `git worktree` at the target commit
-and returns that path. `node_modules` and `.venv` are symlinked into the
-snapshot, so tests and linters keep their installed environment without a
-reinstall.
+check. An explicit target, PR/MCP, remote/remote-only, or CI review materialises
+a detached `git worktree` at the target commit even when that commit equals
+`HEAD`. Only the default local invocation with no target keeps `repo_root`,
+because that mode intentionally reviews the developer's live, possibly dirty
+tree. On Unix, an unowned `node_modules` and `.venv` are symlinked into snapshots,
+so tests and linters keep their installed environment without a reinstall. If
+the target commit already owns a `node_modules` directory, prview preserves its
+contents and links only the operator's missing top-level dependency entries
+inside it instead. If the target also owns `.bin` as a directory, missing tool
+entries are linked inside that directory as well; sibling packages are still
+linked at the top level because npm/pnpm shims commonly resolve `../<package>`.
+
+JS eligibility, execution, and provenance use one resolution model rooted at
+`node_modules/.bin/<tool>`. Exact preflight classifies the target entry as
+missing, runnable, or present-but-unresolved. The last class is admitted only so
+the finished snapshot can resolve absolute/case-sensitive filesystem semantics;
+a directory, broken link, or vanished target is rejected
+before spawn. A missing target entry may use the operator checkout only as a
+borrow candidate. Execution never falls back to a package-manager launcher.
+
+The finished-snapshot resolver follows the invocation path to its canonical
+filesystem identity and publishes one of **three** provenance states. The rule
+is intentionally asymmetric, and the asymmetry runs in both directions:
+
+- `Snapshot` requires the JS-tree closure to be **proved** target-owned: no
+  bytes the proof can see the tool read — the invocation, and a recognized
+  wrapper's payload — come from outside the snapshot. The **ambient runtime is
+  outside the proof**, and always was: `exec node "$basedir/<payload>"` resolves
+  `node` through `PATH`, and a validated platform header says nothing about
+  `ld.so`/`dyld`, libc, or any shared object the loader maps. Requiring the
+  interpreter would not strengthen the claim, it would make it unobtainable —
+  prview ships no `node`, so every JS tool on every platform would be unproven
+  and the state would mean nothing. The promise is therefore the narrower one:
+  the scanned tree is exactly the reviewed commit's; the machine it ran on is
+  the operator's.
+- `SnapshotBorrowedDeps` requires **positive evidence** of borrowed bytes: a
+  prview-created link inside the closure, a canonical identity resolving outside
+  the snapshot root, or a case-ambiguous creator identity.
+- `SnapshotUnprovenDeps` is everything in between — a genuine snapshot of
+  exactly `target_sha` whose dependency closure the resolver could not read in
+  either direction: an unreadable, non-UTF-8 or oversized executable whose
+  bounded kind cannot be proved, a text file with no interpreter directive, or a
+  shebang script matching no recognized grammar.
+
+Unknown is not evidence. Certifying ambient or host-local executable bytes as
+`Snapshot` is forbidden — and so is asserting a borrow nobody observed, because
+that turns `snapshot-borrowed-deps` into a bag for unread files and destroys the
+one state that carries a claim. Both wrong answers are excluded by naming the
+uncertainty instead of resolving it by default. `snapshot-unproven-deps` must be
+read exactly as cautiously as `snapshot-borrowed-deps`: it is **not** an exact
+scan.
+
+The proof boundary has three structural sources. A symlink is resolved by
+canonical filesystem identity. A regular executable is proved target-only either
+by a **fully validated platform header** or by an **anchored grammar**; anything
+else is unproven.
+
+The native test is whether the kernel's own image loader **claims** the file,
+not whether prview recognises its opening bytes. The distinction is the whole
+proof. What no loader claims returns `ENOEXEC`, and `ENOEXEC` has two different
+futures depending on how the spawn was made. POSIX requires `execvp` to retry
+such a file through `/bin/sh`, and prview reaches `execvp` on Rust's
+`fork`+`exec` spawn path (which prview forces with `pre_exec` on the MCP
+child-group path); on the **default `posix_spawn` path there is no such retry** —
+glibc hands `ENOEXEC` straight back to the parent. Measured: the same
+shebangless launcher ran under `/bin/sh` on macOS and failed to spawn at all on
+Linux CI with `Exec format error (os error 8)`.
+
+So the header proof is justified by **caution, not by a universal law**. One
+world executes bytes nobody read; the other refuses to start and is fail-closed.
+Only the first can publish a false `snapshot`, and refusing the unclaimed image
+is correct in both — which is why the classifier, not the spawn, decides the
+provenance state.
+
+Validating a header is not the same as predicting that verdict, and the proof is
+stated in those terms: it holds where the loader claims the file **and** the
+accepted set has been narrowed to shapes a kernel probe measured with **zero**
+fallback. The gap is real, not theoretical. macOS grades fat slices — `arm64e`
+outranks `arm64`, `x86_64h` outranks `x86_64`, under one and the same
+`cputype` — so an image in which merely *some* host slice validates can still be
+handed to `/bin/sh` through the slice the grader picks; measured on macOS/arm64,
+a real `arm64` binary beside a bogus `arm64e` entry ran under the shell (exit
+126), and so did every `FAT_MAGIC_64` image, real slice included. Inside the
+narrowed set a file has two futures, and both keep the closure target-only — the
+kernel executes the committed bytes, or the loader rejects the image outright
+(`EBADMACHO`, `EBADARCH`, `EBADEXEC`) with no shell in the path. Outside it there
+is a third, which is the one this proof exists to exclude.
+
+Nothing in that argument leans on the shell declining to interpret the accepted
+bytes. bash refuses a file carrying a NUL before the first newline, and every
+header macOS accepts happens to carry one, so today no accepted file executes as
+a script even where the loader drops it — but that is an accident of the binary
+formats, not a defence prview chose, and `dash` promises nothing of the kind. It
+is named here so nobody mistakes it for part of the contract.
+
+A recognised **prefix** buys no future at all: a host-format magic on a
+truncated or non-executable header is claimed by nothing, returns `ENOEXEC`, and
+`/bin/sh` then runs the remaining bytes as a script with the full indirection a
+shell allows. Four bytes are a hope about a file's kind; the loader settles the
+kind after the whole header.
+
+Validation is therefore per platform, and a format the running kernel has no
+loader for is never a proof — ELF on macOS and Mach-O on Linux are recognisable
+but not executable, so they are the fallback vector rather than evidence:
+
+- **macOS** accepts only Mach-O. A thin image must carry a complete
+  `mach_header`/`mach_header_64` in host byte order (`MH_MAGIC`/`MH_MAGIC_64`)
+  whose `cputype` is the host's, whose `filetype` is `MH_EXECUTE`, and whose
+  load-command table fits inside the file. A fat/universal image (`FAT_MAGIC`,
+  big-endian by definition) is claimed only when **every** `fat_arch` entry
+  carrying the host `cputype` has an in-bounds extent and a claimable slice
+  header, and at least one such entry exists — "some entry validates" is not
+  enough, because the grader picks and this code cannot rank grades for it.
+  `cpusubtype` is deliberately not matched, because Apple ships `/bin/ls` as an
+  `arm64e` slice a plain `arm64` host runs, and the all-host rule already covers
+  the grade that subtype encodes. `FAT_MAGIC_64` is recognised and **refused**:
+  this platform's `exec` does not claim a 64-bit fat image even when the slice
+  it advertises is a real, working host binary.
+- **Linux** accepts only ELF: a complete 64-bit header with valid `e_ident`
+  (class, data, version), `e_type` of `ET_EXEC` or `ET_DYN` (every PIE
+  executable is `ET_DYN`), `e_machine` equal to the host's, `e_phentsize`
+  **equal** to `sizeof(Elf64_Phdr)`, a program-header table whose total size
+  `sizeof(Elf64_Phdr) * e_phnum` is neither zero nor greater than **65536**,
+  and that table inside the file. `binfmt_elf` rejects a foreign `e_machine`
+  with `ENOEXEC`, which is precisely the code that reaches `/bin/sh`, and
+  `load_elf_phdrs()` turns any other entry size — and any table outside that
+  size bound — into the same code, in one `goto out` chain. With a 56-byte
+  entry the bound is `e_phnum <= 1170`; `e_phnum = 0xffff` (`PN_XNUM`) needs no
+  special case, because extended numbering exists only in the kernel's
+  core-dump writer and the load path simply multiplies. This branch models
+  fewer fields than `binfmt_elf`'s full triage, and the gap is **not**
+  uniformly conservative. The validator checks each `PT_INTERP` size against
+  `[2, PATH_MAX]`, its in-file extent and terminating NUL; malformed entries
+  return `ENOEXEC` and would reach `/bin/sh`. So does `!can_mmap_file()` — which
+  is not a header field at all, so no header
+  validator models it. An image with **no `PT_LOAD` segment is not** such a
+  path: by then the loader is already past `begin_new_exec()`, so it either
+  execs and dies on its entry point or fails `EINVAL`, and `execvp` retries
+  only on `ENOEXEC`. Unlike the macOS set, this one carries no kernel
+  measurement behind it yet.
+- **Any other Unix** has no proof path, so every header is unproven.
+
+Several of these fields are load-bearing rather than hygienic, measured on
+macOS/arm64: a header valid in every other respect but declaring `MH_DYLIB` is
+not claimed and reaches `/bin/sh`; so is a fat header advertising a host slice
+whose bytes are not a Mach-O image; so is one whose graded-higher host entry is
+unclaimable while a real binary sits beside it; and so is any `FAT_MAGIC_64`
+image. The bounds checks are the conservative half — an overflowing table
+already fails `EBADMACHO` without a fallback — and only narrow an acceptance set
+that is safe without them.
+
+The **absence of `#!` is not native recognition** and must never stand in for
+it: a file with no interpreter directive is a shell script with unbounded
+indirection. The header proof runs before the script size bound, because it
+reads a bounded header window rather than content, so file size neither grants
+nor withholds it and a large compiled tool still proves its own kind. An
+oversized file that fails the header proof falls through to that bound and stays
+unproved.
+
+The recognized content grammars are two, both narrow, and both able only to
+RAISE confidence: the strict pnpm-shaped shell skeleton (a shell shebang, a
+`basedir=$(dirname "$0")` assignment, and `exec node "$basedir/<payload>"
+"$@"`), and the proved-direct script of terminal shell builtins used by direct
+launchers. `<payload>` must be a **literal** path — only
+`[A-Za-z0-9._@+/-]`, so nothing the shell would expand, split or glob (`$`,
+backtick, backslash, quotes, whitespace, `~`, `*`, `?`, `[`, `{`, `(`, `;`,
+`|`, `&`) can appear in it. The proof records the file the wrapper executes, and
+it may do that only where the recorded text and the executed text are the same
+string: a grammar admitting `exec node "$basedir/$HOME/x" "$@"` matched a
+wrapper whose payload is chosen by the shell at run time. The payload is
+extracted from the very match that recognized the grammar, so the recognizer and
+the recorded closure cannot disagree — the earlier second, looser scan could
+silently record nothing while the closure stayed "proved". Real `npm`/`pnpm`/`yarn` shims do **not** match: a current pnpm shim
+is ~18 active lines with a `sed`-normalised `basedir`, a `case uname` block, a
+`NODE_PATH` export and an `if [ -x "$basedir/node" ]` fork. Matching a grammar
+can prove a closure; failing to match proves nothing and publishes
+`SnapshotUnprovenDeps`. npm/yarn's ordinary Unix symlink shape is covered by
+canonical symlink resolution. Comments, string literals, dead code, and the mere
+occurrence of `require(`, `import(`, `NODE_PATH=`, or a path fragment are never
+wrapper evidence.
+
+For a recognized wrapper, the resolver follows its `$basedir` payload. The
+snapshot builder records every link it creates in a sidecar outside the reviewed
+tree. Sidecar entries are compared by canonical filesystem identity rather than
+byte-exact spelling, and any final payload outside the canonical snapshot root
+is borrowed even when a tracked absolute symlink led there. A recognized
+package wrapper can resolve plugins, types, or transitive modules dynamically,
+so any prview-created entry in its `node_modules` is conservatively part of that
+command's substrate. Only a file whose platform header the loader claims, or a
+proved-direct shell script (the intentionally small grammar of terminal shell
+builtins used by direct launchers), can remain `Snapshot` without
+wrapper-payload traversal.
+
+The entry/creator matrix is:
+
+| `.bin/<tool>` entry | Target-owned | Prview-created | Ambient/untracked only |
+|---|---|---|---|
+| missing | ineligible unless a borrow candidate can be exposed | link creation failure aborts the snapshot | never executed directly; becomes prview-created when borrowed |
+| executable regular file | `Snapshot` only with proved target-owned closure; `SnapshotBorrowedDeps` on positive borrow evidence; otherwise `SnapshotUnprovenDeps` | `SnapshotBorrowedDeps` | same borrow rule |
+| directory | explicit pre-spawn failure | not a valid created tool | not a borrow candidate |
+| relative symlink | `Snapshot` when the final payload stays in-tree and its closure is proved; borrowed when it crosses a created link; `SnapshotUnprovenDeps` when the in-tree final file's closure is unreadable | `SnapshotBorrowedDeps` | same borrow rule |
+| absolute symlink | `SnapshotBorrowedDeps` when it resolves outside the snapshot; explicit pre-spawn failure when broken | `SnapshotBorrowedDeps` | same borrow rule |
+| broken symlink | explicit pre-spawn failure | explicit pre-spawn failure after a source race | not executable |
+| case variant | on case-insensitive filesystems, classify the actual target/creator identity; on case-sensitive filesystems the differently-cased name is missing | same, with `SnapshotBorrowedDeps` on a case-folded created link | same borrow rule |
+
+The executable/layout matrix composes with every row above:
+
+| Executable | Flat `node_modules` | `.pnpm` store | Nested `node_modules` |
+|---|---|---|---|
+| native object file (fully validated platform header) | invocation bytes only | invocation bytes only | invocation bytes only |
+| proved-direct shell script (terminal-builtin grammar) | invocation bytes only | invocation bytes only | invocation bytes only |
+| npm shim | canonical Unix symlink target; a real shell shim matches no grammar and is `SnapshotUnprovenDeps` | follow package links into the store | follow the canonical target, else unproven |
+| strict pnpm-shaped shell shim | follow the anchored `$basedir/<payload>` grammar and dynamic `node_modules` dependencies | follow sibling links into `.pnpm`; any created dependency makes the closure borrowed | follow the wrapper-relative nested payload; an unmatched grammar is unproven |
+| yarn shim | canonical Unix symlink target; a real shell shim is `SnapshotUnprovenDeps` | follow any store link | follow the canonical target, else unproven |
+
+Unix permissions are an independent, final-resolution axis. The
+executable/layout axis grew from 12 to 15 cells with the third provenance state:
+`native object file` and `proved-direct shell script` are no longer one row,
+because they are now two structurally different proofs — a validated platform
+header and a line grammar — and only the first is available to a file with no
+`#!`. The row count is unchanged: validating the whole header instead of a
+four-byte prefix narrows which files land in that row, not how many rows exist. So the
+entry/creator (28 logical cells) and executable/layout (5 × 3 = 15 cells) axes
+compose with two permission states: **28 × 15 × 2 = 840 logical cells**.
+
+| Permission at the resolved file | Target-owned identity | Prview-created / external identity | Result |
+|---|---|---|---|
+| executable (`mode & 0o111 != 0`) | apply the closure-proof rule above | `SnapshotBorrowedDeps` | spawn only after proof/classification |
+| non-executable (`mode & 0o111 == 0`) | `Snapshot` provenance for the unexecuted target tree | borrowed provenance when resolution crossed a created/external identity | explicit pre-spawn `ERROR`; the OS is never asked to spawn it |
+
+Thus every one of the 420 non-executable cells terminates before spawn. Every
+executable cell applies the same three-way closure rule: proved target-only is
+`Snapshot`; created, external or case-ambiguous identity is
+`SnapshotBorrowedDeps`; unreadable, oversized, shebang-less or
+unrecognized-script closure is `SnapshotUnprovenDeps`. The three cells missed
+at `4bd02645` are pinned by regression tests: alternate-variable wrapper
+(`exact_eslint_unrecognized_wrapper_closure_is_unproven`), wrapper text
+in a comment (`exact_eslint_direct_script_ignores_wrapper_text_in_comments`),
+and mode `100644` (`exact_eslint_non_executable_file_fails_before_spawn`).
+
+**Target entries always win collisions**, and that rule has three faces, all of
+which must hold at once: prview never overwrites a target entry, never writes
+*through* one, and never aborts a review *over* one. The decision is made with
+`symlink_metadata`, never `exists()`, so the reviewed commit's own entry is read
+and not followed:
+
+- the target committed **nothing** at `node_modules`/`.venv` — the operator's
+  whole directory is exposed as one borrowed link;
+- the target committed a **real directory** — only the top-level entries it does
+  not own are linked inside it, including missing packages under target-owned
+  `@scope` directories; `.bin` entries are merged when the target owns `.bin` as a
+  real directory too. The top-level merge is independent of whether the operator
+  has a `.bin` at all: packages are what a shim resolves (`../<package>`), and
+  when the target owns no `.bin`, `.bin` is simply one of the entries this merge
+  exposes;
+- the target committed **anything else** — a symlink (resolving anywhere, or
+  broken) or a file — it is left exactly as the commit spelled it. No merge, no
+  borrow, no failure. `exists()` used to follow that symlink, so a commit
+  carrying `node_modules -> /somewhere/writable` opened the merge path and every
+  "missing" entry was created **inside the operator's own filesystem**; and a
+  commit carrying a *broken* `node_modules` link made the borrow fail `EEXIST`
+  and aborted the whole review.
+
+`create_borrowed_link` re-proves containment per link — the created link's
+parent, canonicalized, must stay inside the canonical snapshot root — so a
+future caller cannot reintroduce a write that leaves the snapshot through a path
+the reviewed commit chose. `strip_prefix` alone compares spelling, not identity,
+and does not catch that.
+Borrowed-link paths are also captured in process-owned memory before checks run.
+Provenance uses that copy even if a check deletes a borrowed link or its sidecar;
+the sidecar remains a diagnostic record, not mutable authority for a live run.
+
+A proved-direct target-owned shell script does not become borrowed merely
+because unrelated ambient packages were exposed elsewhere in `node_modules`; an
+unrecognized script is `SnapshotUnprovenDeps`, because its closure is not
+proved in either direction.
+
+This remains a static proof, not a syscall trace. A proved-direct target script
+can read a runtime path without syntactic indirection that the classifier can
+see. That residual limitation is accepted here; expanding the direct grammar
+requires a new regression and cannot weaken the rule that an **unknown wrapper
+is unproven** — not borrowed, because nothing observed a borrow, and not
+`snapshot`, because nothing proved one.
+
+A failed required link aborts snapshot creation instead of leaving eligibility
+and execution on different toolchains. Non-Unix exact-target JS checks may run a
+tool already present in the target; a tool requiring ambient borrowing is
+skipped with an explicit unsupported-borrow reason. That platform has neither
+the header proof nor the script grammars, so its closure answer is drawn from
+canonical identity alone: nothing resolving at the invocation path is
+`Snapshot` (nothing will execute), an invocation resolving outside the snapshot
+root is `SnapshotBorrowedDeps`, and anything else is `SnapshotUnprovenDeps` —
+never an exact claim for a file this build cannot read. Ambient JS checks remain
+unchanged. Snapshot creation uses an empty per-snapshot `core.hooksPath`;
+checkout hooks belong to the operator's workflow and must not mutate or block
+exact-SHA review input.
 
 The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
 `Vitest`, `Stylelint`) share **one** run-wide snapshot rather than each creating
-its own — see `uses_shared_scan_dir()`. `SemgrepCheck` is the single deliberate
-opt-out: it manages its own worktree because it also needs a baseline commit.
+its own — see `uses_shared_scan_dir()`. Semgrep has its own baseline planner but
+uses the same `ReviewSubstrate` discriminator and reuses `scan_dir_override`
+when the dispatcher already owns the exact-target snapshot.
 
 `share_target_snapshot()` decides whether that snapshot is materialised at all,
 and the condition is **not** "some gate needs it". It is:
 
-> a runnable check is in `uses_shared_scan_dir()`, **or** the reviewed target is
-> off-`HEAD` (`off_head_target_commit()`).
+> a runnable check is in `uses_shared_scan_dir()`, **or** `ReviewSubstrate`
+> classifies the invocation as exact-target.
 
 The second arm exists because the gates are not the only stage that reads the
 tree: the context stage plans and produces the whole of `30_context` from
-`ledger.scan_dir()`. An off-`HEAD` run can have nothing snapshot-backed to run —
+`ledger.scan_dir()`. An exact-target run can have nothing snapshot-backed to run —
 for example, the fast remote-only preset, where those gates skip and only
 semgrep remains, or a profile whose complete runnable set has sound cache hits.
 TypeScript, ESLint, Stylelint, Ruff and Mypy do not currently take that path:
@@ -821,9 +1143,12 @@ commit, and `RUN.json` looked identical either way
 pays for one `git worktree` its gates do not need: a correct pack outranks a
 saved checkout.
 
-When the target **is** the checked-out `HEAD` and no runnable check wants a
-snapshot, nothing is materialised — there the repo root genuinely is the reviewed
-tree, and the artifact stage's fallback to `config.repo_root` is the right answer.
+When an ambient local target is the checked-out `HEAD` and no runnable check
+wants a snapshot, nothing is materialised — there the repo root genuinely is
+the reviewed tree, and the artifact stage's fallback to `config.repo_root` is
+the right answer. Exact-target runs do not use that equivalence: a runnable
+shared-scan check materialises the same-`HEAD` snapshot so untracked operator
+files cannot enter its input.
 The call therefore sits *outside* the dispatcher's "anything to run" guard, since
 a run with an empty runnable set is exactly the case it exists to cover.
 
@@ -840,7 +1165,8 @@ replays off the unknown substrate they were necessarily recorded under. That is
 the quiet half of the same bug: a warm `--pr` run used to report its own
 decisions as being about no particular tree. The run-wide substrate is resolved
 with an **empty** consumable-scaffolding list, so it reports `snapshot` and never
-`snapshot-borrowed-deps` — with no command to name, nothing at that point can
+`snapshot-borrowed-deps` or `snapshot-unproven-deps` — with no command to name,
+there is no closure to prove and nothing at that point can
 consume the linked `node_modules`; a command that does resolve through the link
 reports that for itself.
 
@@ -869,7 +1195,7 @@ project environment before executing, so a reviewed commit whose dependencies
 differ from the local branch would install into — and remove packages from — the
 operator's active `.venv` through the snapshot symlink. `plan_python_run()`
 therefore sets `UV_PROJECT_ENVIRONMENT` to `Config::uv_env_dir_for()`
-(`~/.prview/uv-env/<repo>/<target-sha>`) for off-`HEAD` runs: the reviewed
+(`~/.prview/uv-env/<repo>/<target-sha>`) for exact-target runs: the reviewed
 dependency set is still installed and judged, in a prview-owned environment kept
 warm across runs. A local review sets no override and uses the checkout's own
 environment exactly as before.
@@ -1052,6 +1378,9 @@ snapshot of this repo can never contain it. Off-`HEAD` runs then **skip** the
 cargo checks with a reason naming the unreachable root
 (`unreachable_reviewed_cargo_root()`), instead of quietly analysing the
 operator's unrelated checkout and filing the result under the reviewed commit.
+The rebase rejects `..` components even if the unnormalized path starts with
+the repository spelling, so a programmatic root such as `repo/../outside`
+cannot escape the snapshot through `Path::join`.
 No verdict is the honest answer where a foreign tree's verdict was the bug.
 
 That refusal is lexical, and the reviewed commit controls the tree: it can turn
@@ -1075,10 +1404,10 @@ build-dependencies, `[workspace.dependencies]`, `[target.*]`, `[patch]` and
 `[replace]` — against the snapshot. An absolute path dependency, or a relative
 one that climbs out or passes through a symlink, has cargo compile source the
 reviewed commit does not contain while provenance reports `snapshot`, so the run
-is refused with the dependency named. Only off-`HEAD` runs are held to this: a
-local review is about the working tree as it stands, where a path dependency on
-a sibling checkout is an ordinary setup and no claim is made about a commit's
-contents.
+is refused with the dependency named. Exact-target runs are held to this: an
+ordinary target-less local review is about the working tree as it stands, where
+a path dependency on a sibling checkout is an ordinary setup and no claim is
+made about a commit's contents.
 
 `cargo check` at a workspace root builds its members, and a member declares its
 own dependencies, so every manifest within three levels of the cargo root is
@@ -1091,13 +1420,11 @@ refuses what it can prove escapes rather than pretending to be complete, because
 resolving the true graph means `cargo metadata`, a network-capable second
 resolve for each of six gates.
 
-Whether cargo applies at all is decided by the **reviewed** commit, not by the
-local profile. `config.profile.has_cargo` describes the checkout, so reviewing a
-branch that dropped its last `Cargo.toml` from a Rust checkout used to run every
-cargo gate and report cargo's own "could not find `Cargo.toml`" as the target's
-verdict. Eligibility asks the same resolver — the snapshot carries exactly the
-target commit's tree, so no worktree is materialised to answer it — and skips
-with a reason when no candidate resolves. When git cannot answer at all
+Whether cargo applies at all is decided by the **reviewed** commit. The run
+profile now comes from that tree before check selection. Cargo eligibility also
+checks the pinned Git tree before execution and skips with a reason when no
+candidate resolves. This second check preserves a fail-closed answer if a
+profile is supplied programmatically or a target becomes unavailable. When git cannot answer at all
 (unreadable repo, unresolvable ref) nothing is skipped: an unverifiable claim
 may no more become a skip than a verdict.
 
@@ -1109,11 +1436,9 @@ one path component deeper. `regular_file_at_commit()` answers `false` for a
 symlink, matching what manifest discovery already did, and the containment check
 resolves the manifest alongside the directory for the paths git cannot reach.
 
-Python eligibility follows the same rule for the same reason. `runs_python_checks()`
-reads the local profile, so a target that removed its last `pyproject.toml` and
-Python sources still scheduled the Python gates — and pytest exits 5 for "no
-tests collected", a blocking failure for a target the check no longer applies to.
-`missing_reviewed_python_project()` asks the reviewed tree: a `pyproject.toml`
+Python eligibility follows the same rule. The run profile is selected from the
+reviewed tree; `missing_reviewed_python_project()` checks the pinned Git tree
+again before execution. A `pyproject.toml`
 settles it alone, otherwise the tree is walked for runtime Python source. That
 walk is deliberately unbounded, unlike depth-limited cargo root discovery,
 because it concludes *absence* — a bounded search cannot prove absence, only
@@ -1121,9 +1446,10 @@ manufacture confident false skips for deep layouts. Every step fails open.
 
 Cache keys follow the same substrate. Cached results are looked up **before**
 the shared snapshot exists, so cargo cache keys resolve the target commit
-directly (`off_head_target_commit()`) and key on the commit id whenever it
-differs from `HEAD` — otherwise a `--pr` run would hit an entry a previous local
-run stored under a working-tree hash and serve the local checkout's verdict. The
+through `ReviewSubstrate` and key on the commit id for every exact-target run,
+including exact same-`HEAD` — otherwise an exact run could hit an entry a
+previous ambient run stored under a working-tree hash and serve the local
+checkout's verdict. The
 commit is not the whole substrate, though: the same commit checked from the
 workspace root and from a configured member yields different results, so the
 repo-relative cargo root travels in the key beside it — the discriminator the
@@ -1164,14 +1490,18 @@ failed, the lookup missed, and the most expensive gates in the tool recomputed
 on every review of a workspace member. The same encoding removes the colon these
 keys carried, which is an illegal file-name character on Windows.
 
-**Known limitation — submodules.** `create_worktree_snapshot()` runs
-`git worktree add` only, so gitlink directories stay empty. A Cargo workspace
-whose member or path dependency lives in a submodule therefore reports a missing
-manifest in an off-`HEAD` review, even though the reviewed commit builds in a
-checkout with its submodules initialised. Materialising them in the snapshot
-means a `git submodule update --init` per run — network-capable, unbounded, and
-writing into the superproject's module store while the operator works in it —
-so it is deliberately deferred rather than smuggled into a review path.
+**Pinned submodules.** After `git worktree add`, an exact snapshot expands each
+gitlink at its committed object ID by writing raw Git blobs from an initialized local
+submodule or its local module store. Nested gitlinks use the same rule, with a
+depth bound. It never fetches or copies uncommitted submodule worktree bytes.
+Before writing, tree entries must be repository-relative and cannot
+descend through a symlink or write Git administrative paths. Raw blobs preserve
+committed files even when `export-ignore` or `export-subst` attributes would alter
+an archive. Each recursive
+layer uses that layer's pinned gitlink object ID, never its symbolic `HEAD`.
+If a pinned object is unavailable locally, snapshot creation fails with the
+submodule path and object ID instead of publishing an empty directory as the
+reviewed tree.
 
 #### Check provenance
 
@@ -1211,7 +1541,19 @@ Every check records a `CheckProvenance` alongside its result: `command`,
     resolve their toolchain through `node_modules`; the Python checks resolve
     theirs through the per-commit `UV_PROJECT_ENVIRONMENT` prview points uv at,
     never the linked `.venv`. Installing the target's own dependencies instead is
-    a network operation of unbounded cost and is not attempted;
+    a network operation of unbounded cost and is not attempted. Reported only on
+    **positive** evidence of borrowed bytes — a prview-created link inside the
+    closure, or a canonical identity outside the snapshot root;
+  - `snapshot-unproven-deps` — the reviewed commit's tree, unmodified and
+    materialised from exactly `target_sha`, but the executable closure of the
+    tool the check ran could not be proved in either direction. The **source** is
+    the reviewed commit; which dependency bytes the tool executed is unknown.
+    This is what an unreadable, non-UTF-8 or oversized executable, a text file
+    with no `#!`, or a shebang script matching no recognized wrapper grammar
+    publishes — and that last case covers every real `npm`/`pnpm`/`yarn` shim.
+    It exists so `snapshot-borrowed-deps` can stay a claim with evidence instead
+    of a bag for files nobody could read. Read it as cautiously as
+    `snapshot-borrowed-deps`: it is **not** an exact scan;
   - `local-clean` — repo working tree, nothing uncommitted;
   - `local-dirty` — repo working tree with uncommitted changes — the scanned
     bytes are **not** exactly `target_sha`;
@@ -1240,7 +1582,7 @@ returns an error, and that row used to carry no provenance at all — null `cwd`
 `target_sha` and `tree_state` for exactly the rows a reviewer most needs to
 place. The error path now reconstructs the directory the check was about to read
 without materialising anything: the run-wide shared snapshot is already on disk,
-and a review whose target is the checked-out `HEAD` reads the repo root. Two
+and only an ambient local review reads the repo root. Two
 absences stay absences rather than being filled: `command` is an explicit
 `<no command recorded>`, and an off-`HEAD` check with no shared snapshot keeps a
 `None` provenance, because its own worktree is gone by then and naming the local
@@ -1270,6 +1612,14 @@ proved. TypeScript, ESLint, Stylelint, Ruff and Mypy currently opt out: their
 answers depend on config, ignore rules, plugins and installed tool/dependency
 state beyond the former source-only hashes. They still participate in same-run
 `Run` to `Reused` context dedup; only persistent cross-run replay is disabled.
+
+Cargo cache keys use the same `ReviewSubstrate` decision before snapshot
+materialisation. Ambient runs hash the live Cargo tree; exact-target runs use a
+`commit-<sha>-root-<token>` component even when the target equals checked-out
+`HEAD`. An exact target that cannot be resolved returns no cache key, so lookup
+cannot fall back to an ambient entry. Cargo and Python preflight reads use that
+same exact commit identity; dirty manifests or source files in the operator
+checkout cannot make an exact same-`HEAD` gate runnable or applicable.
 
 The entry is written to a `<key>.tmp-<pid>-<nanos>` staging file and published
 with a single `fs::rename`, so a concurrent reader sees either the old entry or
@@ -1301,8 +1651,9 @@ collapse onto the target and reduce the scanned delta to nothing while the pack
 diff stays non-empty. A pinned target carrying no captured base is the same class
 of planning refusal as an unavailable pinned commit, never a symbolic fallback.
 Multi-base and `--current-only` runs still fall back to a full scan (R3-15).
-Local targets that still match HEAD
-keep the operator checkout. Each new watch iteration resolves its target anew.
+Only ambient target-less local invocations keep the operator checkout; an
+explicit local target matching `HEAD` still uses the exact snapshot. Each new
+watch iteration resolves its target anew.
 
 `checks::snapshot_integrity::SnapshotObservation` compares the ledger-owned
 worktree with the immutable commit resolved before worktree creation. The shared
@@ -1596,9 +1947,9 @@ The ledger also **owns** the run's shared target snapshot
 dispatcher's job, but the handle lives here because the ledger outlives every
 stage: a snapshot parked in it is still on disk when artifact generation asks
 where the reviewed tree is, instead of having been dropped with the frame that
-created it. Because the artifact stage reads it too, an off-`HEAD` target is on
-its own enough to materialise one, whether or not any gate had to run — see
-*Where checks run*.
+created it. Because the artifact stage reads it too, an off-`HEAD` target or an
+exact-target same-`HEAD` run is enough to materialise one, whether or not any
+gate had to run — see *Where checks run*.
 
 The ledger observes; it never runs, skips or caches anything itself.
 
@@ -1734,8 +2085,8 @@ resolved substrate on the ledger, and hands the ledger the snapshot handle.
 context generators' root as `ledger.scan_dir()`, falling back to
 `config.repo_root`.
 
-That fallback is valid only when the reviewed target is the checked-out
-`HEAD`, where both paths name the same tree. If an off-`HEAD` snapshot is
+That fallback is valid only for the ambient local mode, where the reviewed tree
+is deliberately the live checkout. If an exact-target or off-`HEAD` snapshot is
 required but cannot be created, the checks dispatcher returns an error before
 pre-sync or gate execution; it never publishes a mixed-revision pack.
 
@@ -1748,11 +2099,18 @@ had checked out locally (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). Every context
 command's cwd and every filesystem probe that decides which commands to plan now
 read the reviewed tree. Static Tauri discovery, its source walk, and the
 repo-relative mapping used to compare head commands with the base commit use
-that same tree and repository view. A local review resolves to the repo root,
-which *is* the reviewed tree, so its behaviour is unchanged. Cargo context
+that same tree and repository view. The default target-less local review still
+resolves to the repo root, which *is* its intentionally ambient reviewed tree;
+an explicit same-`HEAD` review resolves to a snapshot instead. Cargo context
 commands resolve their directory through `checks::planned_cargo_cwd`, the same
 resolution the cargo gates use, so a workspace member is not collapsed to the
 snapshot root.
+Headless same-`HEAD` heuristic scans use this same `scan_dir_override` and record
+the selected target SHA; otherwise a dirty operator checkout would produce
+heuristic signals for different bytes than checks and context.
+The TUI's non-remote explicit-target path uses the same selection on every
+analysis run. Its remote path continues to use its dedicated target/base
+`AnalysisSnapshot`s for regression comparisons.
 
 ### governor/mod.rs
 

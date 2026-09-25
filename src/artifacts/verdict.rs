@@ -1054,6 +1054,8 @@ impl<'a> LockEvidence<'a> {
 /// * **Remote/snapshot target** (`captured head != target`): only checks listed
 ///   by `check_scans_target_snapshot` qualify. Operator-scanned checks came from
 ///   a different tree, even if the checkout moves to the target before publication.
+///   Cargo audit separately selects its lock/config proof from the actual
+///   snapshot observation, including an explicit same-HEAD target.
 ///
 /// `--current-only` deliberately drops the diff bases to analyse the whole
 /// current state, so there is no diff baseline a finding can "predate": the
@@ -1120,6 +1122,11 @@ impl CleanComparison {
         // source identity to results produced earlier in the run.
         let stable_head = worktree_head_sha.filter(|captured| head.as_deref() == Some(*captured));
         let target_is_checkout = stable_head.map(|captured| captured == resolved_target.commit_id);
+        // A same-HEAD exact review still audits a materialized snapshot. The
+        // snapshot observation, rather than HEAD equality, decides which lock
+        // and audit-config evidence describes the bytes cargo-audit read.
+        let audit_scans_checkout =
+            target_is_checkout.map(|same| same && lock_evidence.snapshot_integrity.is_none());
         CleanComparison {
             target_is_checkout,
             worktree_clean,
@@ -1130,14 +1137,14 @@ impl CleanComparison {
                 config,
                 repo.as_ref(),
                 resolved_target,
-                target_is_checkout,
+                audit_scans_checkout,
                 lock_evidence,
             ) {
                 CargoAuditLockProof::TargetLock => cargo_audit_config_gap(
                     config,
                     repo.as_ref(),
                     resolved_target,
-                    target_is_checkout,
+                    audit_scans_checkout,
                     lock_evidence,
                     diffs,
                 )
@@ -3169,6 +3176,57 @@ mod tests {
             );
             assert!(proven.applies_to("cargo_audit"));
         }
+    }
+
+    #[test]
+    fn same_head_snapshot_uses_snapshot_lock_observation() {
+        let (tmp, _repo, head, base) = comparison_repo_with_lock();
+        let config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        let clean = std::collections::BTreeSet::new();
+        let head = head.to_string();
+        let base = base.to_string();
+        let dirty = snapshot_observed(&head, &["Cargo.lock"]);
+        let comparison = CleanComparison::resolve(
+            &config,
+            &resolved_ref(&head),
+            &[resolved_ref(&base)],
+            Some(true),
+            LockEvidence {
+                dirty_before_checks: Some(&clean),
+                snapshot_integrity: Some(&dirty),
+                snapshot_root: Some(tmp.path()),
+                ..LockEvidence::default()
+            },
+            Some(&head),
+            &[],
+        );
+        assert_eq!(
+            comparison.cargo_audit_lock_proof(),
+            CargoAuditLockProof::Unproven(LockProofGap::DirtyLock),
+            "HEAD equality cannot override a rewritten snapshot lock"
+        );
+
+        let untouched = snapshot_observed(&head, &[]);
+        let comparison = CleanComparison::resolve(
+            &config,
+            &resolved_ref(&head),
+            &[resolved_ref(&base)],
+            Some(true),
+            LockEvidence {
+                dirty_before_checks: Some(&clean),
+                snapshot_integrity: Some(&untouched),
+                snapshot_root: Some(tmp.path()),
+                ..LockEvidence::default()
+            },
+            Some(&head),
+            &[],
+        );
+        assert_eq!(
+            comparison.cargo_audit_lock_proof(),
+            CargoAuditLockProof::TargetLock
+        );
     }
 
     const CORE_MANIFEST: &str = "[package]\nname = \"core\"\nversion = \"0.1.0\"\n";

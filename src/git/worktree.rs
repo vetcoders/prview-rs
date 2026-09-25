@@ -4,8 +4,1106 @@
 //! local dependencies (node_modules, .venv) symlinked to preserve local caches.
 
 use super::cmd::git_cmd;
+use anyhow::Context;
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+const BORROWED_LINKS_MANIFEST: &str = ".prview-borrowed-links";
+
+const MAX_SYMLINK_RESOLUTIONS: usize = 40;
+
+#[cfg(unix)]
+const MAX_JS_SHIM_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitPathResolution {
+    Missing,
+    Runnable,
+    /// The target owns the requested entry or a symlink prefix, but Git alone
+    /// cannot prove a runnable final file. The finished snapshot must resolve
+    /// it and fail before spawn when it remains a directory/broken/non-file.
+    Unresolved,
+}
+
+/// Classify `relative_path` in `commit`, following repository-relative
+/// symlinks as far as the Git tree can prove.
+///
+/// `git2::Tree::get_path` deliberately does not traverse a blob stored with
+/// mode `120000`, so a target-owned `.bin -> bin-owned` needs this small
+/// resolver before eligibility can truthfully say whether the target contains
+/// `node_modules/.bin/<tool>`. An absolute target-owned symlink is an existing
+/// tool candidate too, but its final host path cannot be resolved from the Git
+/// tree; admit it here and let the finished-snapshot resolver either reject a
+/// missing/non-file target or classify the external bytes as borrowed.
+///
+/// An entry the tree does not carry is [`CommitPathResolution::Missing`]
+/// whether or not a symlink was followed to reach it, because following a
+/// repository-relative link is not a loss of information: it lands on another
+/// path in the SAME tree, and that tree either has the entry or does not.
+/// Escapes never reach this point — `resolved_symlink_path` refuses them — and
+/// an absolute link returns above. Reporting `Unresolved` for a followed chain
+/// made JS eligibility treat an absent tool as a target candidate (only
+/// `Missing` is not one), plan the check, and then fail at execution time with
+/// "resolved JS tool disappeared" instead of borrowing the operator's tool or
+/// skipping with a reason.
+pub(crate) fn commit_path_resolution(
+    repo_root: &Path,
+    commit: &str,
+    relative_path: &Path,
+) -> CommitPathResolution {
+    let Ok(repo) = git2::Repository::discover(repo_root) else {
+        return CommitPathResolution::Unresolved;
+    };
+    let Ok(commit) = repo
+        .revparse_single(commit)
+        .and_then(|object| object.peel_to_commit())
+    else {
+        return CommitPathResolution::Unresolved;
+    };
+    let Ok(tree) = commit.tree() else {
+        return CommitPathResolution::Unresolved;
+    };
+    let Some(mut pending) = relative_components(relative_path) else {
+        return CommitPathResolution::Unresolved;
+    };
+    let mut resolved = PathBuf::new();
+
+    for _ in 0..MAX_SYMLINK_RESOLUTIONS {
+        let Some(component) = pending.pop_front() else {
+            return CommitPathResolution::Unresolved;
+        };
+        resolved.push(component);
+        let Ok(entry) = tree.get_path(&resolved) else {
+            return CommitPathResolution::Missing;
+        };
+
+        if entry.filemode() == 0o120000 {
+            let Ok(object) = entry.to_object(&repo) else {
+                return CommitPathResolution::Unresolved;
+            };
+            let Some(blob) = object.as_blob() else {
+                return CommitPathResolution::Unresolved;
+            };
+            let Ok(target) = std::str::from_utf8(blob.content()) else {
+                return CommitPathResolution::Unresolved;
+            };
+            if Path::new(target).is_absolute() {
+                return CommitPathResolution::Runnable;
+            }
+            let Some(next) = resolved_symlink_path(&resolved, Path::new(target), &pending) else {
+                return CommitPathResolution::Unresolved;
+            };
+            let Some(next_components) = relative_components(&next) else {
+                return CommitPathResolution::Unresolved;
+            };
+            resolved.clear();
+            pending = next_components;
+            continue;
+        }
+
+        if pending.is_empty() {
+            return if entry.kind() == Some(git2::ObjectType::Blob) {
+                CommitPathResolution::Runnable
+            } else {
+                CommitPathResolution::Unresolved
+            };
+        }
+        if entry.kind() != Some(git2::ObjectType::Tree) {
+            return CommitPathResolution::Unresolved;
+        }
+    }
+
+    CommitPathResolution::Unresolved
+}
+
+fn relative_components(path: &Path) -> Option<VecDeque<std::ffi::OsString>> {
+    let mut normalized = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => normalized.push(component.to_os_string()),
+            std::path::Component::ParentDir => {
+                normalized.pop()?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized.into())
+}
+
+fn resolved_symlink_path(
+    symlink_path: &Path,
+    target: &Path,
+    tail: &VecDeque<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if target.is_absolute() {
+        return None;
+    }
+    let mut combined = symlink_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(target);
+    combined.extend(tail.iter());
+    let normalized = relative_components(&combined)?;
+    Some(normalized.into_iter().collect())
+}
+
+/// What a static proof could establish about the executable closure a check
+/// resolves through this snapshot.
+///
+/// Three states, not two, because "proved to read borrowed bytes" and "could
+/// not be proved either way" are different facts. Collapsing them makes
+/// `Borrowed` a bag for everything the resolver cannot read — and every real
+/// `npm`/`pnpm`/`yarn` shim is something it cannot read, so the bag swallows
+/// the ordinary case. An unrecognised grammar is the ABSENCE of evidence, in
+/// both directions; it is not evidence that ambient bytes ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClosureProof {
+    /// No JS-tree bytes from outside the snapshot enter this closure: every
+    /// file the proof can see the tool read — the invocation, and a recognised
+    /// wrapper's payload — is the reviewed commit's own.
+    ///
+    /// The ambient RUNTIME is outside the proof and always was. `exec node
+    /// "$basedir/<payload>"` resolves `node` through `PATH`, and the header
+    /// proof likewise says nothing about `ld.so`/`dyld`, libc, or any shared
+    /// object the loader maps. Requiring the interpreter would not make the
+    /// claim stronger, it would make it unobtainable: prview ships no `node`,
+    /// so every JS tool on every platform would be unproven and the state would
+    /// mean nothing. So the promise is deliberately narrower than "every
+    /// statically visible byte is target-owned", which is what this used to
+    /// say: the SCANNED TREE is exactly the commit's, and the machine it runs
+    /// on is the operator's.
+    TargetOnly,
+    /// Positive evidence that the closure consumes bytes from outside the
+    /// snapshot — a link prview itself created, or a canonical identity that
+    /// resolves outside the snapshot root.
+    Borrowed,
+    /// The snapshot is genuine (its source is exactly the reviewed commit), but
+    /// the dependency chain the tool would execute is opaque to a static proof.
+    /// Neither `TargetOnly` nor `Borrowed` is earned, so neither is claimed.
+    Unproven,
+}
+
+#[cfg(unix)]
+fn snapshot_borrow_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// What resolving `relative_path` in this snapshot proves about the bytes it
+/// consumes.
+///
+/// The manifest lives beside the worktree, inside the same temporary directory,
+/// so target-owned files cannot forge or collide with it and it disappears with
+/// the snapshot. Its paths identify links created by prview, but comparison is
+/// made through canonical filesystem identity rather than byte-exact spelling:
+/// on a case-insensitive filesystem `ESLint` and `eslint` may name the same
+/// created link. Canonical resolution also exposes target-owned absolute
+/// symlinks that escape the snapshot.
+///
+/// A package-manager wrapper is not the final payload. Only strict, anchored
+/// wrapper grammars contribute payload paths; comments, strings, and arbitrary
+/// `require(` substrings are not evidence. A script whose closure cannot be
+/// proved from one of those grammars is [`ClosureProof::Unproven`] — not
+/// borrowed, because nothing here observed a borrow.
+///
+/// Positive borrow evidence is settled BEFORE the unproved case. The two are
+/// not competing guesses: one is a proof and the other is its absence, so the
+/// proof publishes even when the closure analysis also came up short. A
+/// target-owned absolute symlink into the operator's tree is exactly that
+/// shape — its content may be unreadable while its canonical identity is
+/// plainly outside the snapshot.
+#[cfg(unix)]
+pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path) -> ClosureProof {
+    let Some(parent) = snapshot_root.parent() else {
+        return ClosureProof::TargetOnly;
+    };
+    let borrowed = match snapshot_borrow_registry().lock() {
+        Ok(registry) => registry.get(snapshot_root).cloned(),
+        Err(_) => return ClosureProof::Unproven,
+    };
+    let borrowed = borrowed.unwrap_or_else(|| {
+        // Standalone proof callers and fixtures can still use a sidecar. Real
+        // snapshots use the process-owned copy captured before any check runs.
+        use std::os::unix::ffi::OsStringExt as _;
+        std::fs::read(parent.join(BORROWED_LINKS_MANIFEST))
+            .unwrap_or_default()
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+            .collect()
+    });
+    if borrowed
+        .iter()
+        .any(|created| relative_path.starts_with(created) || created.starts_with(relative_path))
+    {
+        return ClosureProof::Borrowed;
+    }
+    let consumed = consumed_paths(snapshot_root, relative_path);
+    if consumed.package_wrapper
+        && borrowed.iter().any(|created| {
+            created.starts_with("node_modules") || Path::new("node_modules").starts_with(created)
+        })
+    {
+        return ClosureProof::Borrowed;
+    }
+    if consumed
+        .paths
+        .iter()
+        .any(|path| path_is_external_or_borrowed(snapshot_root, path, borrowed.as_slice()))
+    {
+        return ClosureProof::Borrowed;
+    }
+    if !consumed.closure_proven {
+        return ClosureProof::Unproven;
+    }
+    ClosureProof::TargetOnly
+}
+
+#[cfg(unix)]
+fn path_is_external_or_borrowed(snapshot_root: &Path, path: &Path, borrowed: &[PathBuf]) -> bool {
+    let Ok(snapshot_identity) = std::fs::canonicalize(snapshot_root) else {
+        return false;
+    };
+    let Ok(path_identity) = std::fs::canonicalize(path) else {
+        return false;
+    };
+
+    if !path_identity.starts_with(&snapshot_identity) {
+        return true;
+    }
+
+    borrowed.iter().any(|relative| {
+        std::fs::canonicalize(snapshot_root.join(relative))
+            .is_ok_and(|identity| path_identity.starts_with(identity))
+    })
+}
+
+/// Whether the kernel's own image loader CLAIMS `path` as an executable for
+/// this platform and this architecture.
+///
+/// This is the one positive proof that no interpreter indirection exists, and
+/// the bar has to be "the loader claims the file", never "the file opens with a
+/// magic we recognise". What the loader refuses with `ENOEXEC` may then be run
+/// by `/bin/sh`: POSIX requires that retry of `execvp`, and prview spawns
+/// through `Command`, which reaches `execvp` on its `fork`+`exec` path.
+///
+/// That retry is a real but NOT a universal future, and this proof is justified
+/// by caution rather than by a law. Rust only takes the `fork`+`execvp` path
+/// when the spawn cannot use `posix_spawn` (prview forces it with `pre_exec`
+/// on the MCP child-group path); the default `posix_spawn` path has no such
+/// retry, and glibc hands `ENOEXEC` straight back to the parent — measured on
+/// Linux CI, a shebangless launcher failed to spawn with `Exec format error
+/// (os error 8)` while the same fixture ran under `/bin/sh` on macOS. So one
+/// world executes unread bytes and the other refuses to start; only the first
+/// can publish a false `TargetOnly`, and the second is fail-closed. Refusing
+/// the unclaimed image is right in both.
+///
+/// What that buys is narrower than "a header that parses", and the difference
+/// is the proof. Validating a header is not the same as predicting the
+/// loader's verdict: on macOS the kernel picks the fat slice with the highest
+/// `cpusubtype` GRADE, so an image in which merely SOME host slice validates
+/// can still be handed to `/bin/sh` through the slice the grader actually
+/// picks — measured on macOS/arm64, a real `arm64` binary beside a bogus
+/// `arm64e` entry fell through to the shell (exit 126), as did every
+/// `FAT_MAGIC_64` image, real slice included. So the proof holds only over an
+/// acceptance set narrowed to shapes a kernel probe measured with ZERO
+/// fallback: a fully validated thin header, or a 32-bit fat image in which
+/// EVERY host-`cputype` entry is itself claimable and at least one exists —
+/// whichever entry the grader picks is then one this proof read.
+///
+/// Inside that set a file has two futures, and both keep the closure
+/// target-only: the kernel executes the committed bytes, or the loader rejects
+/// the image outright (`EBADMACHO`, `EBADARCH`, `EBADEXEC`) with no shell in
+/// the path. Outside it there is a third one, and it is what this function
+/// exists to prevent. Nothing here leans on the shell declining to interpret
+/// accepted bytes: bash refuses a file carrying a NUL before the first
+/// newline, which every accepted macOS header happens to carry, but that is an
+/// accident of the format rather than a defence this code chose — `dash`, the
+/// `/bin/sh` of the Linux hosts this runs on, makes no such promise.
+///
+/// A recognised PREFIX buys neither future. A
+/// host-format magic on a truncated or non-executable header is claimed by
+/// nothing, falls through to `ENOEXEC`, and `/bin/sh` then runs the remaining
+/// bytes as a script with the full unbounded indirection a shell allows —
+/// measured on macOS/arm64: a `CF FA ED FE` prefix followed by a shell line
+/// executes that line, while the same magic carrying a complete `MH_EXECUTE`
+/// header for the host `cputype` fails `EBADMACHO` without a fallback.
+///
+/// Everything the loader does not claim is [`ClosureProof::Unproven`]. That
+/// includes formats this platform has no loader for at all: ELF on macOS and
+/// Mach-O on Linux are recognisable, not executable, so they are the fallback
+/// case rather than a proof.
+///
+/// The read is bounded — a header and, for a universal binary, one slice
+/// header — so the proof costs the same on a 4 KiB launcher and a 400 MiB
+/// toolchain. That is why it may run before the script size bound: nothing here
+/// reads content, and file size neither strengthens nor weakens the claim.
+#[cfg(unix)]
+fn kernel_claims_native_executable(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    platform_header_claims_executable(&file, metadata.len())
+}
+
+/// Reads exactly `buffer.len()` bytes at `offset`, or reports failure. A short
+/// file is a failed proof, never a partial one.
+#[cfg(unix)]
+fn read_header_at(file: &std::fs::File, offset: u64, buffer: &mut [u8]) -> bool {
+    use std::os::unix::fs::FileExt as _;
+
+    file.read_exact_at(buffer, offset).is_ok()
+}
+
+/// `CPU_TYPE_ARM64` / `CPU_TYPE_X86_64` — `CPU_ARCH_ABI64 | CPU_TYPE_{ARM,X86}`.
+/// An architecture with no entry here has no proof path, because a `cputype`
+/// this build cannot name cannot be compared against the running kernel.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const HOST_MACH_CPU_TYPE: Option<u32> = Some(0x0100_0000 | 12);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const HOST_MACH_CPU_TYPE: Option<u32> = Some(0x0100_0000 | 7);
+#[cfg(all(
+    target_os = "macos",
+    not(any(target_arch = "aarch64", target_arch = "x86_64"))
+))]
+const HOST_MACH_CPU_TYPE: Option<u32> = None;
+
+/// macOS: only Mach-O, only this host's `cputype`, only a complete header.
+///
+/// Thin magics are read in host byte order on purpose. The byte-swapped forms
+/// (`MH_CIGAM`, `MH_CIGAM_64`) describe an image for a machine of the opposite
+/// endianness, which this kernel never executes; the same goes for the
+/// little-endian fat forms (`FAT_CIGAM`, `FAT_CIGAM_64`), since the fat header
+/// is big-endian by definition. Recognising them would only widen the set of
+/// files that are named and not claimed.
+#[cfg(target_os = "macos")]
+fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool {
+    const MH_MAGIC: u32 = 0xFEED_FACE;
+    const MH_MAGIC_64: u32 = 0xFEED_FACF;
+    const FAT_MAGIC: u32 = 0xCAFE_BABE;
+    const FAT_MAGIC_64: u32 = 0xCAFE_BABF;
+
+    let Some(host_cpu_type) = HOST_MACH_CPU_TYPE else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    if !read_header_at(file, 0, &mut magic) {
+        return false;
+    }
+    match u32::from_le_bytes(magic) {
+        MH_MAGIC_64 => mach_header_claims_executable(file, 0, length, host_cpu_type, true),
+        MH_MAGIC => mach_header_claims_executable(file, 0, length, host_cpu_type, false),
+        _ => match u32::from_be_bytes(magic) {
+            FAT_MAGIC => fat_header_claims_executable(file, length, host_cpu_type),
+            // Recognised and refused on purpose. `exec` does not claim a
+            // 64-bit fat image at all on this platform: measured on
+            // macOS/arm64, a `FAT_MAGIC_64` file carrying a real, working host
+            // slice still returned `ENOEXEC` and ran under `/bin/sh`. Naming
+            // the magic here is documentation of that measurement; treating it
+            // as evidence would certify exactly the files the loader drops.
+            FAT_MAGIC_64 => false,
+            _ => false,
+        },
+    }
+}
+
+/// A complete `mach_header`/`mach_header_64` at `slice_offset`, for an image of
+/// `slice_length` bytes.
+///
+/// `filetype` is load-bearing rather than decorative: a header that is valid in
+/// every other respect but says `MH_DYLIB` is NOT claimed, returns `ENOEXEC`,
+/// and hands the file to `/bin/sh` — measured on macOS/arm64. The `sizeofcmds`
+/// bound is the weaker, conservative half: an overflowing load-command table
+/// fails `EBADMACHO` without a fallback, so checking it only narrows an already
+/// safe acceptance set.
+#[cfg(target_os = "macos")]
+fn mach_header_claims_executable(
+    file: &std::fs::File,
+    slice_offset: u64,
+    slice_length: u64,
+    host_cpu_type: u32,
+    wide: bool,
+) -> bool {
+    /// Smallest `load_command`: `cmd` plus `cmdsize`.
+    const LOAD_COMMAND_MIN_BYTES: u64 = 8;
+    const MH_EXECUTE: u32 = 2;
+
+    let header_bytes: u64 = if wide { 32 } else { 28 };
+    if slice_length < header_bytes {
+        return false;
+    }
+    // Every field this proof reads lives in the 24 bytes both layouts share.
+    let mut header = [0u8; 24];
+    if !read_header_at(file, slice_offset, &mut header) {
+        return false;
+    }
+    let field = |offset: usize| -> u32 {
+        u32::from_le_bytes([
+            header[offset],
+            header[offset + 1],
+            header[offset + 2],
+            header[offset + 3],
+        ])
+    };
+    if field(4) != host_cpu_type || field(12) != MH_EXECUTE {
+        return false;
+    }
+    let commands = u64::from(field(16));
+    let commands_bytes = u64::from(field(20));
+    if commands == 0 || commands_bytes == 0 {
+        return false;
+    }
+    if commands.saturating_mul(LOAD_COMMAND_MIN_BYTES) > commands_bytes {
+        return false;
+    }
+    header_bytes.saturating_add(commands_bytes) <= slice_length
+}
+
+/// A universal binary is claimed only when EVERY `fat_arch` entry carrying the
+/// host `cputype` is itself claimable, and at least one such entry exists.
+///
+/// "Some entry validates" is the wrong rule, and the difference is measurable.
+/// XNU does not take the first matching entry: it grades the candidates and
+/// picks the best one, with `arm64e` outranking `arm64` (and `x86_64h`
+/// outranking `x86_64`) under one and the same `cputype`. A real `arm64`
+/// binary in slice #1 beside an `arm64e` entry pointing at shell text is
+/// therefore accepted on the strongest possible evidence and still executed by
+/// `/bin/sh` — measured on macOS/arm64, exit 126. Since the grading order is
+/// the kernel's and not this code's to reproduce, the sound rule is to require
+/// ALL of them: then the entry the grader picks is one this proof validated,
+/// whichever it is. Rejecting the whole file on one unclaimable host entry
+/// costs nothing real — Apple ships one host slice per image.
+///
+/// Validating the inner header is load-bearing on top of that. A fat header
+/// advertising a host slice whose bytes are not a Mach-O image is NOT claimed,
+/// returns `ENOEXEC`, and reaches `/bin/sh` — measured on macOS/arm64.
+/// Matching the `cpusubtype` is deliberately NOT required: Apple ships
+/// `/bin/ls` as an `arm64e` slice that a plain `arm64` host executes, so a
+/// subtype match would reject the platform's own binaries while the all-host
+/// rule above already covers the grade it encodes.
+#[cfg(target_os = "macos")]
+fn fat_header_claims_executable(file: &std::fs::File, length: u64, host_cpu_type: u32) -> bool {
+    const MH_MAGIC: u32 = 0xFEED_FACE;
+    const MH_MAGIC_64: u32 = 0xFEED_FACF;
+    const FAT_HEADER_BYTES: u64 = 8;
+    /// One `fat_arch`: `cputype`, `cpusubtype`, `offset`, `size`, `align`.
+    /// Only the 32-bit table is read, because `FAT_MAGIC_64` is never a proof.
+    const FAT_ARCHITECTURE_BYTES: u64 = 20;
+    /// Sanity ceiling on `nfat_arch`; Apple ships a handful, never thousands.
+    const MAX_FAT_ARCHITECTURES: u32 = 64;
+
+    let mut count = [0u8; 4];
+    if !read_header_at(file, 4, &mut count) {
+        return false;
+    }
+    let architectures = u32::from_be_bytes(count);
+    if architectures == 0 || architectures > MAX_FAT_ARCHITECTURES {
+        return false;
+    }
+    let table_bytes = u64::from(architectures).saturating_mul(FAT_ARCHITECTURE_BYTES);
+    if FAT_HEADER_BYTES.saturating_add(table_bytes) > length {
+        return false;
+    }
+    let mut host_entry_seen = false;
+    for index in 0..u64::from(architectures) {
+        let entry = FAT_HEADER_BYTES + index * FAT_ARCHITECTURE_BYTES;
+        let mut cpu_type = [0u8; 4];
+        if !read_header_at(file, entry, &mut cpu_type) {
+            return false;
+        }
+        if u32::from_be_bytes(cpu_type) != host_cpu_type {
+            continue;
+        }
+        // From here every failure is the whole file's failure: this entry is a
+        // candidate the grader may prefer, so an unclaimable one is a shell
+        // fallback waiting to happen, not an entry to skip past.
+        host_entry_seen = true;
+        let mut extent = [0u8; 8];
+        if !read_header_at(file, entry + 8, &mut extent) {
+            return false;
+        }
+        let offset = u64::from(u32::from_be_bytes(
+            extent[..4].try_into().expect("four bytes"),
+        ));
+        let size = u64::from(u32::from_be_bytes(
+            extent[4..].try_into().expect("four bytes"),
+        ));
+        if offset.saturating_add(size) > length {
+            return false;
+        }
+        let mut slice_magic = [0u8; 4];
+        if !read_header_at(file, offset, &mut slice_magic) {
+            return false;
+        }
+        let claimed = match u32::from_le_bytes(slice_magic) {
+            MH_MAGIC_64 => mach_header_claims_executable(file, offset, size, host_cpu_type, true),
+            MH_MAGIC => mach_header_claims_executable(file, offset, size, host_cpu_type, false),
+            _ => false,
+        };
+        if !claimed {
+            return false;
+        }
+    }
+    host_entry_seen
+}
+
+/// `EM_X86_64` / `EM_AARCH64`. As on macOS, an architecture with no entry has
+/// no proof path.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const HOST_ELF_MACHINE: Option<u16> = Some(62);
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const HOST_ELF_MACHINE: Option<u16> = Some(183);
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+const HOST_ELF_MACHINE: Option<u16> = None;
+
+/// Linux: only ELF, only this host's `e_machine`, only a complete header.
+///
+/// `e_machine` is the load-bearing field here — `binfmt_elf` rejects a foreign
+/// machine with `ENOEXEC`, which is precisely the code that reaches `/bin/sh`,
+/// so a Mach-O (or a cross-compiled ELF) is a fallback vector rather than a
+/// proof. `ET_DYN` is accepted beside `ET_EXEC` because every PIE executable —
+/// which is what a modern toolchain emits by default — is `ET_DYN`, and the
+/// kernel claims both.
+///
+/// This branch models fewer fields than `binfmt_elf`'s full triage, and the
+/// gap is NOT uniformly conservative: a malformed `PT_INTERP` can return
+/// `-ENOEXEC`, hence a real `/bin/sh` path. Its size, extent and terminating
+/// NUL are checked below. An image with no `PT_LOAD` segment is NOT such a
+/// path: the loader is already past `begin_new_exec()` by then, so it either
+/// execs and dies on its entry point or fails `-EINVAL`, and `execvp` retries
+/// only on `ENOEXEC`. One more real `-ENOEXEC` exit before that point of no
+/// return is `!can_mmap_file(bprm->file)`, and it is not a header field at
+/// all, so no header validator — this one included — can ever model it. The
+/// set accepted here is not proved shell-free by measurement the way the
+/// macOS set is — there was no Linux host in the round that wrote it — so
+/// every field it does model is matched exactly rather than loosely:
+/// `e_phentsize` for equality, and the program-header table against the same
+/// `56 * e_phnum` product the kernel computes, BOTH halves of that bound. An
+/// earlier round asserted that exactness while `e_phnum` was still bounded
+/// from below only, which left `e_phnum = 1171` claimed here and `-ENOEXEC`
+/// in the kernel.
+#[cfg(target_os = "linux")]
+fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool {
+    const ELF_HEADER_BYTES: u64 = 64;
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const EV_CURRENT: u8 = 1;
+    const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
+    /// `sizeof(Elf64_Phdr)`, compared for EQUALITY rather than as a minimum.
+    /// `load_elf_phdrs()` demands the exact size and returns NULL otherwise,
+    /// which `load_elf_binary()` turns into `-ENOEXEC` — the one code that
+    /// reaches `/bin/sh`. A larger entry size is a header the validator would
+    /// pass and the kernel would drop.
+    const PROGRAM_HEADER_BYTES: u16 = 56;
+    /// The kernel's bound on the WHOLE program-header table, reproduced as the
+    /// same arithmetic rather than as a count. `load_elf_phdrs()` computes
+    /// `sizeof(struct elf_phdr) * e_phnum` and leaves through the same
+    /// `goto out` as the entry size above — hence the same `-ENOEXEC`, hence
+    /// `/bin/sh` — when that product is `0` or greater than 65536. With the
+    /// 56-byte entry demanded above, the largest claimable count is 1170, so
+    /// `e_phnum = 1171` is the first header a looser check hands to the shell.
+    ///
+    /// The lower half of that condition (`size == 0`) is why a count of zero is
+    /// refused here: a table of no segments is not a cautious reading of a
+    /// claimable image, it is an image the loader itself drops.
+    ///
+    /// `PN_XNUM` (`0xffff`, "the real count lives in section 0's `sh_info`")
+    /// needs no arm of its own. `binfmt_elf` implements extended numbering only
+    /// where it WRITES a core dump; the load path just multiplies, and
+    /// `56 * 0xffff` is fifty-odd times past the bound — so this arithmetic
+    /// already refuses that header exactly as the kernel does.
+    const PROGRAM_HEADER_TABLE_BYTES_MAX: u64 = 65536;
+
+    let Some(host_machine) = HOST_ELF_MACHINE else {
+        return false;
+    };
+    if length < ELF_HEADER_BYTES {
+        return false;
+    }
+    let mut header = [0u8; 64];
+    if !read_header_at(file, 0, &mut header) {
+        return false;
+    }
+    if header[..4] != [0x7F, b'E', b'L', b'F'] {
+        return false;
+    }
+    if header[4] != ELFCLASS64 || header[5] != ELFDATA2LSB || header[6] != EV_CURRENT {
+        return false;
+    }
+    let file_type = u16::from_le_bytes([header[16], header[17]]);
+    if file_type != ET_EXEC && file_type != ET_DYN {
+        return false;
+    }
+    if u16::from_le_bytes([header[18], header[19]]) != host_machine {
+        return false;
+    }
+    if u32::from_le_bytes([header[20], header[21], header[22], header[23]]) != u32::from(EV_CURRENT)
+    {
+        return false;
+    }
+    let program_header_offset = u64::from_le_bytes(header[32..40].try_into().expect("eight bytes"));
+    let header_size = u16::from_le_bytes([header[52], header[53]]);
+    let program_header_size = u16::from_le_bytes([header[54], header[55]]);
+    let program_headers = u16::from_le_bytes([header[56], header[57]]);
+    // Widened to `u64` BEFORE the multiply, because the product of two `u16`
+    // fields leaves `u16` long before it reaches the bound, and a wrapped
+    // product reads as a small, legal table — the precise false positive this
+    // comparison exists to refuse.
+    let table_bytes = u64::from(program_headers).saturating_mul(u64::from(program_header_size));
+    if u64::from(header_size) != ELF_HEADER_BYTES
+        || program_header_size != PROGRAM_HEADER_BYTES
+        || table_bytes == 0
+        || table_bytes > PROGRAM_HEADER_TABLE_BYTES_MAX
+        || program_header_offset == 0
+    {
+        return false;
+    }
+    if program_header_offset.saturating_add(table_bytes) > length {
+        return false;
+    }
+    const PT_INTERP: u32 = 3;
+    const PATH_MAX: u64 = 4096;
+    for index in 0..u64::from(program_headers) {
+        let offset = program_header_offset + index * u64::from(PROGRAM_HEADER_BYTES);
+        let mut program_header = [0u8; PROGRAM_HEADER_BYTES as usize];
+        if !read_header_at(file, offset, &mut program_header) {
+            return false;
+        }
+        if u32::from_le_bytes(program_header[..4].try_into().expect("four bytes")) != PT_INTERP {
+            continue;
+        }
+        let interpreter_offset =
+            u64::from_le_bytes(program_header[8..16].try_into().expect("eight bytes"));
+        let interpreter_bytes =
+            u64::from_le_bytes(program_header[32..40].try_into().expect("eight bytes"));
+        if !(2..=PATH_MAX).contains(&interpreter_bytes)
+            || interpreter_offset
+                .checked_add(interpreter_bytes)
+                .is_none_or(|end| end > length)
+        {
+            return false;
+        }
+        let mut last = [0u8; 1];
+        if !read_header_at(file, interpreter_offset + interpreter_bytes - 1, &mut last)
+            || last[0] != 0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Every other Unix: no proof path, so no file is ever proved target-only by
+/// its header. The conservative answer is the only honest one — claiming a
+/// closure this build cannot reason about is the failure mode this whole
+/// function exists to prevent.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn platform_header_claims_executable(_file: &std::fs::File, _length: u64) -> bool {
+    false
+}
+
+#[cfg(unix)]
+struct ConsumedPaths {
+    paths: Vec<PathBuf>,
+    package_wrapper: bool,
+    closure_proven: bool,
+}
+
+#[cfg(unix)]
+fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
+    let invocation = snapshot_root.join(relative_path);
+    let mut consumed = vec![invocation.clone()];
+    let Ok(metadata) = std::fs::metadata(&invocation) else {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            // Nothing can execute when final resolution fails. The check layer
+            // reports that failure before spawn; provenance still describes the
+            // target snapshot rather than inventing a borrowed execution.
+            closure_proven: true,
+        };
+    };
+    if !metadata.is_file() {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: true,
+        };
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: true,
+        };
+    }
+    // A header the platform's loader claims is the ONE positive proof that no
+    // script indirection exists: the kernel either executes these bytes or
+    // refuses the image, and neither path reaches an interpreter.
+    //
+    // Checked BEFORE the size bound, because the proof reads a bounded header
+    // rather than content — it neither gains nor loses strength with file size,
+    // and real compiled tools are routinely larger than a shim bound (macOS
+    // ships `/bin/ls` at ~150 KiB). The bound guards CONTENT analysis, which
+    // this does not perform. An oversized file that fails the header proof
+    // still falls through to that bound and stays unproved.
+    if kernel_claims_native_executable(&invocation) {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: true,
+        };
+    }
+    if metadata.len() > MAX_JS_SHIM_BYTES {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: false,
+        };
+    }
+    let Ok(bytes) = std::fs::read(&invocation) else {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: false,
+        };
+    };
+    // No `#!` and no claimed platform header proves NOTHING about the closure,
+    // and it must never be read as "native binary". On the `fork`+`execvp`
+    // spawn path POSIX requires the `ENOEXEC` retry through `/bin/sh`, so this
+    // file is then a shell script whose interpreter was chosen for it, with the
+    // full, unbounded indirection a shell allows; on the default `posix_spawn`
+    // path it simply fails to start. The header proof above is the only thing
+    // that rules the first out.
+    if !bytes.starts_with(b"#!") {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: false,
+        };
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: false,
+        };
+    };
+    let Some(bin_dir) = invocation.parent() else {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: false,
+        };
+    };
+
+    let active_lines: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let payload = known_pnpm_shell_wrapper_payload(text, &active_lines);
+    let package_wrapper = payload.is_some();
+    if !package_wrapper && !is_proved_direct_shell_script(text, &active_lines) {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: false,
+        };
+    }
+
+    // The payload comes out of the SAME match that recognised the grammar, so
+    // the two can never disagree. A second, looser scan used to extract it: a
+    // grammar admitting `$HOME` or `$(...)` matched, the extractor recorded a
+    // literal that does not exist, the loop silently added nothing, and
+    // `closure_proven` stayed true for a wrapper that executes an external file.
+    if let Some(payload) = payload {
+        consumed.push(bin_dir.join(payload));
+    }
+
+    consumed.sort();
+    consumed.dedup();
+    ConsumedPaths {
+        paths: consumed,
+        package_wrapper,
+        closure_proven: true,
+    }
+}
+
+/// The characters a proved `$basedir` payload may be spelled with.
+///
+/// Every character a shell would expand, split, or glob is absent: `$`,
+/// backtick, backslash, quotes, whitespace, `~`, `*`, `?`, `[`, `{`, `(`, `;`,
+/// `|`, `&`. What remains can only denote itself, which is the whole point —
+/// the proof records the path this wrapper executes, and it may do that only
+/// where the recorded text and the executed text are the same string. The
+/// previous `[^\"]+` matched anything but a quote, so `exec node
+/// "$basedir/$HOME/x" "$@"` was read as the known grammar while the file that
+/// actually runs is chosen by the shell at run time.
+#[cfg(unix)]
+const PNPM_PAYLOAD_PATH: &str = r"[A-Za-z0-9._@+/-]+";
+
+/// The payload of a strict pnpm-shaped shell wrapper, or `None` when this text
+/// is not that grammar.
+#[cfg(unix)]
+fn known_pnpm_shell_wrapper_payload(text: &str, active_lines: &[&str]) -> Option<String> {
+    let shebang = text.lines().next()?;
+    if !matches!(shebang.trim(), "#!/bin/sh" | "#!/usr/bin/env sh") {
+        return None;
+    }
+    if active_lines.len() != 2 || active_lines[0] != "basedir=$(dirname \"$0\")" {
+        return None;
+    }
+    let grammar = regex::Regex::new(&format!(
+        r#"^exec node "\$basedir/({PNPM_PAYLOAD_PATH})" "\$@"$"#
+    ))
+    .expect("static pnpm wrapper regex");
+    Some(
+        grammar
+            .captures(active_lines[1])?
+            .get(1)?
+            .as_str()
+            .to_string(),
+    )
+}
+
+#[cfg(unix)]
+fn is_proved_direct_shell_script(text: &str, active_lines: &[&str]) -> bool {
+    let Some(shebang) = text.lines().next() else {
+        return false;
+    };
+    if !matches!(
+        shebang.trim(),
+        "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/env sh" | "#!/usr/bin/env bash"
+    ) {
+        return false;
+    }
+    let literal_output = regex::Regex::new(r#"^(?:printf|echo) '[^']*'$"#)
+        .expect("static direct shell output regex");
+    active_lines.iter().all(|line| {
+        line == &":"
+            || line == &"true"
+            || line == &"false"
+            || literal_output.is_match(line)
+            || line == &"exit"
+            || line
+                .strip_prefix("exit ")
+                .is_some_and(|code| !code.is_empty() && code.chars().all(|ch| ch.is_ascii_digit()))
+    })
+}
+
+/// The same question on a platform with neither of the two proofs above.
+///
+/// There is no borrowed-links manifest here (this build creates no dependency
+/// links), no kernel-header validator, and no script grammar — so the only
+/// evidence available is the canonical identity of the path itself. That is
+/// enough for exactly two honest answers, and `TargetOnly` is not one of them
+/// whenever something can actually run:
+///
+/// * nothing resolves at the invocation path — nothing will execute, so the
+///   provenance describes the target tree and nothing else;
+/// * the invocation canonically resolves outside the snapshot root — a
+///   target-owned absolute symlink into the operator's tree is a borrow this
+///   platform can see as plainly as any other;
+/// * anything else — a real file is there and this build cannot read one byte
+///   of its closure, so the claim is withheld rather than granted.
+///
+/// Returning `TargetOnly` unconditionally published `snapshot` for a wrapper
+/// that could still invoke ambient `node` and ambient dependencies.
+#[cfg(not(unix))]
+pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path) -> ClosureProof {
+    let invocation = snapshot_root.join(relative_path);
+    if std::fs::symlink_metadata(&invocation).is_err() {
+        return ClosureProof::TargetOnly;
+    }
+    match (
+        std::fs::canonicalize(snapshot_root),
+        std::fs::canonicalize(&invocation),
+    ) {
+        (Ok(root), Ok(path)) if !path.starts_with(&root) => ClosureProof::Borrowed,
+        _ => ClosureProof::Unproven,
+    }
+}
+
+/// Create one borrowed dependency link and record it for provenance.
+///
+/// The containment check is defence in depth for the only write this module
+/// performs. `strip_prefix` compares spelling, not identity: a path spelled
+/// inside the snapshot can still land outside it when any directory on the way
+/// is a symlink the REVIEWED COMMIT chose — which is how a committed
+/// `node_modules -> /somewhere/writable` turned this call into a write into the
+/// operator's own filesystem. Callers must already refuse to merge into a
+/// target-owned symlink; canonicalising the parent here means a later caller
+/// cannot quietly reintroduce that write, and the cost is one `realpath` per
+/// created link.
+#[cfg(unix)]
+fn create_borrowed_link(
+    source: &Path,
+    exposed: &Path,
+    snapshot_root: &Path,
+    borrowed_links: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let relative = exposed
+        .strip_prefix(snapshot_root)
+        .context("borrowed dependency escaped snapshot root")?
+        .to_path_buf();
+    let parent = exposed
+        .parent()
+        .context("borrowed dependency has no parent directory")?;
+    let root_identity = std::fs::canonicalize(snapshot_root).with_context(|| {
+        format!(
+            "failed to resolve snapshot root {}",
+            snapshot_root.display()
+        )
+    })?;
+    let parent_identity = std::fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve borrowed dependency directory {}",
+            parent.display()
+        )
+    })?;
+    if !parent_identity.starts_with(&root_identity) {
+        anyhow::bail!(
+            "refusing to expose {} at {}: that directory resolves outside the snapshot",
+            source.display(),
+            exposed.display()
+        );
+    }
+    std::os::unix::fs::symlink(source, exposed).with_context(|| {
+        format!(
+            "failed to expose {} as borrowed dependency {}",
+            source.display(),
+            exposed.display()
+        )
+    })?;
+    borrowed_links.push(relative);
+    Ok(())
+}
+
+/// What the reviewed commit itself put at a dependency root, decided WITHOUT
+/// following the entry.
+///
+/// `Path::exists()` follows symlinks, so a commit carrying
+/// `node_modules -> /somewhere/writable` answered "yes, a directory is there"
+/// and the merge below then created borrowed links inside that outside
+/// directory. `symlink_metadata` answers the only question this decision may
+/// ask: what did the TARGET put here?
+#[cfg(unix)]
+enum DependencyRoot {
+    /// The target committed nothing here, so the operator's whole directory can
+    /// be exposed as a single borrowed link.
+    Absent,
+    /// The target committed a real directory. Entries it does not own may be
+    /// borrowed into it, and every write stays inside the snapshot.
+    TargetDirectory,
+    /// The target committed something that is not a real directory: a symlink
+    /// (resolving anywhere, or broken) or a file. It wins as-is — no merge, no
+    /// borrow, and no abort either. Writing into it would leave the snapshot,
+    /// replacing it would overwrite a target entry, and failing would let a
+    /// committed broken `node_modules` link abort the whole review.
+    TargetOwnedOpaque,
+}
+
+#[cfg(unix)]
+fn dependency_root(snapshot_entry: &Path) -> Result<DependencyRoot> {
+    match std::fs::symlink_metadata(snapshot_entry) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(DependencyRoot::TargetDirectory),
+        Ok(_) => Ok(DependencyRoot::TargetOwnedOpaque),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DependencyRoot::Absent),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect target-owned dependency path {}",
+                snapshot_entry.display()
+            )
+        }),
+    }
+}
+
+/// Expose the ambient entries `snapshot` does not already own, one link each.
+///
+/// PRECONDITION: `snapshot` is a real directory inside `snapshot_root`, proved
+/// by [`dependency_root`]. Only then is `snapshot.join(name)` a path whose
+/// parent the reviewed commit cannot have redirected, and only then can the
+/// last-component `symlink_metadata` below be the whole collision test.
+/// [`create_borrowed_link`] re-proves containment per link, so a caller that
+/// forgets this fails closed instead of writing outside the snapshot.
+#[cfg(unix)]
+fn link_missing_entries(
+    ambient: &Path,
+    snapshot: &Path,
+    snapshot_root: &Path,
+    borrowed_links: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(ambient)
+        .with_context(|| format!("failed to enumerate ambient {}", ambient.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!("failed to read an entry from ambient {}", ambient.display())
+        })?;
+        let borrowed = entry.path();
+        let exposed = snapshot.join(entry.file_name());
+        match std::fs::symlink_metadata(&exposed) {
+            Ok(metadata) => {
+                // A scoped package directory is a namespace, not one package.
+                // Keep every target-owned child and expose only missing ambient
+                // packages within that namespace.
+                if entry.file_name().to_string_lossy().starts_with('@')
+                    && metadata.is_dir()
+                    && std::fs::symlink_metadata(&borrowed)?.is_dir()
+                    && matches!(dependency_root(&exposed)?, DependencyRoot::TargetDirectory)
+                {
+                    link_missing_entries(&borrowed, &exposed, snapshot_root, borrowed_links)?;
+                }
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect target-owned dependency path {}",
+                        exposed.display()
+                    )
+                });
+            }
+        }
+        create_borrowed_link(&borrowed, &exposed, snapshot_root, borrowed_links)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_borrowed_links_manifest(temp_root: &Path, borrowed_links: &mut [PathBuf]) -> Result<()> {
+    if borrowed_links.is_empty() {
+        return Ok(());
+    }
+    borrowed_links.sort();
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut encoded = Vec::new();
+    for path in borrowed_links {
+        encoded.extend_from_slice(path.as_os_str().as_bytes());
+        encoded.push(0);
+    }
+    std::fs::write(temp_root.join(BORROWED_LINKS_MANIFEST), encoded)
+        .context("failed to record snapshot borrowed-link provenance")
+}
 
 /// Roll back one exact worktree registration without spawning another child.
 ///
@@ -83,6 +1181,10 @@ pub struct WorktreeSnapshot {
 
 impl Drop for WorktreeSnapshot {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Ok(mut registry) = snapshot_borrow_registry().lock() {
+            registry.remove(&self.worktree_path);
+        }
         // Drop can run while unwinding an async stage. Never start or wait for a
         // child here: the explicit success path owns governed `git worktree
         // remove`, while this backstop only prunes this exact registration in
@@ -157,6 +1259,208 @@ impl WorktreeSnapshot {
     }
 }
 
+/// Inspect the pinned tree before writing raw blobs. Git trees cannot
+/// contain children below a symlink, but checking that invariant before writes
+/// keeps materialization fail-closed even for malformed imported objects.
+fn pinned_gitlinks(
+    source_repo: &git2::Repository,
+    commit: git2::Oid,
+    validate_archive: bool,
+) -> Result<Vec<(PathBuf, git2::Oid)>> {
+    let tree = source_repo.find_commit(commit)?.tree()?;
+    let mut links = Vec::new();
+    let mut archive_paths = std::collections::BTreeSet::new();
+    let mut symlinks = Vec::new();
+    let mut unreadable_path = false;
+    tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+        let Some(name) = entry.name() else {
+            if entry.kind() == Some(git2::ObjectType::Tree)
+                || entry.kind() == Some(git2::ObjectType::Commit)
+                || validate_archive
+            {
+                unreadable_path = true;
+                return git2::TreeWalkResult::Abort;
+            }
+            return git2::TreeWalkResult::Ok;
+        };
+        let path = format!("{dir}{name}");
+        if validate_archive {
+            archive_paths.insert(path.clone());
+            if entry.filemode() == 0o120000 {
+                symlinks.push(path.clone());
+            }
+        }
+        if entry.kind() == Some(git2::ObjectType::Commit) {
+            links.push((PathBuf::from(path), entry.id()));
+        }
+        git2::TreeWalkResult::Ok
+    })
+    .or_else(|error| {
+        if unreadable_path {
+            anyhow::bail!("cannot materialize non-UTF-8 submodule path in exact snapshot")
+        }
+        Err(error.into())
+    })?;
+    for path in &archive_paths {
+        crate::paths::validate_repo_relative_str(path)?;
+        anyhow::ensure!(
+            !Path::new(path)
+                .components()
+                .any(|part| part.as_os_str() == ".git"),
+            "submodule archive contains Git administrative path: {path}"
+        );
+    }
+    for link in symlinks {
+        let prefix = format!("{link}/");
+        anyhow::ensure!(
+            !archive_paths
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|path| path.starts_with(&prefix)),
+            "submodule archive would extract through symlink: {link}"
+        );
+    }
+    Ok(links)
+}
+
+/// Write the pinned tree's raw blobs. `git archive` is unsuitable here:
+/// committed export-ignore/export-subst attributes can omit or alter bytes.
+fn materialize_pinned_tree(
+    repo: &git2::Repository,
+    tree: &git2::Tree<'_>,
+    destination: &Path,
+) -> Result<()> {
+    for entry in tree {
+        let name = entry.name().context("non-UTF-8 submodule path")?;
+        crate::paths::validate_repo_relative_str(name)?;
+        anyhow::ensure!(
+            name != ".git",
+            "submodule tree contains Git administrative path"
+        );
+        let path = destination.join(name);
+        match entry.filemode() {
+            0o040000 => {
+                std::fs::create_dir(&path)?;
+                let child = repo.find_tree(entry.id())?;
+                materialize_pinned_tree(repo, &child, &path)?;
+            }
+            0o100644 | 0o100755 => {
+                let blob = repo.find_blob(entry.id())?;
+                std::fs::write(&path, blob.content())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(if entry.filemode() == 0o100755 {
+                            0o755
+                        } else {
+                            0o644
+                        }),
+                    )?;
+                }
+            }
+            0o120000 => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    let blob = repo.find_blob(entry.id())?;
+                    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(blob.content()), &path)?;
+                }
+                #[cfg(not(unix))]
+                anyhow::bail!("cannot materialize submodule symlink on this platform");
+            }
+            0o160000 => {} // Nested gitlink is expanded from its own pinned object below.
+            mode => anyhow::bail!(
+                "unsupported submodule tree mode {mode:o} at {}",
+                path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Expand gitlinks from local object stores at their pinned commit IDs. This
+/// never fetches or reads uncommitted submodule contents from the operator's
+/// checkout. Missing objects are a hard error: an empty gitlink directory is
+/// not the exact target tree.
+fn materialize_pinned_gitlinks(
+    source_repo: &git2::Repository,
+    operator_root: &Path,
+    commit: git2::Oid,
+    snapshot_root: &Path,
+    depth: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        depth < 16,
+        "nested submodule depth exceeds offline snapshot limit"
+    );
+    let links = pinned_gitlinks(source_repo, commit, false)?;
+
+    for (relative, pinned_oid) in links {
+        let relative_str = relative
+            .to_str()
+            .context("non-UTF-8 submodule path in exact snapshot")?;
+        crate::paths::validate_repo_relative_str(relative_str)?;
+        let operator_submodule = operator_root.join(&relative);
+        let module_store = source_repo.commondir().join("modules").join(&relative);
+        let sub_repo = git2::Repository::open(&operator_submodule)
+            .ok()
+            .filter(|repo| repo.find_commit(pinned_oid).is_ok())
+            .or_else(|| {
+                // A submodule's administrative repo can outlive its checkout.
+                // Force a bare object-store view: plain `open` follows the
+                // removed core.worktree, while `open_bare` requires the config
+                // itself to declare a bare repository.
+                git2::Repository::open_ext(
+                    &module_store,
+                    git2::RepositoryOpenFlags::NO_SEARCH | git2::RepositoryOpenFlags::BARE,
+                    &[] as &[&std::ffi::OsStr],
+                )
+                    .ok()
+                    .filter(|repo| repo.find_commit(pinned_oid).is_ok())
+            })
+            .with_context(|| {
+                format!(
+                    "submodule {} has no local object store containing pinned commit {}; exact snapshot cannot fetch it",
+                    relative.display(), pinned_oid
+                )
+            })?;
+        pinned_gitlinks(&sub_repo, pinned_oid, true)?;
+
+        let mut destination = snapshot_root.to_path_buf();
+        for component in relative.components() {
+            destination.push(component);
+            match std::fs::symlink_metadata(&destination) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => anyhow::bail!(
+                    "submodule destination is not a directory in exact snapshot: {}",
+                    destination.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&destination)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::ensure!(
+            std::fs::read_dir(&destination)?.next().is_none(),
+            "submodule destination is not empty in exact snapshot: {}",
+            destination.display()
+        );
+        let tree = sub_repo.find_commit(pinned_oid)?.tree()?;
+        materialize_pinned_tree(&sub_repo, &tree, &destination)?;
+        materialize_pinned_gitlinks(
+            &sub_repo,
+            &operator_submodule,
+            pinned_oid,
+            &destination,
+            depth + 1,
+        )?;
+    }
+    Ok(())
+}
+
 /// Create an ephemeral detached worktree of `commit` under a fresh temp dir.
 pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<WorktreeSnapshot> {
     // Resolve symbolic inputs once, before creating the checkout. All later
@@ -170,13 +1474,24 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     // `git worktree add` wants a path it can create, so point it at a fresh
     // subdirectory of the temp dir rather than the (already-created) temp root.
     let worktree_path = tmp.path().join("snapshot");
+    // A reviewed commit is input data, not an operator checkout. In particular,
+    // `worktree add` must not execute an inherited/global post-checkout hook:
+    // that hook can require ambient tools, mutate the snapshot, or inspect an
+    // unrelated checkout. Point Git at an empty, snapshot-owned hook directory
+    // without changing the repository's persistent configuration.
+    let hooks_path = tmp.path().join("hooks");
+    std::fs::create_dir(&hooks_path)?;
     // Armed before the child starts: if cancellation/timeout wins after Git has
     // registered the path but before the command returns, Drop can still undo
     // that exact administrative entry in-process.
     let mut registration_rollback = WorktreeRegistrationRollback::new(repo_root, &worktree_path);
 
+    let mut hooks_config = std::ffi::OsString::from("core.hooksPath=");
+    hooks_config.push(&hooks_path);
     let mut command = git_cmd();
     command
+        .arg("-c")
+        .arg(hooks_config)
         .args(["worktree", "add", "--detach", "--force"])
         .arg(&worktree_path)
         .arg(&original_target_sha)
@@ -192,17 +1507,76 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
         anyhow::bail!("git worktree add failed: {}", stderr.trim());
     }
 
-    // Symlink untracked dependencies (node_modules and .venv) to bypass reinstall overhead
+    let source_repo = git2::Repository::discover(repo_root)?;
+    materialize_pinned_gitlinks(
+        &source_repo,
+        repo_root,
+        git2::Oid::from_str(&original_target_sha)?,
+        &worktree_path,
+        0,
+    )?;
+
+    // Symlink untracked dependencies (node_modules and .venv) to bypass reinstall overhead.
+    // A failed borrow is terminal instead of silently leaving a snapshot whose
+    // JS eligibility was decided from the operator checkout but whose toolchain
+    // is absent at execution time. A target is allowed to commit files under
+    // node_modules; preserve that directory and borrow only missing top-level
+    // dependency entries in that case. Linking `.bin` alone is insufficient for
+    // npm/pnpm shims because they resolve sibling package paths such as
+    // `../eslint` from the snapshot.
+    //
+    // Every decision below reads the SNAPSHOT entry with `symlink_metadata`, so
+    // the reviewed commit cannot redirect a write. A target entry that is not a
+    // real directory wins untouched, which is the same rule stated three ways:
+    // prview never overwrites a target entry, never writes through one, and
+    // never aborts a review over one.
     #[cfg(unix)]
     {
+        let mut borrowed_links = Vec::new();
         let nm = repo_root.join("node_modules");
+        let snapshot_nm = worktree_path.join("node_modules");
         if nm.exists() {
-            let _ = std::os::unix::fs::symlink(&nm, worktree_path.join("node_modules"));
+            match dependency_root(&snapshot_nm)? {
+                DependencyRoot::Absent => {
+                    create_borrowed_link(&nm, &snapshot_nm, &worktree_path, &mut borrowed_links)?;
+                }
+                DependencyRoot::TargetDirectory => {
+                    // Top-level packages first, and independently of `.bin`:
+                    // the two answer different questions. Packages are what a
+                    // shim resolves (`../eslint` from `.bin`), so a target that
+                    // committed its own `.bin` still needs them; and when the
+                    // target owns no `.bin` at all, `.bin` is simply one of the
+                    // ambient entries this call exposes.
+                    link_missing_entries(&nm, &snapshot_nm, &worktree_path, &mut borrowed_links)?;
+                    let ambient_bin = nm.join(".bin");
+                    let snapshot_bin = snapshot_nm.join(".bin");
+                    if ambient_bin.is_dir()
+                        && matches!(
+                            dependency_root(&snapshot_bin)?,
+                            DependencyRoot::TargetDirectory
+                        )
+                    {
+                        link_missing_entries(
+                            &ambient_bin,
+                            &snapshot_bin,
+                            &worktree_path,
+                            &mut borrowed_links,
+                        )?;
+                    }
+                }
+                DependencyRoot::TargetOwnedOpaque => {}
+            }
         }
         let venv = repo_root.join(".venv");
-        if venv.exists() {
-            let _ = std::os::unix::fs::symlink(&venv, worktree_path.join(".venv"));
+        let snapshot_venv = worktree_path.join(".venv");
+        if venv.exists() && matches!(dependency_root(&snapshot_venv)?, DependencyRoot::Absent) {
+            create_borrowed_link(&venv, &snapshot_venv, &worktree_path, &mut borrowed_links)?;
         }
+        write_borrowed_links_manifest(tmp.path(), &mut borrowed_links)?;
+        snapshot_borrow_registry()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot borrow registry is unavailable"))?
+            .insert(worktree_path.clone(), borrowed_links);
     }
 
     registration_rollback.disarm();
@@ -238,6 +1612,740 @@ mod tests {
         (tmp, repo)
     }
 
+    /// A snapshot-shaped directory holding one executable tool, with no
+    /// borrowed-links manifest beside it — so nothing but the tool's own bytes
+    /// can decide the classification.
+    #[cfg(unix)]
+    fn snapshot_with_tool(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("snapshot tempdir");
+        let root = tmp.path().join("snapshot");
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("snapshot bin dir");
+        let tool = bin_dir.join("eslint");
+        std::fs::write(&tool, bytes).expect("snapshot tool");
+        let mut permissions = std::fs::metadata(&tool)
+            .expect("tool metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("executable tool");
+        (tmp, root)
+    }
+
+    /// Bytes of a real, kernel-executable image for THIS host.
+    ///
+    /// Synthesising one from a magic prefix is the circularity these fixtures
+    /// exist to break: it would prove only that the validator agrees with
+    /// itself, and the prefix-shaped file it produces is exactly the one the
+    /// kernel hands to `/bin/sh`. A freshly compiled binary is the strongest
+    /// available source; a system executable the OS itself ships and runs is
+    /// the fallback on a machine with no C compiler.
+    #[cfg(unix)]
+    fn host_native_executable_bytes(scratch: &Path) -> Option<Vec<u8>> {
+        let source = scratch.join("probe.c");
+        let binary = scratch.join("probe");
+        if std::fs::write(&source, "int main(void) { return 0; }\n").is_ok()
+            && std::process::Command::new("cc")
+                .arg("-o")
+                .arg(&binary)
+                .arg(&source)
+                .status()
+                .is_ok_and(|status| status.success())
+            && let Ok(bytes) = std::fs::read(&binary)
+        {
+            return Some(bytes);
+        }
+        ["/bin/ls", "/bin/cat", "/bin/sh", "/usr/bin/env"]
+            .into_iter()
+            .find_map(|candidate| std::fs::read(candidate).ok())
+    }
+
+    /// The magic of a format this platform has NO loader for. It is
+    /// recognisable and never executable, which is precisely the shape that
+    /// returns `ENOEXEC` and reaches `/bin/sh`.
+    #[cfg(target_os = "macos")]
+    const FOREIGN_FORMAT_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+    #[cfg(target_os = "linux")]
+    const FOREIGN_FORMAT_MAGIC: [u8; 4] = [0xCF, 0xFA, 0xED, 0xFE];
+
+    /// The magic of THIS platform's own executable format. On its own, without
+    /// the rest of the header, it is still not a proof — the loader claims
+    /// nothing from four bytes.
+    #[cfg(target_os = "macos")]
+    const HOST_FORMAT_MAGIC: [u8; 4] = [0xCF, 0xFA, 0xED, 0xFE];
+    #[cfg(target_os = "linux")]
+    const HOST_FORMAT_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_host_binary_proves_a_target_only_closure() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let Some(native) = host_native_executable_bytes(scratch.path()) else {
+            // Nothing on this machine is independently established as
+            // kernel-executable, so there is no honest positive fixture. A
+            // synthesised one would re-introduce the circularity above, so the
+            // case is skipped by name rather than faked.
+            eprintln!(
+                "skipped: no C compiler and no readable system executable on this host, \
+                 so no independently kernel-executable fixture exists"
+            );
+            return;
+        };
+
+        // Real compiled tools run past the shim bound, and that is the point:
+        // the header proof reads a bounded window, so size neither grants nor
+        // withholds it.
+        let (_tmp, root) = snapshot_with_tool(&native);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "a complete platform header for this host's architecture is claimed by the \
+             kernel's loader, so the closure is the invocation itself",
+        );
+    }
+
+    /// Apple ships `/bin/ls` as a universal binary, so this is the fat path on
+    /// real bytes: a `cputype` match inside the `fat_arch` table, and a slice
+    /// whose own `mach_header` is claimable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_universal_binary_with_a_host_slice_proves_a_target_only_closure() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let Ok(universal) = std::fs::read("/bin/ls") else {
+            eprintln!("skipped: /bin/ls is not readable, so no real universal binary is available");
+            return;
+        };
+        assert_eq!(
+            universal.get(..4),
+            Some([0xCA, 0xFE, 0xBA, 0xBE].as_slice()),
+            "this fixture is only meaningful while /bin/ls is a fat binary",
+        );
+        let (_tmp, root) = snapshot_with_tool(&universal);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "a universal binary carrying a claimable slice for the host cputype is \
+             executed by the kernel, not by an interpreter",
+        );
+    }
+
+    /// The `cpusubtype` XNU grades ABOVE the host's baseline under the same
+    /// `cputype`: `arm64e` on Apple Silicon, `x86_64h` on Intel. The validator
+    /// never compares it — this is the fixture side, where it is what makes a
+    /// hostile entry the one the kernel would actually pick.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const HOST_GRADED_CPU_SUBTYPE: u32 = 2;
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    const HOST_GRADED_CPU_SUBTYPE: u32 = 8;
+
+    /// A 32-bit universal binary over `(cputype, cpusubtype, bytes)` slices,
+    /// built from the format rather than from a recognised prefix: an 8-byte
+    /// fat header, one 20-byte `fat_arch` per slice, then the slice bodies.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn universal_binary(slices: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        const SLICE_ALIGNMENT: usize = 16;
+
+        let table_end = 8 + 20 * slices.len();
+        let mut image = 0xCAFE_BABEu32.to_be_bytes().to_vec();
+        image.extend_from_slice(
+            &u32::try_from(slices.len())
+                .expect("slice count")
+                .to_be_bytes(),
+        );
+        let mut body: Vec<u8> = Vec::new();
+        for (cpu_type, cpu_subtype, bytes) in slices {
+            let offset = (table_end + body.len()).next_multiple_of(SLICE_ALIGNMENT);
+            body.resize(offset - table_end, 0);
+            body.extend_from_slice(bytes);
+            image.extend_from_slice(&cpu_type.to_be_bytes());
+            image.extend_from_slice(&cpu_subtype.to_be_bytes());
+            image.extend_from_slice(&u32::try_from(offset).expect("slice offset").to_be_bytes());
+            image.extend_from_slice(
+                &u32::try_from(bytes.len())
+                    .expect("slice size")
+                    .to_be_bytes(),
+            );
+            image.extend_from_slice(&4u32.to_be_bytes());
+        }
+        assert_eq!(
+            image.len(),
+            table_end,
+            "the fat table ends where the bodies begin"
+        );
+        image.extend_from_slice(&body);
+        image
+    }
+
+    /// The same slices under `FAT_MAGIC_64`: 8-byte header, 32-byte entries
+    /// with 64-bit `offset`/`size` and a trailing `reserved` word.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn fat64_universal_binary(slices: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        const SLICE_ALIGNMENT: usize = 16;
+
+        let table_end = 8 + 32 * slices.len();
+        let mut image = 0xCAFE_BABFu32.to_be_bytes().to_vec();
+        image.extend_from_slice(
+            &u32::try_from(slices.len())
+                .expect("slice count")
+                .to_be_bytes(),
+        );
+        let mut body: Vec<u8> = Vec::new();
+        for (cpu_type, cpu_subtype, bytes) in slices {
+            let offset = (table_end + body.len()).next_multiple_of(SLICE_ALIGNMENT);
+            body.resize(offset - table_end, 0);
+            body.extend_from_slice(bytes);
+            image.extend_from_slice(&cpu_type.to_be_bytes());
+            image.extend_from_slice(&cpu_subtype.to_be_bytes());
+            image.extend_from_slice(&u64::try_from(offset).expect("slice offset").to_be_bytes());
+            image.extend_from_slice(
+                &u64::try_from(bytes.len())
+                    .expect("slice size")
+                    .to_be_bytes(),
+            );
+            image.extend_from_slice(&4u32.to_be_bytes());
+            image.extend_from_slice(&0u32.to_be_bytes());
+        }
+        assert_eq!(
+            image.len(),
+            table_end,
+            "the fat table ends where the bodies begin"
+        );
+        image.extend_from_slice(&body);
+        image
+    }
+
+    /// A thin Mach-O for this host, or a named skip. Fat bytes cannot be
+    /// nested inside a `fat_arch` slice, so a host whose only available
+    /// executable is universal has no honest fixture here.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn thin_host_slice_bytes(scratch: &Path) -> Option<Vec<u8>> {
+        let native = host_native_executable_bytes(scratch)?;
+        if native.get(..4) == Some([0xCF, 0xFA, 0xED, 0xFE].as_slice()) {
+            return Some(native);
+        }
+        eprintln!(
+            "skipped: the only kernel-executable image available on this host is not a thin \
+             Mach-O, so it cannot stand in for a universal slice"
+        );
+        None
+    }
+
+    /// The whole file is refused when ONE host-`cputype` entry is unclaimable,
+    /// because the loader grades entries and this code cannot say which one it
+    /// will pick. The control in the same test is the point: the identical
+    /// builder with the real slice alone still proves a target-only closure,
+    /// so the refusal below is the hostile entry, never a broken fixture.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn a_universal_binary_with_one_unclaimable_host_slice_is_unproven() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let Some(host_cpu_type) = HOST_MACH_CPU_TYPE else {
+            eprintln!("skipped: this build has no host cputype, so no fat entry can match it");
+            return;
+        };
+        let Some(native) = thin_host_slice_bytes(scratch.path()) else {
+            return;
+        };
+
+        let (_tmp, root) = snapshot_with_tool(&universal_binary(&[(host_cpu_type, 0, &native)]));
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "control: a universal image whose only host entry is a real binary is claimed, \
+             so this fixture shape is sound and the case below is not passing by accident",
+        );
+
+        // The verifier's attack: the real binary is slice #1 on the host's
+        // baseline subtype, and the graded-higher entry points at shell text.
+        // Accepting on slice #1 hands the file to `/bin/sh` through slice #2.
+        let launcher = magic_prefixed_launcher(FOREIGN_FORMAT_MAGIC);
+        let proof = path_uses_prview_borrow(
+            &snapshot_with_tool(&universal_binary(&[
+                (host_cpu_type, 0, &native),
+                (host_cpu_type, HOST_GRADED_CPU_SUBTYPE, &launcher),
+            ]))
+            .1,
+            relative,
+        );
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "one unclaimable host slice is a shell fallback the grader may choose, so the \
+             image proves nothing however strong the other entries are",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "a real binary beside a hostile entry must never certify an exact snapshot scan",
+        );
+    }
+
+    /// `FAT_MAGIC_64` is recognised and never a proof: measured on
+    /// macOS/arm64, `exec` does not claim a 64-bit fat image even when the
+    /// slice it advertises is a real, working host binary — it returns
+    /// `ENOEXEC` and the file runs under `/bin/sh`.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn a_fat64_universal_binary_is_unproven_even_with_a_real_host_slice() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let Some(host_cpu_type) = HOST_MACH_CPU_TYPE else {
+            eprintln!("skipped: this build has no host cputype, so no fat entry can match it");
+            return;
+        };
+        let Some(native) = thin_host_slice_bytes(scratch.path()) else {
+            return;
+        };
+
+        let (_tmp, root) =
+            snapshot_with_tool(&fat64_universal_binary(&[(host_cpu_type, 0, &native)]));
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "the strongest possible fat64 image is still not claimed by this platform's \
+             loader, so recognising its magic would certify a shell fallback",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "a magic the kernel refuses is not evidence, whatever it wraps",
+        );
+    }
+
+    /// `e_phentsize` is matched for equality, not as a minimum: `load_elf_phdrs()`
+    /// demands `sizeof(Elf64_Phdr)` exactly and turns any other size into
+    /// `-ENOEXEC`, the code that reaches `/bin/sh`. The fixture is a real host
+    /// binary with that one field rewritten, so the control is the unmodified
+    /// image and the only variable is the field under test.
+    ///
+    /// STATIC correction: this cell has no runtime measurement behind it, the
+    /// round that wrote it had no Linux host. It runs on CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_elf_program_header_size_the_kernel_rejects_is_unproven() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let Some(native) = host_native_executable_bytes(scratch.path()) else {
+            eprintln!(
+                "skipped: no C compiler and no readable system executable on this host, \
+                 so no independently kernel-executable fixture exists"
+            );
+            return;
+        };
+        if native.get(..5) != Some([0x7F, b'E', b'L', b'F', 2].as_slice()) {
+            eprintln!("skipped: the available host executable is not a 64-bit ELF image");
+            return;
+        }
+
+        let (_tmp, root) = snapshot_with_tool(&native);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "control: the unmodified host binary is claimed, so each rejection below is \
+             the rewritten field and nothing else",
+        );
+
+        let program_header_offset =
+            u64::from_le_bytes(native[32..40].try_into().expect("eight bytes"));
+        let program_headers = u64::from(u16::from_le_bytes([native[56], native[57]]));
+        for size in [55u16, 57u16] {
+            // Without this the case could pass on the bounds check instead of
+            // the size check, and prove nothing about either.
+            let table_bytes = program_headers.saturating_mul(u64::from(size));
+            assert!(
+                program_header_offset.saturating_add(table_bytes)
+                    <= u64::try_from(native.len()).expect("image length fits u64"),
+                "the near-miss table must still fit inside the file, or the rejection \
+                 would come from the bounds check rather than from `e_phentsize`",
+            );
+
+            let mut mutated = native.clone();
+            mutated[54..56].copy_from_slice(&size.to_le_bytes());
+            let (_tmp, root) = snapshot_with_tool(&mutated);
+            let proof = path_uses_prview_borrow(&root, relative);
+            assert_eq!(
+                proof,
+                ClosureProof::Unproven,
+                "`e_phentsize` = {size} is not `sizeof(Elf64_Phdr)`, so `load_elf_phdrs()` \
+                 fails and the image falls through to `/bin/sh`",
+            );
+            assert_ne!(
+                proof,
+                ClosureProof::TargetOnly,
+                "a program-header size the kernel refuses must never certify a snapshot scan",
+            );
+        }
+    }
+
+    /// A 64-bit ELF header built from the specification instead of from a host
+    /// toolchain. The cells below then measure format discrimination on every
+    /// runner, including the ones with no `cc` and no readable system binary,
+    /// where a toolchain-derived fixture can only skip itself — and a cell that
+    /// skips proves nothing about the field it is named after.
+    #[cfg(target_os = "linux")]
+    fn synthetic_host_elf(machine: u16, file_type: u16, entry_size: u16, entries: u16) -> Vec<u8> {
+        const PROGRAM_HEADER_OFFSET: u64 = 64;
+        /// Bytes past the advertised table, so no fixture built here is ever
+        /// refused by the header-length gate or by the in-file bounds check —
+        /// a rejection has to come from the field under test.
+        const TAIL_BYTES: usize = 16;
+
+        let mut bytes = vec![0u8; usize::try_from(PROGRAM_HEADER_OFFSET).expect("header fits")];
+        bytes[..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1; // EV_CURRENT
+        bytes[16..18].copy_from_slice(&file_type.to_le_bytes());
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        bytes[32..40].copy_from_slice(&PROGRAM_HEADER_OFFSET.to_le_bytes()); // e_phoff
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        bytes[54..56].copy_from_slice(&entry_size.to_le_bytes());
+        bytes[56..58].copy_from_slice(&entries.to_le_bytes());
+        let table_bytes = usize::from(entries) * usize::from(entry_size);
+        bytes.resize(bytes.len() + table_bytes + TAIL_BYTES, 0);
+        bytes
+    }
+
+    /// The cell the verifier's F3 asked for. On Linux the magic-prefix fixtures
+    /// are refused by the 64-byte length gate before a single field is read, so
+    /// they would still pass with `e_machine` deleted — and deleting it accepts
+    /// a cross-compiled ELF as target-only, which is the false positive this
+    /// whole proof exists to refuse. This cell runs the other way round: a
+    /// complete, claimable header is the control, and each rejection moves
+    /// exactly one field away from it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_complete_elf_header_is_claimed_only_for_this_host_and_this_kind() {
+        /// The header length gate, which no fixture in this cell may trip.
+        const ELF_HEADER_BYTES: usize = 64;
+        const ET_REL: u16 = 1;
+        const ET_EXEC: u16 = 2;
+        const ET_DYN: u16 = 3;
+        const PROGRAM_HEADER_BYTES: u16 = 56;
+        /// `EM_386`: a real machine and never this branch's host, so it is the
+        /// shape a cross-compiler emits — claimed by no loader running here.
+        const FOREIGN_MACHINE: u16 = 3;
+
+        let relative = Path::new("node_modules/.bin/eslint");
+        let Some(host_machine) = HOST_ELF_MACHINE else {
+            eprintln!("skipped: this build has no host `e_machine`, so no header can match it");
+            return;
+        };
+
+        for file_type in [ET_EXEC, ET_DYN] {
+            let image = synthetic_host_elf(host_machine, file_type, PROGRAM_HEADER_BYTES, 9);
+            let (_tmp, root) = snapshot_with_tool(&image);
+            assert_eq!(
+                path_uses_prview_borrow(&root, relative),
+                ClosureProof::TargetOnly,
+                "control: a complete host header with `e_type` = {file_type} is claimed by \
+                 `binfmt_elf`, so every rejection below is the rewritten field and nothing else",
+            );
+        }
+
+        for (label, image) in [
+            (
+                "a cross-compiled `e_machine`",
+                synthetic_host_elf(FOREIGN_MACHINE, ET_DYN, PROGRAM_HEADER_BYTES, 9),
+            ),
+            (
+                "a relocatable object rather than an executable",
+                synthetic_host_elf(host_machine, ET_REL, PROGRAM_HEADER_BYTES, 9),
+            ),
+            (
+                "an `e_phentsize` the loader refuses",
+                synthetic_host_elf(host_machine, ET_DYN, PROGRAM_HEADER_BYTES + 1, 9),
+            ),
+        ] {
+            // Without this the case could be passing on the length gate, which
+            // reads no field at all — exactly the vacuity F3 found.
+            assert!(
+                image.len() > ELF_HEADER_BYTES,
+                "{label}: the fixture must outlive the header-length gate, or the case would \
+                 pass without the validator reading a single field",
+            );
+
+            let (_tmp, root) = snapshot_with_tool(&image);
+            let proof = path_uses_prview_borrow(&root, relative);
+            assert_eq!(
+                proof,
+                ClosureProof::Unproven,
+                "{label}: `binfmt_elf` drops this header with `-ENOEXEC`, the one code that \
+                 sends the file to `/bin/sh`",
+            );
+            assert_ne!(
+                proof,
+                ClosureProof::TargetOnly,
+                "{label} must never certify an exact snapshot scan",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_elf_interpreter_cannot_certify_a_snapshot_scan() {
+        let Some(host_machine) = HOST_ELF_MACHINE else {
+            return;
+        };
+        let relative = Path::new("node_modules/.bin/eslint");
+        let mut valid = synthetic_host_elf(host_machine, 3, 56, 9);
+        let interpreter_offset = 64 + 56 * 9;
+        valid[64..68].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        valid[72..80].copy_from_slice(&(interpreter_offset as u64).to_le_bytes());
+        valid[96..104].copy_from_slice(&2u64.to_le_bytes());
+        valid[interpreter_offset..interpreter_offset + 2].copy_from_slice(b"/\0");
+        let (_tmp, root) = snapshot_with_tool(&valid);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly
+        );
+
+        let mut too_short = valid.clone();
+        too_short[96..104].copy_from_slice(&1u64.to_le_bytes());
+        let (_tmp, root) = snapshot_with_tool(&too_short);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven
+        );
+
+        let mut not_terminated = valid.clone();
+        not_terminated[interpreter_offset + 1] = b'x';
+        let (_tmp, root) = snapshot_with_tool(&not_terminated);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven
+        );
+
+        let mut too_long = valid;
+        too_long.resize(interpreter_offset + 4097, 0);
+        too_long[96..104].copy_from_slice(&4097u64.to_le_bytes());
+        let (_tmp, root) = snapshot_with_tool(&too_long);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven
+        );
+    }
+
+    /// `e_phnum` is bounded from ABOVE as well as from below: `load_elf_phdrs()`
+    /// computes `sizeof(Elf64_Phdr) * e_phnum` and refuses the image when that
+    /// product is `0` or greater than 65536 — the same `goto out`, the same
+    /// `-ENOEXEC`, the same `/bin/sh` as the entry size beside it. `1170` is the
+    /// largest count that fits; `1171` is the first that does not.
+    ///
+    /// STATIC correction, like its sibling: no Linux host measured this cell,
+    /// the source is `fs/binfmt_elf.c`, `load_elf_phdrs()`. It runs on CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_elf_program_header_count_the_kernel_rejects_is_unproven() {
+        const ET_DYN: u16 = 3;
+        const PROGRAM_HEADER_BYTES: u16 = 56;
+        /// `56 * 1170 = 65_520`, the largest table `load_elf_phdrs()` reads.
+        const LARGEST_CLAIMABLE_COUNT: u16 = 1170;
+        /// `PN_XNUM`. Extended numbering lives only in the kernel's core-dump
+        /// writer, never on the load path, so here it is just a huge product.
+        const PN_XNUM: u16 = 0xffff;
+
+        let relative = Path::new("node_modules/.bin/eslint");
+        let Some(host_machine) = HOST_ELF_MACHINE else {
+            eprintln!("skipped: this build has no host `e_machine`, so no header can match it");
+            return;
+        };
+
+        let accepted = synthetic_host_elf(
+            host_machine,
+            ET_DYN,
+            PROGRAM_HEADER_BYTES,
+            LARGEST_CLAIMABLE_COUNT,
+        );
+        // The largest claimable table also carries the image past the script
+        // size bound, which pins the ordering this proof depends on: the header
+        // is read first, so a claim here is a claim about the header.
+        assert!(
+            u64::try_from(accepted.len()).expect("image length fits u64") > MAX_JS_SHIM_BYTES,
+            "the control must sit past the shim bound, or it would not show that the header \
+             proof runs before the size bound",
+        );
+        let (_tmp, root) = snapshot_with_tool(&accepted);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "control: `56 * 1170` is exactly the kernel's bound, so this header is claimed and \
+             each rejection below is the count and nothing else",
+        );
+
+        for count in [0, LARGEST_CLAIMABLE_COUNT + 1, 2000, PN_XNUM] {
+            let image = synthetic_host_elf(host_machine, ET_DYN, PROGRAM_HEADER_BYTES, count);
+            // Without this the case could be passing on the in-file bounds
+            // check — the last thing the branch evaluates — and would prove
+            // nothing about the kernel's arithmetic.
+            let table_bytes = u64::from(count) * u64::from(PROGRAM_HEADER_BYTES);
+            assert!(
+                64 + table_bytes <= u64::try_from(image.len()).expect("image length fits u64"),
+                "the advertised table must fit inside the fixture, or the rejection would come \
+                 from the bounds check rather than from `e_phnum` = {count}",
+            );
+
+            let (_tmp, root) = snapshot_with_tool(&image);
+            let proof = path_uses_prview_borrow(&root, relative);
+            assert_eq!(
+                proof,
+                ClosureProof::Unproven,
+                "`56 * {count}` is outside `load_elf_phdrs()`'s bound, so the kernel returns \
+                 `-ENOEXEC` and `execvp` retries the file through `/bin/sh`",
+            );
+            assert_ne!(
+                proof,
+                ClosureProof::TargetOnly,
+                "a program-header count the kernel refuses must never certify a snapshot scan",
+            );
+        }
+    }
+
+    /// A shell launcher wearing an object-file prefix. Everything after the
+    /// magic is what `/bin/sh` would run.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn magic_prefixed_launcher(magic: [u8; 4]) -> Vec<u8> {
+        let mut bytes = magic.to_vec();
+        bytes.extend_from_slice(
+            b"\nexec node \"$(dirname \"$0\")/../eslint/bin/eslint.js\" \"$@\"\n",
+        );
+        bytes
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_foreign_object_format_prefix_is_unproven() {
+        // A format with no loader on this platform, in front of a shell line.
+        // `execvp` returns `ENOEXEC`, `/bin/sh` runs the line with full
+        // indirection, and the operator's ambient bytes execute — so
+        // recognising the magic must certify nothing.
+        let relative = Path::new("node_modules/.bin/eslint");
+        let (_tmp, root) = snapshot_with_tool(&magic_prefixed_launcher(FOREIGN_FORMAT_MAGIC));
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "a foreign object format is recognisable, not executable, so it proves nothing",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "prefixing a shell script with a foreign magic must never flip a run to an \
+             exact snapshot claim",
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_host_format_magic_without_a_complete_header_is_unproven() {
+        // The sharpest cell: the magic is the one every real binary on this
+        // host carries, and the file still falls through to `/bin/sh`, because
+        // a loader claims a header, not a prefix.
+        let relative = Path::new("node_modules/.bin/eslint");
+        let (_tmp, root) = snapshot_with_tool(&magic_prefixed_launcher(HOST_FORMAT_MAGIC));
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "a host-format magic on an incomplete header is claimed by no loader",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "four bytes of the host's own magic are not a platform header",
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_oversized_magic_prefix_is_unproven() {
+        // Size is not what withholds the proof here — the absent header is —
+        // but this is the cell the size bound used to keep cautious, so it gets
+        // its own pin.
+        let relative = Path::new("node_modules/.bin/eslint");
+        let bound = usize::try_from(MAX_JS_SHIM_BYTES).expect("shim bound fits usize");
+        let mut oversized = HOST_FORMAT_MAGIC.to_vec();
+        oversized.resize(bound * 2, 0);
+        let (_tmp, root) = snapshot_with_tool(&oversized);
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "padding a magic prefix past the shim bound does not build a platform header",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "an oversized file with no claimable header is unread, not proved",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_without_a_shebang_is_unproven_never_native() {
+        let relative = Path::new("node_modules/.bin/eslint");
+
+        // The exact regressed vector: no `#!` and no platform header. On the
+        // `fork`+`execvp` spawn path POSIX requires the `ENOEXEC` retry through
+        // `/bin/sh`, so these bytes run with full shell indirection. Certifying
+        // them as an exact snapshot scan is the claim this pins shut — and this
+        // cell needs no spawn at all to pin it, because the classifier is asked
+        // directly.
+        let (_tmp, root) =
+            snapshot_with_tool(b"exec node \"$(dirname \"$0\")/../eslint/bin/eslint.js\" \"$@\"\n");
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "a missing interpreter directive proves nothing in either direction",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "the absence of `#!` must never stand in for a claimed platform header",
+        );
+
+        // Shorter than any header window: nothing to validate.
+        let (_tmp, root) = snapshot_with_tool(b"\x7FEL");
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven,
+            "a file too short to carry a header cannot have proved one",
+        );
+
+        // An oversized SCRIPT still has no proved kind, so the content bound
+        // keeps withholding the exact claim.
+        let bound = usize::try_from(MAX_JS_SHIM_BYTES).expect("shim bound fits usize");
+        let mut oversized = b"#!/bin/sh\n".to_vec();
+        oversized.resize(bound * 2, b'\n');
+        let (_tmp, root) = snapshot_with_tool(&oversized);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven,
+            "an oversized script's closure is unread, not borrowed and not proved",
+        );
+    }
+
     fn registered_paths(repo: &git2::Repository) -> Vec<PathBuf> {
         repo.worktrees()
             .expect("worktree names")
@@ -250,6 +2358,196 @@ mod tests {
                     .to_path_buf()
             })
             .collect()
+    }
+
+    #[test]
+    fn exact_snapshot_materializes_pinned_local_submodule_bytes() {
+        let (super_tmp, super_repo) = repo_with_commit();
+        let sub_path = super_tmp.path().join("module");
+        std::fs::create_dir(&sub_path).unwrap();
+        let sub_repo = git2::Repository::init(&sub_path).unwrap();
+        std::fs::write(sub_path.join("payload.txt"), "committed\n").unwrap();
+        std::fs::write(
+            sub_path.join(".gitattributes"),
+            "payload.txt export-ignore\nsubstituted.txt export-subst\n",
+        )
+        .unwrap();
+        std::fs::write(sub_path.join("substituted.txt"), "$Format:%H$\n").unwrap();
+        #[cfg(unix)]
+        let external = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            std::fs::write(external.path().join("sentinel.txt"), "operator-owned\n").unwrap();
+            symlink(external.path(), sub_path.join("escape")).unwrap();
+        }
+        let mut sub_index = sub_repo.index().unwrap();
+        sub_index.add_path(Path::new(".gitattributes")).unwrap();
+        sub_index.add_path(Path::new("payload.txt")).unwrap();
+        sub_index.add_path(Path::new("substituted.txt")).unwrap();
+        #[cfg(unix)]
+        sub_index.add_path(Path::new("escape")).unwrap();
+        let sub_tree_oid = sub_index.write_tree().unwrap();
+        let sub_tree = sub_repo.find_tree(sub_tree_oid).unwrap();
+        #[cfg(unix)]
+        assert_eq!(sub_tree.get_name("escape").unwrap().filemode(), 0o120000);
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let sub_oid = sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "submodule",
+                &sub_tree,
+                &[],
+            )
+            .unwrap();
+
+        let parent = super_repo.head().unwrap().peel_to_commit().unwrap();
+        let mut builder = super_repo
+            .treebuilder(Some(&parent.tree().unwrap()))
+            .unwrap();
+        builder.insert("module", sub_oid, 0o160000).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = super_repo.find_tree(tree_oid).unwrap();
+        super_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "gitlink",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        // Advance the submodule's own HEAD. The superproject still pins the
+        // earlier object, so archiving the symbolic submodule HEAD is wrong.
+        std::fs::write(sub_path.join("payload.txt"), "new submodule HEAD\n").unwrap();
+        sub_index.add_path(Path::new("payload.txt")).unwrap();
+        let next_tree_oid = sub_index.write_tree().unwrap();
+        let next_tree = sub_repo.find_tree(next_tree_oid).unwrap();
+        let sub_parent = sub_repo.find_commit(sub_oid).unwrap();
+        sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "submodule advanced",
+                &next_tree,
+                &[&sub_parent],
+            )
+            .unwrap();
+        std::fs::write(sub_path.join("payload.txt"), "operator dirty\n").unwrap();
+
+        let snapshot = create_worktree_snapshot(super_tmp.path(), "HEAD").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(snapshot.worktree_path.join("module/payload.txt")).unwrap(),
+            "committed\n",
+            "snapshot must write pinned gitlink bytes, never the operator checkout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshot.worktree_path.join("module/substituted.txt")).unwrap(),
+            "$Format:%H$\n",
+            "materialization must preserve the raw pinned blob despite export-subst"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_to_string(external.path().join("sentinel.txt")).unwrap(),
+            "operator-owned\n",
+            "a symlink in the archive must not redirect extraction outside the gitlink path"
+        );
+    }
+
+    #[test]
+    fn exact_snapshot_fails_when_pinned_submodule_objects_are_missing() {
+        let (super_tmp, super_repo) = repo_with_commit();
+        let parent = super_repo.head().unwrap().peel_to_commit().unwrap();
+        let absent = git2::Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let mut builder = super_repo
+            .treebuilder(Some(&parent.tree().unwrap()))
+            .unwrap();
+        builder.insert("module", absent, 0o160000).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = super_repo.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        super_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "missing gitlink",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let error = create_worktree_snapshot(super_tmp.path(), "HEAD")
+            .err()
+            .expect("missing local gitlink objects must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("submodule module"), "{message}");
+        assert!(message.contains("local object store"), "{message}");
+    }
+
+    #[test]
+    fn exact_snapshot_can_use_local_module_store_without_operator_checkout() {
+        let (super_tmp, _super_repo) = repo_with_commit();
+        let sub_tmp = tempfile::tempdir().unwrap();
+        let sub_repo = git2::Repository::init(sub_tmp.path()).unwrap();
+        std::fs::write(sub_tmp.path().join("payload.txt"), "pinned\n").unwrap();
+        let mut index = sub_repo.index().unwrap();
+        index.add_path(Path::new("payload.txt")).unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = sub_repo.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "submodule",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let output = git_cmd()
+            .args(["-c", "protocol.file.allow=always", "submodule", "add"])
+            .arg(sub_tmp.path())
+            .arg("module")
+            .current_dir(super_tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = git_cmd()
+            .args(["commit", "-qm", "gitlink"])
+            .current_dir(super_tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = git_cmd()
+            .args(["submodule", "absorbgitdirs"])
+            .current_dir(super_tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(super_tmp.path().join("module")).unwrap();
+
+        let snapshot = create_worktree_snapshot(super_tmp.path(), "HEAD").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(snapshot.worktree_path.join("module/payload.txt")).unwrap(),
+            "pinned\n"
+        );
     }
 
     #[test]
@@ -321,6 +2619,377 @@ mod tests {
         let names = repo.worktrees().expect("remaining worktree names");
         assert!(names.iter().flatten().any(|name| name == "m-healthy"));
         assert!(!names.iter().flatten().any(|name| name == "z-target"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_creation_does_not_execute_checkout_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo_tmp, repo) = repo_with_commit();
+        let hooks = repo_tmp.path().join("operator-hooks");
+        std::fs::create_dir(&hooks).expect("hooks dir");
+        let marker = repo_tmp.path().join("post-checkout-ran");
+        let hook = hooks.join("post-checkout");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf called > '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .expect("write hook");
+        let mut permissions = std::fs::metadata(&hook)
+            .expect("hook metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&hook, permissions).expect("make hook executable");
+        repo.config()
+            .expect("repo config")
+            .set_str("core.hooksPath", hooks.to_str().expect("utf8 temp path"))
+            .expect("configure hooks");
+
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head)
+            .expect("operator hooks must not participate in snapshot creation");
+        assert!(snapshot.worktree_path.is_dir());
+        assert!(!marker.exists(), "post-checkout hook must stay isolated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_borrows_untracked_node_modules_with_a_real_symlink() {
+        let (repo_tmp, repo) = repo_with_commit();
+        let node_modules = repo_tmp.path().join("node_modules");
+        std::fs::create_dir(&node_modules).expect("node_modules");
+        std::fs::write(node_modules.join("marker"), "operator dependency\n")
+            .expect("dependency marker");
+        let head = repo.head().unwrap().target().unwrap().to_string();
+
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head).expect("snapshot");
+        let borrowed = snapshot.worktree_path.join("node_modules");
+        assert!(
+            borrowed.is_symlink(),
+            "borrow must be visible to provenance"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&borrowed).expect("borrow target"),
+            std::fs::canonicalize(&node_modules).expect("operator dependencies"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(borrowed.join("marker")).expect("borrowed marker"),
+            "operator dependency\n",
+        );
+    }
+
+    /// Commit exactly these worktree paths with the repository's own `git`, so
+    /// a symlink entry is stored with the mode Git itself chooses rather than
+    /// the one a test reconstructs.
+    #[cfg(unix)]
+    fn commit_paths(repo_root: &Path, message: &str, paths: &[&str]) -> String {
+        let run = |args: &[&str]| {
+            let output = git_cmd()
+                .args(args)
+                .current_dir(repo_root)
+                .output()
+                .expect("git command");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        run(&["config", "commit.gpgsign", "false"]);
+        let mut add = vec!["add", "-f"];
+        add.extend_from_slice(paths);
+        run(&add);
+        run(&["commit", "-q", "-m", message]);
+        let output = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_root)
+            .output()
+            .expect("rev-parse");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("utf8 commit id")
+            .trim()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn borrowed_links_manifest(snapshot: &WorktreeSnapshot) -> PathBuf {
+        snapshot
+            .worktree_path
+            .parent()
+            .expect("snapshot temp root")
+            .join(BORROWED_LINKS_MANIFEST)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_merges_missing_scoped_packages_without_replacing_target_package() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        let scope = repo_tmp.path().join("node_modules/@scope");
+        std::fs::create_dir_all(scope.join("owned")).unwrap();
+        std::fs::write(scope.join("owned/index.js"), "target\n").unwrap();
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns one scoped package",
+            &["node_modules/@scope/owned/index.js"],
+        );
+        std::fs::create_dir_all(scope.join("borrowed")).unwrap();
+        std::fs::write(scope.join("borrowed/index.js"), "ambient\n").unwrap();
+
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head).unwrap();
+        let snap_scope = snapshot.worktree_path.join("node_modules/@scope");
+        assert_eq!(
+            std::fs::read_to_string(snap_scope.join("owned/index.js")).unwrap(),
+            "target\n"
+        );
+        assert!(snap_scope.join("borrowed").is_symlink());
+        assert_eq!(
+            path_uses_prview_borrow(
+                &snapshot.worktree_path,
+                Path::new("node_modules/@scope/borrowed/index.js"),
+            ),
+            ClosureProof::Borrowed,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_borrowed_link_and_sidecar_cannot_erase_creator_evidence() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        let node_modules = repo_tmp.path().join("node_modules");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::write(node_modules.join("owned"), "target\n").unwrap();
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns node_modules",
+            &["node_modules/owned"],
+        );
+        std::fs::create_dir_all(node_modules.join(".bin")).unwrap();
+        std::fs::write(node_modules.join(".bin/eslint"), "#!/bin/sh\nexit 0\n").unwrap();
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head).unwrap();
+        let borrowed_dir = snapshot.worktree_path.join("node_modules/.bin");
+        assert_eq!(
+            path_uses_prview_borrow(
+                &snapshot.worktree_path,
+                Path::new("node_modules/.bin/eslint")
+            ),
+            ClosureProof::Borrowed,
+        );
+        std::fs::remove_file(&borrowed_dir).unwrap();
+        std::fs::remove_file(borrowed_links_manifest(&snapshot)).unwrap();
+        assert_eq!(
+            path_uses_prview_borrow(
+                &snapshot.worktree_path,
+                Path::new("node_modules/.bin/eslint")
+            ),
+            ClosureProof::Borrowed,
+        );
+    }
+
+    /// The reviewed commit owns `node_modules` as a symlink to a writable
+    /// directory the operator never offered. `Path::exists()` followed it, the
+    /// merge path opened, and every "missing" ambient entry was then created
+    /// INSIDE that outside directory — a reviewed commit writing into an
+    /// arbitrary host path. The decision now reads the snapshot entry with
+    /// `symlink_metadata`, so the target's own entry wins untouched.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_merge_refuses_a_target_owned_node_modules_symlink() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        let outside_tmp = tempfile::tempdir().expect("outside tempdir");
+        let outside = outside_tmp.path().join("operator-deps");
+        std::fs::create_dir(&outside).expect("outside dir");
+
+        let committed = repo_tmp.path().join("node_modules");
+        std::os::unix::fs::symlink(&outside, &committed).expect("committed dependency symlink");
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns node_modules as a symlink",
+            &["node_modules"],
+        );
+
+        // The operator's own checkout carries a real, populated `node_modules`:
+        // exactly the bytes the merge path would try to expose.
+        std::fs::remove_file(&committed).expect("replace the checked-out link");
+        let ambient_bin = committed.join(".bin");
+        std::fs::create_dir_all(&ambient_bin).expect("ambient bin dir");
+        std::fs::write(ambient_bin.join("eslint"), "#!/bin/sh\nexit 0\n").expect("ambient shim");
+        std::fs::create_dir_all(committed.join("eslint")).expect("ambient package");
+
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head)
+            .expect("a target-owned dependency symlink must not fail the snapshot");
+
+        assert_eq!(
+            std::fs::read_dir(&outside)
+                .expect("outside dependency directory")
+                .count(),
+            0,
+            "the reviewed commit must not be able to write through its own symlink",
+        );
+        assert!(
+            snapshot.worktree_path.join("node_modules").is_symlink(),
+            "the target's entry stays exactly as the commit spelled it",
+        );
+        assert!(
+            !borrowed_links_manifest(&snapshot).exists(),
+            "nothing was borrowed, so no borrow may be recorded",
+        );
+    }
+
+    /// A commit carrying a BROKEN `node_modules`/`.venv` symlink used to abort
+    /// the whole review: `exists()` said "no", the borrow was attempted, and
+    /// `symlink()` failed `EEXIST` through `?`. The entry is target-owned, so
+    /// the honest answer is to leave it alone and review the commit.
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_target_owned_dependency_symlink_does_not_abort_the_snapshot() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        std::os::unix::fs::symlink("nowhere", repo_tmp.path().join("node_modules"))
+            .expect("broken dependency symlink");
+        std::os::unix::fs::symlink("nowhere-either", repo_tmp.path().join(".venv"))
+            .expect("broken venv symlink");
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns broken dependency symlinks",
+            &["node_modules", ".venv"],
+        );
+
+        // Both directories exist for the operator, which is what used to make
+        // the snapshot try to create a link over the target's own entry.
+        std::fs::remove_file(repo_tmp.path().join("node_modules")).expect("drop checked-out link");
+        std::fs::remove_file(repo_tmp.path().join(".venv")).expect("drop checked-out link");
+        std::fs::create_dir(repo_tmp.path().join("node_modules")).expect("ambient node_modules");
+        std::fs::create_dir(repo_tmp.path().join(".venv")).expect("ambient venv");
+
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head)
+            .expect("a broken target-owned dependency link must not abort the review");
+
+        assert!(snapshot.worktree_path.join("node_modules").is_symlink());
+        assert!(snapshot.worktree_path.join(".venv").is_symlink());
+        assert!(
+            !borrowed_links_manifest(&snapshot).exists(),
+            "a target-owned entry is never replaced, so nothing is borrowed here",
+        );
+    }
+
+    /// Following a repository-relative symlink lands on another path in the
+    /// SAME tree, so an absent entry there is `Missing` like any other. Saying
+    /// `Unresolved` made JS eligibility treat the tool as a target candidate
+    /// (only `Missing` is not one), plan the check, and fail at spawn with
+    /// "resolved JS tool disappeared".
+    #[cfg(unix)]
+    #[test]
+    fn relative_bin_symlink_to_absent_entry_is_missing() {
+        let (repo_tmp, _repo) = repo_with_commit();
+        let node_modules = repo_tmp.path().join("node_modules");
+        let owned = node_modules.join("bin-owned");
+        std::fs::create_dir_all(&owned).expect("target-owned bin directory");
+        // Git stores no empty directory, and the tool under test is precisely
+        // the one entry this directory does NOT have.
+        std::fs::write(owned.join("prettier"), "#!/bin/sh\nexit 0\n").expect("unrelated tool");
+        std::os::unix::fs::symlink("bin-owned", node_modules.join(".bin"))
+            .expect("relative .bin symlink");
+        let head = commit_paths(
+            repo_tmp.path(),
+            "target owns .bin as a relative symlink",
+            &["node_modules"],
+        );
+
+        assert_eq!(
+            commit_path_resolution(
+                repo_tmp.path(),
+                &head,
+                Path::new("node_modules/.bin/eslint"),
+            ),
+            CommitPathResolution::Missing,
+            "the chain resolves inside the tree and the entry is simply absent",
+        );
+        assert_eq!(
+            commit_path_resolution(
+                repo_tmp.path(),
+                &head,
+                Path::new("node_modules/.bin/prettier"),
+            ),
+            CommitPathResolution::Runnable,
+            "control: the same chain finds the entry the tree does carry",
+        );
+    }
+
+    /// The pnpm grammar may only record a payload it can also predict. A path
+    /// carrying shell metacharacters is chosen by the shell at run time, so the
+    /// literal prview would record is not the file that executes.
+    #[cfg(unix)]
+    #[test]
+    fn pnpm_wrapper_with_shell_expansion_is_unproven() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let wrapper = |payload: &str| {
+            format!(
+                "#!/bin/sh\nbasedir=$(dirname \"$0\")\nexec node \"$basedir/{payload}\" \"$@\"\n"
+            )
+        };
+
+        // Control: the same skeleton with a literal payload is still read, so
+        // every refusal below is the metacharacter and not a broken fixture.
+        let (_tmp, root) = snapshot_with_tool(wrapper("../eslint/bin/eslint.js").as_bytes());
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "a literal payload path is the one the wrapper really executes",
+        );
+
+        for payload in [
+            "$HOME/x",
+            "$(cat /etc/hostname)/x",
+            "`id`/x",
+            "*/bin/eslint.js",
+            "~/x",
+            "a\\b",
+            "x;id",
+            "x|id",
+            "x y",
+            "'x'",
+        ] {
+            let (_tmp, root) = snapshot_with_tool(wrapper(payload).as_bytes());
+            let proof = path_uses_prview_borrow(&root, relative);
+            assert_eq!(
+                proof,
+                ClosureProof::Unproven,
+                "`{payload}` is not a literal path, so the closure is unread",
+            );
+            assert_ne!(
+                proof,
+                ClosureProof::TargetOnly,
+                "`{payload}` could execute a file outside the snapshot",
+            );
+        }
+    }
+
+    /// Non-Unix builds have neither proof, so `TargetOnly` may only be the
+    /// answer when nothing is there to run. Returning it unconditionally
+    /// published `snapshot` for a tool this build cannot read at all — and left
+    /// `Borrowed`/`Unproven` unconstructed, which is what `-D warnings` caught
+    /// on Windows.
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_proves_nothing_about_a_present_executable() {
+        let tmp = tempfile::tempdir().expect("snapshot tempdir");
+        let root = tmp.path().join("snapshot");
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("snapshot bin dir");
+        let relative = Path::new("node_modules/.bin/eslint");
+
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "nothing resolves there, so nothing can execute ambient bytes",
+        );
+
+        std::fs::write(bin_dir.join("eslint"), "@echo off\r\n").expect("snapshot tool");
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven,
+            "this platform has no header proof and no grammar, so the closure is unread",
+        );
     }
 
     #[cfg(unix)]
@@ -419,7 +3088,7 @@ mod tests {
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\ngit \"$@\"\nstatus=$?\nif [ \"$1\" = worktree ] && [ \"$2\" = add ] && [ \"$status\" -eq 0 ]; then\n  printf '%s\\n' \"$5\" > '{}'\n  sleep 30\nfi\nexit \"$status\"\n",
+                "#!/bin/sh\ngit \"$@\"\nstatus=$?\nif [ \"$3\" = worktree ] && [ \"$4\" = add ] && [ \"$status\" -eq 0 ]; then\n  printf '%s\\n' \"$7\" > '{}'\n  sleep 30\nfi\nexit \"$status\"\n",
                 ready.display()
             ),
         )

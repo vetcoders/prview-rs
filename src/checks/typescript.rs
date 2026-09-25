@@ -2,7 +2,7 @@
 
 use super::{
     Check, CheckProvenance, CheckResult, CheckStatus, TEST_TIMEOUT_SECS, find_hard_fail_signatures,
-    js_tool_available, plan_check_run, run_js_command, run_js_command_with_timeout,
+    js_tool_unavailable_reason, plan_check_run, run_js_command, run_js_command_with_timeout,
 };
 use crate::Config;
 use anyhow::Result;
@@ -590,10 +590,8 @@ impl Check for TypeScriptCheck {
         if config.is_fast_remote_only_standard() && !config.lint_forced {
             return super::CheckEligibility::Skip("fast remote-only preset".to_string());
         }
-        if !js_tool_available("tsc", &config.repo_root) {
-            return super::CheckEligibility::Skip(
-                "tool not installed (node_modules/.bin/tsc is missing)".to_string(),
-            );
+        if let Some(reason) = js_tool_unavailable_reason("tsc", config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -612,7 +610,9 @@ impl Check for TypeScriptCheck {
         let plan = plan_check_run(config)?;
         let run_dir = &plan.scan_dir;
 
-        let output = run_js_command("tsc", &["--noEmit"], run_dir).await?;
+        let args = ["--noEmit"];
+        let run = run_js_command("tsc", &args, run_dir).await?;
+        let output = &run.output;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -625,11 +625,6 @@ impl Check for TypeScriptCheck {
             CheckStatus::Failed
         };
 
-        let js_runner = if which::which("pnpm").is_ok() {
-            "pnpm exec"
-        } else {
-            "npx"
-        };
         Ok(CheckResult {
             name: self.name().to_string(),
             status,
@@ -638,7 +633,7 @@ impl Check for TypeScriptCheck {
             cached: false,
             provenance: Some(
                 CheckProvenance {
-                    command: format!("{} tsc --noEmit", js_runner),
+                    command: run.command(&args),
                     tool_version: None,
                     cwd: run_dir.display().to_string(),
                     exit_code: output.status.code(),
@@ -681,10 +676,8 @@ impl Check for ESLintCheck {
         if !config.run_lint {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
-        if !js_tool_available("eslint", &config.repo_root) {
-            return super::CheckEligibility::Skip(
-                "tool not installed (node_modules/.bin/eslint is missing)".to_string(),
-            );
+        if let Some(reason) = js_tool_unavailable_reason("eslint", config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -704,7 +697,8 @@ impl Check for ESLintCheck {
 
         let args = eslint_args(config);
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = run_js_command("eslint", &args_ref, run_dir).await?;
+        let run = run_js_command("eslint", &args_ref, run_dir).await?;
+        let output = &run.output;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -714,11 +708,6 @@ impl Check for ESLintCheck {
 
         let status = classify_eslint_status(output.status.success(), &filtered_output);
 
-        let js_runner = if which::which("pnpm").is_ok() {
-            "pnpm exec"
-        } else {
-            "npx"
-        };
         Ok(CheckResult {
             name: self.name().to_string(),
             status,
@@ -727,7 +716,7 @@ impl Check for ESLintCheck {
             cached: false,
             provenance: Some(
                 CheckProvenance {
-                    command: format!("{} eslint {}", js_runner, args.join(" ")),
+                    command: run.command(&args_ref),
                     tool_version: None,
                     cwd: run_dir.display().to_string(),
                     exit_code: output.status.code(),
@@ -822,10 +811,8 @@ impl Check for VitestCheck {
         if !config.run_tests {
             return super::CheckEligibility::Skip("tests disabled".to_string());
         }
-        if !js_tool_available("vitest", &config.repo_root) {
-            return super::CheckEligibility::Skip(
-                "tool not installed (node_modules/.bin/vitest is missing)".to_string(),
-            );
+        if let Some(reason) = js_tool_unavailable_reason("vitest", config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -874,8 +861,9 @@ impl Check for VitestCheck {
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
 
         // Use longer timeout for tests
-        let output =
+        let run =
             run_js_command_with_timeout("vitest", &args_ref, run_dir, TEST_TIMEOUT_SECS).await?;
+        let output = &run.output;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -901,12 +889,7 @@ impl Check for VitestCheck {
 
         let executed_scope = published_executed_scope(executed_scope, verdict.collected);
 
-        let js_runner = if which::which("pnpm").is_ok() {
-            "pnpm exec"
-        } else {
-            "npx"
-        };
-        let cmd_str = format!("{} vitest {}", js_runner, args.join(" "));
+        let cmd_str = run.command(&args_ref);
         Ok(CheckResult {
             name: self.name().to_string(),
             status: verdict.status,
@@ -953,10 +936,8 @@ impl Check for StylelintCheck {
         if !config.run_lint {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
-        if !js_tool_available("stylelint", &config.repo_root) {
-            return super::CheckEligibility::Skip(
-                "tool not installed (node_modules/.bin/stylelint is missing)".to_string(),
-            );
+        if let Some(reason) = js_tool_unavailable_reason("stylelint", config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -976,7 +957,8 @@ impl Check for StylelintCheck {
 
         let args = stylelint_args(config);
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = run_js_command("stylelint", &args_ref, run_dir).await?;
+        let run = run_js_command("stylelint", &args_ref, run_dir).await?;
+        let output = &run.output;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -996,11 +978,6 @@ impl Check for StylelintCheck {
             CheckStatus::Failed
         };
 
-        let js_runner = if which::which("pnpm").is_ok() {
-            "pnpm exec"
-        } else {
-            "npx"
-        };
         Ok(CheckResult {
             name: self.name().to_string(),
             status,
@@ -1009,7 +986,7 @@ impl Check for StylelintCheck {
             cached: false,
             provenance: Some(
                 CheckProvenance {
-                    command: format!("{} stylelint {}", js_runner, args.join(" ")),
+                    command: run.command(&args_ref),
                     tool_version: None,
                     cwd: run_dir.display().to_string(),
                     exit_code: output.status.code(),
@@ -1081,7 +1058,7 @@ mod tests {
 
     #[test]
     fn test_js_tool_available_nonexistent() {
-        use super::js_tool_available;
+        use crate::checks::js_tool_available;
         use std::path::PathBuf;
         // Non-existent path should return false
         assert!(!js_tool_available("tsc", &PathBuf::from("/nonexistent")));
