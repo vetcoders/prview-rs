@@ -1291,6 +1291,59 @@ mod tests {
         assert!(config.profile.rust_dirs.is_empty());
     }
 
+    #[test]
+    fn exact_profile_normalizes_manifest_cargo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git_run(repo, &["init", "-q", "-b", "main"]);
+        git_run(repo, &["config", "user.email", "t@t.t"]);
+        git_run(repo, &["config", "user.name", "T"]);
+        git_run(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir(repo.join("backend")).unwrap();
+        std::fs::write(
+            repo.join("backend/Cargo.toml"),
+            "[package]\nname = 'backend'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        let mut config = test_config();
+        config.repo_root = repo.to_path_buf();
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        let backend = repo.join("backend");
+        for root in [
+            "backend",
+            "./backend",
+            "backend/",
+            "backend/../backend",
+            "../outside",
+        ] {
+            std::fs::write(
+                repo.join("prview.toml"),
+                format!("[project]\ncargo_root = '{root}'\n"),
+            )
+            .unwrap();
+            git_run(repo, &["add", "."]);
+            git_run(repo, &["commit", "-q", "-m", "manifest root"]);
+            config
+                .refresh_profile_from_target(&rev_parse(repo, "HEAD"))
+                .unwrap();
+            if root == "../outside" {
+                assert_eq!(config.profile.kind, crate::config::ProfileKind::Generic);
+                assert_eq!(config.profile.cargo_root, None);
+            } else {
+                assert_eq!(
+                    config.profile.kind,
+                    crate::config::ProfileKind::Rust,
+                    "{root}"
+                );
+                assert_eq!(
+                    config.profile.cargo_root.as_deref(),
+                    Some(backend.as_path()),
+                    "{root}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn tui_exact_profile_uses_target_commit_instead_of_checkout() {
         let repo = tempfile::tempdir().unwrap();
@@ -1314,11 +1367,22 @@ mod tests {
             .await
             .unwrap();
         let mut pack = None;
+        let mut saw_profile = false;
         while let Ok(event) = rx.try_recv() {
-            if let crate::tui::types::TuiEvent::AnalysisComplete { report } = event {
-                pack = Some(report.artifacts_dir);
+            match event {
+                crate::tui::types::TuiEvent::ProfileReady { profile, .. } => {
+                    assert!(!saw_profile);
+                    assert_eq!(profile.kind, crate::config::ProfileKind::Js);
+                    saw_profile = true;
+                }
+                crate::tui::types::TuiEvent::AnalysisComplete { report } => {
+                    assert!(saw_profile, "visible profile must arrive before completion");
+                    pack = Some(report.artifacts_dir);
+                }
+                _ => {}
             }
         }
+        assert!(saw_profile);
         let gate: serde_json::Value = serde_json::from_slice(
             &std::fs::read(pack.expect("TUI report").join("00_summary/MERGE_GATE.json")).unwrap(),
         )

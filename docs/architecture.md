@@ -187,12 +187,17 @@ or building profile-dependent artifacts. Exact reviews derive markers, the
 manifest and Cargo paths from regular entries and blobs in the pinned Git tree;
 they do not follow snapshot symlinks into the operator's filesystem. They also
 materialize one target snapshot, which the run ledger keeps alive through checks
-and artifact generation. The TUI uses the same preparation path. Ordinary target-less reviews
+and artifact generation. The TUI sends the refreshed profile to its display
+state before check events, replacing the header profile and check rows; it
+keeps the refresh baseline for another analysis in the same session. Ordinary target-less reviews
 refresh from the live checkout, including its uncommitted changes; an external
 manifest-configured Cargo root keeps its original path there. The
 requested `--profile` kind remains explicit, while marker fields and detected
 Cargo paths come from the reviewed tree. Exact-target Cargo paths stay anchored
 to the logical repository root for consumers that map them into a scan directory.
+Manifest Cargo roots in an exact review normalize harmless dot and trailing
+separator components before Git-tree lookup, while paths escaping the tree are
+rejected for profile detection.
 `Config::from_cli` records `Some(Auto)` or the explicit CLI selection to opt into
 that refresh. A programmatic `Config` passed to `App::from_config` starts with
 `requested_profile: None`, so its supplied `profile` remains authoritative;

@@ -690,6 +690,13 @@ pub enum TuiEvent {
     Tick,
     /// Keyboard input
     Key(crossterm::event::KeyEvent),
+    /// Pinned-tree profile selected for this analysis, before any check event.
+    ProfileReady {
+        profile: crate::config::DetectedProfile,
+        /// Keeps explicit programmatic overrides distinct from a CLI refresh
+        /// when the operator starts another analysis in the same TUI session.
+        cli_detection: Option<crate::config::DetectedProfile>,
+    },
     /// Check entered the execution set but has not been admitted by the
     /// resource governor yet — queued, not running.
     CheckQueued { name: String },

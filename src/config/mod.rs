@@ -866,6 +866,32 @@ fn run_id_taken_in_repo(repo_runs_root: &Path, run_id: &str) -> bool {
     false
 }
 
+/// Normalize a manifest Cargo root to a Git-tree relative directory. Harmless
+/// dot and separator components retain their filesystem meaning, while a path
+/// escaping the reviewed tree cannot select an operator-side Cargo manifest.
+fn normalize_cargo_root(root: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for component in Path::new(root).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => parts.push(part.to_str()?),
+            std::path::Component::ParentDir => {
+                parts.pop()?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn cargo_manifest_path(root: &str) -> String {
+    if root.is_empty() {
+        "Cargo.toml".to_owned()
+    } else {
+        format!("{root}/Cargo.toml")
+    }
+}
+
 impl Config {
     /// Detect an exact review profile from regular blobs in the pinned Git
     /// tree. A materialized snapshot may contain symlinks into the operator's
@@ -902,24 +928,17 @@ impl Config {
         let configured_cargo = manifest
             .as_ref()
             .and_then(|m| m.project.cargo_root.as_deref())
-            .filter(|root| {
-                !root.is_empty()
-                    && !root
-                        .split('/')
-                        .any(|part| part == "." || part == ".." || part.is_empty())
-            })
-            .filter(|root| has(&format!("{root}/Cargo.toml")));
+            .and_then(normalize_cargo_root)
+            .filter(|root| has(&cargo_manifest_path(root)));
         let root_cargo = has("Cargo.toml");
         let mut rust_dirs: Vec<String> = Vec::new();
-        if let Some(root) = configured_cargo {
+        if let Some(root) = configured_cargo.as_deref() {
             rust_dirs.push(root.to_owned());
         }
-        if root_cargo {
+        if root_cargo && !rust_dirs.iter().any(String::is_empty) {
             rust_dirs.push(String::new());
         }
-        let mut cargo_root = configured_cargo
-            .map(str::to_owned)
-            .or_else(|| root_cargo.then(String::new));
+        let mut cargo_root = configured_cargo.or_else(|| root_cargo.then(String::new));
         if cargo_root.is_none() {
             for dir in ["src-tauri", "rust", "crates"] {
                 if has(&format!("{dir}/Cargo.toml")) {
