@@ -1578,6 +1578,15 @@ fn generate_consistency_check(
     // per-check substrate disagree cannot be published as consistent, however
     // well its numbers line up.
     report.merge_provenance(provenance);
+    // Claims, not just counters: the PR_REVIEW.md checklist is re-derived from
+    // the check statuses report.json serialized.
+    report.merge_pr_checklist(
+        disk.pr_checklist.as_deref(),
+        disk.pr_checklist_unreadable,
+        disk.check_outcomes_report.as_deref(),
+        disk.check_entries_unreadable,
+        "report.json",
+    );
 
     fs::write(
         summary_dir.join("CONSISTENCY_CHECK.json"),

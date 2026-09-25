@@ -664,6 +664,16 @@ carrying a contradiction is also
 reported as `consistent: false` in `00_summary/CONSISTENCY_CHECK.json` **and** in
 `report.json`'s `quality.consistency`: the two sections check different counters,
 but neither may call a run consistent while a substrate contradiction stands.
+Both sections also re-derive the `PR_REVIEW.md` checklist claims from the check
+statuses and report any rendered mark those statuses do not earn — and any
+checklist line or serialized check entry whose name, canonical id, status or cached flag cannot be read — as a
+`pr_checklist` warning. The consistency reader requires this gate's check rows
+to be readable and every executed `(id, name, status, cached)` row to match the
+complete set in `report.json`; alias collisions, omissions and duplicates warn.
+The comparison maps this gate's lowercase raw statuses to the report's uppercase
+display statuses through a closed five-value vocabulary.
+`CONSISTENCY_CHECK.json` is written after this file, so
+none of its warnings changes the gate decision.
 
 `tools/validate_merge_gate.py` enforces the whole of the above on a 3.0 gate, not
 just the row shapes:

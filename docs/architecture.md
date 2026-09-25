@@ -3766,6 +3766,44 @@ changes, and inline findings to detect mismatches that would erode trust in the 
 This is the independent side of the cross-check: it recovers counters from the
 already-serialized artifacts on disk and flags any disagreement.
 
+Beyond counters it cross-checks one set of claims: the `PR_REVIEW.md` checklist.
+`pr_review.rs` owns the single derivation (`derive_pr_checklist`): a universal
+claim (`Compiles / type-checks`, `Tests pass`, `No lint errors`) is ticked only
+when every executed check of its category passed and at least one executed.
+The renderer prints that derivation; `ConsistencyReport::merge_pr_checklist`
+re-derives it and compares it with the marks `parse_pr_checklist` reads back
+from `PR_REVIEW.md` — a divergence is a `pr_checklist.<item>` warning.
+`CONSISTENCY_CHECK.json` re-derives from the statuses serialized in
+`report.json` (`/checks`, read from disk after report.json is written);
+`report.json`'s `quality.consistency` is built before report.json exists, so it
+re-derives from the in-memory statuses it is about to serialize. The parser
+reads only the checklist inside the PR Template's fenced block — the
+`## Checklist` heading under the final generated `## PR Template` heading and its
+preceding separator, up to the block's closing fence — so even a complete
+signature in an earlier newline-containing Git path cannot stand in for the
+template. Git paths, including loctree twin pairs, are escaped onto one line before rendering; a second
+complete PR Template, or a second `## Checklist` inside it, leaves every
+item unreadable. Inside that section each item may be named by exactly one
+line, `- [x] <label>` or `- [ ] <label>`: a second line naming the same item (a
+duplicate, a contradicting copy, or a variant spelling) leaves that item
+unreadable instead of letting the first copy win. The fold fails closed: a missing or unreadable checklist line
+is a warning for its item, and `/checks` entries without a readable `name`,
+an `id` matching that name's canonical check ID, boolean `cached`, and status
+from the serialized vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`)
+withhold the comparison behind one `pr_checklist` warning. A missing or
+unreadable gate likewise withholds it. The disk reader compares the complete executed-row multiset
+of `(id, name, status, cached)` against `MERGE_GATE.json`, using an explicit
+five-value mapping from gate raw statuses to report display statuses. Canonical ids alone
+cannot prove identity because distinct names can share an id; this comparison
+also detects a missing failed row without restricting custom check names. A present but
+unreadable `report.json` does the same; only an absent report is skipped while
+the pack is being built. A present but unreadable `PR_REVIEW.md` likewise
+withholds the comparison with a `pr_checklist` warning, rather than being
+treated as an absent checklist. Because both sides share the derivation, the checker catches the
+rendered text drifting from the statuses; the derivation's own semantics
+(all-of, not any-of, and which check belongs to which item) are pinned by the
+`artifacts::tests` checklist tests.
+
 #### signal/semantic.rs — semantic cross-file rules
 
 Domain-aware finding generation backed by multi-file evidence. The first rule

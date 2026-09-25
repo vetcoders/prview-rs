@@ -1265,6 +1265,39 @@ quality, policy, and permission axes beside that explanation.
   Any contradiction turns `consistent` to `false` in BOTH `00_summary/CONSISTENCY_CHECK.json` and
   `report.json`'s `quality.consistency`, so no reader can pick a surface that calls the run clean.
 - `PR_REVIEW.md` is a concise review narrative, not a raw log dump.
+- The `## Checklist` of the PR Template in `PR_REVIEW.md` auto-ticks three universal claims —
+  `Compiles / type-checks` (TypeScript, `cargo check`, Mypy), `Tests pass` (checks named `*test*`, Vitest,
+  Pytest) and `No lint errors` (checks named `*lint*`, Clippy, Ruff). A claim is ticked only when at least
+  one check of its category executed in this review and **every** executed check of that category passed;
+  a cached `PASS` replay does not count as execution, while a cached failure still vetoes the claim. A failed,
+  errored or warnings-only check, or no executed check at all, leaves it `[ ]` (skipped checks neither
+  earn nor veto it). A failing ESLint next to a passing Clippy therefore leaves `No lint errors` unticked;
+  the failing check is named in the Check Status table above it. `Manually tested` is never auto-ticked.
+- `00_summary/CONSISTENCY_CHECK.json` re-derives those three claims from the check statuses serialized in
+  `report.json` (and `report.json`'s `quality.consistency` from the statuses it serializes) and compares
+  them with the marks rendered in `PR_REVIEW.md`. A mark the statuses do not earn — or an earned claim left
+  unticked — is a `pr_checklist.<item>` warning (`compiles`, `tests_pass`, `no_lint_errors`) and turns
+  `consistent` to `false`. The check fails closed: all three items always count toward `checked_fields`, a
+  checklist line that is missing or carries an unreadable mark is itself a `pr_checklist.<item>` warning,
+  and `report.json` `/checks` entries without a readable `name`, matching canonical `id`, boolean
+  `cached`, and a `status` from the serialized
+  vocabulary (`PASS`/`FAIL`/`ERROR`/`SKIP`/`WARN`) withhold the comparison behind one `pr_checklist`
+  warning. The executed rows must also match the complete check set in a readable
+  `MERGE_GATE.json`; a missing or damaged gate cannot certify the checklist. This compares
+  `(id, name, status, cached)` values after mapping the gate's lowercase raw
+  status vocabulary to the report's uppercase display vocabulary. This catches alias collisions that preserve
+  an id but change checklist category, altered outcomes, duplicates, and omitted failures while
+  allowing custom check names. An existing `report.json` that cannot be decoded also withholds the comparison and warns; an
+  absent report is expected while the pack is being built. An existing `PR_REVIEW.md` that cannot
+  be read as UTF-8 likewise emits a `pr_checklist` warning, including a broken symlink. Only the
+  checklist inside the final generated PR Template's fenced block is read; the preceding separator anchors
+  it even when earlier diagnostic text or a newline-containing Git path quotes the complete template
+  signature. Changed paths and loctree twin paths are escaped onto one line before rendering. A second complete PR Template
+  makes every item unreadable, as does a second line naming the same item for that
+  item. Only without `PR_REVIEW.md` or `report.json` is nothing compared. In a normal
+  run both sides come from the same check results, so this catches the rendered checklist diverging from
+  the statuses (a rendering regression, or an artifact edited or damaged after the run), not a check filed
+  under the wrong category: that mapping is shared by both sides and pinned by tests.
 - `00_summary/FAILURES_SUMMARY.md` summarizes blocking failures and advisories without copying whole JSON files.
 - When `30_context/INLINE_FINDINGS.sarif` exists, it emits findings per location/advisory and is suitable for annotation integrations.
 - In Rust runs, `PR_REVIEW.md` and `FAILURES_SUMMARY.md` can surface dependency paths to vulnerable crates based on `30_context/cargo-tree.txt`.

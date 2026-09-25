@@ -233,6 +233,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `PR_REVIEW.md` PR Template checklist no longer claims what the checks did
+  not prove. `Compiles / type-checks`, `Tests pass` and `No lint errors` were each
+  ticked when ANY check of the category passed, so a failing ESLint hid behind a
+  passing Clippy, and a run with no checks at all ticked `Compiles / type-checks`.
+  A claim is now ticked only when at least one check of its category executed and
+  every executed one passed, and Mypy counts toward `Compiles / type-checks`.
+  `CONSISTENCY_CHECK.json` and `report.json`'s `quality.consistency` re-derive the
+  three claims from the check statuses and report a rendered mark those statuses
+  do not earn as a `pr_checklist.<item>` warning; a checklist line or serialized
+  check entry that cannot be read (including a status outside the serialized
+  vocabulary) is reported too, never skipped. Only the checklist inside the PR
+  Template's fenced block counts, so text elsewhere in `PR_REVIEW.md` cannot
+  stand in for it, and each item must be named by exactly one line there: a
+  duplicated item is unreadable rather than read from its first copy.
+  A heading-shaped line in earlier check evidence does not create a second
+  template, and a present but unreadable `report.json` now withholds the
+  checklist comparison with an explicit warning. An unreadable `PR_REVIEW.md`
+  does the same instead of passing as an absent checklist.
+  Template parsing now anchors to the final generated separator, so a
+  newline-containing Git path cannot impersonate a second template; paths are
+  rendered with escaped control characters on one line, including loctree twin
+  pairs. A genuinely duplicated
+  complete template remains unreadable. Cached
+  check replays no longer count as execution toward an auto-ticked claim;
+  their serialized `cached` flags are checked alongside statuses. Serialized
+  check names are also matched to their canonical IDs and to the complete
+  executed check set in `MERGE_GATE.json` (name, status and cache state), so an
+  alias collision, omitted failed row, or missing gate cannot silently change a checklist
+  claim. Custom check names remain valid when both artifacts agree.
 - A `Cargo audit` failure whose advisories the baseline already proved
   pre-existing no longer blocks the merge because of unrelated uncommitted
   changes. The pre-existing downgrade for this one check now rests on lockfile
