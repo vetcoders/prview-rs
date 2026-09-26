@@ -1122,11 +1122,11 @@ const JS_KEYWORDS_BEFORE_OPERAND: &[&str] = &[
 /// followed by `/` or `*` opens a comment. Any other `/` is a division after
 /// an operand and opens a regular expression everywhere else. An operand ends
 /// with an identifier or number that is not a keyword such as `return`, a
-/// literal, a closing bracket, a postfix `++` or `--`, or TypeScript's
-/// non-null `!` after another operand. On an export line a `}` closes an
-/// object literal or a body, and a regular expression is not written straight
-/// after a body, so a `/` there divides (`{} / 2; // old`). A literal or
-/// comment the line leaves open runs to its end.
+/// literal, a `]`, a `)` that closes no `if`, `while`, `for` or `with`
+/// condition, a `}` that closes an object literal rather than a statement
+/// block (`{} / 2` divides, `if (x) {} /[{]/` starts a regular expression), a
+/// postfix `++` or `--`, or TypeScript's non-null `!` after another operand.
+/// A literal or comment the line leaves open runs to its end.
 fn js_lex(text: &str) -> Vec<JsLexeme> {
     js_lex_until(text, false, false).0
 }
@@ -1203,10 +1203,13 @@ fn js_operand_ends_before(text: &str, lexemes: &[JsLexeme]) -> bool {
     };
     let last = &lexemes[index];
     match last.kind {
-        JsLexKind::Literal | JsLexKind::Code(']' | '}') => true,
+        JsLexKind::Literal | JsLexKind::Code(']') => true,
         // The `)` of an `if (…)` condition ends no operand: a statement,
         // possibly a regular expression, starts after it (`if (x) /[{]/`).
         JsLexKind::Code(')') => !js_closes_condition(text, lexemes, index),
+        // Nor does the `}` of a statement block (`if (x) {} /[{]/`); the `}`
+        // of an object literal does (`{} / 2`).
+        JsLexKind::Code('}') => !js_closes_block(text, lexemes, index),
         // A keyword after a `.` is a property name (`mod.default / 2`).
         JsLexKind::Code(ch) if is_js_identifier_char(ch) => {
             let word = js_word_ending_at(text, lexemes, last);
@@ -1280,6 +1283,38 @@ fn js_closes_condition(text: &str, lexemes: &[JsLexeme], close: usize) -> bool {
             .filter(|lexeme| lexeme.end <= last.end - word.len())
             .find(|lexeme| !lexeme.is_gap())
             .is_some_and(|lexeme| lexeme.kind == JsLexKind::Code('.'))
+}
+
+/// Whether the `}` at `lexemes[close]` closes a statement block, after which a
+/// statement, possibly a regular expression, starts. The `{` of a block
+/// follows a `)` (`if (x) {`, `function f() {`), a `;`, `{` or `}`, `else`,
+/// `do`, `try`, `finally`, or a name that is no expression keyword
+/// (`catch {`, `class A {`). After anything else (`= {`, `({`, `, {`, `? {`,
+/// `=> {`, `return {`, `default {`) and when the line does not show the `{`,
+/// the `}` closes an object literal or another expression.
+fn js_closes_block(text: &str, lexemes: &[JsLexeme], close: usize) -> bool {
+    let Some(depth) = lexemes[close].depth.checked_sub(1) else {
+        return false;
+    };
+    let Some(open) = lexemes[..close]
+        .iter()
+        .rposition(|lexeme| lexeme.kind == JsLexKind::Code('{') && lexeme.depth == depth)
+    else {
+        return false;
+    };
+    let Some(before) = lexemes[..open].iter().rposition(|lexeme| !lexeme.is_gap()) else {
+        return false;
+    };
+    let last = &lexemes[before];
+    match last.kind {
+        JsLexKind::Code(')' | ';' | '{' | '}') => true,
+        JsLexKind::Code(ch) if is_js_identifier_char(ch) => {
+            let word = js_word_ending_at(text, &lexemes[..=before], last);
+            matches!(word, "else" | "do" | "try" | "finally")
+                || !JS_KEYWORDS_BEFORE_OPERAND.contains(&word)
+        }
+        _ => false,
+    }
 }
 
 /// End of the template literal opened at `start`. A backtick inside a `${…}`
@@ -2231,6 +2266,36 @@ mod tests {
         assert!(same(
             "export const HALF = value.if(x) / 2; // old",
             "export const HALF = value.if(x) / 2; // new"
+        ));
+        // A regular expression may follow a statement block too; the `}` of
+        // an object literal still ends an operand.
+        assert!(same(
+            "export function f(x) { if (x) {} /[{]/.test(x); }",
+            "export function f(x) { if (x) {} /[{]/.test(y); }"
+        ));
+        assert!(same(
+            "export function f(x) { if (x) {} else {} /[}]/.exec(x); }",
+            "export function f(x) { if (x) {} else {} /[}]/.exec(y); }"
+        ));
+        assert!(same(
+            "export function f(x) { try {} catch {} /[{]/.test(x); }",
+            "export function f(x) { try {} catch {} /[{]/.test(y); }"
+        ));
+        assert!(same(
+            "export function f(x) { x; {} /[{]/.test(x); }",
+            "export function f(x) { x; {} /[{]/.test(y); }"
+        ));
+        assert!(same(
+            "export function f(x) { return {} / 2; } // old",
+            "export function f(x) { return {} / 2; } // new"
+        ));
+        assert!(same(
+            "export const HALF = x ? {} : {} / 2; // old",
+            "export const HALF = x ? {} : {} / 2; // new"
+        ));
+        assert!(same(
+            "export default {} / 2; // old",
+            "export default {} / 2; // new"
         ));
         // A comment before the final `;` is a comment too.
         assert!(same(
