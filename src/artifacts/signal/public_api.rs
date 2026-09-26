@@ -940,6 +940,7 @@ mod tests {
                 "export abstract class Store<T, U> {",
             ),
             ("export let limit: number;", "export let limit: string;"),
+            ("export\tlet limit: number;", "export\tlet limit: string;"),
         ] {
             let patch = format!(
                 "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1 +1 @@\n-{before}\n+{after}\n"
