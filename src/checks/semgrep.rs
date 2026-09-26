@@ -1,6 +1,9 @@
 //! Semgrep security scan check
 
-use super::{Check, CheckEligibility, CheckResult, CheckStatus, ProvenanceBuilder, run_command};
+use super::{
+    Check, CheckEligibility, CheckResult, CheckStatus, ProvenanceBuilder, ReviewSubstrate,
+    review_substrate, run_command,
+};
 use crate::Config;
 use crate::git::{Repository, ResolvedRef, WorktreeSnapshot, create_worktree_snapshot};
 use anyhow::Result;
@@ -401,68 +404,40 @@ struct SemgrepScanPlan {
 
 /// Decide where semgrep should scan.
 ///
-/// When the analysed target is the checked-out commit, scan the working tree in
-/// place. When it is a fetched remote target (`--pr` / `--remote`) that is NOT
-/// checked out, materialise it in an ephemeral detached worktree and scan that —
-/// otherwise the scan analyses the local checkout instead of the target. In the
-/// snapshot HEAD == target and the tree is clean, so a diff-scoped baseline
-/// against the merge-base is sound again.
+/// Ambient reviews scan the working tree in place. Exact-target reviews always
+/// scan an ephemeral detached worktree, including when the requested commit is
+/// the checked-out `HEAD`; otherwise uncommitted and untracked operator files
+/// would leak into a scan advertised as that commit. When the dispatcher already
+/// owns the shared snapshot, Semgrep reuses it instead of creating a twin.
 ///
 /// Returns `Err(reason)` when a remote target cannot be materialised, so the
 /// caller can fail loud (SKIPPED) rather than scan the wrong tree.
 fn plan_semgrep_scan(config: &Config) -> std::result::Result<SemgrepScanPlan, String> {
     let repo_root = config.repo_root.clone();
-
-    let repo = match Repository::open(&repo_root) {
-        Ok(repo) => repo,
-        Err(error) => {
-            if config.pinned_target.is_some() {
-                // Name the class, not only the cause: the policy engine reads
-                // this reason, and an unavailable substrate must never be
-                // scored as a declared mode skip.
-                return Err(format!(
-                    "semgrep: the pinned review target is unavailable, its repository cannot be opened: {error:#}"
-                ));
-            }
-            // Unpinned, non-repository scans retain their in-place behavior.
-            return Ok(SemgrepScanPlan {
-                scan_dir: repo_root,
-                baseline_commit: None,
-                _snapshot: None,
-            });
-        }
-    };
-
-    let resolution = repo
-        .resolve_target(config)
-        .and_then(|target| repo.head_commit_id().map(|head| (target, head)));
-    let (target, head) = match resolution {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            if config.pinned_target.is_some() {
-                return Err(format!(
-                    "semgrep: the pinned review target is unavailable for scan planning: {error:#}"
-                ));
-            }
-            // An unresolved, unpinned input retains its in-place fallback.
-            return Ok(SemgrepScanPlan {
-                baseline_commit: semgrep_baseline_commit(config, &repo_root)?,
-                scan_dir: repo_root,
-                _snapshot: None,
-            });
-        }
-    };
-
-    if head == target.commit_id {
-        // Working tree IS the target: in-place scan with the existing baseline.
+    let substrate = review_substrate(config).map_err(|error| {
+        format!("semgrep: the exact review target is unavailable for scan planning: {error:#}")
+    })?;
+    let ReviewSubstrate::ExactTarget(target) = substrate else {
         return Ok(SemgrepScanPlan {
             baseline_commit: semgrep_baseline_commit(config, &repo_root)?,
             scan_dir: repo_root,
             _snapshot: None,
         });
+    };
+
+    let repo = Repository::open(&repo_root).map_err(|error| {
+        format!(
+            "semgrep: the exact review target is unavailable, its repository cannot be opened: {error:#}"
+        )
+    })?;
+    if let Some(scan_dir) = &config.scan_dir_override {
+        return Ok(SemgrepScanPlan {
+            scan_dir: scan_dir.clone(),
+            baseline_commit: snapshot_baseline_commit(&repo, config, &target)?,
+            _snapshot: None,
+        });
     }
 
-    // Remote target: materialise it in an ephemeral detached worktree.
     let snapshot = create_worktree_snapshot(&repo_root, &target.commit_id).map_err(|e| {
         format!(
             "semgrep: could not create an ephemeral worktree for target {} ({e}); \
@@ -470,7 +445,6 @@ fn plan_semgrep_scan(config: &Config) -> std::result::Result<SemgrepScanPlan, St
             short_oid(&target.commit_id),
         )
     })?;
-
     let baseline = snapshot_baseline_commit(&repo, config, &target)?;
 
     Ok(SemgrepScanPlan {
@@ -1094,6 +1068,43 @@ mod tests {
             worktree_count(tmp.path()),
             1,
             "worktree must be deregistered on drop"
+        );
+    }
+
+    #[test]
+    fn exact_same_head_semgrep_excludes_ambient_violation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let head = write_commit(tmp.path(), "clean.js", "const clean = 1;\n");
+        std::fs::write(
+            tmp.path().join("ambient-only.js"),
+            "eval(userControlled); // fixture violation\n",
+        )
+        .expect("ambient violation");
+
+        let mut config = test_config();
+        config.repo_root = tmp.path().to_path_buf();
+        config.target = Some("main".to_string());
+        config.pinned_target = Some(ResolvedRef {
+            name: "main".to_string(),
+            commit_id: head.clone(),
+            is_remote: false,
+        });
+        config.pinned_diff_bases = Some(Vec::new());
+
+        let plan = plan_semgrep_scan(&config).expect("exact same-HEAD plan");
+        assert_ne!(plan.scan_dir, config.repo_root);
+        assert!(plan.scan_dir.join("clean.js").is_file());
+        assert!(
+            !plan.scan_dir.join("ambient-only.js").exists(),
+            "untracked operator violation must not enter exact-target Semgrep",
+        );
+        let substrate =
+            crate::checks::resolve_scan_substrate(&plan.scan_dir, &config.repo_root, &[]);
+        assert_eq!(substrate.target_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            substrate.tree_state,
+            Some(crate::checks::TreeState::Snapshot),
         );
     }
 

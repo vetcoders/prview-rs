@@ -132,6 +132,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`checks[].tree_state` has a third snapshot value: `snapshot-unproven-deps`.**
+  A JS gate's provenance used to have two answers for three facts, so
+  `snapshot-borrowed-deps` carried both "these bytes came from outside the
+  snapshot" and "this closure could not be read". Since prview recognises no
+  real `npm`/`pnpm`/`yarn` shim grammar, the second meaning swallowed the
+  ordinary case and a fully target-owned toolchain reported borrowed. The new
+  value says what is actually known — the reviewed source is exactly
+  `target_sha`, the dependency closure is unread — and `snapshot-borrowed-deps`
+  goes back to meaning a borrow that was positively observed. Read
+  `snapshot-unproven-deps` as cautiously as `snapshot-borrowed-deps`: it is not
+  an exact scan. Existing values are unchanged, and test/package selection
+  treats the new state exactly like the other two exact-source snapshots.
+- **A tool with no `#!` is no longer certified as an exact snapshot scan, and
+  neither is one that merely opens with an object-file magic.** "No shebang" was
+  standing in for "native binary, no indirection". It is the opposite: prview
+  spawns through `Command`, hence `execvp`, and POSIX requires `execvp` to retry
+  an `ENOEXEC` file through `/bin/sh` — so such a file is a shell script with
+  unbounded indirection. Deleting one `#!/bin/sh` line was enough to flip a run
+  that executed the operator's uncommitted bytes from `snapshot-borrowed-deps`
+  to `snapshot`. Recognising a four-byte magic does not close that hole, because
+  `ENOEXEC` is returned by the *loader*, after the whole header: prefixing the
+  same launcher with `\x7fELF` — or even with the host's own `CF FA ED FE` —
+  still reaches `/bin/sh`, and merely recognising the prefix turned silence into
+  a false positive claim. Target-only closure is now proved only by a **fully
+  validated platform header for the running kernel**: on macOS a complete
+  `mach_header` with the host `cputype` and `MH_EXECUTE`, or a 32-bit universal
+  binary in which **every** host-`cputype` slice is claimable; on Linux a
+  complete ELF header with the host `e_machine`, `ET_EXEC`/`ET_DYN`,
+  `e_phentsize` equal to `sizeof(Elf64_Phdr)` and a program-header table within
+  the kernel's `56 * e_phnum <= 65536` bound; on any other Unix, nothing. A
+  format this kernel has no loader for — ELF on macOS, Mach-O on Linux — is
+  recognisable but not executable, so it is the fallback vector rather than
+  evidence. The proof reads a bounded header window and so still runs before the
+  script size bound, leaving a large compiled tool able to prove its own kind
+  while an oversized file with no claimable header stays unproved.
+- **Validating a header is not the same as predicting the loader's verdict, and
+  the proof now says so.** An earlier draft of this change claimed a completely
+  validated header leaves "only two futures … with no shell in the path". That
+  was false where it mattered most: macOS grades fat slices (`arm64e` outranks
+  `arm64`, `x86_64h` outranks `x86_64`, under one `cputype`), so accepting
+  because *some* host slice validates certified images the kernel hands to
+  `/bin/sh` — measured on macOS/arm64, a real `arm64` binary beside a bogus
+  `arm64e` entry ran under the shell at exit 126, as did every `FAT_MAGIC_64`
+  image with a real, working slice inside it. Both shapes reported `snapshot`,
+  the state that promises the scanned bytes are exactly `target_sha`. So the
+  accepted set is narrowed to what a kernel probe measured with zero fallback:
+  all host slices claimable for fat, `FAT_MAGIC_64` recognised and refused, and
+  on Linux the whole of `load_elf_phdrs()`'s arithmetic reproduced rather than
+  half of it: `e_phentsize` matched for equality, and the program-header table
+  refused when `56 * e_phnum` is zero or above 65536, because every one of those
+  exits is the same `ENOEXEC`. Modelling only the lower half of that bound left
+  `e_phnum` = 1171 claimed here and dropped to `/bin/sh` there. One thing is
+  named rather than relied on: bash refuses a file carrying a NUL before its
+  first newline, and every
+  accepted macOS header happens to carry one, so no accepted file ran as a
+  script even before this fix — that is an accident of the binary formats, not
+  part of the contract, and `dash` makes no such promise.
 - **Every run is now bounded in time.** A local review, `--tui`, and a detached
   MCP `run_review deep` get 30 minutes; `--ci` and `prview gate` get 60. (An MCP
   `quick` review keeps its own, tighter 120-second server budget.) The numbers
@@ -230,6 +287,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0 ok, 1 tooling, 2 unsupported platform, 3 missing artifact, 4
   checksum/archive invalid, 5 macOS signature/notarization, 6 post-install
   verification. `docs/INSTALL.md` carries the full contract.
+- Library API: `prview::checks::run_js_command` and
+  `run_js_command_with_timeout` return `JsRun { program, output }` instead of a
+  bare `std::process::Output`. The recorded provenance of a JS check is now
+  built from `JsRun::command(&args)` — the program the OS was actually handed —
+  so a pack no longer reports `pnpm exec eslint …` for a run that executed
+  `node_modules/.bin/eslint` directly. The published command was previously
+  reconstructed from a second, independent `which::which("pnpm")` probe that the
+  runner never consulted, which could name a launcher the run did not use and,
+  under `--target-sha`, a launcher outside the snapshot. Callers that only need
+  the process result read `run.output`; this is source-incompatible for library
+  consumers.
 - Rust API delta finding IDs are now `api-delta:` followed by 16 hex digits of
   a SHA-256 over the finding's complete semantic identity, instead of that
   serialized identity itself (about 1.4 kB per ID). IDs stay deterministic and
@@ -242,6 +310,216 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Exact reviews now derive their check set and reported project profile from
+  the pinned target tree. A dirty operator checkout can no longer hide JS,
+  Python, or Rust checks by removing local project markers; ordinary local
+  reviews continue to reflect the live checkout. Programmatic `App::from_config`
+  callers keep a supplied `Config.profile` unless they set
+  `requested_profile: Some(Profile::Auto)` to opt into target-derived detection.
+  Changing the public profile after `Config::from_cli` also preserves that
+  explicit programmatic override.
+
+- **A snapshot never writes through an entry the reviewed commit owns.** The
+  dependency merge decided whether the target already had `node_modules` /
+  `.venv` with `Path::exists()`, which follows symlinks. A commit carrying
+  `node_modules -> /some/writable/path` therefore looked like a plain directory,
+  the merge opened, and every "missing" package was created **inside the
+  operator's own filesystem** — outside the snapshot, at a location the reviewed
+  branch chose. The decision now reads the commit's own entry with
+  `symlink_metadata`: only a real directory receives borrowed entries, an absent
+  entry receives one whole borrowed link, and anything else the commit spelled
+  (a symlink, resolving anywhere or nowhere, or a file) is left exactly as it
+  is — no merge, no borrow, no failure. `create_borrowed_link` additionally
+  re-proves per link that the parent it is about to write into canonicalizes
+  inside the snapshot root, because `strip_prefix` compares spelling, not
+  identity.
+- **A broken dependency symlink in the reviewed commit no longer aborts the
+  review.** `node_modules -> nowhere` made `exists()` report `false`, the borrow
+  was attempted anyway, and `symlink(2)` failed `EEXIST`, so snapshot creation —
+  and with it the whole run — died on a repository that is merely unusual. Such
+  a commit is now left alone and reviewed.
+- **The exposure of top-level packages no longer depends on the operator having
+  a `.bin`.** The merge was gated on `ambient_bin.exists()`, so an operator
+  install without `node_modules/.bin` suppressed the package merge as well, even
+  though what a shim resolves is `../<package>`. The two merges are now
+  independent, and `.bin` is simply one more entry the top-level merge can
+  expose.
+- **A `.bin` shim that resolves inside the tree to an entry the commit does not
+  contain is `Missing`, not `Unresolved`.** Following a repository-relative link
+  lands on another path in the *same* tree, so the tree can answer for it.
+  Reporting `Unresolved` made JS eligibility treat an absent tool as a target
+  candidate; the check was scheduled and then failed at execution time with
+  `resolved JS tool disappeared` instead of being skipped with a reason.
+- **The recognized pnpm wrapper grammar admits only a literal payload.** The
+  grammar accepted any text between the quotes of `exec node "$basedir/…" "$@"`,
+  while a second, looser scan extracted the closure path. A wrapper reading
+  `exec node "$basedir/$HOME/x" "$@"` therefore proved a closure whose contents
+  the shell picks at run time, and the two passes could disagree — the extractor
+  could record nothing while the closure stayed "proved". The payload must now
+  match `[A-Za-z0-9._@+/-]+` (nothing the shell expands, splits or globs) and is
+  taken from the very match that recognized the grammar, so the recognizer and
+  the recorded closure cannot diverge.
+- **On non-Unix, an invocation that exists is no longer certified as an exact
+  snapshot scan.** The non-Unix closure proof answered `TargetOnly` for every
+  path, so a Windows run published `tree_state: "snapshot"` — "the scanned bytes
+  are exactly `target_sha`" — for a launcher this build cannot read at all
+  (there is no header proof and no script grammar there). It now answers from
+  canonical identity alone: nothing at the invocation path is `TargetOnly`
+  (nothing will execute), an invocation resolving outside the snapshot root is
+  `Borrowed`, and everything else is `Unproven`. All three variants are
+  therefore constructed on every platform, which also removes the `dead_code`
+  asymmetry that broke the Windows build.
+- **Two claims about the proof were stated more broadly than the code
+  supports, and are corrected in place** (`ClosureProof::TargetOnly` docstring,
+  `docs/architecture.md`): `snapshot` never promised that "every statically
+  visible byte is target-owned" — the ambient `node` runtime is outside the
+  proof and always was, prview ships none; and the `/bin/sh` retry that
+  motivates the platform-header proof happens on the `fork`+`execvp` path, not
+  on Rust's default `posix_spawn`, which hands `ENOEXEC` straight back
+  (`Exec format error (os error 8)`, measured on Linux CI). The header proof is
+  justified by caution, not by a universal law. An unrecognized wrapper is
+  `snapshot-unproven-deps`, never "borrowed".
+- The `PR_REVIEW.md` PR Template checklist no longer claims what the checks did
+  not prove. `Compiles / type-checks`, `Tests pass` and `No lint errors` were each
+  ticked when ANY check of the category passed, so a failing ESLint hid behind a
+  passing Clippy, and a run with no checks at all ticked `Compiles / type-checks`.
+  A claim is now ticked only when at least one check of its category executed and
+  every executed one passed, and Mypy counts toward `Compiles / type-checks`.
+  `CONSISTENCY_CHECK.json` and `report.json`'s `quality.consistency` re-derive the
+  three claims from the check statuses and report a rendered mark those statuses
+  do not earn as a `pr_checklist.<item>` warning; a checklist line or serialized
+  check entry that cannot be read (including a status outside the serialized
+  vocabulary) is reported too, never skipped. Only the checklist inside the PR
+  Template's fenced block counts, so text elsewhere in `PR_REVIEW.md` cannot
+  stand in for it, and each item must be named by exactly one line there: a
+  duplicated item is unreadable rather than read from its first copy.
+  A heading-shaped line in earlier check evidence does not create a second
+  template, and a present but unreadable `report.json` now withholds the
+  checklist comparison with an explicit warning. An unreadable `PR_REVIEW.md`
+  does the same instead of passing as an absent checklist.
+  Template parsing now anchors to the final generated separator, so a
+  newline-containing Git path cannot impersonate a second template; paths are
+  rendered with escaped control characters on one line, including loctree twin
+  pairs. A genuinely duplicated
+  complete template remains unreadable. Cached
+  check replays no longer count as execution toward an auto-ticked claim;
+  their serialized `cached` flags are checked alongside statuses. Serialized
+  check names are also matched to their canonical IDs and to the complete
+  executed check set in `MERGE_GATE.json` (name, status and cache state), so an
+  alias collision, omitted failed row, or missing gate cannot silently change a checklist
+  claim. Custom check names remain valid when both artifacts agree.
+- A `Cargo audit` failure whose advisories the baseline already proved
+  pre-existing no longer blocks the merge because of unrelated uncommitted
+  changes. The pre-existing downgrade for this one check now rests on lockfile
+  provenance — the audited `Cargo.lock` is the analysed target's — instead of
+  whole-tree cleanliness, which is evidence about source files and says nothing
+  about an advisory that lives in `Cargo.lock` × the advisory database. A pack
+  could previously carry `Cargo audit baseline: new=0, pre-existing=2` in its
+  review caveats and `BLOCK … Cargo audit (Failed)` in its decision with nothing
+  bridging the two. Dirt in the lockfile itself still revokes the downgrade, an
+  introduced advisory still blocks, and a changed lock with no base audit is
+  still unclassified rather than assumed clean. The proof also requires that the
+  target tree actually carry a `Cargo.lock`: `cargo audit` resolves one from the
+  registry when a crate has none and audits that, so advisories from such a run
+  are real but concern a file no commit contains, and they now keep gating
+  instead of being reported as unchanged. That lockfile is the one the audit
+  reads — `Cargo.lock` in the cargo root itself, since `cargo audit` never falls
+  back to a workspace root's — so a root lock beside a lock-less member, or a
+  symlink committed in the lockfile's place, proves nothing; and a reviewed
+  commit that moved its crate away from the configured cargo root withholds the
+  proof, because cargo ran in a directory the lockfile questions were not asked
+  about. The lock must also stay the committed one while the checks run: none
+  of prview's cargo commands pass `--locked`, so a target that adds a dependency
+  without regenerating `Cargo.lock` has the lock rewritten before the audit reads
+  it. A snapshot run whose check-boundary observations saw the audited lock
+  change, or could not be read, withholds the proof, and a local run reads the
+  audited lock again after the checks. A repository whose committed `Cargo.lock`
+  does not cover its manifest has it rewritten by every cargo run, so it no
+  longer earns the pre-existing downgrade until the regenerated lock is
+  committed; the gate says so as `Cargo.lock dirty or rewritten in the scanned
+  tree`. A new `warnings`-category advisory (`unmaintained`, `unsound`,
+  `yanked`) blocks the downgrade like a new vulnerability: it has no
+  vulnerability row of its own, so it reaches the classifier as a dashboard
+  note, and a changed lock that kept an old vulnerability while adding one no
+  longer passes as pre-existing. A yanked crate is part of that set too:
+  cargo-audit reports it with no advisory, and it used to be dropped from the
+  comparison while the check status still counted it; it is now keyed as
+  `yanked`, and any vulnerability or counted `warnings` item that cannot be
+  keyed makes the report unreadable rather than invisible — a vulnerability
+  missing its advisory id or locked version no longer shares a placeholder key
+  with an unrelated malformed one in the base. Two items that share a key (the
+  key names no package source, and rustsec's yanked check accepts both
+  spellings of the crates.io index) make the report unreadable too, instead of
+  shrinking the compared set. The base audit reads the base's copy
+  of the lockfile the audit read: a member that gains its own `Cargo.lock` is
+  no longer compared against the repository-root lock (a superset of every
+  member's resolution), so an advisory the new member lock introduced is no
+  longer classified as pre-existing — that baseline is unavailable instead. A
+  change to the cargo-audit configuration (`.cargo/audit.toml` in the cargo
+  root, whose base copy no audit reads) withholds the proof as `the
+  cargo-audit configuration (.cargo/audit.toml) changed or is dirty in the
+  scanned tree`, so dropping an ignored advisory no longer passes its failure
+  off as pre-existing. So does a configuration in the checkout that is not the
+  target's, whether staged, unstaged, untracked or ignored: it could ignore the
+  advisory a change introduced while the pre-existing ones still fail and are
+  downgraded. A configuration committed under another case (`.cargo/Audit.toml`,
+  `.CARGO/audit.toml`), which a case-insensitive checkout reads, withholds the
+  proof as `.cargo/audit.toml is committed under another case, which a
+  case-insensitive checkout reads`. A lock that was staged and then reverted in
+  the working file no longer reads as untouched: the local re-read checks the
+  index and the working tree separately. Nor does a lock or configuration
+  edited under a skip-worktree or assume-unchanged flag, which status and the
+  index's view hide: the re-read also compares the working tree with the target
+  commit directly, and the snapshot's check-boundary observations
+  (`SNAPSHOT_INTEGRITY`) read such entries on disk the same way. A snapshot
+  run whose target has no configuration withholds the proof when a check left
+  one at the path in the snapshot, which no boundary lists as untracked. A
+  relative Cargo home (`CARGO_HOME`, else `$HOME/.cargo`), inherited by the
+  checks, resolves inside the scanned tree, where cargo-audit's fallback
+  configuration and advisory database then live; it withholds the proof as
+  `the Cargo home (CARGO_HOME, else $HOME/.cargo) is relative, so cargo audit
+  read its fallback configuration and advisory database inside the scanned
+  tree`. An absolute one that is, or lies inside, the checkout or the snapshot,
+  however it is spelled or linked, withholds it the same way, as `the Cargo
+  home (CARGO_HOME, else $HOME/.cargo) lies inside the checkout or the scanned
+  tree, so cargo audit read its fallback configuration and advisory database
+  from files there`. With `CARGO_HOME` unset, a `HOME` inside the tree counts.
+  An external home whose `audit.toml` or `advisory-db` is a link into either
+  tree, or a configuration (committed or fallback) whose `[database] path` is
+  relative or leads into either tree, withholds the proof as `cargo audit's
+  fallback configuration or advisory database is not shown to lie outside the
+  checkout and the scanned tree (a link or a configured database path leads
+  there, or it could not be read)`.
+  The gate states which proof it
+  applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this
+  PR (N advisories)`; a blocking one names the advisories it blocks on — all of
+  them, counted and named from one set, so an `unmaintained` warning is no
+  longer counted as a "vulnerability" nor silently left unnamed, and they are
+  called "introduced" only while the lockfile proof holds — and an audit that
+  blocks for want of the proof says which premise was missing instead of
+  reporting a bare `Cargo audit (Failed)`. The dashboard now states the gate
+  verdict as a `data-merge-verdict` attribute on the merge chip, so its parity
+  with `MERGE_GATE.json` is assertable rather than assumed. An audit whose only
+  items are pre-existing warnings-category advisories is downgraded the same
+  way: each warning reaches the classifier with the origin the baseline counts
+  give it, where it used to have no row and held the gate at CONDITIONAL. The
+  proof describes only an audit this run executed, so `Cargo audit` replays
+  only a `passed` result from the check cache; a failing or warning report,
+  which the downgrade reads, always runs live, because the cache key does not
+  bind `.cargo/audit.toml`.
+  `docs/contracts/merge_gate.md` and `docs/architecture.md` carry the rule.
+
+- `30_context/GHOST_REFERENCES.*` now audits the reviewed tree instead of the
+  operator's checkout. For an off-`HEAD` target the scan walks the shared target
+  snapshot the rest of `30_context/` is planned from, so untracked or dirty
+  local files no longer surface as ghost findings that belong to no PR, and a
+  file the PR deletes but the checkout still holds no longer passes for a
+  relocation survivor that suppressed the real deletion. Only a local review
+  (`target == HEAD`) scans the checkout, because there it is the reviewed tree.
+  Both the relocation guard and the scan also skip `node_modules`: a snapshot
+  links it in as a symlink the walk does not follow while a local review walked
+  it for real, so a vendored file with the deleted file's name could silence a
+  real deletion in one mode only.
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch
