@@ -671,16 +671,23 @@ fn js_default_kind(value: &str) -> JsDeclKind {
 ///   token (`a + ++b` against `a++ + b`), and a comma before a closing bracket
 ///   is dropped. String, template and regular-expression literals are kept
 ///   verbatim, and no arrow, body or comment is found inside them. Where the
-///   file may write JSX, the line from the JSX it writes on is kept verbatim
-///   the same way ([`opaque_js_jsx`]).
+///   file may write JSX, each JSX element the line writes is kept verbatim
+///   the same way, and JSX this reader cannot follow keeps the whole line
+///   ([`opaque_js_jsx`]).
 ///
 /// The form is a bounded line heuristic: a signature spread over several lines
 /// is compared on the line the diff shows.
 fn js_ts_export_contract(line: &str, kind: JsDeclKind, jsx: bool) -> String {
     let opaque = jsx.then(|| opaque_js_jsx(line, kind)).flatten();
-    let line = opaque.as_deref().unwrap_or(line);
+    let line = opaque.as_ref().map_or(line, |opaque| opaque.text.as_str());
+    // A comment may stand on either side of the final `;` (`} /* note */;`).
     let text = strip_js_trailing_comments(line).trim_end();
-    let text = text.strip_suffix(';').map_or(text, str::trim_end);
+    let text = text
+        .strip_suffix(';')
+        .map_or(text, |text| strip_js_trailing_comments(text).trim_end());
+    if opaque.as_ref().is_some_and(|opaque| opaque.whole) {
+        return compact_js(text);
+    }
     match kind {
         JsDeclKind::Binding => return js_binding_contract(&ungroup_js_initializers(text, kind)),
         JsDeclKind::Expression => {
@@ -700,47 +707,221 @@ fn js_ts_export_contract(line: &str, kind: JsDeclKind, jsx: bool) -> String {
     compact_js(text)
 }
 
-/// The line with the JSX it writes turned into one string literal of the same
-/// text, or `None` when it writes none. JSX text is not code: the `//` of
-/// `<p>See https://a.com</p>` opens no comment, and neither `=>` nor a quote
-/// in it is an arrow or a string. A `<` opens JSX where an operand starts
-/// (`= <p>`, `return <Row`, `(<>`) and a tag name or the `>` of a fragment
-/// follows it; a generic arrow's `<T,>`, `<T extends U>` or `<T = U>` does
-/// not. A binding is searched after its initializer's `=`, so a generic
-/// function type in its annotation is not taken for JSX, and a type
-/// declaration never writes JSX. The line is kept from that `<` to its end,
-/// escaped, so two different tails stay two different literals, and the
-/// literal opens with a line break no diff line holds, so it never equals a
-/// string the line writes (`= <p/>` against `= "<p/>"`).
-fn opaque_js_jsx(line: &str, kind: JsDeclKind) -> Option<String> {
+/// A line whose JSX [`opaque_js_jsx`] turned into string literals.
+struct OpaqueJsx {
+    text: String,
+    /// JSX this reader could not follow runs to the end of the line, and the
+    /// code after it may be hidden in the literal: nothing may be cut from
+    /// the line as implementation.
+    whole: bool,
+}
+
+/// The line with each JSX expression it writes turned into one string literal
+/// of the same text, or `None` when it writes none. JSX text is not code: the
+/// `//` of `<p>See https://a.com</p>` opens no comment, and neither `=>` nor a
+/// quote in it is an arrow or a string. A `<` opens JSX where an operand
+/// starts (`= <p>`, `return <Row`, `(<>`) and a tag name or the `>` of a
+/// fragment follows it; a generic arrow's `<T,>`, `<T extends U>` or
+/// `<T = U>` does not. A binding is searched only in its initializers
+/// ([`js_initializers`]), so a generic function type in an annotation is not
+/// taken for JSX, and a type declaration never writes JSX.
+///
+/// The literal covers the element [`jsx_element_end`] reads, so the code
+/// after it stays code: a later declarator (`() => <div />, legacy = 1`) or
+/// the `}` that closes a function body. An element still open at the end of
+/// the line runs to it; so does one this reader cannot follow, and then the
+/// line is kept [`whole`](OpaqueJsx::whole). The text is escaped, so two
+/// different elements stay two different literals, and the literal opens
+/// with a line break no diff line holds, so it never equals a string the
+/// line writes (`= <p/>` against `= "<p/>"`).
+fn opaque_js_jsx(line: &str, kind: JsDeclKind) -> Option<OpaqueJsx> {
     if kind == JsDeclKind::Type {
         return None;
     }
-    let lexemes = js_lex(line);
-    let bytes = line.as_bytes();
-    let from = match kind {
-        JsDeclKind::Binding => {
-            lexemes
-                .iter()
-                .find(|lexeme| {
-                    lexeme.kind == JsLexKind::Code('=')
-                        && lexeme.depth == 0
-                        && js_assigns_at(bytes, lexeme.start)
-                })?
-                .end
+    let mut text = line.to_owned();
+    let mut from = 0;
+    let mut whole = false;
+    loop {
+        let lexemes = js_lex(&text);
+        let initializers = (kind == JsDeclKind::Binding).then(|| js_initializers(&text, &lexemes));
+        let Some(open) = (0..lexemes.len()).find(|&index| {
+            let lexeme = lexemes[index];
+            lexeme.start >= from
+                && lexeme.kind == JsLexKind::Code('<')
+                && initializers.as_ref().is_none_or(|initializers| {
+                    initializers
+                        .iter()
+                        .any(|initializer| initializer.contains(&index))
+                })
+                && !js_operand_ends_before(&text, &lexemes[..index])
+                && js_opens_jsx(&text[lexeme.end..])
+        }) else {
+            break;
+        };
+        let at = lexemes[open].start;
+        let end = match jsx_element_end(&text, at) {
+            JsxEnd::At(end) => Some(end),
+            JsxEnd::Open => None,
+            JsxEnd::Unknown => {
+                whole = true;
+                None
+            }
+        };
+        let jsx = at..end.unwrap_or(text.len());
+        let literal = format!(
+            "\"\n{}\"",
+            text[jsx.clone()].replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        text.replace_range(jsx, &literal);
+        if end.is_none() {
+            break;
         }
-        _ => 0,
+        from = at + literal.len();
+    }
+    (text != line).then_some(OpaqueJsx { text, whole })
+}
+
+/// How far a JSX element reaches on its line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsxEnd {
+    /// It closes just before this byte offset.
+    At(usize),
+    /// It is still open where the line ends.
+    Open,
+    /// Its text is not JSX this reader follows.
+    Unknown,
+}
+
+/// Read the JSX element or fragment whose `<` is at `start`: its tag name,
+/// attributes (`name`, `name="…"`, `name={…}`, `{...spread}`), and the
+/// children and closing tag of an element that is not self-closing. Child
+/// text is not code; a `{…}` expression is lexed as code, JSX nested in it
+/// included ([`js_lex_until`]).
+fn jsx_element_end(text: &str, start: usize) -> JsxEnd {
+    let bytes = text.as_bytes();
+    let mut at = jsx_skip_whitespace(bytes, start + 1);
+    if bytes.get(at) == Some(&b'>') {
+        return jsx_children_end(text, at + 1);
+    }
+    let Some(name_end) = jsx_name_end(text, at) else {
+        return JsxEnd::Unknown;
     };
-    let open = (0..lexemes.len()).find(|&index| {
-        let lexeme = lexemes[index];
-        lexeme.start >= from
-            && lexeme.kind == JsLexKind::Code('<')
-            && !js_operand_ends_before(line, &lexemes[..index])
-            && js_opens_jsx(&line[lexeme.end..])
-    })?;
-    let at = lexemes[open].start;
-    let tail = line[at..].replace('\\', "\\\\").replace('"', "\\\"");
-    Some(format!("{}\"\n{tail}\"", &line[..at]))
+    at = name_end;
+    loop {
+        at = jsx_skip_whitespace(bytes, at);
+        match bytes.get(at) {
+            None => return JsxEnd::Open,
+            Some(b'/') => {
+                return match bytes.get(at + 1) {
+                    Some(b'>') => JsxEnd::At(at + 2),
+                    None => JsxEnd::Open,
+                    Some(_) => JsxEnd::Unknown,
+                };
+            }
+            Some(b'>') => return jsx_children_end(text, at + 1),
+            Some(b'{') => match jsx_expression_end(text, at + 1) {
+                JsxEnd::At(end) => at = end,
+                other => return other,
+            },
+            Some(_) => {
+                let Some(name_end) = jsx_name_end(text, at) else {
+                    return JsxEnd::Unknown;
+                };
+                at = jsx_skip_whitespace(bytes, name_end);
+                if bytes.get(at) != Some(&b'=') {
+                    continue;
+                }
+                at = jsx_skip_whitespace(bytes, at + 1);
+                let value_end = match bytes.get(at) {
+                    None => JsxEnd::Open,
+                    // An attribute string escapes nothing and may span lines.
+                    Some(&quote @ (b'"' | b'\'')) => text[at + 1..]
+                        .find(char::from(quote))
+                        .map_or(JsxEnd::Open, |close| JsxEnd::At(at + 1 + close + 1)),
+                    Some(b'{') => jsx_expression_end(text, at + 1),
+                    Some(b'<') => jsx_element_end(text, at),
+                    Some(_) => JsxEnd::Unknown,
+                };
+                match value_end {
+                    JsxEnd::At(end) => at = end,
+                    other => return other,
+                }
+            }
+        }
+    }
+}
+
+/// Read an element's children from `at` through its closing tag.
+fn jsx_children_end(text: &str, mut at: usize) -> JsxEnd {
+    let bytes = text.as_bytes();
+    loop {
+        match bytes.get(at) {
+            None => return JsxEnd::Open,
+            Some(b'{') => match jsx_expression_end(text, at + 1) {
+                JsxEnd::At(end) => at = end,
+                other => return other,
+            },
+            Some(b'<') => {
+                let close = jsx_skip_whitespace(bytes, at + 1);
+                if bytes.get(close) != Some(&b'/') {
+                    match jsx_element_end(text, at) {
+                        JsxEnd::At(end) => at = end,
+                        other => return other,
+                    }
+                    continue;
+                }
+                let mut close = jsx_skip_whitespace(bytes, close + 1);
+                if bytes.get(close) != Some(&b'>') {
+                    let Some(name_end) = jsx_name_end(text, close) else {
+                        return if close >= bytes.len() {
+                            JsxEnd::Open
+                        } else {
+                            JsxEnd::Unknown
+                        };
+                    };
+                    close = jsx_skip_whitespace(bytes, name_end);
+                }
+                return match bytes.get(close) {
+                    Some(b'>') => JsxEnd::At(close + 1),
+                    None => JsxEnd::Open,
+                    Some(_) => JsxEnd::Unknown,
+                };
+            }
+            // JSX text cannot hold a bare `>` or `}`.
+            Some(b'>' | b'}') => return JsxEnd::Unknown,
+            Some(_) => at += 1,
+        }
+    }
+}
+
+/// Read a `{…}` expression of JSX from just after its `{` through its `}`.
+fn jsx_expression_end(text: &str, from: usize) -> JsxEnd {
+    match js_lex_until(&text[from..], true, true).1 {
+        JsLexStop::Closed(end) => JsxEnd::At(from + end),
+        JsLexStop::Ended => JsxEnd::Open,
+        JsLexStop::UnknownJsx => JsxEnd::Unknown,
+    }
+}
+
+/// End of the JSX tag or attribute name at `at`, if one starts there.
+fn jsx_name_end(text: &str, at: usize) -> Option<usize> {
+    let rest = text.get(at..)?;
+    let first = rest.chars().next()?;
+    if !is_js_identifier_char(first) || first.is_ascii_digit() {
+        return None;
+    }
+    Some(
+        at + rest
+            .find(|ch: char| !(is_js_identifier_char(ch) || matches!(ch, '.' | '-' | ':')))
+            .unwrap_or(rest.len()),
+    )
+}
+
+fn jsx_skip_whitespace(bytes: &[u8], mut at: usize) -> usize {
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    at
 }
 
 /// Whether the text after a `<` where an operand starts opens JSX: the `>` of
@@ -776,14 +957,9 @@ fn ungroup_js_initializers(text: &str, kind: JsDeclKind) -> String {
         // Where each initializer starts: after a binding's assignment `=`, or
         // after `export default`.
         let starts: Vec<usize> = if kind == JsDeclKind::Binding {
-            lexemes
+            js_initializers(&text, &lexemes)
                 .iter()
-                .filter(|lexeme| {
-                    lexeme.kind == JsLexKind::Code('=')
-                        && lexeme.depth == 0
-                        && js_assigns_at(text.as_bytes(), lexeme.start)
-                })
-                .map(|lexeme| lexeme.end)
+                .map(|initializer| lexemes[initializer.start - 1].end)
                 .collect()
         } else {
             strip_js_keyword(&text, "export")
@@ -942,20 +1118,32 @@ const JS_KEYWORDS_BEFORE_OPERAND: &[&str] = &[
 /// after a body, so a `/` there divides (`{} / 2; // old`). A literal or
 /// comment the line leaves open runs to its end.
 fn js_lex(text: &str) -> Vec<JsLexeme> {
-    js_lex_until(text, false).0
+    js_lex_until(text, false, false).0
+}
+
+/// Where [`js_lex_until`] stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsLexStop {
+    /// Just past the `}` that closes the interpolation.
+    Closed(usize),
+    /// At the end of the text.
+    Ended,
+    /// At JSX that [`jsx_element_end`] cannot follow.
+    UnknownJsx,
 }
 
 /// Lex `text`, or with `interpolation` set only up to the `}` that closes the
-/// `${` it follows. Returns the lexemes and the byte offset where lexing
-/// stopped (past that `}`).
-fn js_lex_until(text: &str, interpolation: bool) -> (Vec<JsLexeme>, usize) {
+/// `${` (or the JSX `{`) it follows. With `jsx` set, a `<` that opens JSX
+/// where an operand starts is read as one element ([`jsx_element_end`]) and
+/// becomes one literal. Returns the lexemes and where lexing stopped.
+fn js_lex_until(text: &str, interpolation: bool, jsx: bool) -> (Vec<JsLexeme>, JsLexStop) {
     let bytes = text.as_bytes();
     let mut lexemes: Vec<JsLexeme> = Vec::new();
     let mut depth = 0_usize;
     let mut at = 0_usize;
     while let Some(ch) = text[at..].chars().next() {
         if interpolation && ch == '}' && depth == 0 {
-            return (lexemes, at + 1);
+            return (lexemes, JsLexStop::Closed(at + 1));
         }
         let next = bytes.get(at + 1).copied();
         let (kind, end) = match ch {
@@ -970,6 +1158,16 @@ fn js_lex_until(text: &str, interpolation: bool) -> (Vec<JsLexeme>, usize) {
             ),
             '/' if js_operand_ends_before(text, &lexemes) => (JsLexKind::Code('/'), at + 1),
             '/' => (JsLexKind::Literal, js_regex_end(bytes, at)),
+            '<' if jsx
+                && !js_operand_ends_before(text, &lexemes)
+                && js_opens_jsx(&text[at + 1..]) =>
+            {
+                match jsx_element_end(text, at) {
+                    JsxEnd::At(end) => (JsLexKind::Literal, end),
+                    JsxEnd::Open => (JsLexKind::Literal, text.len()),
+                    JsxEnd::Unknown => return (lexemes, JsLexStop::UnknownJsx),
+                }
+            }
             _ => (JsLexKind::Code(ch), at + ch.len_utf8()),
         };
         lexemes.push(JsLexeme {
@@ -985,7 +1183,7 @@ fn js_lex_until(text: &str, interpolation: bool) -> (Vec<JsLexeme>, usize) {
         }
         at = end;
     }
-    (lexemes, text.len())
+    (lexemes, JsLexStop::Ended)
 }
 
 /// Whether the tokens before a `/` end an operand, making it a division.
@@ -995,7 +1193,10 @@ fn js_operand_ends_before(text: &str, lexemes: &[JsLexeme]) -> bool {
     };
     let last = &lexemes[index];
     match last.kind {
-        JsLexKind::Literal | JsLexKind::Code(')' | ']' | '}') => true,
+        JsLexKind::Literal | JsLexKind::Code(']' | '}') => true,
+        // The `)` of an `if (…)` condition ends no operand: a statement,
+        // possibly a regular expression, starts after it (`if (x) /[{]/`).
+        JsLexKind::Code(')') => !js_closes_condition(text, lexemes, index),
         // A keyword after a `.` is a property name (`mod.default / 2`).
         JsLexKind::Code(ch) if is_js_identifier_char(ch) => {
             let word = js_word_ending_at(text, lexemes, last);
@@ -1040,6 +1241,37 @@ fn js_word_ending_at<'a>(text: &'a str, lexemes: &[JsLexeme], last: &JsLexeme) -
     &text[start..last.end]
 }
 
+/// Whether the `)` at `lexemes[close]` closes the condition of an `if`,
+/// `while`, `for` or `with`, rather than a call or a group. A keyword after a
+/// `.` is a method name (`value.if(x) / 2`).
+fn js_closes_condition(text: &str, lexemes: &[JsLexeme], close: usize) -> bool {
+    let Some(depth) = lexemes[close].depth.checked_sub(1) else {
+        return false;
+    };
+    let Some(open) = lexemes[..close]
+        .iter()
+        .rposition(|lexeme| lexeme.kind == JsLexKind::Code('(') && lexeme.depth == depth)
+    else {
+        return false;
+    };
+    let Some(keyword) = lexemes[..open].iter().rposition(|lexeme| !lexeme.is_gap()) else {
+        return false;
+    };
+    let last = &lexemes[keyword];
+    let JsLexKind::Code(ch) = last.kind else {
+        return false;
+    };
+    let word = js_word_ending_at(text, &lexemes[..=keyword], last);
+    is_js_identifier_char(ch)
+        && matches!(word, "if" | "while" | "for" | "with")
+        && !lexemes
+            .iter()
+            .rev()
+            .filter(|lexeme| lexeme.end <= last.end - word.len())
+            .find(|lexeme| !lexeme.is_gap())
+            .is_some_and(|lexeme| lexeme.kind == JsLexKind::Code('.'))
+}
+
 /// End of the template literal opened at `start`. A backtick inside a `${…}`
 /// belongs to a template nested there, not to this one.
 fn js_template_end(text: &str, start: usize) -> usize {
@@ -1051,7 +1283,10 @@ fn js_template_end(text: &str, start: usize) -> usize {
             b'`' => return at + 1,
             b'$' if bytes.get(at + 1) == Some(&b'{') => {
                 at += 2;
-                at += js_lex_until(&text[at..], true).1;
+                match js_lex_until(&text[at..], true, false).1 {
+                    JsLexStop::Closed(end) => at += end,
+                    JsLexStop::Ended | JsLexStop::UnknownJsx => return bytes.len(),
+                }
             }
             _ => at += 1,
         }
@@ -1136,43 +1371,81 @@ fn strip_js_trailing_comments(text: &str) -> &str {
 }
 
 /// Byte offset just past the top-level `=>` of an arrow function. For a
-/// binding the search starts after the initializer's `=`, so an arrow inside
-/// the type annotation (`const f: (a: A) => void = …`) is not taken for it.
+/// binding only its declarators' initializers are searched
+/// ([`js_initializers`]), so an arrow inside a type annotation
+/// (`const f: (a: A) => void = …`, or a later declarator's
+/// `b: () => T = …`) is not taken for it.
 ///
-/// An arrow after a top-level conditional `?` of its own declarator is one
+/// An arrow after a top-level conditional `?` of its own initializer is one
 /// branch of it (`c ? (x) => 1 : (y) => 2`): what follows its body is the
 /// other branch, so there is no arrow to cut at and the line compares whole.
-/// A declarator starts after a `,` that [`js_declarator_follows`], so the
-/// comma of a generic arrow's `<A, B>` does not end the conditional's reach.
 fn js_arrow_end(text: &str, after_initializer: bool) -> Option<usize> {
     let lexemes = js_lex(text);
     let bytes = text.as_bytes();
     let top = |index: usize, ch: char| {
         lexemes[index].kind == JsLexKind::Code(ch) && lexemes[index].depth == 0
     };
-    let start = if after_initializer {
-        (0..lexemes.len())
-            .find(|&index| top(index, '=') && js_assigns_at(bytes, lexemes[index].start))?
-            + 1
+    let initializers = if after_initializer {
+        js_initializers(text, &lexemes)
     } else {
-        0
+        vec![0..lexemes.len()]
     };
-    let arrow = (start..lexemes.len())
-        .find(|&index| top(index, '=') && bytes.get(lexemes[index].start + 1) == Some(&b'>'))?;
-    let declarator = (start..arrow)
-        .rev()
-        .find(|&index| top(index, ',') && js_declarator_follows(text, &lexemes[index + 1..]))
-        .map_or(start, |comma| comma + 1);
-    let conditional = (declarator..arrow)
-        .any(|index| top(index, '?') && js_conditional_at(bytes, lexemes[index].start));
-    (!conditional).then_some(lexemes[arrow].start + 2)
+    for initializer in initializers {
+        let Some(arrow) = initializer
+            .clone()
+            .find(|&index| top(index, '=') && bytes.get(lexemes[index].start + 1) == Some(&b'>'))
+        else {
+            continue;
+        };
+        let conditional = (initializer.start..arrow)
+            .any(|index| top(index, '?') && js_conditional_at(bytes, lexemes[index].start));
+        return (!conditional).then_some(lexemes[arrow].start + 2);
+    }
+    None
 }
 
-/// Whether the `=` at `at` assigns, rather than belonging to `==`, `=>`,
-/// `!=`, `<=` or `>=`.
-fn js_assigns_at(bytes: &[u8], at: usize) -> bool {
-    !matches!(bytes.get(at + 1), Some(b'=' | b'>'))
-        && (at == 0 || !matches!(bytes[at - 1], b'=' | b'!' | b'<' | b'>'))
+/// Each declarator's initializer on a binding line, as the range of lexemes
+/// after its `=` up to the `,` that starts the next declarator or the end.
+///
+/// A declarator's name and type annotation come before its `=`. There `<` and
+/// `>` bracket type parameters and arguments, so the `=` of a type parameter's
+/// default (`: <T = unknown>(x: T) => R`) and the arrow of a function type
+/// (`: (a: A) => R`) start no initializer. In an initializer a `<` compares,
+/// and a top-level `,` that [`js_declarator_follows`] starts the next
+/// declarator: the comma of a generic arrow's `<A, B>` does not.
+fn js_initializers(text: &str, lexemes: &[JsLexeme]) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut initializers = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut angle = 0_usize;
+    for (index, lexeme) in lexemes.iter().enumerate() {
+        let JsLexKind::Code(ch) = lexeme.kind else {
+            continue;
+        };
+        if lexeme.depth != 0 {
+            continue;
+        }
+        let before = lexeme.start.checked_sub(1).map(|at| bytes[at]);
+        match (open, ch) {
+            (Some(start), ',') if js_declarator_follows(text, &lexemes[index + 1..]) => {
+                initializers.push(start..index);
+                open = None;
+                angle = 0;
+            }
+            (None, '<') => angle += 1,
+            (None, '>') if before != Some(b'=') => angle = angle.saturating_sub(1),
+            (None, '=')
+                if angle == 0
+                    && !matches!(bytes.get(lexeme.start + 1), Some(b'=' | b'>'))
+                    && !matches!(before, Some(b'=' | b'!')) =>
+            {
+                open = Some(index + 1);
+            }
+            _ => {}
+        }
+    }
+    initializers.extend(open.map(|start| start..lexemes.len()));
+    initializers
 }
 
 /// Whether the `?` at `at` is a conditional operator, rather than part of
@@ -1923,6 +2196,40 @@ mod tests {
             "export const make = () => create<A, B>();",
             "export const make = () => create<A, B>(1);"
         ));
+        // A type parameter's default is not the initializer: the body after
+        // the initializer's own arrow is still implementation.
+        assert!(same(
+            "export const f: <T = unknown>(x: T) => R = (x) => old;",
+            "export const f: <T = unknown>(x: T) => R = (x) => new;"
+        ));
+        // A regular expression may follow a control-flow condition: its
+        // brackets are not the body's.
+        assert!(same(
+            "export function f(x) { if (x) /[{]/.test(x); }",
+            "export function f(x) { if (x) /[{]/.test(y); }"
+        ));
+        assert!(same(
+            "export function f(x) { while (x) /[}]/.exec(x); }",
+            "export function f(x) { while (x) /[}]/.exec(y); }"
+        ));
+        // A call's or a method's `)` still ends an operand: the `/` divides.
+        assert!(same(
+            "export const HALF = f(x) / 2; // old",
+            "export const HALF = f(x) / 2; // new"
+        ));
+        assert!(same(
+            "export const HALF = value.if(x) / 2; // old",
+            "export const HALF = value.if(x) / 2; // new"
+        ));
+        // A comment before the final `;` is a comment too.
+        assert!(same(
+            "export function f() { return 1 };",
+            "export function f() { return 1 } /* note */;"
+        ));
+        assert!(same(
+            "export function f() { return 1 } /* old */ ;",
+            "export function f() { return 2 } /* new */;"
+        ));
 
         // What importers see still differs.
         assert!(!same(
@@ -1951,6 +2258,24 @@ mod tests {
         assert!(!same(
             "export const f: (a: A) => void = (a) => {",
             "export const f: (a: B) => void = (a) => {"
+        ));
+        // Neither is an arrow after a type parameter's default, nor one in a
+        // later declarator's annotation.
+        assert!(!same(
+            "export const f: <T = unknown>(x: T) => Old = (x) => value;",
+            "export const f: <T = unknown>(x: T) => New = (x) => value;"
+        ));
+        assert!(!same(
+            "export const f: <A, B = C>(x: A) => Old = (x) => x;",
+            "export const f: <A, B = C>(x: A) => New = (x) => x;"
+        ));
+        assert!(!same(
+            "export const a = 1, b: () => Old = f;",
+            "export const a = 1, b: () => New = f;"
+        ));
+        assert!(!same(
+            "export const a = (x) => x, b: () => Old = f;",
+            "export const a = (x) => x, b: () => New = f;"
         ));
         // Strings are opaque: no arrow or comment is found inside them.
         assert!(!same(
@@ -2208,6 +2533,69 @@ mod tests {
                 ),
                 "{file}"
             );
+            // The JSX ends where its element closes: a later declarator after
+            // it is an exported binding, and the `}` after it closes a body.
+            for (before, after) in [
+                (
+                    "export const handler = () => <div />, legacy = 1;",
+                    "export const handler = () => <div />;",
+                ),
+                (
+                    "export const List = () => <ul>{items.map((i) => <li>{i}</li>)}</ul>, legacy = 1;",
+                    "export const List = () => <ul>{items.map((i) => <li>{i}</li>)}</ul>;",
+                ),
+                (
+                    "export const Row = () => <p {...rest} onClick={() => go('/a')}>x</p>, b = 1;",
+                    "export const Row = () => <p {...rest} onClick={() => go('/a')}>x</p>, b = 2;",
+                ),
+                (
+                    "export const a = <A/>, f = () => <p>// x</p>, b = 1;",
+                    "export const a = <A/>, f = () => <p>// x</p>, b = 2;",
+                ),
+            ] {
+                assert!(!same(before, after), "{file}: {before}");
+            }
+            for (before, after) in [
+                (
+                    "export function Row() { return <p>old</p>; }",
+                    "export function Row() { return <p>new</p>; }",
+                ),
+                (
+                    "export const Row = () => <p>old</p>, legacy = 1;",
+                    "export const Row = () => <p>new</p>, legacy = 1;",
+                ),
+                (
+                    "export const Row = () => <p {...rest} onClick={() => go('/old')}>x</p>, b = 1;",
+                    "export const Row = () => <p {...rest} onClick={() => go('/new')}>x</p>, b = 1;",
+                ),
+                (
+                    "export const a = <A/>, f = () => <p>// old</p>, b = 1;",
+                    "export const a = <A/>, f = () => <p>// new</p>, b = 1;",
+                ),
+                // An element still open at the end of the line holds the rest.
+                (
+                    "export const Row = () => <div className=\"old\">",
+                    "export const Row = () => <div className=\"new\">",
+                ),
+            ] {
+                assert!(same(before, after), "{file}: {before}");
+            }
+            // JSX this reader cannot follow may hide what follows it, so
+            // nothing of that line is cut as implementation.
+            assert!(
+                !same(
+                    "export const Row = () => <p>a > b</p>, legacy = 1;",
+                    "export const Row = () => <p>a > b</p>;"
+                ),
+                "{file}"
+            );
+            assert!(
+                !same(
+                    "export const Row = () => <p>a > b</p>;",
+                    "export const Row = () => <p>a > c</p>;"
+                ),
+                "{file}"
+            );
         }
 
         let same = |before: &str, after: &str| js_contracts_equal("src/view.tsx", before, after);
@@ -2300,8 +2688,6 @@ mod tests {
             (sides.old.as_str(), sides.new.as_str()),
             ("src/added.ts", "src/added.ts")
         );
-    }
-}
         assert!(!sides.copy);
 
         // A copy section leaves its source in place, until the next section.
@@ -2342,3 +2728,5 @@ mod tests {
             sides.read(line);
         }
         assert!(!sides.copy, "{filtered}");
+    }
+}
