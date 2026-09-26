@@ -104,6 +104,9 @@ pub(crate) fn classify_review_file(path: &str) -> ReviewFileCategory {
 /// but Rust production truth is revision-backed. Filtering before invoking the
 /// legacy analyzer makes that boundary structural: Rust patch lines never enter
 /// the legacy parser and cannot become a second source of Rust facts.
+///
+/// Each kept section is rewritten to the simple header shape the legacy parsers
+/// read; a copy section keeps its `copy from` line ([`LegacyPatchSides`]).
 pub(crate) fn js_ts_patch_sections(patch: &str) -> String {
     let mut output = String::new();
     let mut section = String::new();
@@ -131,10 +134,13 @@ fn flush_js_ts_section(output: &mut String, section: &str, header_paths: Option<
     let mut marker_error = false;
     let mut new_file = false;
     let mut deleted_file = false;
+    let mut copy = false;
     let mut has_hunk_or_change_content = false;
     let mut in_hunk = false;
     for line in section.lines() {
-        if let Some(value) = line.strip_prefix("--- ").filter(|_| !in_hunk) {
+        if line.starts_with("copy from ") && !in_hunk {
+            copy = true;
+        } else if let Some(value) = line.strip_prefix("--- ").filter(|_| !in_hunk) {
             if old_marker.is_some() {
                 marker_error = true;
             } else {
@@ -192,6 +198,11 @@ fn flush_js_ts_section(output: &mut String, section: &str, header_paths: Option<
     };
     let current_path = legacy_safe_patch_path(current_path);
     output.push_str(&format!("diff --git a/{current_path} b/{current_path}\n"));
+    // A copy leaves its source in place: the parsers must know that the
+    // removed lines of this section remove nothing.
+    if copy && let Some(old_path) = &old_path {
+        output.push_str(&format!("copy from {}\n", legacy_safe_patch_path(old_path)));
+    }
     output.push_str(&format!(
         "--- {}\n",
         (if old_js { old_path.as_deref() } else { None })
@@ -249,10 +260,17 @@ fn flush_js_ts_section(output: &mut String, section: &str, header_paths: Option<
 /// re-addition under the new path. A section without markers keeps the two
 /// paths of its header, and a `/dev/null` side keeps them too: it has no
 /// lines.
+///
+/// A copy section (`copy from` in its header) is different: its old side is
+/// a file that still exists, and a removed line only says how the new copy
+/// differs from it. [`copy`](Self::copy) is set for such a section, and its
+/// removed lines remove nothing.
 #[derive(Debug, Default)]
 pub(crate) struct LegacyPatchSides {
     pub(crate) old: String,
     pub(crate) new: String,
+    /// The current section copies its old side, which it leaves in place.
+    pub(crate) copy: bool,
     in_hunk: bool,
 }
 
@@ -261,7 +279,8 @@ pub(crate) struct LegacyPatchSides {
 pub(crate) enum LegacyPatchHeader {
     /// A `diff --git` line: a new section starts.
     Section,
-    /// A `---` or `+++` side marker of the current section.
+    /// A `---` or `+++` side marker, or the `copy from` line, of the current
+    /// section.
     Marker,
 }
 
@@ -274,6 +293,7 @@ impl LegacyPatchSides {
                 self.old = rest[..space_idx].to_owned();
                 self.new = rest[space_idx + 3..].to_owned();
             }
+            self.copy = false;
             self.in_hunk = false;
             return Some(LegacyPatchHeader::Section);
         }
@@ -282,6 +302,10 @@ impl LegacyPatchSides {
         }
         if self.in_hunk {
             return None;
+        }
+        if line.starts_with("copy from ") {
+            self.copy = true;
+            return Some(LegacyPatchHeader::Marker);
         }
         let marker_path = |path: &str| path.split('\t').next().unwrap_or(path).to_owned();
         if let Some(path) = line.strip_prefix("--- a/") {
@@ -2278,3 +2302,43 @@ mod tests {
         );
     }
 }
+        assert!(!sides.copy);
+
+        // A copy section leaves its source in place, until the next section.
+        sides.read("diff --git a/src/base.ts b/src/copy.ts");
+        assert_eq!(
+            sides.read("copy from src/base.ts"),
+            Some(LegacyPatchHeader::Marker)
+        );
+        assert!(sides.copy);
+        sides.read("@@ -1 +1 @@");
+        assert_eq!(sides.read("copy from src/other.ts"), None);
+        sides.read("diff --git a/src/next.ts b/src/next.ts");
+        assert!(!sides.copy);
+    }
+
+    #[test]
+    fn js_ts_patch_sections_keep_a_copy_section_a_copy() {
+        let patch = "diff --git a/src/base.ts b/src/copy.ts\nsimilarity index 80%\ncopy from src/base.ts\ncopy to src/copy.ts\n--- a/src/base.ts\n+++ b/src/copy.ts\n@@ -1 +1 @@\n-export const a = 1;\n+export const a = 2;\n";
+        let filtered = js_ts_patch_sections(patch);
+        let mut sides = LegacyPatchSides::default();
+        for line in filtered.lines() {
+            sides.read(line);
+        }
+        assert!(sides.copy, "{filtered}");
+        assert_eq!(
+            (sides.old.as_str(), sides.new.as_str()),
+            ("src/base.ts", "src/copy.ts"),
+            "{filtered}"
+        );
+
+        // A rename is not a copy.
+        let renamed = patch
+            .replace("copy from", "rename from")
+            .replace("copy to", "rename to");
+        let filtered = js_ts_patch_sections(&renamed);
+        let mut sides = LegacyPatchSides::default();
+        for line in filtered.lines() {
+            sides.read(line);
+        }
+        assert!(!sides.copy, "{filtered}");

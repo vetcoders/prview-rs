@@ -1381,6 +1381,28 @@ fn quoted_and_unquoted_space_js_paths_survive_both_legacy_adapters() {
     }));
 }
 
+/// A copy section's `-` lines say how the new copy differs from a source that
+/// still exists: reformatting an export only in the copy removes nothing from
+/// the source, and changes no signature of it.
+#[test]
+fn js_ts_copy_section_reports_no_removal_from_its_source() {
+    let patch = "diff --git a/src/base.ts b/src/copy.ts\nsimilarity index 80%\ncopy from src/base.ts\ncopy to src/copy.ts\n--- a/src/base.ts\n+++ b/src/copy.ts\n@@ -1,3 +1,3 @@\n export const a = 1;\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n export const c = 3;\n";
+
+    let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+    assert!(public.removed.is_empty(), "{:?}", public.removed);
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+    assert!(
+        breaking.iter().all(|finding| finding.file != "src/base.ts"
+            && !matches!(
+                finding.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+        "{breaking:?}"
+    );
+}
+
 /// The export lines of the vbl-190 review: two inventories whose arrow
 /// functions went from a block body to an expression body (the implementation
 /// changed, the exported contract did not), next to real API changes in the

@@ -1805,6 +1805,37 @@ mod tests {
         assert!(repo.resolve_ref("HEAD^{tree}").is_err());
     }
 
+    /// The API signals read a copy from its section header: the full diff
+    /// must carry `copy from` for a copy it detects.
+    #[test]
+    fn full_diff_names_a_detected_copy_in_its_section_header() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let body: String = (0..20)
+            .map(|index| format!("export const value{index} = {index};\n"))
+            .collect();
+        let base = write_commit(tmp.path(), "base.ts", &body);
+        // Copies are looked for among the files the same diff modifies.
+        fs::write(
+            tmp.path().join("copy.ts"),
+            body.replace("value3 = 3", "value3 = 30"),
+        )
+        .expect("write copy");
+        run_git(tmp.path(), &["add", "copy.ts"]);
+        let head = write_commit(
+            tmp.path(),
+            "base.ts",
+            &body.replace("value19 = 19", "value19 = 190"),
+        );
+
+        let repo = Repository::open(tmp.path()).expect("repo");
+        let patch = repo.full_diff(&base, &head).expect("full diff");
+        assert!(
+            patch.contains("copy from base.ts\ncopy to copy.ts\n"),
+            "{patch}"
+        );
+    }
+
     fn init_repo_with_diverged_local_base() -> (tempfile::TempDir, String, String) {
         let tmp = tempfile::tempdir().expect("tempdir");
         run_git(tmp.path(), &["init", "-q", "-b", "main"]);

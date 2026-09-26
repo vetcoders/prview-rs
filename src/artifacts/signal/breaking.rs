@@ -678,7 +678,8 @@ fn compute_breaking_risk(path: &str) -> BreakingRisk {
 fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     let mut findings = Vec::new();
     // Removed lines belong to the section's old path and added lines to its new
-    // one, so a rename section's two sides are two files.
+    // one, so a rename section's two sides are two files. A copy section's
+    // old path keeps its lines: nothing is removed from it.
     let mut sides = LegacyPatchSides::default();
     let mut scan_old = false;
     let mut scan_new = false;
@@ -722,7 +723,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                 before_cfg.reset();
                 after_cfg.reset();
             }
-            scan_old = should_scan_for_breaking_changes(&sides.old);
+            scan_old = !sides.copy && should_scan_for_breaking_changes(&sides.old);
             scan_new = should_scan_for_breaking_changes(&sides.new);
             continue;
         }

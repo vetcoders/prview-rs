@@ -373,7 +373,8 @@ fn analyze_patch_for_api_diff(
     let mut changed = Vec::new();
 
     // Removed lines belong to the section's old path and added lines to its new
-    // one, so a rename section's two sides are two files.
+    // one, so a rename section's two sides are two files. A copy section's
+    // old path keeps its lines: nothing is removed from it.
     let mut sides = LegacyPatchSides::default();
     let mut scan_old = false;
     let mut scan_new = false;
@@ -394,7 +395,7 @@ fn analyze_patch_for_api_diff(
                 rust_state_old = RustLexState::default();
                 rust_state_new = RustLexState::default();
             }
-            scan_old = scanned(&sides.old);
+            scan_old = !sides.copy && scanned(&sides.old);
             scan_new = scanned(&sides.new);
             continue;
         }
@@ -912,6 +913,19 @@ mod tests {
         assert!(ch.is_empty());
         assert!(rm.iter().any(|r| r.signature.contains("helperA")));
         assert!(rm.iter().any(|r| r.signature.contains("MY_CONSTANT")));
+    }
+
+    #[test]
+    fn a_copy_section_removes_nothing_from_its_source() {
+        // Copy detection pairs a new file with a source that still exists:
+        // the copy's `-` lines say how it differs from the source.
+        let patch = "diff --git a/src/base.ts b/src/copy.ts\nsimilarity index 80%\ncopy from src/base.ts\ncopy to src/copy.ts\n--- a/src/base.ts\n+++ b/src/copy.ts\n@@ -1,3 +1,3 @@\n export const a = 1;\n-export function api(value: number): number { return value; }\n+export function api(value: number): number {\n export const c = 3;\n";
+        let diff = analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+        assert!(diff.removed.is_empty(), "{:?}", diff.removed);
+        assert!(diff.changed.is_empty(), "{:?}", diff.changed);
+        // What the new copy exports is new.
+        assert_eq!(diff.added.len(), 1, "{:?}", diff.added);
+        assert_eq!(diff.added[0].file, "src/copy.ts");
     }
 
     #[test]
