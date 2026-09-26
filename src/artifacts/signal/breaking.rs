@@ -2,8 +2,8 @@
 
 use super::api_delta::{ApiArtifactView, ApiDeltaConfidence, ApiDeltaKind};
 use super::common::{
-    LegacyPatchHeader, LegacyPatchSides, ReviewFileCategory, classify_review_file, js_ts_export,
-    js_ts_export_is_nested, js_ts_patch_sections,
+    LegacyPatchHeader, LegacyPatchSides, ReviewFileCategory, classify_review_file,
+    is_js_ts_export_line, js_ts_export, js_ts_export_is_nested, js_ts_patch_sections,
 };
 use anyhow::Result;
 use std::fmt::Write as FmtWrite;
@@ -783,7 +783,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             before_cfg.feed(content);
 
             // JS/TS exports, paired with the added side once the patch is read.
-            if is_export_line(trimmed) {
+            if is_js_ts_export_line(&sides.old, trimmed) {
                 removed_exports.push((
                     sides.old.clone(),
                     trimmed.to_string(),
@@ -818,7 +818,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
 
             after_scope.feed(content);
 
-            if is_export_line(trimmed) {
+            if is_js_ts_export_line(&sides.new, trimmed) {
                 added_exports.push((
                     sides.new.clone(),
                     trimmed.to_string(),
@@ -928,12 +928,6 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     pair_js_ts_exports(&removed_exports, &added_exports, &mut findings);
 
     findings
-}
-
-/// Whether a trimmed diff line is an `export` statement, including a bare
-/// `export default` whose value starts on the next line.
-fn is_export_line(trimmed: &str) -> bool {
-    trimmed.starts_with("export ") || trimmed.starts_with("export default")
 }
 
 /// Report the removed JS/TS `export` lines of one patch against its added ones.

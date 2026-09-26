@@ -5,7 +5,8 @@ use super::api_delta::{
 };
 use super::common::{
     LegacyPatchHeader, LegacyPatchSides, ReviewFileCategory, RustLexState, classify_review_file,
-    js_ts_export, js_ts_export_is_nested, js_ts_patch_sections, strip_rust_non_code,
+    is_js_ts_export_line, js_ts_export, js_ts_export_is_nested, js_ts_patch_sections,
+    strip_rust_non_code,
 };
 use crate::checks::{CheckResult, CheckStatus};
 use anyhow::Result;
@@ -560,11 +561,15 @@ fn extract_public_symbol_for_file(
         return extract_public_symbol(code, true);
     }
 
-    // Every declaration the pairing reads is an export here too
+    // Every export line BREAKING_CHANGES collects is collected here too, not
+    // only the forms the prefix list names: a declaration it misses
     // (`export async function`, `export declare`, `export abstract class`,
-    // `export let` …), not only the forms the prefix list names.
-    extract_public_symbol(trimmed, false)
-        .or_else(|| js_ts_export(file, trimmed).map(|_| ("export".to_owned(), trimmed.to_owned())))
+    // `export let` …) pairs, and a re-export (`export { a } from`,
+    // `export * from`) has no single identity, never pairs, and keeps its
+    // removal or addition.
+    extract_public_symbol(trimmed, false).or_else(|| {
+        is_js_ts_export_line(file, trimmed).then(|| ("export".to_owned(), trimmed.to_owned()))
+    })
 }
 
 fn extract_public_symbol(line: &str, rust_file: bool) -> Option<(String, String)> {

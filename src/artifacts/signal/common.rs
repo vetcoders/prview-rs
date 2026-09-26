@@ -555,6 +555,16 @@ pub(crate) fn js_ts_export(file: &str, line: &str) -> Option<JsTsExport> {
     })
 }
 
+/// Whether a trimmed diff line of `file` is an `export` statement, as both API
+/// artifacts collect them: a line opening with `export ` (a declaration, a
+/// bare `export default` whose value starts on the next line, a re-export
+/// list, `export =`), or any other spelling [`js_ts_export`] reads as an
+/// exported declaration. A line that cannot pair keeps its removal or addition
+/// in both artifacts.
+pub(crate) fn is_js_ts_export_line(file: &str, trimmed: &str) -> bool {
+    trimmed.starts_with("export ") || js_ts_export(file, trimmed).is_some()
+}
+
 /// Whether a JS/TS file may write JSX: any JavaScript file, and TypeScript as
 /// `.tsx`. A `.ts`, `.mts` or `.cts` file has none, and its `<T>value` is a
 /// type assertion.

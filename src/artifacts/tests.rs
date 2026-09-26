@@ -1403,6 +1403,42 @@ fn js_ts_copy_section_reports_no_removal_from_its_source() {
     );
 }
 
+#[test]
+fn js_ts_re_exports_keep_their_removal_and_addition_in_both_api_artifacts() {
+    // A re-export binds no single name the pairing could match, so neither
+    // artifact may drop it: what importers of `src/api.ts` can reach changed.
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,3 +1,2 @@\n-export { foo } from './foo';\n-export * from './bar';\n+export * from './baz';\n export const a = 1;\n";
+
+    let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+    let removed: Vec<_> = public
+        .removed
+        .iter()
+        .map(|finding| finding.signature.as_str())
+        .collect();
+    let added: Vec<_> = public
+        .added
+        .iter()
+        .map(|finding| finding.signature.as_str())
+        .collect();
+    assert_eq!(
+        removed,
+        ["export { foo } from './foo';", "export * from './bar';"]
+    );
+    assert_eq!(added, ["export * from './baz';"]);
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+    let removed: Vec<_> = breaking
+        .iter()
+        .filter(|finding| matches!(finding.kind, BreakingKind::RemovedSymbol { .. }))
+        .map(|finding| finding.line.as_str())
+        .collect();
+    assert_eq!(
+        removed,
+        ["export { foo } from './foo';", "export * from './bar';"]
+    );
+}
+
 /// The export lines of the vbl-190 review: two inventories whose arrow
 /// functions went from a block body to an expression body (the implementation
 /// changed, the exported contract did not), next to real API changes in the
