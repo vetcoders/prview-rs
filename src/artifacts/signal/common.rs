@@ -1388,7 +1388,8 @@ fn js_arrow_end(text: &str, after_initializer: bool) -> Option<usize> {
     let initializers = if after_initializer {
         js_initializers(text, &lexemes)
     } else {
-        vec![0..lexemes.len()]
+        // The whole expression is the one place to look.
+        std::iter::once(0..lexemes.len()).collect()
     };
     for initializer in initializers {
         let Some(arrow) = initializer
