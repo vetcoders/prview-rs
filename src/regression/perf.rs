@@ -466,6 +466,7 @@ fn is_diff_metadata_line(line: &str) -> bool {
         || line.starts_with("index ")
         || line.starts_with("similarity index ")
         || line.starts_with("rename ")
+        || line.starts_with("copy ")
         || line.starts_with("new file mode ")
         || line.starts_with("deleted file mode ")
 }

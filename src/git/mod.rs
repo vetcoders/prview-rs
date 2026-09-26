@@ -1485,11 +1485,7 @@ impl Repository {
             if !in_scope(delta.new_file().path()) && !in_scope(delta.old_file().path()) {
                 return true; // skip every line of an out-of-scope delta
             }
-            let origin = line.origin();
-            if origin == '+' || origin == '-' || origin == ' ' {
-                patch.push(origin as u8);
-            }
-            patch.extend_from_slice(line.content());
+            push_patch_line(&mut patch, &delta, &line);
             true
         }) {
             eprintln!("[prview] warning: scoped diff patch formatting failed: {e}");
@@ -1497,17 +1493,11 @@ impl Repository {
         Ok(String::from_utf8_lossy(&patch).to_string())
     }
 
-    /// Convert a git2 Diff to a unified patch string.
-    /// git2's `line.content()` does NOT include the origin character (+/-/space),
-    /// so we must prepend it for content lines to produce valid unified diff output.
+    /// Convert a git2 Diff to a unified patch string (see [`push_patch_line`]).
     fn diff_to_patch(diff: &git2::Diff<'_>) -> String {
         let mut patch = Vec::new();
-        if let Err(e) = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-            let origin = line.origin();
-            if origin == '+' || origin == '-' || origin == ' ' {
-                patch.push(origin as u8);
-            }
-            patch.extend_from_slice(line.content());
+        if let Err(e) = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+            push_patch_line(&mut patch, &delta, &line);
             true
         }) {
             eprintln!("[prview] warning: diff patch formatting failed: {e}");
@@ -1604,6 +1594,58 @@ fn diff_path_to_string(path: Option<&Path>) -> Result<Option<String>> {
             .ok_or_else(|| anyhow::anyhow!("Git diff contains a non-UTF-8 path"))
     })
     .transpose()
+}
+
+/// Append one line printed by [`git2::Diff::print`] to a unified patch.
+///
+/// git2's `line.content()` does not include the origin character (+/-/space),
+/// so it is prepended for content lines. A copy's file header gets the
+/// `copy from`/`copy to` lines Git prints for every copy: libgit2 prints them
+/// only when the copy is unchanged, and without them a copy that also changes
+/// cannot be told from a rename of a file that still exists.
+fn push_patch_line(patch: &mut Vec<u8>, delta: &git2::DiffDelta<'_>, line: &git2::DiffLine<'_>) {
+    let origin = line.origin();
+    if origin == '+' || origin == '-' || origin == ' ' {
+        patch.push(origin as u8);
+    }
+    let content = line.content();
+    if origin == 'F'
+        && delta.status() == git2::Delta::Copied
+        && !content.windows(11).any(|window| window == b"\ncopy from ")
+        && let (Some(old), Some(new)) =
+            (delta.old_file().path_bytes(), delta.new_file().path_bytes())
+        && let Some(first_line) = content.iter().position(|&byte| byte == b'\n')
+    {
+        let (diff_git, rest) = content.split_at(first_line + 1);
+        patch.extend_from_slice(diff_git);
+        for (label, path) in [("copy from ", old), ("copy to ", new)] {
+            patch.extend_from_slice(label.as_bytes());
+            patch.extend_from_slice(&quote_patch_path(path));
+            patch.push(b'\n');
+        }
+        patch.extend_from_slice(rest);
+        return;
+    }
+    patch.extend_from_slice(content);
+}
+
+/// Quote a path for a patch header line the way Git and libgit2 do.
+fn quote_patch_path(path: &[u8]) -> Vec<u8> {
+    let plain = |byte: &u8| (b' '..=b'~').contains(byte) && !matches!(byte, b'"' | b'\\');
+    if path.first() != Some(&b'!') && path.iter().all(plain) {
+        return path.to_vec();
+    }
+    let mut quoted = vec![b'"'];
+    for &byte in path {
+        match byte {
+            0x07..=0x0d => quoted.extend_from_slice(&[b'\\', b"abtnvfr"[usize::from(byte - 0x07)]]),
+            b'"' | b'\\' => quoted.extend_from_slice(&[b'\\', byte]),
+            b' '..=b'~' => quoted.push(byte),
+            _ => quoted.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
+        }
+    }
+    quoted.push(b'"');
+    quoted
 }
 
 fn truncate_commit_list(commits: &mut Vec<CommitInfo>) {
@@ -1805,10 +1847,11 @@ mod tests {
         assert!(repo.resolve_ref("HEAD^{tree}").is_err());
     }
 
-    /// The API signals read a copy from its section header: the full diff
-    /// must carry `copy from` for a copy it detects.
+    /// The API signals read a copy from its section header: a patch must
+    /// carry `copy from` for every copy it detects, exactly once, whether or
+    /// not the copy changes (libgit2 prints it only for an unchanged one).
     #[test]
-    fn full_diff_names_a_detected_copy_in_its_section_header() {
+    fn patches_name_a_detected_copy_in_its_section_header() {
         let tmp = tempfile::tempdir().expect("tempdir");
         run_git(tmp.path(), &["init", "-q", "-b", "main"]);
         let body: String = (0..20)
@@ -1821,7 +1864,8 @@ mod tests {
             body.replace("value3 = 3", "value3 = 30"),
         )
         .expect("write copy");
-        run_git(tmp.path(), &["add", "copy.ts"]);
+        fs::write(tmp.path().join("same.ts"), &body).expect("write exact copy");
+        run_git(tmp.path(), &["add", "copy.ts", "same.ts"]);
         let head = write_commit(
             tmp.path(),
             "base.ts",
@@ -1829,10 +1873,73 @@ mod tests {
         );
 
         let repo = Repository::open(tmp.path()).expect("repo");
+        for patch in [
+            repo.full_diff(&base, &head).expect("full diff"),
+            repo.scoped_full_diff(&base, &head, &["copy.ts", "same.ts"])
+                .expect("scoped diff"),
+        ] {
+            assert!(
+                patch.contains(
+                    "diff --git a/base.ts b/copy.ts\ncopy from base.ts\ncopy to copy.ts\nindex "
+                ),
+                "{patch}"
+            );
+            assert_eq!(patch.matches("copy to same.ts\n").count(), 1, "{patch}");
+            assert_eq!(patch.matches("copy from ").count(), 2, "{patch}");
+        }
+    }
+
+    /// End to end, as the review pack reads it: a copy that changes an
+    /// export's signature leaves the export of its source in place.
+    #[test]
+    fn a_changed_copy_removes_nothing_from_its_source_in_the_js_ts_signals() {
+        use crate::artifacts::signal;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let mut body: String = (0..18)
+            .map(|index| format!("export const value{index} = {index};\n"))
+            .collect();
+        body.push_str("export function api(value: number): number { return value; }\n");
+        body.push_str("// revision 1\n");
+        let base = write_commit(tmp.path(), "base.ts", &body);
+        fs::write(
+            tmp.path().join("copy.ts"),
+            body.replace("value: number): number", "value: string): string"),
+        )
+        .expect("write copy");
+        run_git(tmp.path(), &["add", "copy.ts"]);
+        let head = write_commit(
+            tmp.path(),
+            "base.ts",
+            &body.replace("revision 1", "revision 2"),
+        );
+
+        let repo = Repository::open(tmp.path()).expect("repo");
         let patch = repo.full_diff(&base, &head).expect("full diff");
+        assert!(patch.contains("copy from base.ts\n"), "{patch}");
+
+        let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+        assert!(public.removed.is_empty(), "{:?}", public.removed);
+        assert!(public.changed.is_empty(), "{:?}", public.changed);
+        let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
         assert!(
-            patch.contains("copy from base.ts\ncopy to copy.ts\n"),
-            "{patch}"
+            breaking.iter().all(|finding| finding.file != "base.ts"),
+            "{breaking:?}"
+        );
+    }
+
+    #[test]
+    fn quote_patch_path_quotes_like_git() {
+        assert_eq!(quote_patch_path(b"src/a b.ts"), b"src/a b.ts");
+        assert_eq!(quote_patch_path(b"!bang.ts"), b"\"!bang.ts\"");
+        assert_eq!(
+            quote_patch_path(b"a\tb\"c\\d.ts"),
+            b"\"a\\tb\\\"c\\\\d.ts\""
+        );
+        assert_eq!(
+            quote_patch_path("za\u{17c}\u{f3}\u{142}\u{107}.ts".as_bytes()),
+            b"\"za\\305\\274\\303\\263\\305\\202\\304\\207.ts\""
         );
     }
 
