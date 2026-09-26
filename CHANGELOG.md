@@ -531,10 +531,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different tokens, a conditional whose branches are arrow functions, and a
   binding's later declarators after an arrow function
   (`f = (x) => x, legacy = 1`) are all kept apart from formatting, so none of
-  them can hide a real change. A `/` after a closing `}`, a postfix `++` or
-  `--`, or a non-null `!` divides, so a comment after it is still a comment,
-  while a `/` after an `if`/`while`/`for` condition starts a regular
-  expression; parentheses around a whole initializer, spacing that joins no
+  them can hide a real change. A `/` after an object literal's `}`, a postfix
+  `++` or `--`, or a non-null `!` divides, so a comment after it is still a
+  comment, while a `/` after an `if`/`while`/`for` condition or a statement
+  block starts a regular expression; parentheses around a whole initializer, spacing that joins no
   token (`a + -b`) and a `;` after a one-line function body (a comment beside
   it included) are formatting. Every export form the reader recognizes is
   paired, `export async function`, `export declare`, `export abstract class`
@@ -544,7 +544,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a copy that also changes. A re-export list, an export with no single
   name, an export moved to another file (including the old path of a renamed
   module), and an export written indented inside a TypeScript `namespace` or
-  `declare module` block keep their removal.
+  `declare module` block keep their removal, in `PUBLIC_API_DIFF` as in
+  `BREAKING_CHANGES` (a re-export used to reach only the latter).
 
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops

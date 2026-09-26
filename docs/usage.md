@@ -1061,13 +1061,16 @@ parameter's default (`<T = unknown>`), a function type in a declarator's
 annotation, a conditional whose branches are arrow functions and the
 declarators a binding lists after an arrow function
 (`f = (x) => x, legacy = 1`) are read for what they are, so they never hide a
-change; a line whose JSX the reader cannot follow is compared whole. A file
+change; a regular expression is recognized after a statement block too
+(`if (x) {} /[{]/`). A line whose JSX the reader cannot follow is compared
+whole. A file
 copied from one the same change modifies removes nothing from its source: the
 copy's differences are not read as the source's exports removed or changed.
 The comparison is a single-line heuristic: an export with no single
 declared name (`export { a } from`, `export *`), one moved to another file (the
 old path of a renamed module included), and one written indented inside a
-TypeScript `namespace` or `declare module` block keep their removal, since
+TypeScript `namespace` or `declare module` block keep their removal (and an
+added one its addition) in both `PUBLIC_API_DIFF` and `BREAKING_CHANGES`, since
 importers of the old path or qualified name still break.
 
 The ordinary remote `prview --pr <number>` fast preset does not enter the full

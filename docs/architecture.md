@@ -3518,9 +3518,12 @@ it is part of the outer one) and `//` / `/* */` comments as whitespace. A `/`
 is a division only after an operand: a name that is not a keyword such as
 `return` or `default` (or is one read as a property, `mod.default`), a
 literal, a closing `)` (unless it closes an `if`, `while`, `for` or `with`
-condition, after which a regular expression starts), `]` or `}` (on an export
-line a `}` ends an object literal or a body, never a place a regular
-expression starts), a postfix `++` or `--`, or TypeScript's non-null `!`.
+condition, after which a regular expression starts), `]`, a `}` that closes
+an object literal rather than a statement block (`common::js_closes_block`: a
+block's `{` follows a `)`, `;`, `{`, `}`, `else`, `do`, `try`, `finally` or a
+name that is no expression keyword, so `if (x) {} /[{]/` starts a regular
+expression while `= {} / 2` and `return {} / 2` divide), a postfix `++` or
+`--`, or TypeScript's non-null `!`.
 Whitespace survives only where the characters on both sides would join into
 another token (`+ +`, `= >`, `/ /`, but not `+ -`). Where the file may write
 JSX (any JavaScript file, and `.tsx`), each JSX element is one opaque unit too
@@ -3547,12 +3550,16 @@ different: its source still exists, and a removed line only says how the copy
 differs from it, so both analyzers skip a copy's old side. libgit2 prints
 `copy from` only for an unchanged copy; the patch printers
 (`git::push_patch_line`) add it, quoted as Git quotes it, for every copy, as
-Git does. The public API diff pairs every line `common::js_ts_export`
-recognizes (`export async function`, `export declare`, `export abstract class`,
-`export let`/`var`), not only the forms its own prefix list names. A
-line with no single name (`export { a } from`, `export *`, `export =`), an
-export moved to another file, and an export written indented
-(`common::js_ts_export_is_nested`) stay a `RemovedSymbol`: an indented export
+Git does. Both analyzers collect the same export lines
+(`common::is_js_ts_export_line`: a line opening with `export `, or any other
+spelling `common::js_ts_export` reads as a declaration), so the public API diff
+pairs every form the reader recognizes (`export async function`,
+`export declare`, `export abstract class`, `export let`/`var`), not only the
+forms its own prefix list names. A line with no single name
+(`export { a } from`, `export *`, `export =`), an export moved to another
+file, and an export written indented (`common::js_ts_export_is_nested`) stay a
+`RemovedSymbol`, and a removal (or an addition) in the public API diff: an
+indented export
 is a member of a `namespace` or ambient `module` block whose name the line
 does not show, and moving it between blocks breaks consumers of the old
 qualified name. An unindented member of such a block still pairs; that is the
