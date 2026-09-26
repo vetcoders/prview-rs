@@ -759,9 +759,9 @@ fn plan_context_cmds(
 
     // Cargo profile
     if config.profile.has_cargo {
-        // `config.profile.cargo_root` names the LOCAL checkout's cargo root; a
-        // workspace member sits below the scan root, and the reviewed commit may
-        // have moved it. Resolve it the way the cargo gates do so `cargo tree`
+        // `config.profile.cargo_root` names a logical repository path; a
+        // workspace member sits below the scan root. Resolve it the way the
+        // cargo gates do so `cargo tree`
         // reports the crate they judged, not a sibling.
         let cwd = crate::checks::planned_cargo_cwd(config, &scan_root);
         cmds.push(ContextCmd {

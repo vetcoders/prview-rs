@@ -142,6 +142,13 @@ impl ReviewedTree {
     /// Its reviewed SOURCE is exactly `target_sha` — only the dependency links
     /// came from the operator checkout — and source is the whole of what test
     /// selection reads.
+    ///
+    /// [`TreeState::SnapshotUnprovenDeps`] joins it for the same reason, and the
+    /// reason is worth stating precisely: an unproved closure is a statement
+    /// about DEPENDENCY bytes, never about source. The snapshot was still
+    /// materialised from exactly `target_sha`, so the change set lists every
+    /// file a selection can read. Escalating here would punish selection for an
+    /// uncertainty that cannot reach it.
     pub fn resolve(
         repo_root: &Path,
         scan_dir: Option<PathBuf>,
@@ -151,9 +158,11 @@ impl ReviewedTree {
         use crate::checks::TreeState;
         match scan_dir {
             Some(snapshot) => match snapshot_tree_state {
-                Some(TreeState::Snapshot | TreeState::SnapshotBorrowedDeps) => {
-                    Self::Snapshot(snapshot)
-                }
+                Some(
+                    TreeState::Snapshot
+                    | TreeState::SnapshotBorrowedDeps
+                    | TreeState::SnapshotUnprovenDeps,
+                ) => Self::Snapshot(snapshot),
                 // Includes `None`: a snapshot on disk whose substrate the run
                 // never resolved is a tree nobody has identified. Unknown is the
                 // honest name for it, and it escalates.
@@ -1559,13 +1568,9 @@ enum CargoRoot {
 
 /// Where to read `cargo metadata` from.
 ///
-/// `profile.cargo_root` is detected in the OPERATOR's checkout, which on a
-/// `--pr` or `--remote` run is a different revision from the one under review.
-/// Reading metadata there would describe another revision's members and path
-/// edges while the change set describes this one — members could be missing,
-/// added, or moved between them, and the resulting selection would be drawn
-/// from the wrong workspace. So the detected root is re-expressed relative to
-/// the repository root and rebased onto the reviewed tree.
+/// `profile.cargo_root` is a logical repository path. An exact review detects
+/// it from the pinned tree and maps it under `repo_root`; the operator checkout
+/// need not contain that path. Rebase it onto the scan tree before metadata.
 ///
 /// When that cannot be done — a cargo root outside the repository, or roots
 /// that will not canonicalise onto each other — the answer is not "guess":
@@ -1574,6 +1579,12 @@ fn reviewed_cargo_root(config: &crate::config::Config, reviewed_root: &Path) -> 
     let Some(detected) = &config.profile.cargo_root else {
         return CargoRoot::None;
     };
+    if config.scan_dir_override.is_some() {
+        // This path was mapped from the reviewed snapshot. Canonicalising it
+        // through the operator checkout could turn a missing or redirected
+        // local path into an unrelated root.
+        return rebase_cargo_root(detected, &config.repo_root, reviewed_root);
+    }
     let repo_root = config
         .repo_root
         .canonicalize()
@@ -1587,8 +1598,17 @@ fn reviewed_cargo_root(config: &crate::config::Config, reviewed_root: &Path) -> 
 /// inside the repository has no reviewed counterpart to compute.
 fn rebase_cargo_root(detected: &Path, repo_root: &Path, reviewed_root: &Path) -> CargoRoot {
     match detected.strip_prefix(repo_root) {
-        Ok(relative) => CargoRoot::Reviewed(reviewed_root.join(relative)),
-        Err(_) => CargoRoot::Unlocatable,
+        Ok(relative)
+            if relative.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            }) =>
+        {
+            CargoRoot::Reviewed(reviewed_root.join(relative))
+        }
+        _ => CargoRoot::Unlocatable,
     }
 }
 

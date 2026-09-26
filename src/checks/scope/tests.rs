@@ -1170,10 +1170,7 @@ fn a_run_that_neutralised_nothing_publishes_no_neutral_list() {
 // The cargo root must be the REVIEWED one
 // ---------------------------------------------------------------------------
 
-/// `profile.cargo_root` is detected in the operator checkout, which on a `--pr`
-/// run is a different revision from the one under review. Reading metadata
-/// there would describe another revision's members and path edges while the
-/// change set describes this one.
+/// A profile root is mapped from the reviewed tree into the scan tree.
 #[test]
 fn the_cargo_root_is_rebased_onto_the_reviewed_tree() {
     assert_eq!(
@@ -1198,6 +1195,21 @@ fn the_cargo_root_is_rebased_onto_the_reviewed_tree() {
 }
 
 #[test]
+fn target_profile_root_need_not_exist_in_operator_checkout() {
+    let operator = tempfile::tempdir().unwrap();
+    let reviewed = tempfile::tempdir().unwrap();
+    let mut config = crate::config::test_config();
+    config.repo_root = operator.path().to_path_buf();
+    config.profile.cargo_root = Some(operator.path().join("backend"));
+    config.scan_dir_override = Some(reviewed.path().to_path_buf());
+
+    assert_eq!(
+        reviewed_cargo_root(&config, reviewed.path()),
+        CargoRoot::Reviewed(reviewed.path().join("backend"))
+    );
+}
+
+#[test]
 fn a_cargo_root_outside_the_repository_escalates_rather_than_guessing() {
     assert_eq!(
         rebase_cargo_root(
@@ -1206,6 +1218,15 @@ fn a_cargo_root_outside_the_repository_escalates_rather_than_guessing() {
             Path::new("/snap")
         ),
         CargoRoot::Unlocatable
+    );
+    assert_eq!(
+        rebase_cargo_root(
+            Path::new("/repo/../outside"),
+            Path::new("/repo"),
+            Path::new("/snap")
+        ),
+        CargoRoot::Unlocatable,
+        "a lexical prefix cannot permit traversal outside the reviewed tree"
     );
     let unlocatable: Result<CargoWorkspace, WorkspaceError> = Err(WorkspaceError::UnlocatableRoot);
     let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
