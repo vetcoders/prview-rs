@@ -1410,11 +1410,13 @@ fn js_ts_re_exports_keep_their_removal_and_addition_in_both_api_artifacts() {
     let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,3 +1,2 @@\n-export { foo } from './foo';\n-export * from './bar';\n+export * from './baz';\n export const a = 1;\n";
 
     let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
-    let removed: Vec<_> = public
+    // Row order is not part of either artifact's contract.
+    let mut removed: Vec<_> = public
         .removed
         .iter()
         .map(|finding| finding.signature.as_str())
         .collect();
+    removed.sort_unstable();
     let added: Vec<_> = public
         .added
         .iter()
@@ -1422,20 +1424,21 @@ fn js_ts_re_exports_keep_their_removal_and_addition_in_both_api_artifacts() {
         .collect();
     assert_eq!(
         removed,
-        ["export { foo } from './foo';", "export * from './bar';"]
+        ["export * from './bar';", "export { foo } from './foo';"]
     );
     assert_eq!(added, ["export * from './baz';"]);
     assert!(public.changed.is_empty(), "{:?}", public.changed);
 
     let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
-    let removed: Vec<_> = breaking
+    let mut removed: Vec<_> = breaking
         .iter()
         .filter(|finding| matches!(finding.kind, BreakingKind::RemovedSymbol { .. }))
         .map(|finding| finding.line.as_str())
         .collect();
+    removed.sort_unstable();
     assert_eq!(
         removed,
-        ["export { foo } from './foo';", "export * from './bar';"]
+        ["export * from './bar';", "export { foo } from './foo';"]
     );
 }
 
