@@ -1583,10 +1583,23 @@ fn one_line_js_class_members_and_ambient_return_types_are_contract() {
     // changed without a `;`: both are changes importers see.
     let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,2 +1,2 @@\n-export class Client { oldMethod() {} }\n-export declare function load(): { old: string }\n+export class Client { newMethod() {} }\n+export declare function load(): { new: string }\n".to_owned();
 
+    // Both artifacts report both: the `export declare function` form reaches
+    // the public API pairing too.
     let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
     assert!(public.added.is_empty() && public.removed.is_empty());
-    assert_eq!(public.changed.len(), 1, "{:?}", public.changed);
-    assert!(public.changed[0].after.contains("newMethod"));
+    assert_eq!(
+        public
+            .changed
+            .iter()
+            .map(|change| change.after.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "export class Client { newMethod() {} }",
+            "export declare function load(): { new: string }"
+        ],
+        "{:?}",
+        public.changed
+    );
 
     let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
     let changed = breaking
