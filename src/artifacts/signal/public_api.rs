@@ -560,7 +560,11 @@ fn extract_public_symbol_for_file(
         return extract_public_symbol(code, true);
     }
 
+    // Every declaration the pairing reads is an export here too
+    // (`export async function`, `export declare`, `export abstract class`,
+    // `export let` …), not only the forms the prefix list names.
     extract_public_symbol(trimmed, false)
+        .or_else(|| js_ts_export(file, trimmed).map(|_| ("export".to_owned(), trimmed.to_owned())))
 }
 
 fn extract_public_symbol(line: &str, rust_file: bool) -> Option<(String, String)> {
@@ -913,6 +917,37 @@ mod tests {
         assert!(ch.is_empty());
         assert!(rm.iter().any(|r| r.signature.contains("helperA")));
         assert!(rm.iter().any(|r| r.signature.contains("MY_CONSTANT")));
+    }
+
+    #[test]
+    fn every_recognized_export_form_reaches_the_pairing() {
+        for (before, after) in [
+            (
+                "export async function load(x: string) {",
+                "export async function load(x: number) {",
+            ),
+            (
+                "export declare function load(x: string): void;",
+                "export declare function load(x: number): void;",
+            ),
+            (
+                "export abstract class Store<T> {",
+                "export abstract class Store<T, U> {",
+            ),
+            ("export let limit: number;", "export let limit: string;"),
+        ] {
+            let patch = format!(
+                "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1 +1 @@\n-{before}\n+{after}\n"
+            );
+            let diff = analyze_js_ts_public_api_diff(&[patch]);
+            assert_eq!(diff.changed.len(), 1, "{before}");
+            assert!(
+                diff.changed[0]
+                    .before
+                    .contains(before.trim_end_matches(" {"))
+            );
+            assert!(diff.removed.is_empty() && diff.added.is_empty(), "{before}");
+        }
     }
 
     #[test]
