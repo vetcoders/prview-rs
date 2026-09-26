@@ -3497,13 +3497,19 @@ binding importers use (the declared name or `default`), whether it lives in
 TypeScript's type namespace (`interface`, `type`), and a comparison form with
 formatting, comments and implementation removed: an arrow function up to its
 `=>` (a later declarator of the same binding, `f = (x) => x, legacy = 1`,
-stays, its own arrow body dropped the same way), a `function` without the body
-it opens or holds, `;` after it or not, when that `{` follows the parameter
-list or a finished return type (a `{` after `:`, `=>`, `|` opens a return-type
-literal, which stays), a `class` without only the `{` that opens its body below
-(members written on the line stay), and an initializer without parentheses
-that group it whole (`= ((x) => x)`; a comma expression `(a, b)` and a called
-group `((x) => x)(1)` keep theirs). An arrow in a conditional's branch
+stays, its own arrow body dropped the same way). The arrow is looked for only
+in a declarator's initializer (`common::js_initializers`): its name and type
+annotation come before its `=`, and there `<` and `>` bracket type parameters,
+so neither a type parameter's default (`: <T = unknown>(x: T) => R = …`) nor a
+function type in a later declarator's annotation (`a = 1, b: () => R = f`) is
+taken for an initializer or its arrow body. The form also drops the body a
+`function` opens or holds, `;` after it or not (a comment may stand on either
+side of that `;`), when that `{` follows the parameter list or a finished
+return type (a `{` after `:`, `=>`, `|` opens a return-type literal, which
+stays); only the `{` that opens a `class` body below (members written on the
+line stay); and parentheses that group an initializer whole (`= ((x) => x)`;
+a comma expression `(a, b)` and a called group `((x) => x)(1)` keep theirs).
+An arrow in a conditional's branch
 (`c ? (x) => 1 : (y) => 2`) is no body to cut at, since the other branch
 follows it, so that line compares whole. The form is built from a line lexer
 (`common::js_lex`) that reads string, template and regular-expression literals
@@ -3511,16 +3517,24 @@ as opaque units (a template's `${…}` is lexed as code, so a template nested in
 it is part of the outer one) and `//` / `/* */` comments as whitespace. A `/`
 is a division only after an operand: a name that is not a keyword such as
 `return` or `default` (or is one read as a property, `mod.default`), a
-literal, a closing `)`, `]` or `}` (on an export line a `}` ends an object
-literal or a body, never a place a regular expression starts), a postfix `++`
-or `--`, or TypeScript's non-null `!`. Whitespace survives only where the
-characters on both sides would join into another token (`+ +`, `= >`, `/ /`,
-but not `+ -`). Where the file may write JSX (any JavaScript file, and `.tsx`),
-the line from the JSX it writes on is one opaque unit too
-(`common::opaque_js_jsx`): a `<` where an operand starts, followed by a tag
-name or a fragment's `>`, and not a generic arrow's `<T,>`, `<T extends U>` or
-`<T = U>`. JSX text such as a URL's `//` is then no comment, and the unit never
-equals a string literal of the same text. A removal pairs with an addition in
+literal, a closing `)` (unless it closes an `if`, `while`, `for` or `with`
+condition, after which a regular expression starts), `]` or `}` (on an export
+line a `}` ends an object literal or a body, never a place a regular
+expression starts), a postfix `++` or `--`, or TypeScript's non-null `!`.
+Whitespace survives only where the characters on both sides would join into
+another token (`+ +`, `= >`, `/ /`, but not `+ -`). Where the file may write
+JSX (any JavaScript file, and `.tsx`), each JSX element is one opaque unit too
+(`common::opaque_js_jsx`): a `<` where an operand starts (on a binding line,
+inside an initializer), followed by a tag name or a fragment's `>`, and not a
+generic arrow's `<T,>`, `<T extends U>` or `<T = U>`. A bounded reader
+(`common::jsx_element_end`) follows the element's attributes, its `{…}`
+expressions (nested JSX included), its children and its closing tag, and the
+unit ends where the element closes, so a later declarator or the `}` that ends
+a one-line body stays visible. An element still open at the end of the line
+runs to it. JSX the reader cannot follow (a bare `>` or `}` in its text) keeps
+the whole line uncut: noise, never a hidden change. JSX text such as a URL's
+`//` is then no comment, and the unit never equals a string literal of the
+same text. A removal pairs with an addition in
 the same file with the same name and namespace, equal forms first. Equal forms
 report nothing; different forms are one `ChangedSignature`.
 
@@ -3528,6 +3542,14 @@ Each side of a section has its own file (`common::LegacyPatchSides`): removed
 lines take the `--- a/…` path and added lines the `+++ b/…` path read before
 the first hunk, so a modified rename's old-module export is a removal there and
 not paired away by the new path the normalized `diff --git` header carries. A
+copy section (`copy from` in its header, which the JS/TS filter keeps) is
+different: its source still exists, and a removed line only says how the copy
+differs from it, so both analyzers skip a copy's old side. libgit2 prints
+`copy from` only for an unchanged copy; the patch printers
+(`git::push_patch_line`) add it, quoted as Git quotes it, for every copy, as
+Git does. The public API diff pairs every line `common::js_ts_export`
+recognizes (`export async function`, `export declare`, `export abstract class`,
+`export let`/`var`), not only the forms its own prefix list names. A
 line with no single name (`export { a } from`, `export *`, `export =`), an
 export moved to another file, and an export written indented
 (`common::js_ts_export_is_nested`) stay a `RemovedSymbol`: an indented export

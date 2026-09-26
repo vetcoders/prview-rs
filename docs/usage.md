@@ -1051,12 +1051,20 @@ reported as a removal plus an addition. When the two lines agree once
 formatting, comments and implementation are set aside, the export was only
 re-emitted, for example a formatter turning an arrow function's `=> {` block
 body into an `=>` expression body, and nothing is reported. When they differ,
-the pair is one signature change. Comments, string, template and
-regular-expression literals, JSX (in JavaScript and `.tsx` files), a one-line
-class's members, a return-type literal, a conditional whose branches are arrow
-functions and the declarators a binding lists after an arrow function
+the pair is one signature change. Every export form the reader recognizes is
+paired, `export async function`, `export declare function`,
+`export abstract class` and `export let`/`var` included. Comments, string,
+template and regular-expression literals, JSX (in JavaScript and `.tsx` files,
+read element by element, so what follows an element on the line stays
+visible), a one-line class's members, a return-type literal, a type
+parameter's default (`<T = unknown>`), a function type in a declarator's
+annotation, a conditional whose branches are arrow functions and the
+declarators a binding lists after an arrow function
 (`f = (x) => x, legacy = 1`) are read for what they are, so they never hide a
-change. The comparison is a single-line heuristic: an export with no single
+change; a line whose JSX the reader cannot follow is compared whole. A file
+copied from one the same change modifies removes nothing from its source: the
+copy's differences are not read as the source's exports removed or changed.
+The comparison is a single-line heuristic: an export with no single
 declared name (`export { a } from`, `export *`), one moved to another file (the
 old path of a renamed module included), and one written indented inside a
 TypeScript `namespace` or `declare module` block keep their removal, since

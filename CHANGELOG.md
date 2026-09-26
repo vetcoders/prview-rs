@@ -523,18 +523,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature change in both artifacts instead of a removal. Comments (`//` and
   `/* */`, with or without surrounding spaces), string, template (a template
   nested in a `${…}` included) and regular-expression literals, JSX in
-  JavaScript and `.tsx` files, a one-line class's members, a return-type
-  literal, whitespace that separates two operators into different tokens, a
-  conditional whose branches are arrow functions, and a binding's later
-  declarators after an arrow function (`f = (x) => x, legacy = 1`) are all kept
-  apart from formatting, so none of them can hide a real change. A `/` after a
-  closing `}`, a postfix `++` or `--`, or a non-null `!` divides, so a comment
-  after it is still a comment, while parentheses around a whole initializer,
-  spacing that joins no token (`a + -b`) and a `;` after a one-line function
-  body are formatting. A re-export list, an export with no single name, an
-  export moved to another file (including the old path of a renamed module),
-  and an export written indented inside a TypeScript `namespace` or `declare
-  module` block keep their removal.
+  JavaScript and `.tsx` files (read element by element, so a declarator or a
+  body's end after an element stays visible, and compared whole where an
+  element cannot be followed), a one-line class's members, a return-type
+  literal, a type parameter's default (`<T = unknown>`), a function type in a
+  declarator's annotation, whitespace that separates two operators into
+  different tokens, a conditional whose branches are arrow functions, and a
+  binding's later declarators after an arrow function
+  (`f = (x) => x, legacy = 1`) are all kept apart from formatting, so none of
+  them can hide a real change. A `/` after a closing `}`, a postfix `++` or
+  `--`, or a non-null `!` divides, so a comment after it is still a comment,
+  while a `/` after an `if`/`while`/`for` condition starts a regular
+  expression; parentheses around a whole initializer, spacing that joins no
+  token (`a + -b`) and a `;` after a one-line function body (a comment beside
+  it included) are formatting. Every export form the reader recognizes is
+  paired, `export async function`, `export declare`, `export abstract class`
+  and `export let`/`var` included. A file copied from one the same change
+  modifies no longer reads as that source's exports removed or changed: the
+  review pack's patch names every copy (`copy from`), which libgit2 left out
+  for a copy that also changes. A re-export list, an export with no single
+  name, an export moved to another file (including the old path of a renamed
+  module), and an export written indented inside a TypeScript `namespace` or
+  `declare module` block keep their removal.
 
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
