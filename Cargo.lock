@@ -2211,9 +2211,9 @@ dependencies = [
 
 [[package]]
 name = "loctree"
-version = "0.14.4"
+version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb53dd325c734340caf026bad67fa16afbb9d351be2c3d497a731875eb030a14"
+checksum = "70a0112972b4f386cce5a55963747d55ded464b7123535eb886148aba5fbc65f"
 dependencies = [
  "aicx",
  "anyhow",
@@ -2244,7 +2244,7 @@ dependencies = [
  "oxc_span",
  "regex",
  "report-leptos",
- "rmcp 1.8.0",
+ "rmcp",
  "schemars",
  "serde",
  "serde_json",
@@ -2267,9 +2267,9 @@ dependencies = [
 
 [[package]]
 name = "loctree-ast"
-version = "0.14.4"
+version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67b9cddb9b08d42345c6a86c6ec06fe8828b43173daf974710b889a5c006bab3"
+checksum = "44c27a2d89447dc6407c2913db82ae1b0f5ae46a7be2ccb17fd34583c339aa25"
 dependencies = [
  "thiserror 2.0.18",
  "tree-sitter",
@@ -3275,7 +3275,7 @@ dependencies = [
  "quote",
  "ratatui",
  "regex",
- "rmcp 2.0.0",
+ "rmcp",
  "schemars",
  "semver",
  "serde",
@@ -3579,37 +3579,13 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "report-leptos"
-version = "0.14.4"
+version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c29cd7d44fc4d520b9c6d2b38d6a4ed92c53a877ec1387d7d02998be87f370db"
+checksum = "a378564f39518dbbd0b8e9822a21b7c9e4fffd1928caf84f071c81e99bea0aee"
 dependencies = [
  "leptos",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "rmcp"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59"
-dependencies = [
- "async-trait",
- "base64",
- "chrono",
- "futures",
- "pastey",
- "pin-project-lite",
- "process-wrap",
- "rmcp-macros 1.8.0",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -3624,27 +3600,16 @@ dependencies = [
  "futures",
  "pastey",
  "pin-project-lite",
- "rmcp-macros 2.0.0",
+ "process-wrap",
+ "rmcp-macros",
  "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "rmcp-macros"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aad0035b69380782d78ea95b508327e6deaa2235909053e596eea8f27b5e1d5"
-dependencies = [
- "darling",
- "proc-macro2",
- "quote",
- "serde_json",
- "syn 2.0.117",
 ]
 
 [[package]]
