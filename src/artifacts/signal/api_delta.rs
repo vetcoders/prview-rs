@@ -162,6 +162,14 @@ type ModuleKey<'a> = (&'a str, &'a [String]);
 /// name).
 type ReexportKey<'a> = (&'a str, &'a [String], &'a str);
 
+/// One public module alias retained for unknown-region projection.
+struct ModuleAliasRegion<'a> {
+    crate_name: &'a str,
+    alias_path: &'a [String],
+    target_path: &'a [String],
+    cfg_guard: &'a [String],
+}
+
 /// What one snapshot's unknown regions can hide from pairing: the unknowns
 /// and the module structure the snapshot still proves around them.
 struct SnapshotRegions<'a> {
@@ -173,9 +181,8 @@ struct SnapshotRegions<'a> {
     /// The origin module of every re-export, per crate, re-exporting module
     /// and external name.
     reexport_origins: BTreeMap<ReexportKey<'a>, Vec<&'a [String]>>,
-    /// Public module aliases as (crate, alias path, target module path, cfg
-    /// guard).
-    module_aliases: Vec<(&'a str, &'a [String], &'a [String], &'a [String])>,
+    /// Public module aliases available for path projection.
+    module_aliases: Vec<ModuleAliasRegion<'a>>,
 }
 
 impl<'a> SnapshotRegions<'a> {
@@ -225,13 +232,11 @@ impl<'a> SnapshotRegions<'a> {
         let module_aliases = snapshot
             .module_aliases
             .iter()
-            .map(|alias| {
-                (
-                    alias.crate_name.as_str(),
-                    alias.module_path.as_slice(),
-                    alias.target_module_path.as_slice(),
-                    alias.cfg_guard.as_slice(),
-                )
+            .map(|alias| ModuleAliasRegion {
+                crate_name: alias.crate_name.as_str(),
+                alias_path: alias.module_path.as_slice(),
+                target_path: alias.target_module_path.as_slice(),
+                cfg_guard: alias.cfg_guard.as_slice(),
             })
             .collect();
         Self {
@@ -1911,14 +1916,14 @@ fn region_may_cover(
         bound_path.push(identity.name.clone());
     }
     let mut candidates = vec![bound_path];
-    for (alias_crate, alias_path, target_path, alias_guard) in &regions.module_aliases {
-        if *alias_crate == crate_name
-            && candidates[0].starts_with(alias_path)
-            && guards_may_overlap(alias_guard, &identity.cfg_region)
-            && guards_may_overlap(alias_guard, &unknown.cfg_guard)
+    for alias in &regions.module_aliases {
+        if alias.crate_name == crate_name
+            && candidates[0].starts_with(alias.alias_path)
+            && guards_may_overlap(alias.cfg_guard, &identity.cfg_region)
+            && guards_may_overlap(alias.cfg_guard, &unknown.cfg_guard)
         {
-            let mut projected = target_path.to_vec();
-            projected.extend_from_slice(&candidates[0][alias_path.len()..]);
+            let mut projected = alias.target_path.to_vec();
+            projected.extend_from_slice(&candidates[0][alias.alias_path.len()..]);
             candidates.push(projected);
         }
     }
