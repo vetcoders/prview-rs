@@ -3506,8 +3506,9 @@ taken for an initializer or its arrow body. The form also drops the body a
 `function` opens or holds, `;` after it or not (a comment may stand on either
 side of that `;`), when that `{` follows the parameter list or a finished
 return type (a `{` after `:`, `=>`, `|` opens a return-type literal, which
-stays); only the `{` that opens a `class` body below (members written on the
-line stay); and parentheses that group an initializer whole (`= ((x) => x)`;
+stays); a one-line class's method and static-block implementations while its
+member declarations stay; only the `{` from a class body continued below; and
+parentheses that group an initializer whole (`= ((x) => x)`;
 a comma expression `(a, b)` and a called group `((x) => x)(1)` keep theirs).
 An arrow in a conditional's branch
 (`c ? (x) => 1 : (y) => 2`) is no body to cut at, since the other branch
@@ -3519,11 +3520,13 @@ is a division only after an operand: a name that is not a keyword such as
 `return` or `default` (or is one read as a property, `mod.default`), a
 literal, a closing `)` (unless it closes an `if`, `while`, `for` or `with`
 condition, after which a regular expression starts), `]`, a `}` that closes
-an object literal rather than a statement block (`common::js_closes_block`: a
-block's `{` follows a `)`, `;`, `{`, `}`, `else`, `do`, `try`, `finally` or a
-name that is no expression keyword, so `if (x) {} /[{]/` starts a regular
-expression while `= {} / 2` and `return {} / 2` divide), a postfix `++` or
-`--`, or TypeScript's non-null `!`.
+an object literal or function-expression body rather than a statement block
+(`common::js_closes_block`: a block's `{` follows a `)`, except when those
+parentheses belong to a `function` expression in expression position, or follows `;`, `{`,
+`}`, `else`, `do`, `try`, `finally` or a name that is no expression keyword;
+therefore `if (x) {} /[{]/` starts a regular expression while `= {} / 2`,
+`return {} / 2` and `= function () {} / 2` divide), a postfix `++` or `--`, or
+TypeScript's non-null `!`.
 Whitespace survives only where the characters on both sides would join into
 another token (`+ +`, `= >`, `/ /`, but not `+ -`). Where the file may write
 JSX (any JavaScript file, and `.tsx`), each JSX element is one opaque unit too
@@ -3539,7 +3542,9 @@ the whole line uncut: noise, never a hidden change. JSX text such as a URL's
 `//` is then no comment, and the unit never equals a string literal of the
 same text. A removal pairs with an addition in
 the same file with the same name and namespace, equal forms first. Equal forms
-report nothing; different forms are one `ChangedSignature`.
+report nothing; different forms are one `ChangedSignature`. Re-exports without
+a single identity remain additions or removals whether whitespace or comment
+trivia follows the `export` keyword or the list/star follows it directly.
 
 Each side of a section has its own file (`common::LegacyPatchSides`): removed
 lines take the `--- a/…` path and added lines the `+++ b/…` path read before
@@ -3551,8 +3556,9 @@ differs from it, so both analyzers skip a copy's old side. libgit2 prints
 `copy from` only for an unchanged copy; the patch printers
 (`git::push_patch_line`) add it, quoted as Git quotes it, for every copy, as
 Git does. Both analyzers collect the same export lines
-(`common::is_js_ts_export_line`: a line opening with `export `, or any other
-spelling `common::js_ts_export` reads as a declaration), so the public API diff
+(`common::is_js_ts_export_line`: a line opening with the `export` keyword and a
+declaration, list, star or assignment, or any other spelling
+`common::js_ts_export` reads as a declaration), so the public API diff
 pairs every form the reader recognizes (`export async function`,
 `export declare`, `export abstract class`, `export let`/`var`), not only the
 forms its own prefix list names. A line with no single name

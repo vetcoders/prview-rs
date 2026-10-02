@@ -525,8 +525,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nested in a `${…}` included) and regular-expression literals, JSX in
   JavaScript and `.tsx` files (read element by element, so a declarator or a
   body's end after an element stays visible, and compared whole where an
-  element cannot be followed), a one-line class's members, a return-type
-  literal, a type parameter's default (`<T = unknown>`), a function type in a
+  element cannot be followed), a one-line class's member declarations while
+  method and static-block implementations are set aside, a return-type literal,
+  a type parameter's default (`<T = unknown>`), a function type in a
   declarator's annotation, whitespace that separates two operators into
   different tokens, a conditional whose branches are arrow functions, and a
   binding's later declarators after an arrow function
@@ -534,9 +535,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them can hide a real change. A `/` after an object literal's `}`, a postfix
   `++` or `--`, or a non-null `!` divides, so a comment after it is still a
   comment, while a `/` after an `if`/`while`/`for` condition or a statement
-  block starts a regular expression; parentheses around a whole initializer, spacing that joins no
-  token (`a + -b`) and a `;` after a one-line function body (a comment beside
-  it included) are formatting. Every export form the reader recognizes is
+  block starts a regular expression; a function-expression body in expression
+  position ends an operand, so its following `/` divides. Parentheses around a whole
+  initializer, spacing that joins no token (`a + -b`) and a `;` after a one-line
+  function body (a comment beside it included) are formatting. Every export
+  form the reader recognizes is
   paired, `export async function`, `export declare`, `export abstract class`
   and `export let`/`var` included. A file copied from one the same change
   modifies no longer reads as that source's exports removed or changed: the
@@ -545,7 +548,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name, an export moved to another file (including the old path of a renamed
   module), and an export written indented inside a TypeScript `namespace` or
   `declare module` block keep their removal, in `PUBLIC_API_DIFF` as in
-  `BREAKING_CHANGES` (a re-export used to reach only the latter).
+  `BREAKING_CHANGES` (a re-export used to reach only the latter), including
+  list, star and assignment forms written directly after the `export` keyword
+  or separated from it by comment trivia.
 
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops

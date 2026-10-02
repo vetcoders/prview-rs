@@ -556,13 +556,24 @@ pub(crate) fn js_ts_export(file: &str, line: &str) -> Option<JsTsExport> {
 }
 
 /// Whether a trimmed diff line of `file` is an `export` statement, as both API
-/// artifacts collect them: a line opening with `export ` (a declaration, a
-/// bare `export default` whose value starts on the next line, a re-export
-/// list, `export =`), or any other spelling [`js_ts_export`] reads as an
-/// exported declaration. A line that cannot pair keeps its removal or addition
-/// in both artifacts.
+/// artifacts collect them: a line opening with the `export` keyword and a
+/// declaration, re-export list, star or assignment, or any other spelling
+/// [`js_ts_export`] reads as an exported declaration. A line that cannot pair
+/// keeps its removal or addition in both artifacts.
 pub(crate) fn is_js_ts_export_line(file: &str, trimmed: &str) -> bool {
-    trimmed.starts_with("export ") || js_ts_export(file, trimmed).is_some()
+    let unpaired_export = trimmed.strip_prefix("export").is_some_and(|mut rest| {
+        let mut separated = rest.starts_with(char::is_whitespace);
+        rest = rest.trim_start();
+        while let Some(comment) = rest.strip_prefix("/*") {
+            let Some(end) = comment.find("*/") else {
+                return false;
+            };
+            separated = true;
+            rest = comment[end + 2..].trim_start();
+        }
+        separated || matches!(rest.chars().next(), Some('{' | '*' | '='))
+    });
+    unpaired_export || js_ts_export(file, trimmed).is_some()
 }
 
 /// Whether a JS/TS file may write JSX: any JavaScript file, and TypeScript as
@@ -598,8 +609,8 @@ enum JsDeclKind {
     /// `function`: a body opened or written whole on the line is
     /// implementation; a return-type literal is contract.
     Function,
-    /// `class`: members written on the line are the class's API. Only the `{`
-    /// that opens a body continued on the next lines is dropped.
+    /// `class`: members written on the line are the class's API. Method and
+    /// static-block implementations are dropped.
     Class,
     /// `interface` / `type`: a body written on the same line IS the contract.
     Type,
@@ -673,8 +684,8 @@ fn js_default_kind(value: &str) -> JsDeclKind {
 /// - A `function` body opened on the line, or written whole on it, is
 ///   dropped when its `{` follows the parameter list or a finished return
 ///   type; a `{` in type position (`(): {`) opens a return-type literal, which
-///   stays, `;` after it or not. A `class` line drops only the `{` that opens
-///   its body on the next lines.
+///   stays, `;` after it or not. A `class` line keeps member declarations but
+///   drops method and static-block implementations.
 /// - Parentheses around a whole initializer (`= ((x) => x)`) are dropped.
 /// - `//` and `/* */` comments read as whitespace. Whitespace survives as one
 ///   space only where the characters on both sides would join into another
@@ -711,7 +722,7 @@ fn js_ts_export_contract(line: &str, kind: JsDeclKind, jsx: bool) -> String {
     }
     let text = match kind {
         JsDeclKind::Function => strip_js_function_body(text),
-        JsDeclKind::Class => strip_js_body_opener(text),
+        JsDeclKind::Class => return compact_js(&strip_js_class_implementation_bodies(text)),
         _ => text,
     };
     compact_js(text)
@@ -1287,11 +1298,12 @@ fn js_closes_condition(text: &str, lexemes: &[JsLexeme], close: usize) -> bool {
 
 /// Whether the `}` at `lexemes[close]` closes a statement block, after which a
 /// statement, possibly a regular expression, starts. The `{` of a block
-/// follows a `)` (`if (x) {`, `function f() {`), a `;`, `{` or `}`, `else`,
-/// `do`, `try`, `finally`, or a name that is no expression keyword
-/// (`catch {`, `class A {`). After anything else (`= {`, `({`, `, {`, `? {`,
-/// `=> {`, `return {`, `default {`) and when the line does not show the `{`,
-/// the `}` closes an object literal or another expression.
+/// follows a `)` (`if (x) {`, `function f() {`) unless that parameter list
+/// belongs to a function expression, a `;`, `{` or `}`, `else`, `do`, `try`,
+/// `finally`, or a name that is no expression keyword (`catch {`,
+/// `class A {`). After anything else (`= {`, `({`, `, {`, `? {`, `=> {`,
+/// `return {`, `default {`) and when the line does not show the `{`, the `}`
+/// closes an object literal or another expression.
 fn js_closes_block(text: &str, lexemes: &[JsLexeme], close: usize) -> bool {
     let Some(depth) = lexemes[close].depth.checked_sub(1) else {
         return false;
@@ -1302,6 +1314,9 @@ fn js_closes_block(text: &str, lexemes: &[JsLexeme], close: usize) -> bool {
     else {
         return false;
     };
+    if js_opens_function_expression_body(text, lexemes, open) {
+        return false;
+    }
     let Some(before) = lexemes[..open].iter().rposition(|lexeme| !lexeme.is_gap()) else {
         return false;
     };
@@ -1313,6 +1328,59 @@ fn js_closes_block(text: &str, lexemes: &[JsLexeme], close: usize) -> bool {
             matches!(word, "else" | "do" | "try" | "finally")
                 || !JS_KEYWORDS_BEFORE_OPERAND.contains(&word)
         }
+        _ => false,
+    }
+}
+
+/// Whether `lexemes[open]` opens a function expression's implementation body.
+/// Its closing brace ends an operand (`const f = function () {} / 2`), unlike
+/// a declaration or control-flow statement body, after which a regular
+/// expression may start. Finding `function` from the body rather than its
+/// parameter list also covers generic parameters and TypeScript return types.
+fn js_opens_function_expression_body(text: &str, lexemes: &[JsLexeme], open: usize) -> bool {
+    let previous = |before: usize| {
+        lexemes
+            .iter()
+            .rposition(|lexeme| !lexeme.is_gap() && lexeme.end <= before)
+    };
+    let word_at = |index: usize| match lexemes[index].kind {
+        JsLexKind::Code(ch) if is_js_identifier_char(ch) => {
+            Some(js_word_ending_at(text, &lexemes[..=index], &lexemes[index]))
+        }
+        _ => None,
+    };
+
+    let Some(function) = (0..open).rev().find(|&index| {
+        lexemes[index].depth == lexemes[open].depth && word_at(index) == Some("function")
+    }) else {
+        return false;
+    };
+    if lexemes[function + 1..open]
+        .iter()
+        .any(|lexeme| lexeme.depth == lexemes[open].depth && lexeme.kind == JsLexKind::Code(';'))
+    {
+        return false;
+    }
+    let function_start = lexemes[function].end - "function".len();
+    let Some(mut context) = previous(function_start) else {
+        return false;
+    };
+    if let Some("async") = word_at(context) {
+        let async_start = lexemes[context].end - "async".len();
+        let Some(previous) = previous(async_start) else {
+            return false;
+        };
+        context = previous;
+    }
+
+    match lexemes[context].kind {
+        JsLexKind::Code(
+            '=' | '(' | '[' | ',' | ':' | '?' | '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '!'
+            | '~' | '<' | '>',
+        ) => true,
+        JsLexKind::Code(ch) if is_js_identifier_char(ch) => word_at(context).is_some_and(|word| {
+            JS_KEYWORDS_BEFORE_OPERAND.contains(&word) && !matches!(word, "default" | "do" | "else")
+        }),
         _ => false,
     }
 }
@@ -1512,6 +1580,42 @@ fn strip_js_body_opener(text: &str) -> &str {
     }
 }
 
+/// Keep declarations of members written in a one-line class, but empty the
+/// direct method and static-block bodies. A type literal or object-valued field
+/// is not a statement block and remains part of the bounded line contract.
+fn strip_js_class_implementation_bodies(text: &str) -> String {
+    let lexemes = js_lex(text);
+    let mut bodies = Vec::new();
+    for (open, lexeme) in lexemes.iter().enumerate() {
+        if lexeme.kind != JsLexKind::Code('{') || lexeme.depth != 1 {
+            continue;
+        }
+        let Some(close) = lexemes[open + 1..]
+            .iter()
+            .position(|candidate| candidate.kind == JsLexKind::Code('}') && candidate.depth == 2)
+        else {
+            continue;
+        };
+        let close = open + 1 + close;
+        if !js_type_position_before(text, &lexemes[..open])
+            && js_closes_block(text, &lexemes, close)
+        {
+            bodies.push(lexeme.end..lexemes[close].start);
+        }
+    }
+    if bodies.is_empty() {
+        return strip_js_body_opener(text).to_owned();
+    }
+    let mut contract = String::with_capacity(text.len());
+    let mut copied = 0;
+    for body in bodies {
+        contract.push_str(&text[copied..body.start]);
+        copied = body.end;
+    }
+    contract.push_str(&text[copied..]);
+    contract
+}
+
 /// Drop the body a function line opens (`) {`) or writes whole
 /// (`{ return x; }`, with or without a `;` after it). Only the last top-level
 /// `{` is a body candidate, and only when it follows the parameter list or a
@@ -1561,7 +1665,7 @@ fn js_type_position_before(text: &str, before: &[JsLexeme]) -> bool {
         JsLexKind::Code('>') => last.start > 0 && text.as_bytes()[last.start - 1] == b'=',
         JsLexKind::Code(ch) if is_js_identifier_char(ch) => matches!(
             js_word_ending_at(text, before, last),
-            "is" | "extends" | "keyof"
+            "as" | "extends" | "is" | "keyof" | "satisfies"
         ),
         _ => false,
     }
@@ -2157,6 +2261,21 @@ mod tests {
         ] {
             assert_eq!(js_ts_export("src/a.ts", line), None, "{line}");
         }
+        for line in [
+            "export { a } from './x';",
+            "export{ a } from './x';",
+            "export\t{ a } from './x';",
+            "export* from './x';",
+            "export= foo;",
+            "export/* list */{ a } from './x';",
+            "export/* star */* from './x';",
+            "export/* assignment */= foo;",
+        ] {
+            assert!(is_js_ts_export_line("src/a.ts", line), "{line}");
+        }
+        for line in ["exported { a }", "export!(a)", "exports.a = 1;"] {
+            assert!(!is_js_ts_export_line("src/a.ts", line), "{line}");
+        }
     }
 
     #[test]
@@ -2198,6 +2317,18 @@ mod tests {
             "export function f(): Promise<void> { await g(); }"
         ));
         assert!(same(
+            "export class Client { method() { return 1; } }",
+            "export class Client { method() { return 2; } }"
+        ));
+        assert!(same(
+            "export default class { method() { return old; } }",
+            "export default class { method() { return new; } }"
+        ));
+        assert!(same(
+            "export class Client { method(): { value: string } { return { value: 'a' }; } }",
+            "export class Client { method(): { value: string } { return { value: 'b' }; } }"
+        ));
+        assert!(same(
             "export default async (req) => {",
             "export default async req =>"
         ));
@@ -2228,6 +2359,53 @@ mod tests {
             "export const VALUE = {} / 2; // old",
             "export const VALUE = {} / 2; // new"
         ));
+        assert!(same(
+            "export const HALF = function () {} / 2; // old",
+            "export const HALF = function () {} / 2; // new"
+        ));
+        assert!(same(
+            "export const HALF = function<T>() {} / 2; // old",
+            "export const HALF = function<T>() {} / 2; // new"
+        ));
+        assert!(same(
+            "export const HALF = function (): number {} / 2; // old",
+            "export const HALF = function (): number {} / 2; // new"
+        ));
+        assert!(same(
+            "export const HALF = function (): { value: number } {} / 2; // old",
+            "export const HALF = function (): { value: number } {} / 2; // new"
+        ));
+        for line in [
+            "const x = function named() {} / 2",
+            "const x = function* () {} / 2",
+            "const x = function* named() {} / 2",
+            "const x = async function () {} / 2",
+            "const x = function<T>() {} / 2",
+            "const x = function (): number {} / 2",
+            "const x = function (): { value: number } {} / 2",
+            "return function () {} / 2",
+            "typeof function () {} / 2",
+            "delete function () {} / 2",
+            "value instanceof function () {} / 2",
+            "value in function () {} / 2",
+            "for (const value of function () {} / 2)",
+            "const x = (function () {}) / 2",
+        ] {
+            let slash = line.rfind("/ 2").unwrap();
+            assert!(
+                js_lex(line)
+                    .iter()
+                    .any(|lexeme| { lexeme.start == slash && lexeme.kind == JsLexKind::Code('/') }),
+                "{line}"
+            );
+        }
+        let statement_regex = "const f = function () {}; if (x) {} /[{]/.test(x)";
+        let slash = statement_regex.rfind("/[{]/").unwrap();
+        assert!(
+            js_lex(statement_regex)
+                .iter()
+                .any(|lexeme| lexeme.start == slash && lexeme.kind == JsLexKind::Literal)
+        );
         // A later declarator's own arrow body is implementation too, and a
         // comma between type arguments does not start a declarator.
         assert!(same(
@@ -2403,6 +2581,30 @@ mod tests {
         assert!(!same(
             "export default class { oldMethod() {} }",
             "export default class { newMethod() {} }"
+        ));
+        assert!(!same(
+            "export class Client { method(): { old: string } { return { old: 'x' }; } }",
+            "export class Client { method(): { new: string } { return { new: 'x' }; } }"
+        ));
+        assert!(!same(
+            "export class C { method(): keyof { old: string } { return 'old'; } }",
+            "export class C { method(): keyof { new: string } { return 'new'; } }"
+        ));
+        assert!(!same(
+            "export class C { method<T extends { old: string }>() {} }",
+            "export class C { method<T extends { new: string }>() {} }"
+        ));
+        assert!(!same(
+            "export class C { method(x: unknown): x is { old: string } {} }",
+            "export class C { method(x: unknown): x is { new: string } {} }"
+        ));
+        assert!(!same(
+            "export class C { field = value as { old: string }; }",
+            "export class C { field = value as { new: string }; }"
+        ));
+        assert!(!same(
+            "export class C { field = value satisfies { old: string }; }",
+            "export class C { field = value satisfies { new: string }; }"
         ));
         assert!(!same(
             "export class Store extends Base {",

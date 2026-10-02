@@ -1407,7 +1407,7 @@ fn js_ts_copy_section_reports_no_removal_from_its_source() {
 fn js_ts_re_exports_keep_their_removal_and_addition_in_both_api_artifacts() {
     // A re-export binds no single name the pairing could match, so neither
     // artifact may drop it: what importers of `src/api.ts` can reach changed.
-    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,3 +1,2 @@\n-export { foo } from './foo';\n-export * from './bar';\n+export * from './baz';\n export const a = 1;\n";
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,8 +1,2 @@\n-export { foo } from './foo';\n-export * from './bar';\n-export{ compact } from './compact';\n-export\t{ tabbed } from './tabbed';\n-export/* list */{ commented } from './commented';\n-export/* star */* from './star';\n-export/* assignment */= legacy;\n+export * from './baz';\n export const a = 1;\n";
 
     let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
     // Row order is not part of either artifact's contract.
@@ -1422,10 +1422,17 @@ fn js_ts_re_exports_keep_their_removal_and_addition_in_both_api_artifacts() {
         .iter()
         .map(|finding| finding.signature.as_str())
         .collect();
-    assert_eq!(
-        removed,
-        ["export * from './bar';", "export { foo } from './foo';"]
-    );
+    let mut expected_removed = [
+        "export * from './bar';",
+        "export\t{ tabbed } from './tabbed';",
+        "export { foo } from './foo';",
+        "export{ compact } from './compact';",
+        "export/* assignment */= legacy;",
+        "export/* list */{ commented } from './commented';",
+        "export/* star */* from './star';",
+    ];
+    expected_removed.sort_unstable();
+    assert_eq!(removed, expected_removed);
     assert_eq!(added, ["export * from './baz';"]);
     assert!(public.changed.is_empty(), "{:?}", public.changed);
 
@@ -1436,10 +1443,7 @@ fn js_ts_re_exports_keep_their_removal_and_addition_in_both_api_artifacts() {
         .map(|finding| finding.line.as_str())
         .collect();
     removed.sort_unstable();
-    assert_eq!(
-        removed,
-        ["export * from './bar';", "export { foo } from './foo';"]
-    );
+    assert_eq!(removed, expected_removed);
 }
 
 /// The export lines of the vbl-190 review: two inventories whose arrow
@@ -1656,6 +1660,19 @@ fn one_line_js_class_members_and_ambient_return_types_are_contract() {
         ],
         "{breaking:?}"
     );
+}
+
+#[test]
+fn one_line_js_implementation_and_comment_rewrites_are_not_api_changes() {
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,2 +1,2 @@\n-export class Client { method() { return 1; } }\n-export const HALF = function () {} / 2; // old\n+export class Client { method() { return 2; } }\n+export const HALF = function () {} / 2; // new\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert!(public.added.is_empty(), "{:?}", public.added);
+    assert!(public.removed.is_empty(), "{:?}", public.removed);
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(breaking.is_empty(), "{breaking:?}");
 }
 
 #[test]
