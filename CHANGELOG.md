@@ -304,6 +304,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under `--target-sha`, a launcher outside the snapshot. Callers that only need
   the process result read `run.output`; this is source-incompatible for library
   consumers.
+- Rust API delta finding IDs are now `api-delta:` followed by 16 hex digits of
+  a SHA-256 over the finding's complete semantic identity, instead of that
+  serialized identity itself (about 1.4 kB per ID). IDs stay deterministic and
+  still join review caveats to `BREAKING_CHANGES.json`. Rust API delta review
+  caveats keep the exact finding count but name at most the first five IDs,
+  followed by `+K more`: a run with 964 unknowns previously repeated a
+  megabyte-sized caveat line into `MERGE_GATE.json`, `report.json`, the
+  context pack, and the dashboard payload. The complete list stays in
+  `BREAKING_CHANGES.json` and `PUBLIC_API_DIFF.json`.
 
 ### Fixed
 
@@ -574,6 +583,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `components: clippy, rustfmt`, and `tools/bounded_runtime_acceptance.py`
   requires both checks to have their own live, non-cached `passed` row in
   `RUN.json`, matching the other six required checks.
+- The Rust API delta no longer times out on large crates. Every exhausted alias
+  walk re-hashed the complete private alias graph; on a large Tauri crate that
+  was ~314 s of a 326 s snapshot. The graph is now hashed once per graph.
+- `#[cfg(test)]` code no longer produces Rust API unknowns. `cfg(test)` holds
+  only in a crate's own unit-test build, yet `#[cfg(test)] mod tests` blocks
+  were walked and their macros, `include!` calls, and missing module files
+  became unknowns (100 of 596 unknown records on the measured Vista range).
+  Items whose guard requires `test` now leave the surface; `any(test, ..)`,
+  `not(test)`, and `cfg_attr(test, ..)` stay observable, and moving a public
+  item under `#[cfg(test)]` is a removal. Inner file-level test guards apply to
+  crate roots and modules, and proven test-only fields, variants, and trait
+  members also leave their parent canonical contracts.
+- Opaque-return, proc-macro, macro-invocation, and cfg-authority digests bind
+  each package's Cargo input scope instead of the whole revision, so an
+  unrelated tracked change (docs, a sibling package) no longer turns every such
+  proof into an unknown (474 of the 596 measured unknown records). Anything the
+  scope model cannot bound widens that package back to the whole revision.
+  Same-name package digests are aggregated before walking any root, so earlier
+  proofs bind later packages too. Build watch declarations are read from the
+  active build script and its Rust source closure, not application strings. A
+  file outside the scope that a build script or proc macro reads without a
+  literal declaration is not bound, as Cargo does not track it either.
+- An unknown Rust API region blocks a pair only where its hidden content could
+  define the identity or the name bound to it. A private `#[tokio::main]` or an
+  `include!` in `lib.rs` previously turned every added, removed, or changed fact
+  of the crate into an unknown. Region-blocked unknowns now name the blocking
+  region's kind, crate, and module and carry its `unknown_source`.
+- An unresolved, ambiguous, or cyclic named re-export (`pub use a::{B, C as D}`)
+  blocks only the one name it binds instead of every name of its module and
+  its unproven children, so one unresolved leaf in `lib.rs` no longer blocks
+  new top-level modules. Its unknown records that name as a `bound-name:`
+  evidence line, so renaming an unresolved re-export is now reported instead of
+  cancelling out as an unchanged proof. A leaf whose path passes through such a
+  name (`pub use crate::ali::Thing` with `ali` unresolved under `windows`) is
+  itself unknown under that guard, even when another cfg variant of `ali`
+  resolves, so the narrower block cannot confirm an addition the hidden variant
+  may already provide. Named external re-exports follow the same name-bound
+  rule. Unknown-region projection through module aliases retains cfg guards,
+  so a provably disjoint alias cannot hide an unrelated confirmed change.
 
 ## [0.8.0] - 2026-09-13
 

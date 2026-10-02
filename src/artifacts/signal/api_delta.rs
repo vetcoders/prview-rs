@@ -151,8 +151,124 @@ pub struct ApiArtifactView {
 struct SnapshotEvidence<'a> {
     base_declarations: &'a [RustApiDeclaration],
     target_declarations: &'a [RustApiDeclaration],
-    base_unknowns: &'a [RustApiUnknown],
-    target_unknowns: &'a [RustApiUnknown],
+    base_regions: &'a SnapshotRegions<'a>,
+    target_regions: &'a SnapshotRegions<'a>,
+}
+
+/// A module of one crate: (crate, module path).
+type ModuleKey<'a> = (&'a str, &'a [String]);
+
+/// A name bound by a re-export: (crate, re-exporting module path, external
+/// name).
+type ReexportKey<'a> = (&'a str, &'a [String], &'a str);
+
+/// One public module alias retained for unknown-region projection.
+struct ModuleAliasRegion<'a> {
+    crate_name: &'a str,
+    alias_path: &'a [String],
+    target_path: &'a [String],
+    cfg_guard: &'a [String],
+}
+
+/// What one snapshot's unknown regions can hide from pairing: the unknowns
+/// and the module structure the snapshot still proves around them.
+struct SnapshotRegions<'a> {
+    unknowns: &'a [RustApiUnknown],
+    /// The cfg guard of every processed module, per crate and module path.
+    module_guards: BTreeMap<ModuleKey<'a>, Vec<&'a [String]>>,
+    /// Crate names built from more than one root.
+    shared_crates: BTreeSet<&'a str>,
+    /// The origin module of every re-export, per crate, re-exporting module
+    /// and external name.
+    reexport_origins: BTreeMap<ReexportKey<'a>, Vec<&'a [String]>>,
+    /// Public module aliases available for path projection.
+    module_aliases: Vec<ModuleAliasRegion<'a>>,
+}
+
+impl<'a> SnapshotRegions<'a> {
+    fn new(snapshot: &'a RustApiSnapshot) -> Self {
+        let mut module_guards: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for module in &snapshot.modules {
+            module_guards
+                .entry((module.crate_name.as_str(), module.module_path.as_slice()))
+                .or_default()
+                .push(module.cfg_guard.as_slice());
+        }
+        // A crate name that several packages build has one root per package,
+        // loaded or not, and one package's modules prove nothing about what
+        // another package's hidden content declares.
+        let mut roots: BTreeMap<&str, usize> = BTreeMap::new();
+        for module in &snapshot.modules {
+            if module.module_path.is_empty() {
+                *roots.entry(module.crate_name.as_str()).or_default() += 1;
+            }
+        }
+        for unknown in &snapshot.unknowns {
+            if let Some(crate_name) = &unknown.crate_name
+                && unknown.module_path.is_empty()
+                && may_fail_root_load(unknown)
+            {
+                *roots.entry(crate_name.as_str()).or_default() += 1;
+            }
+        }
+        let shared_crates = roots
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(crate_name, _)| crate_name)
+            .collect();
+        // Keyed without the namespace on purpose: a name any namespace of the
+        // module re-exports from the region stays covered in every namespace.
+        let mut reexport_origins: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for reexport in &snapshot.reexports {
+            reexport_origins
+                .entry((
+                    reexport.crate_name.as_str(),
+                    reexport.module_path.as_slice(),
+                    reexport.external_name.as_str(),
+                ))
+                .or_default()
+                .push(reexport.target_module_path.as_slice());
+        }
+        let module_aliases = snapshot
+            .module_aliases
+            .iter()
+            .map(|alias| ModuleAliasRegion {
+                crate_name: alias.crate_name.as_str(),
+                alias_path: alias.module_path.as_slice(),
+                target_path: alias.target_module_path.as_slice(),
+                cfg_guard: alias.cfg_guard.as_slice(),
+            })
+            .collect();
+        Self {
+            unknowns: &snapshot.unknowns,
+            module_guards,
+            shared_crates,
+            reexport_origins,
+            module_aliases,
+        }
+    }
+
+    /// Whether `child` is declared, in every processed variant of `parent`,
+    /// under exactly that variant's guard, by the only root of its crate.
+    /// Content hidden in `parent` then cannot declare another `child`: it
+    /// would collide with this one.
+    fn child_module_is_fixed(&self, crate_name: &str, parent: &[String], child: &str) -> bool {
+        if self.shared_crates.contains(crate_name) {
+            return false;
+        }
+        let Some(parent_guards) = self.module_guards.get(&(crate_name, parent)) else {
+            return false;
+        };
+        let mut child_path = parent.to_vec();
+        child_path.push(child.to_owned());
+        let Some(child_guards) = self.module_guards.get(&(crate_name, child_path.as_slice()))
+        else {
+            return false;
+        };
+        parent_guards
+            .iter()
+            .all(|guard| child_guards.contains(guard))
+    }
 }
 
 impl ApiDelta {
@@ -194,6 +310,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         visibility_changed: Vec::new(),
         unknown: snapshot_unknown_findings(base, target),
     };
+    let base_regions = SnapshotRegions::new(base);
+    let target_regions = SnapshotRegions::new(target);
 
     let base_items: Vec<_> = base.items.iter().map(item_side).collect();
     let target_items: Vec<_> = target.items.iter().map(item_side).collect();
@@ -203,8 +321,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
     pair_exact_identities(
         &base_items,
         &target_items,
-        &base.unknowns,
-        &target.unknowns,
+        &base_regions,
+        &target_regions,
         &mut base_used,
         &mut target_used,
         &mut delta,
@@ -215,8 +333,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
     pair_cfg_changes(
         &base_items,
         &target_items,
-        &base.unknowns,
-        &target.unknowns,
+        &base_regions,
+        &target_regions,
         &mut base_used,
         &mut target_used,
         &mut delta,
@@ -230,8 +348,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         &SnapshotEvidence {
             base_declarations: &base.declarations,
             target_declarations: &target.declarations,
-            base_unknowns: &base.unknowns,
-            target_unknowns: &target.unknowns,
+            base_regions: &base_regions,
+            target_regions: &target_regions,
         },
         &mut base_used,
         &mut target_used,
@@ -244,8 +362,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
     pair_relocations(
         &base_items,
         &target_items,
-        &base.unknowns,
-        &target.unknowns,
+        &base_regions,
+        &target_regions,
         &mut base_used,
         &mut target_used,
         &mut delta,
@@ -263,12 +381,16 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         if base_used[index] {
             continue;
         }
-        if region_is_unknown(&target.unknowns, &before.identity) {
-            delta.unknown.push(pairing_unknown(
+        if let Some(unknown) = blocking_region(&target_regions, &before.identity) {
+            delta.unknown.push(region_pairing_unknown(
                 before.identity.clone(),
                 Some(before.clone()),
                 None,
                 "target counterpart is unprovable in an unknown snapshot region",
+                BlockingRegion {
+                    side: ApiSnapshotSide::Target,
+                    unknown,
+                },
             ));
         } else {
             delta.removed.push(known_finding(
@@ -283,12 +405,16 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         if target_used[index] {
             continue;
         }
-        if region_is_unknown(&base.unknowns, &after.identity) {
-            delta.unknown.push(pairing_unknown(
+        if let Some(unknown) = blocking_region(&base_regions, &after.identity) {
+            delta.unknown.push(region_pairing_unknown(
                 after.identity.clone(),
                 None,
                 Some(after.clone()),
                 "base counterpart is unprovable in an unknown snapshot region",
+                BlockingRegion {
+                    side: ApiSnapshotSide::Base,
+                    unknown,
+                },
             ));
         } else {
             delta.added.push(known_finding(
@@ -641,7 +767,7 @@ fn merge_comparisons(mut comparisons: Vec<ApiDelta>) -> ApiDelta {
                 finding
                     .evidence
                     .push(format!("revision comparison: {comparison}"));
-                finding.id = format!("{}|comparison:{comparison}", finding.id);
+                finding.id = comparison_finding_id(&finding.id, &comparison);
             }
         }
         merged.added.extend(delta.added);
@@ -1203,25 +1329,38 @@ fn relocation_key(side: &ApiFactSide) -> (String, String, String, String, Vec<St
     )
 }
 
-fn pair_is_certain(
+/// An unknown snapshot region that leaves a pairing unprovable, with the
+/// revision that declared it.
+#[derive(Clone, Copy)]
+struct BlockingRegion<'a> {
+    side: ApiSnapshotSide,
+    unknown: &'a RustApiUnknown,
+}
+
+/// The first unknown region, from either revision, that may hide a
+/// counterpart of either side of a pair; `None` when the pair is certain.
+fn pair_blocking_region<'a>(
     before: &ApiFactSide,
     after: &ApiFactSide,
-    base_unknowns: &[RustApiUnknown],
-    target_unknowns: &[RustApiUnknown],
-) -> bool {
-    ![&before.identity, &after.identity]
+    base_regions: &SnapshotRegions<'a>,
+    target_regions: &SnapshotRegions<'a>,
+) -> Option<BlockingRegion<'a>> {
+    [&before.identity, &after.identity]
         .into_iter()
-        .any(|identity| {
-            region_is_unknown(base_unknowns, identity)
-                || region_is_unknown(target_unknowns, identity)
+        .find_map(|identity| {
+            let region = |side, regions| {
+                blocking_region(regions, identity).map(|unknown| BlockingRegion { side, unknown })
+            };
+            region(ApiSnapshotSide::Base, base_regions)
+                .or_else(|| region(ApiSnapshotSide::Target, target_regions))
         })
 }
 
 fn pair_exact_identities(
     base: &[ApiFactSide],
     target: &[ApiFactSide],
-    base_unknowns: &[RustApiUnknown],
-    target_unknowns: &[RustApiUnknown],
+    base_regions: &SnapshotRegions<'_>,
+    target_regions: &SnapshotRegions<'_>,
     base_used: &mut [bool],
     target_used: &mut [bool],
     delta: &mut ApiDelta,
@@ -1253,12 +1392,14 @@ fn pair_exact_identities(
             if before.contract == after.contract {
                 continue;
             }
-            if !pair_is_certain(before, after, base_unknowns, target_unknowns) {
-                delta.unknown.push(pairing_unknown(
+            if let Some(region) = pair_blocking_region(before, after, base_regions, target_regions)
+            {
+                delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
                     Some(before.clone()),
                     Some(after.clone()),
                     "changed contract intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 push_contract_changes(delta, before, after);
@@ -1298,8 +1439,8 @@ fn pair_exact_identities(
 fn pair_cfg_changes(
     base: &[ApiFactSide],
     target: &[ApiFactSide],
-    base_unknowns: &[RustApiUnknown],
-    target_unknowns: &[RustApiUnknown],
+    base_regions: &SnapshotRegions<'_>,
+    target_regions: &SnapshotRegions<'_>,
     base_used: &mut [bool],
     target_used: &mut [bool],
     delta: &mut ApiDelta,
@@ -1336,12 +1477,14 @@ fn pair_cfg_changes(
             }
             base_used[base_index] = true;
             target_used[target_index] = true;
-            if !pair_is_certain(before, after, base_unknowns, target_unknowns) {
-                delta.unknown.push(pairing_unknown(
+            if let Some(region) = pair_blocking_region(before, after, base_regions, target_regions)
+            {
+                delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
                     Some(before.clone()),
                     Some(after.clone()),
                     "cfg-region pairing intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 delta.changed.push(known_finding(
@@ -1408,17 +1551,18 @@ fn pair_visibility_changes(
         if matches.len() == 1 {
             base_used[index] = true;
             let after = declaration_side(matches[0]);
-            if !pair_is_certain(
+            if let Some(region) = pair_blocking_region(
                 before,
                 &after,
-                evidence.base_unknowns,
-                evidence.target_unknowns,
+                evidence.base_regions,
+                evidence.target_regions,
             ) {
-                delta.unknown.push(pairing_unknown(
+                delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
                     Some(before.clone()),
                     Some(after),
                     "visibility transition intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 delta.visibility_changed.push(known_finding(
@@ -1457,17 +1601,18 @@ fn pair_visibility_changes(
         if matches.len() == 1 {
             target_used[index] = true;
             let before = declaration_side(matches[0]);
-            if !pair_is_certain(
+            if let Some(region) = pair_blocking_region(
                 &before,
                 after,
-                evidence.base_unknowns,
-                evidence.target_unknowns,
+                evidence.base_regions,
+                evidence.target_regions,
             ) {
-                delta.unknown.push(pairing_unknown(
+                delta.unknown.push(region_pairing_unknown(
                     after.identity.clone(),
                     Some(before),
                     Some(after.clone()),
                     "visibility transition intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 delta.visibility_changed.push(known_finding(
@@ -1492,8 +1637,8 @@ fn pair_visibility_changes(
 fn pair_relocations(
     base: &[ApiFactSide],
     target: &[ApiFactSide],
-    base_unknowns: &[RustApiUnknown],
-    target_unknowns: &[RustApiUnknown],
+    base_regions: &SnapshotRegions<'_>,
+    target_regions: &SnapshotRegions<'_>,
     base_used: &mut [bool],
     target_used: &mut [bool],
     delta: &mut ApiDelta,
@@ -1530,12 +1675,14 @@ fn pair_relocations(
             target_used[target_index] = true;
             let before = &base[base_index];
             let after = &target[target_index];
-            if !pair_is_certain(before, after, base_unknowns, target_unknowns) {
-                delta.unknown.push(pairing_unknown(
+            if let Some(region) = pair_blocking_region(before, after, base_regions, target_regions)
+            {
+                delta.unknown.push(region_pairing_unknown(
                     before.identity.clone(),
                     Some(before.clone()),
                     Some(after.clone()),
                     "relocation intersects an unknown snapshot region",
+                    region,
                 ));
             } else {
                 delta.relocated.push(known_finding(
@@ -1623,29 +1770,206 @@ fn consume_one_sided_ambiguities(
     }
 }
 
-fn region_is_unknown(unknowns: &[RustApiUnknown], identity: &ApiIdentity) -> bool {
-    unknowns.iter().any(|unknown| {
-        !(matches!(
-            unknown.kind,
-            RustApiUnknownKind::PathNonUtf8
-                | RustApiUnknownKind::TraitImplResolution
-                | RustApiUnknownKind::PrivateTypeDependency
-                | RustApiUnknownKind::OpaqueReturnAutoTraits
-        ) || unknown.kind == RustApiUnknownKind::MacroGeneratedItems
-            && unknown
+/// How far the content an unknown region hides can reach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegionReach {
+    /// Manifest- or crate-level uncertainty: anything in the crate.
+    Crate,
+    /// Unresolved re-exports: names bound in the re-exporting module, only
+    /// the recorded one for a named leaf.
+    Names,
+    /// Unread source or unexpanded output: items in its module, plus the
+    /// inherent members and exported macros any module can contribute.
+    Items,
+}
+
+/// The bound name carried by a named use-leaf proof. Snapshot construction
+/// appends this line from parsed path identifiers; other external-resolution
+/// failures do not gain name-scoped reach merely from sharing their kind.
+fn unknown_bound_name(unknown: &RustApiUnknown) -> Option<&str> {
+    unknown
+        .evidence
+        .lines()
+        .find_map(|line| line.strip_prefix("bound-name:"))
+}
+
+/// The reach of the content `unknown` hides, or `None` when it hides no
+/// item: proof gaps about already visible items do not block pairing.
+fn region_reach(unknown: &RustApiUnknown) -> Option<RegionReach> {
+    use RustApiUnknownKind as Kind;
+    match unknown.kind {
+        Kind::PathNonUtf8
+        | Kind::TraitImplResolution
+        | Kind::PrivateTypeDependency
+        | Kind::OpaqueReturnAutoTraits => None,
+        Kind::MacroGeneratedItems
+            if unknown
                 .evidence
                 .lines()
-                .any(|line| line == "transform-kind:additive-derive"))
-            && unknown
-                .crate_name
-                .as_ref()
-                .is_none_or(|crate_name| crate_name == &identity.crate_name)
-            && (unknown.module_path.is_empty()
-                || identity.module_path.starts_with(&unknown.module_path)
-                || unknown.module_path.starts_with(&identity.module_path))
+                .any(|line| line == "transform-kind:additive-derive") =>
+        {
+            None
+        }
+        Kind::ManifestRead
+        | Kind::ManifestNonUtf8
+        | Kind::ManifestParse
+        | Kind::WorkspaceDiscovery
+        | Kind::MissingLibRoot
+        | Kind::ResolutionLimit => Some(RegionReach::Crate),
+        // A target-level note from the manifest (a native-only library or
+        // binary target) qualifies the whole crate, not one module.
+        Kind::UnsupportedExternResolution if declared_by_manifest(unknown) => {
+            Some(RegionReach::Crate)
+        }
+        // A named external use leaf binds only its parsed external name. Keep
+        // every other external-resolution failure item-wide below.
+        Kind::UnsupportedExternResolution if unknown_bound_name(unknown).is_some() => {
+            Some(RegionReach::Names)
+        }
+        Kind::GlobReexport
+        | Kind::UnresolvedReexport
+        | Kind::AmbiguousReexport
+        | Kind::ReexportCycle => Some(RegionReach::Names),
+        Kind::SourceRead
+        | Kind::SourceNonUtf8
+        | Kind::SourceParse
+        | Kind::MissingModule
+        | Kind::AmbiguousModule
+        | Kind::NonRegularModule
+        | Kind::ModuleCycle
+        | Kind::UnsupportedModulePath
+        | Kind::MacroGeneratedItems
+        | Kind::IncludeMacro
+        | Kind::UnsupportedExternResolution
+        | Kind::UnresolvedInherentOwner
+        | Kind::CfgPredicate => Some(RegionReach::Items),
+    }
+}
+
+fn declared_by_manifest(unknown: &RustApiUnknown) -> bool {
+    unknown.source_path == "Cargo.toml" || unknown.source_path.ends_with("/Cargo.toml")
+}
+
+/// Whether `unknown` is a kind the snapshot records when a module source
+/// fails to load, which at the crate root drops the whole crate.
+fn may_fail_root_load(unknown: &RustApiUnknown) -> bool {
+    use RustApiUnknownKind as Kind;
+    matches!(
+        unknown.kind,
+        Kind::SourceRead | Kind::SourceNonUtf8 | Kind::SourceParse | Kind::ModuleCycle
+    )
+}
+
+/// The first unknown region of one snapshot that may hide `identity`.
+fn blocking_region<'a>(
+    regions: &SnapshotRegions<'a>,
+    identity: &ApiIdentity,
+) -> Option<&'a RustApiUnknown> {
+    regions.unknowns.iter().find(|unknown| {
+        unknown
+            .crate_name
+            .as_ref()
+            .is_none_or(|crate_name| crate_name == &identity.crate_name)
+            && region_reach(unknown)
+                .is_some_and(|reach| region_may_cover(regions, unknown, reach, identity))
             && guards_may_overlap(&unknown.cfg_guard, &identity.cfg_region)
             && transform_scope_may_cover(unknown, identity)
     })
+}
+
+/// Whether content hidden in `unknown`'s module may define `identity` or
+/// the name it is bound to there.
+///
+/// Hidden content binds names only in its own module, below it only through
+/// modules the snapshot does not prove, and above it only through a
+/// re-export of a name that originates inside it. An unresolved named use
+/// leaf hides only the one name it binds; a leaf that reaches that name
+/// through another cfg variant carries its own unknown from the snapshot.
+/// For unread or unexpanded source (`RegionReach::Items`), inherent members
+/// and crate-root `#[macro_export]` macros are the exception: any module of
+/// the crate may contribute them.
+fn region_may_cover(
+    regions: &SnapshotRegions<'_>,
+    unknown: &RustApiUnknown,
+    reach: RegionReach,
+    identity: &ApiIdentity,
+) -> bool {
+    if reach == RegionReach::Crate {
+        return true;
+    }
+    // Crates and Cargo features come from the manifest, but a crate records
+    // them only once its root loads: a root it cannot read or parse hides them.
+    if matches!(identity.namespace.as_str(), "crate" | "cargo_feature") {
+        return unknown.module_path.is_empty() && may_fail_root_load(unknown);
+    }
+    if reach == RegionReach::Items
+        && (identity.name.contains("::")
+            || identity.namespace == "macro" && identity.module_path.is_empty())
+    {
+        return true;
+    }
+    let crate_name = identity.crate_name.as_str();
+    let region = unknown.module_path.as_slice();
+    // A module is bound by its own path; any other item by its module's.
+    let mut bound_path = identity.module_path.clone();
+    if identity.namespace == "module" {
+        bound_path.push(identity.name.clone());
+    }
+    let mut candidates = vec![bound_path];
+    for alias in &regions.module_aliases {
+        if alias.crate_name == crate_name
+            && candidates[0].starts_with(alias.alias_path)
+            && guards_may_overlap(alias.cfg_guard, &identity.cfg_region)
+            && guards_may_overlap(alias.cfg_guard, &unknown.cfg_guard)
+        {
+            let mut projected = alias.target_path.to_vec();
+            projected.extend_from_slice(&candidates[0][alias.alias_path.len()..]);
+            candidates.push(projected);
+        }
+    }
+    // A named use leaf binds exactly one name in its module, which the
+    // snapshot records; its unknown hides that name and what lies below it.
+    // Only re-export evidence is read for it: that evidence is built from
+    // path identifiers, so no source text can forge the line.
+    let leaf_name = if reach == RegionReach::Names {
+        unknown_bound_name(unknown)
+    } else {
+        None
+    };
+    let within_region = candidates.iter().any(|path| {
+        if !path.starts_with(region) {
+            return false;
+        }
+        match path.get(region.len()) {
+            Some(child) => {
+                leaf_name.is_none_or(|name| child.as_str() == name)
+                    && !regions.child_module_is_fixed(crate_name, region, child)
+            }
+            // Bound in the region module itself. A module identity here is
+            // that module, which no use leaf inside it declares.
+            None => leaf_name.is_none_or(|name| {
+                identity.namespace != "module" && identity.name.split("::").next() == Some(name)
+            }),
+        }
+    });
+    if within_region {
+        return true;
+    }
+    let bound_name = identity.name.split("::").next().unwrap_or_default();
+    // A named leaf's hidden content lies below its one name. An origin that
+    // is the region module itself stays covered: the origin key does not
+    // say which of its names was re-exported.
+    regions
+        .reexport_origins
+        .get(&(crate_name, identity.module_path.as_slice(), bound_name))
+        .is_some_and(|origins| {
+            origins.iter().any(|origin| {
+                origin.starts_with(region)
+                    && origin
+                        .get(region.len())
+                        .is_none_or(|child| leaf_name.is_none_or(|name| child.as_str() == name))
+            })
+        })
 }
 
 fn transform_scope_may_cover(unknown: &RustApiUnknown, identity: &ApiIdentity) -> bool {
@@ -1935,13 +2259,11 @@ fn snapshot_unknown_finding(unknown: &RustApiUnknown, side: ApiSnapshotSide) -> 
         name: format!("{:?}", unknown.kind),
         cfg_region: unknown.cfg_guard.clone(),
     };
-    let side_name = match side {
-        ApiSnapshotSide::Base => "base",
-        ApiSnapshotSide::Target => "target",
-    };
     let reason = format!(
-        "{side_name} snapshot {:?}: {}",
-        unknown.kind, unknown.evidence
+        "{} snapshot {:?}: {}",
+        snapshot_side_name(side),
+        unknown.kind,
+        unknown.evidence
     );
     let mut finding = ApiDeltaFinding {
         id: String::new(),
@@ -1953,14 +2275,25 @@ fn snapshot_unknown_finding(unknown: &RustApiUnknown, side: ApiSnapshotSide) -> 
         confidence: ApiDeltaConfidence::Unknown,
         evidence: vec![unknown.evidence.clone()],
         unknown_reason: Some(reason),
-        unknown_source: Some(ApiUnknownSource {
-            side,
-            source_path: unknown.source_path.clone(),
-            provenance: provenance_id(&unknown.provenance),
-        }),
+        unknown_source: Some(unknown_region_source(unknown, side)),
     };
     finding.id = stable_finding_id(&finding);
     finding
+}
+
+fn snapshot_side_name(side: ApiSnapshotSide) -> &'static str {
+    match side {
+        ApiSnapshotSide::Base => "base",
+        ApiSnapshotSide::Target => "target",
+    }
+}
+
+fn unknown_region_source(unknown: &RustApiUnknown, side: ApiSnapshotSide) -> ApiUnknownSource {
+    ApiUnknownSource {
+        side,
+        source_path: unknown.source_path.clone(),
+        provenance: provenance_id(&unknown.provenance),
+    }
 }
 
 fn known_finding(
@@ -2013,6 +2346,35 @@ fn pairing_unknown(
     finding
 }
 
+/// A pairing unknown that names the region blocking it: `unknown_source`
+/// points at the declaring source and revision, and one evidence line names
+/// the region's kind and module, even when the region's own declaration was
+/// neutralized out of the lossless unknown list.
+fn region_pairing_unknown(
+    identity: ApiIdentity,
+    before: Option<ApiFactSide>,
+    after: Option<ApiFactSide>,
+    reason: &str,
+    region: BlockingRegion<'_>,
+) -> ApiDeltaFinding {
+    let unknown = region.unknown;
+    let module = if unknown.module_path.is_empty() {
+        "crate".to_owned()
+    } else {
+        format!("crate::{}", unknown.module_path.join("::"))
+    };
+    let mut finding = pairing_unknown(identity, before, after, reason);
+    finding.evidence.push(format!(
+        "blocking {} region: {:?} in {} {module}",
+        snapshot_side_name(region.side),
+        unknown.kind,
+        unknown.crate_name.as_deref().unwrap_or("<unknown-crate>"),
+    ));
+    finding.unknown_source = Some(unknown_region_source(unknown, region.side));
+    finding.id = stable_finding_id(&finding);
+    finding
+}
+
 #[derive(serde::Serialize)]
 struct FindingIdMaterial<'a> {
     kind: ApiDeltaKind,
@@ -2027,6 +2389,14 @@ struct FindingIdMaterial<'a> {
     unknown_source: Option<&'a ApiUnknownSource>,
 }
 
+/// Hex digits of the SHA-256 over the serialized identity material that make
+/// up a finding ID. 64 bits keep IDs short enough to list in caveats while
+/// collisions stay negligible at any realistic finding count.
+const FINDING_ID_HEX_DIGITS: usize = 16;
+
+/// A deterministic, fixed-length ID over the complete semantic identity:
+/// both sides' identities, contracts and visibility, the unknown reason and
+/// the typed unknown source.
 fn stable_finding_id(finding: &ApiDeltaFinding) -> String {
     let material = FindingIdMaterial {
         kind: finding.kind,
@@ -2040,10 +2410,23 @@ fn stable_finding_id(finding: &ApiDeltaFinding) -> String {
         unknown_reason: finding.unknown_reason.as_deref(),
         unknown_source: finding.unknown_source.as_ref(),
     };
-    format!(
-        "api-delta:{}",
-        serde_json::to_string(&material).expect("finding ID material is serializable")
+    hashed_finding_id(
+        &serde_json::to_string(&material).expect("finding ID material is serializable"),
     )
+}
+
+/// The ID of a finding from one of several base/target comparisons folded
+/// into one delta: the same finding from different comparisons stays
+/// distinct.
+fn comparison_finding_id(id: &str, comparison: &str) -> String {
+    hashed_finding_id(&format!("{id}|comparison:{comparison}"))
+}
+
+fn hashed_finding_id(material: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = hex::encode(Sha256::digest(material));
+    format!("api-delta:{}", &digest[..FINDING_ID_HEX_DIGITS])
 }
 
 fn push_finding(delta: &mut ApiDelta, bucket: ApiDeltaKind, finding: ApiDeltaFinding) {
@@ -2078,7 +2461,7 @@ fn normalize_delta(delta: &mut ApiDelta) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifacts::signal::api_surface::snapshot_rust_api;
+    use crate::artifacts::signal::api_surface::{RustModuleAlias, snapshot_rust_api};
     use crate::artifacts::signal::breaking::{
         BreakingKind, analyze_all_breaking_changes, historical_scenarios,
         write_breaking_changes_with_api,
@@ -4560,6 +4943,49 @@ mod tests {
     }
 
     #[test]
+    fn repository_backed_test_only_code_is_not_api_surface() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let test_module = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "pub fn api() {}\n",
+                concat!(
+                    "pub fn api() {}\n",
+                    "#[cfg(test)] mod tests { include!(\"fixtures.rs\"); generated!(); #[tokio::test] async fn smoke() {} }\n",
+                ),
+            ),
+        ]);
+        assert!(
+            test_module.findings().is_empty(),
+            "a unit-test module never reaches a dependent: {:?}",
+            test_module.findings()
+        );
+
+        let moved_under_test = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "pub fn api() {}\npub fn helper() {}\n",
+                "pub fn api() {}\n#[cfg(test)] pub fn helper() {}\n",
+            ),
+        ]);
+        assert!(
+            moved_under_test.unknown.is_empty(),
+            "{:?}",
+            moved_under_test.unknown
+        );
+        assert!(
+            moved_under_test
+                .removed
+                .iter()
+                .any(|finding| finding.identity.name == "helper"),
+            "gating an item on `test` removes it from every observable build: {:?}",
+            moved_under_test.findings()
+        );
+    }
+
+    #[test]
     fn repository_backed_builtin_default_and_rust_2024_unsafe_attrs_remain_confirmed_contracts() {
         let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
         let builtin_default = repository_delta(&[
@@ -6481,6 +6907,104 @@ mod tests {
                     reason.contains("declarative-implementation-digest:unresolved:")
                 })
         }));
+    }
+
+    #[test]
+    fn opaque_return_uncertainty_follows_only_the_package_cargo_inputs() {
+        let workspace = |shared: &'static str, worker: &'static str| {
+            let root = "[workspace]\nmembers=['api','shared','worker']\nresolver='2'\n";
+            let api = "[package]\nname='api'\nversion='0.0.0'\n[dependencies]\nshared={path='../shared'}\n";
+            let shared_manifest = "[package]\nname='shared'\nversion='0.0.0'\n";
+            let worker_manifest = "[package]\nname='worker'\nversion='0.0.0'\n";
+            repository_delta(&[
+                ("Cargo.toml", root, root),
+                ("Cargo.lock", "version = 4\n", "version = 4\n"),
+                ("api/Cargo.toml", api, api),
+                (
+                    "api/src/lib.rs",
+                    "pub async fn api() { shared::helper().await; }\n",
+                    "pub async fn api() { shared::helper().await; }\n",
+                ),
+                ("shared/Cargo.toml", shared_manifest, shared_manifest),
+                ("shared/src/lib.rs", "pub async fn helper() {}\n", shared),
+                ("worker/Cargo.toml", worker_manifest, worker_manifest),
+                ("worker/src/lib.rs", "pub fn worker() {}\n", worker),
+                ("docs/guide.md", "guide\n", "changed guide\n"),
+            ])
+        };
+
+        let unrelated = workspace(
+            "pub async fn helper() {}\n",
+            "fn helper() {}\npub fn worker() { helper() }\n",
+        );
+        assert!(
+            unrelated.findings().is_empty(),
+            "a sibling package and docs are not inputs of api: {:?}",
+            unrelated.findings()
+        );
+
+        let dependency_changed = workspace(
+            "pub async fn helper() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); }\n",
+            "pub fn worker() {}\n",
+        );
+        assert!(dependency_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding.identity.crate_name == "api"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("opaque-implementation-digest:sha256:"))
+        }));
+    }
+
+    #[test]
+    fn an_unloadable_same_name_package_leaves_earlier_opaque_proofs_bound() {
+        // Three packages build a lib crate named `api`; the middle one (in
+        // manifest order) does not parse, so its digests are dropped before
+        // `c` records its own. Only `a` depends on `shared`: `a`'s opaque
+        // return must keep the digest it read while `a` was walked, not one
+        // rebuilt from `c` alone.
+        let manifest = |package: &str, dependency: &str| {
+            format!("[package]\nname='{package}'\nversion='0.0.0'\n[lib]\nname='api'\n{dependency}")
+        };
+        let a = manifest("api-a", "[dependencies]\nshared={path='../shared'}\n");
+        let b = manifest("api-b", "");
+        let c = manifest("api-c", "");
+        let root = "[workspace]\nmembers=['a','b','c','shared']\nresolver='2'\n";
+        let shared_manifest = "[package]\nname='shared'\nversion='0.0.0'\n";
+        let delta = repository_delta(&[
+            ("Cargo.toml", root, root),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("a/Cargo.toml", a.as_str(), a.as_str()),
+            (
+                "a/src/lib.rs",
+                "pub async fn api() { shared::helper().await; }\n",
+                "pub async fn api() { shared::helper().await; }\n",
+            ),
+            ("b/Cargo.toml", b.as_str(), b.as_str()),
+            ("b/src/lib.rs", "pub fn x() { ) }\n", "pub fn x() { ) }\n"),
+            ("c/Cargo.toml", c.as_str(), c.as_str()),
+            ("c/src/lib.rs", "pub fn other() {}\n", "pub fn other() {}\n"),
+            ("shared/Cargo.toml", shared_manifest, shared_manifest),
+            (
+                "shared/src/lib.rs",
+                "pub async fn helper() {}\n",
+                "pub async fn helper() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); }\n",
+            ),
+        ]);
+
+        assert!(
+            delta.unknown.iter().any(|finding| {
+                finding.identity.name == "OpaqueReturnAutoTraits"
+                    && finding.identity.crate_name == "api"
+                    && finding.evidence.iter().any(|line| {
+                        line.starts_with("origin:Value:api\n")
+                            && line.contains("opaque-implementation-digest:sha256:")
+                    })
+            }),
+            "a changed dependency of `a` must keep its opaque return unknown: {:?}",
+            delta.unknown
+        );
     }
 
     #[test]
@@ -8907,8 +9431,59 @@ mod tests {
             .find(|finding| finding.identity.name == "foo")
             .unwrap();
         assert_ne!(upper.id, lower.id);
-        assert!(upper.id.contains("Foo"));
-        assert!(lower.id.contains("foo"));
+        assert_finding_id_shape(&upper.id);
+        assert_finding_id_shape(&lower.id);
+    }
+
+    #[test]
+    fn pairing_unknowns_name_the_region_that_blocks_them() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let delta = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "include!(\"extra.rs\");\n",
+                "include!(\"extra.rs\");\npub fn added() {}\n",
+            ),
+            ("src/extra.rs", "fn hidden() {}\n", "fn hidden() {}\n"),
+        ]);
+        let finding = delta
+            .unknown
+            .iter()
+            .find(|finding| finding.identity.name == "added")
+            .expect("a root include! can hide the base counterpart");
+        assert_eq!(
+            finding.unknown_reason.as_deref(),
+            Some("base counterpart is unprovable in an unknown snapshot region")
+        );
+        let source = finding
+            .unknown_source
+            .as_ref()
+            .expect("a pairing unknown names its blocking region");
+        assert_eq!(source.side, ApiSnapshotSide::Base);
+        assert_eq!(source.source_path, "src/lib.rs");
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|line| line == "blocking base region: IncludeMacro in fixture crate"),
+            "{:?}",
+            finding.evidence
+        );
+        assert_finding_id_shape(&finding.id);
+    }
+
+    fn assert_finding_id_shape(id: &str) {
+        let digest = id
+            .strip_prefix("api-delta:")
+            .unwrap_or_else(|| panic!("{id} has no api-delta prefix"));
+        assert_eq!(digest.len(), FINDING_ID_HEX_DIGITS, "{id}");
+        assert!(
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "{id}"
+        );
     }
 
     #[test]
@@ -9057,6 +9632,588 @@ mod tests {
                     .is_some_and(|reason| reason.contains("relocation intersects"))
             }));
         }
+    }
+
+    fn finding_at<'a>(
+        findings: &'a [ApiDeltaFinding],
+        module_path: &[&str],
+        namespace: &str,
+        name: &str,
+    ) -> Option<&'a ApiDeltaFinding> {
+        findings.iter().find(|finding| {
+            finding.identity.module_path == module_path
+                && finding.identity.namespace == namespace
+                && finding.identity.name == name
+        })
+    }
+
+    const BASE_REGION_BLOCKS: &str = "base counterpart is unprovable in an unknown snapshot region";
+
+    #[test]
+    fn a_root_region_does_not_block_pairing_inside_a_declared_child_module() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[tokio::main] async fn main() {}\ninclude!(\"extra.rs\");\npub mod api { pub fn kept() {} pub fn changed(_: u8) {} }\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[tokio::main] async fn main() {}\ninclude!(\"extra.rs\");\npub mod api { pub fn kept() {} pub fn changed(_: u16) {} pub fn added() {} }\npub fn root_added() {}\npub mod fresh { pub fn inside() {} }\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&delta.added, &["api"], "value", "added").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+        assert!(
+            finding_at(&delta.changed, &["api"], "value", "changed").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+        // The root expansion may still define root items and new top-level
+        // modules, so their base counterparts stay unprovable.
+        let root: &[&str] = &[];
+        for (module_path, namespace, name) in [
+            (root, "value", "root_added"),
+            (root, "module", "fresh"),
+            (&["fresh"][..], "value", "inside"),
+        ] {
+            let finding = finding_at(&delta.unknown, module_path, namespace, name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn hidden_content_blocks_inherent_members_and_exported_macros_anywhere_in_its_crate() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod api { pub struct Owner; }\npub mod other { #[my_attr] fn hidden() {} }\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod api { pub struct Owner; impl Owner { pub fn member() {} } }\npub mod other { #[my_attr] fn hidden() {} #[macro_export] macro_rules! exported { () => {} } }\npub fn plain() {}\n",
+                "target",
+            )),
+        );
+        // `other`'s expansion may add an inherent impl or an exported macro,
+        // but it cannot bind an ordinary root item.
+        for (module_path, namespace, name) in [
+            (&["api"][..], "value", "Owner::member"),
+            (&[][..], "macro", "exported"),
+        ] {
+            let finding = finding_at(&delta.unknown, module_path, namespace, name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+        assert!(
+            finding_at(&delta.added, &[], "value", "plain").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn a_region_reaches_its_ancestors_only_through_reexports_of_its_names() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod api { #[my_attr] fn hidden() {} pub struct Name {} }\npub use api::Name;\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod api { #[my_attr] fn hidden() {} pub struct Name {} pub fn Name() {} }\npub use api::Name;\npub fn other() {}\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&delta.added, &[], "value", "other").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+        for module_path in [&["api"][..], &[][..]] {
+            let finding = finding_at(&delta.unknown, module_path, "value", "Name")
+                .unwrap_or_else(|| panic!("{module_path:?}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn a_region_covers_its_module_under_every_public_alias() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "mod private { pub mod inner { #[my_attr] fn hidden() {} pub fn kept() {} } }\npub use private::inner as alias;\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "mod private { pub mod inner { #[my_attr] fn hidden() {} pub fn kept() {} pub fn added() {} } }\npub use private::inner as alias;\npub fn plain() {}\n",
+                "target",
+            )),
+        );
+        let finding = finding_at(&delta.unknown, &["alias"], "value", "added")
+            .unwrap_or_else(|| panic!("{:?}", delta.findings()));
+        assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        assert!(
+            finding_at(&delta.added, &[], "value", "plain").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn a_region_projects_through_only_cfg_compatible_public_aliases() {
+        let incompatible = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[cfg(unix)] pub mod real { pub fn kept() {} }\n\
+                 #[cfg(windows)] pub mod real { include!(\"generated.rs\"); }\n\
+                 #[cfg(unix)] pub use real as alias;\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[cfg(unix)] pub mod real { pub fn kept() {} }\n\
+                 #[cfg(windows)] pub mod real {}\n\
+                 #[cfg(unix)] pub use real as alias;\n\
+                 #[cfg(windows)] pub mod alias { pub fn added() {} }\n",
+                "target",
+            )),
+        );
+        assert_eq!(incompatible.added.len(), 2, "{:?}", incompatible.findings());
+        assert!(
+            finding_at(&incompatible.added, &[], "module", "alias").is_some(),
+            "{:?}",
+            incompatible.findings()
+        );
+        assert!(
+            finding_at(&incompatible.added, &["alias"], "value", "added").is_some(),
+            "{:?}",
+            incompatible.findings()
+        );
+        assert!(
+            finding_at(&incompatible.unknown, &["alias"], "value", "added").is_none(),
+            "{:?}",
+            incompatible.findings()
+        );
+        assert_eq!(
+            incompatible.unknown.len(),
+            1,
+            "{:?}",
+            incompatible.findings()
+        );
+        assert!(
+            finding_at(&incompatible.unknown, &["real"], "unknown", "IncludeMacro").is_some(),
+            "{:?}",
+            incompatible.findings()
+        );
+
+        let compatible = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[cfg(windows)] pub mod real { include!(\"generated.rs\"); }\n\
+                 #[cfg(windows)] pub use real as alias;\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[cfg(windows)] pub mod real { pub fn added() {} }\n\
+                 #[cfg(windows)] pub use real as alias;\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&compatible.added, &["alias"], "value", "added").is_none(),
+            "{:?}",
+            compatible.findings()
+        );
+        assert_eq!(compatible.unknown.len(), 3, "{:?}", compatible.findings());
+        assert!(
+            finding_at(&compatible.unknown, &["real"], "value", "added").is_some(),
+            "{:?}",
+            compatible.findings()
+        );
+        assert!(
+            finding_at(&compatible.unknown, &["real"], "unknown", "IncludeMacro").is_some(),
+            "{:?}",
+            compatible.findings()
+        );
+        let compatible_finding = finding_at(&compatible.unknown, &["alias"], "value", "added")
+            .unwrap_or_else(|| panic!("{:?}", compatible.findings()));
+        assert_eq!(
+            compatible_finding.unknown_reason.as_deref(),
+            Some(BASE_REGION_BLOCKS)
+        );
+        assert!(
+            compatible_finding
+                .evidence
+                .iter()
+                .any(|line| line == "blocking base region: IncludeMacro in fixture crate::real"),
+            "{:?}",
+            compatible.findings()
+        );
+
+        let mut overlapping = snapshot_rust_api(&MemorySource::source(
+            "#[cfg(feature = \"b\")] mod real { include!(\"generated.rs\"); }\n",
+            "base",
+        ));
+        overlapping.module_aliases.push(RustModuleAlias {
+            crate_name: "fixture".to_owned(),
+            module_path: vec!["alias".to_owned()],
+            target_module_path: vec!["real".to_owned()],
+            cfg_guard: vec!["feature = \"a\"".to_owned()],
+            source_path: "src/lib.rs".to_owned(),
+            provenance: overlapping.provenance.clone(),
+            certainty: RustSourceCertainty::Confirmed,
+        });
+        let regions = SnapshotRegions::new(&overlapping);
+        let identity = ApiIdentity {
+            crate_name: "fixture".to_owned(),
+            module_path: vec!["alias".to_owned()],
+            namespace: "value".to_owned(),
+            name: "added".to_owned(),
+            cfg_region: vec!["feature = \"b\"".to_owned()],
+        };
+        assert!(
+            blocking_region(&regions, &identity).is_some(),
+            "independent feature guards may overlap and must stay conservative"
+        );
+    }
+
+    #[test]
+    fn only_an_unconditionally_declared_child_module_bounds_a_region() {
+        // The hidden root content may declare `gated` under another cfg, or
+        // produce the transformed inline module itself.
+        for (base, target, module) in [
+            (
+                "#[my_attr] fn hidden() {}\n#[cfg(feature = \"x\")] pub mod gated { pub fn kept() {} }\n",
+                "#[my_attr] fn hidden() {}\n#[cfg(feature = \"x\")] pub mod gated { pub fn kept() {} pub fn added() {} }\n",
+                "gated",
+            ),
+            (
+                "#[my_attr] pub mod generated { pub fn kept() {} }\n",
+                "pub mod generated { pub fn kept() {} pub fn added() {} }\n",
+                "generated",
+            ),
+        ] {
+            let delta = compare_rust_api(
+                &snapshot_rust_api(&MemorySource::source(base, "base")),
+                &snapshot_rust_api(&MemorySource::source(target, "target")),
+            );
+            let finding = finding_at(&delta.unknown, &[module], "value", "added")
+                .unwrap_or_else(|| panic!("{module}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn an_unloaded_module_blocks_its_own_module_item() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source("pub mod a { pub mod c; }\n", "base")),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub mod a { pub mod c { pub fn x() {} } }\n",
+                "target",
+            )),
+        );
+        for (module_path, namespace, name) in
+            [(&["a"][..], "module", "c"), (&["a", "c"][..], "value", "x")]
+        {
+            let finding = finding_at(&delta.unknown, module_path, namespace, name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn a_root_glob_binds_names_only_in_its_module() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "mod donor { pub fn item() {} }\npub use donor::*;\npub mod api { pub fn kept() {} }\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "mod donor { pub fn item() {} }\npub use donor::*;\npub mod api { pub fn kept() {} pub fn added() {} }\npub fn root_added() {}\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&delta.added, &["api"], "value", "added").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+        let finding = finding_at(&delta.unknown, &[], "value", "root_added")
+            .unwrap_or_else(|| panic!("{:?}", delta.findings()));
+        assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+    }
+
+    #[test]
+    fn an_unresolved_named_reexport_hides_only_the_name_it_binds() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::{Thing as Renamed, deep};\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub struct Renamed;\npub struct Thing;\npub mod deep { pub fn inside() {} }\npub mod fresh { pub fn inside() {} }\n",
+                "target",
+            )),
+        );
+        // A leaf binds its rename, not the last segment of its source path.
+        let root: &[&str] = &[];
+        for (module_path, namespace, name) in [
+            (root, "type", "Thing"),
+            (root, "module", "fresh"),
+            (&["fresh"][..], "value", "inside"),
+        ] {
+            assert!(
+                finding_at(&delta.added, module_path, namespace, name).is_some(),
+                "{name}: {:?}",
+                delta.findings()
+            );
+        }
+        for (module_path, namespace, name) in [
+            (root, "type", "Renamed"),
+            (root, "module", "deep"),
+            (&["deep"][..], "value", "inside"),
+        ] {
+            let finding = finding_at(&delta.unknown, module_path, namespace, name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
+            assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+        }
+    }
+
+    #[test]
+    fn a_named_external_reexport_hides_only_its_bound_name() {
+        let base = snapshot_rust_api(&MemorySource::source(
+            "pub use serde::Serialize;\npub fn changed(_: u8) {}\n",
+            "base",
+        ));
+        let external = base
+            .unknowns
+            .iter()
+            .find(|unknown| unknown.kind == RustApiUnknownKind::UnsupportedExternResolution)
+            .expect("the external re-export stays a typed unknown");
+        assert_eq!(external.module_path, Vec::<String>::new());
+        assert_eq!(external.evidence, "serde::Serialize\nbound-name:Serialize");
+
+        let target = snapshot_rust_api(&MemorySource::source(
+            "pub use serde::Serialize;\npub fn changed(_: u16) {}\npub fn added() {}\n",
+            "target",
+        ));
+        let delta = compare_rust_api(&base, &target);
+        assert_eq!(delta.added.len(), 1, "{:?}", delta.findings());
+        assert!(finding_at(&delta.added, &[], "value", "added").is_some());
+        assert_eq!(delta.changed.len(), 1, "{:?}", delta.findings());
+        assert!(finding_at(&delta.changed, &[], "value", "changed").is_some());
+        assert!(delta.removed.is_empty(), "{:?}", delta.findings());
+        assert!(delta.relocated.is_empty(), "{:?}", delta.findings());
+        assert!(
+            delta.visibility_changed.is_empty(),
+            "{:?}",
+            delta.findings()
+        );
+        assert!(delta.unknown.is_empty(), "{:?}", delta.findings());
+
+        let bound_name = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source("pub use serde::Serialize;\n", "base")),
+            &snapshot_rust_api(&MemorySource::source("pub struct Serialize;\n", "target")),
+        );
+        assert!(
+            finding_at(&bound_name.added, &[], "type", "Serialize").is_none(),
+            "{:?}",
+            bound_name.findings()
+        );
+        assert_eq!(
+            bound_name
+                .unknown
+                .iter()
+                .filter(|finding| {
+                    finding.identity.module_path.is_empty()
+                        && finding.identity.namespace == "type"
+                        && finding.identity.name == "Serialize"
+                })
+                .count(),
+            1,
+            "{:?}",
+            bound_name.findings()
+        );
+
+        let broad = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub extern crate core;\npub fn changed(_: u8) {}\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub extern crate core;\npub fn changed(_: u16) {}\n",
+                "target",
+            )),
+        );
+        assert!(broad.changed.is_empty(), "{:?}", broad.findings());
+        assert_eq!(broad.unknown.len(), 1, "{:?}", broad.findings());
+        assert!(finding_at(&broad.unknown, &[], "value", "changed").is_some());
+    }
+
+    #[test]
+    fn an_unresolved_named_reexport_reaches_ancestors_only_below_its_name() {
+        // `outer::Moved` re-exports an item whose origin lies inside the root
+        // region, but not below the one name the unresolved root leaf binds.
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::Thing;\npub mod outer { mod hidden { pub struct Moved; } pub use hidden::Moved; }\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::Thing;\npub mod outer { mod hidden { pub struct Moved(pub u8); } pub use hidden::Moved; }\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&delta.changed, &["outer"], "type", "Moved").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn a_reexport_through_an_unresolved_alias_variant_stays_unknown() {
+        // Under `windows` the base binds `ali` to content it cannot resolve,
+        // so what `crate::Thing` names there is hidden, although the `unix`
+        // variant resolves `ali` and records `real` as the origin.
+        let base = "#[cfg(unix)] pub mod real { pub struct Thing; }\n\
+            #[cfg(unix)] pub use crate::real as ali;\n\
+            #[cfg(windows)] pub use crate::nowhere as ali;\n\
+            pub use crate::ali::Thing;\n";
+        let resolved = "#[cfg(unix)] pub mod real { pub struct Thing; }\n\
+            #[cfg(windows)] pub mod alt { pub struct Thing; }\n\
+            #[cfg(unix)] pub use crate::real as ali;\n\
+            #[cfg(windows)] pub use crate::alt as ali;\n\
+            pub use crate::ali::Thing;\n";
+        // The review's pair keeps the unresolved variant beside the new one.
+        let beside = "#[cfg(unix)] pub mod real { pub struct Thing; }\n\
+            #[cfg(windows)] pub mod alt { pub struct Thing; }\n\
+            #[cfg(unix)] pub use crate::real as ali;\n\
+            #[cfg(windows)] pub use crate::nowhere as ali;\n\
+            #[cfg(windows)] pub use crate::alt as ali;\n\
+            pub use crate::ali::Thing;\n";
+        for target in [resolved, beside] {
+            let delta = compare_rust_api(
+                &snapshot_rust_api(&MemorySource::source(base, "base")),
+                &snapshot_rust_api(&MemorySource::source(target, "target")),
+            );
+            let under_windows = |finding: &&ApiDeltaFinding| {
+                finding.identity.module_path.is_empty()
+                    && finding.identity.namespace == "type"
+                    && finding.identity.name == "Thing"
+                    && finding
+                        .identity
+                        .cfg_region
+                        .iter()
+                        .any(|guard| guard.contains("windows"))
+            };
+            assert!(
+                !delta.added.iter().any(|finding| under_windows(&finding)),
+                "{:?}",
+                delta.findings()
+            );
+            let finding = delta
+                .unknown
+                .iter()
+                .find(under_windows)
+                .unwrap_or_else(|| panic!("{:?}", delta.findings()));
+            if target == resolved {
+                assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
+            }
+        }
+    }
+
+    #[test]
+    fn renaming_an_unresolved_reexport_is_not_neutralized() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::Thing as Before;\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub use crate::nowhere::Thing as After;\n",
+                "target",
+            )),
+        );
+        assert!(
+            delta.unknown.iter().any(|finding| {
+                finding.identity.namespace == "unknown"
+                    && finding.identity.name == "UnresolvedReexport"
+            }),
+            "{:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn source_regions_never_hide_cargo_features() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[features]\nextra=[]\n",
+            ),
+            (
+                "src/lib.rs",
+                "include!(\"extra.rs\");\n",
+                "include!(\"extra.rs\");\n",
+            ),
+            ("src/extra.rs", "fn hidden() {}\n", "fn hidden() {}\n"),
+        ]);
+        assert!(
+            finding_at(&delta.added, &[], "cargo_feature", "extra").is_some(),
+            "{:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn a_root_that_fails_to_load_hides_its_crate_and_cargo_features() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[features]\nextra=[]\n";
+        let delta = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("src/lib.rs", "pub fn kept() {}\n", "pub fn kept( {}\n"),
+        ]);
+        assert!(delta.removed.is_empty(), "{:?}", delta.findings());
+        for (namespace, name) in [("crate", "fixture"), ("cargo_feature", "extra")] {
+            let finding = finding_at(&delta.unknown, &[], namespace, name)
+                .unwrap_or_else(|| panic!("{namespace} {name}: {:?}", delta.findings()));
+            assert!(
+                finding
+                    .evidence
+                    .iter()
+                    .any(|line| line.contains("blocking target region: SourceParse")),
+                "{:?}",
+                finding.evidence
+            );
+        }
+    }
+
+    #[test]
+    fn another_packages_modules_do_not_bound_a_region_of_a_shared_crate_name() {
+        // Two packages build a lib crate named `api`. `a`'s root never parses,
+        // so it may declare its own `m::added`; `c` proving `pub mod m` bounds
+        // nothing in `a`.
+        let manifest = |package: &str| {
+            format!("[package]\nname='{package}'\nversion='0.0.0'\n[lib]\nname='api'\n")
+        };
+        let a = manifest("api-a");
+        let c = manifest("api-c");
+        let root = "[workspace]\nmembers=['a','c']\nresolver='2'\n";
+        let delta = repository_delta(&[
+            ("Cargo.toml", root, root),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("a/Cargo.toml", a.as_str(), a.as_str()),
+            ("a/src/lib.rs", "pub fn x() { ) }\n", "pub fn x() { ) }\n"),
+            ("c/Cargo.toml", c.as_str(), c.as_str()),
+            (
+                "c/src/lib.rs",
+                "pub mod m {}\n",
+                "pub mod m { pub fn added() {} }\n",
+            ),
+        ]);
+        assert!(delta.added.is_empty(), "{:?}", delta.findings());
+        let finding = finding_at(&delta.unknown, &["m"], "value", "added")
+            .unwrap_or_else(|| panic!("{:?}", delta.findings()));
+        assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
     }
 
     #[test]
@@ -9432,7 +10589,7 @@ mod tests {
             .unwrap();
         assert_eq!(delta.added.len(), 1);
         assert!(!delta.base_revision.starts_with("multiple:"));
-        assert!(!delta.added[0].id.contains("|comparison:"));
+        assert_eq!(delta.added[0].id, stable_finding_id(&delta.added[0]));
     }
 
     #[test]
@@ -9504,12 +10661,14 @@ mod tests {
         let delta = compare_rust_api_revisions(&repo, &diffs).unwrap().unwrap();
         assert_eq!(delta.added.len(), 2);
         assert_ne!(delta.added[0].id, delta.added[1].id);
-        assert!(
-            delta
-                .added
-                .iter()
-                .all(|finding| finding.id.contains("|comparison:"))
-        );
+        assert!(delta.added.iter().all(|finding| {
+            assert_finding_id_shape(&finding.id);
+            finding.id != stable_finding_id(finding)
+                && finding
+                    .evidence
+                    .iter()
+                    .any(|line| line.starts_with("revision comparison: "))
+        }));
     }
 
     fn fixture_patch(cell: &str) -> String {
@@ -9968,7 +11127,7 @@ mod tests {
             23
         );
         let ledger = ParityLedger {
-            schema: "prview.api_delta_phase_a_parity.v3",
+            schema: "prview.api_delta_phase_a_parity.v4",
             rows,
             controlled_cases: controlled_parity_cases(),
         };
