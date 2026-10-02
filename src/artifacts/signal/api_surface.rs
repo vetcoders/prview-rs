@@ -778,6 +778,13 @@ struct ModuleVisibilityProof {
     declared_public: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleLoadOutcome {
+    Loaded,
+    CfgExcluded,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CargoBinaryTarget {
     // A package's library and default binary normally share a Rust crate name.
@@ -822,7 +829,7 @@ struct SnapshotBuilder<'a> {
     pending_trait_impls: Vec<PendingTraitImpl>,
     module_proofs: Vec<ModuleProof>,
     all_module_aliases: Vec<RustModuleAlias>,
-    completed_sources: BTreeMap<(String, String, Vec<String>, Vec<String>), bool>,
+    completed_sources: BTreeMap<(String, String, Vec<String>, Vec<String>), ModuleLoadOutcome>,
     active_sources: BTreeSet<(String, String)>,
     proc_macro_crates: BTreeSet<String>,
     rust_linkable_crates: BTreeSet<String>,
@@ -1543,6 +1550,7 @@ impl<'a> SnapshotBuilder<'a> {
         let parsed_manifest_authorities = parsed_manifest_authorities(self.source, &manifests);
         let package_digests =
             package_implementation_digests(self.source, &self.inventory, &manifests, &allowed);
+        self.preload_library_implementation_digests(&manifests, &allowed, &package_digests);
         if let Some(evidence) = workspace_ambiguity {
             self.unknown(
                 RustApiUnknownKind::WorkspaceDiscovery,
@@ -1863,12 +1871,6 @@ impl<'a> SnapshotBuilder<'a> {
                 }
                 None => None,
             };
-            let repo_config_cfg_authority = repository_cargo_cfg_authority(
-                self.source,
-                &self.inventory,
-                &manifest_dir,
-                package_links,
-            );
             let build_script_cfg_authority =
                 match package_has_active_build_script(package, &manifest_dir, &self.inventory) {
                     Ok(active) => Ok(active),
@@ -1893,15 +1895,6 @@ impl<'a> SnapshotBuilder<'a> {
                 );
                 continue;
             }
-            let cfg_authority = match build_script_cfg_authority {
-                Ok(true) => Some(digests.cfg_authority.clone()),
-                Ok(false) => match &repo_config_cfg_authority {
-                    Ok(true) => Some(digests.cfg_authority.clone()),
-                    Ok(false) => None,
-                    Err(reason) => Some(format!("unresolved:cargo-config:{reason}")),
-                },
-                Err(reason) => Some(format!("unresolved:build-script:{reason}")),
-            };
             if proc_macro {
                 self.proc_macro_crates.insert(crate_name.clone());
             }
@@ -1913,12 +1906,8 @@ impl<'a> SnapshotBuilder<'a> {
             }
             self.crate_editions
                 .insert(crate_name.clone(), edition.clone());
-            if let Some(cfg_authority) = cfg_authority {
-                merge_crate_digest(&mut self.cfg_authority_digests, &crate_name, &cfg_authority);
-            }
-            self.record_implementation_digests(&crate_name, &digests);
             let base_dir = parent_repo_path(&root_path);
-            if !self.load_module(
+            if self.load_module(
                 &crate_name,
                 Vec::new(),
                 &root_path,
@@ -1928,13 +1917,12 @@ impl<'a> SnapshotBuilder<'a> {
                     declared_public: true,
                 },
                 Vec::new(),
-            ) {
+            ) != ModuleLoadOutcome::Loaded
+            {
                 self.proc_macro_crates.remove(&crate_name);
                 self.rust_linkable_crates.remove(&crate_name);
                 self.native_artifact_crates.remove(&crate_name);
                 self.crate_editions.remove(&crate_name);
-                self.cfg_authority_digests.remove(&crate_name);
-                self.forget_implementation_digests(&crate_name);
                 continue;
             }
             if !rust_linkable && !proc_macro {
@@ -2000,6 +1988,115 @@ impl<'a> SnapshotBuilder<'a> {
         }
     }
 
+    fn preload_library_implementation_digests(
+        &mut self,
+        manifests: &[String],
+        allowed: &BTreeSet<String>,
+        package_digests: &BTreeMap<String, PackageImplementationDigests>,
+    ) {
+        for manifest_path in manifests {
+            if !allowed.contains(manifest_path) {
+                continue;
+            }
+            let Some(manifest) = peek_manifest_toml(self.source, manifest_path) else {
+                continue;
+            };
+            let Some(package) = manifest.get("package").and_then(toml::Value::as_table) else {
+                continue;
+            };
+            let Some(package_name) = required_string(package, "name") else {
+                continue;
+            };
+            if validate_package_name(package_name).is_err() {
+                continue;
+            }
+            let lib = match manifest.get("lib") {
+                Some(value) => match value.as_table() {
+                    Some(lib) => Some(lib),
+                    None => continue,
+                },
+                None => None,
+            };
+            let autolib = match package.get("autolib") {
+                Some(value) => match value.as_bool() {
+                    Some(value) => value,
+                    None => continue,
+                },
+                None => true,
+            };
+            if lib.is_none() && !autolib {
+                continue;
+            }
+            let explicit_root = match optional_string(lib, "path") {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let manifest_dir = parent_repo_path(manifest_path);
+            let Ok(root_path) =
+                safe_join_repo_path(&manifest_dir, explicit_root.unwrap_or("src/lib.rs"))
+            else {
+                continue;
+            };
+            if lib.is_none()
+                && self.inventory.get(&root_path).is_none_or(|entry| {
+                    matches!(
+                        entry.state,
+                        RevisionEntryState::Deleted | RevisionEntryState::Renamed { .. }
+                    )
+                })
+            {
+                continue;
+            }
+            let explicit_name = match optional_string(lib, "name") {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if explicit_name.is_some_and(|name| validate_lib_name(name).is_err()) {
+                continue;
+            }
+            let crate_name = normalize_identifier(
+                explicit_name
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| package_name.replace('-', "_")),
+            );
+            let digests = package_digests
+                .get(manifest_path)
+                .cloned()
+                .unwrap_or_else(|| {
+                    PackageImplementationDigests::unresolved("package digests were not captured")
+                });
+            self.record_implementation_digests(&crate_name, &digests);
+
+            let package_links = match package.get("links") {
+                Some(toml::Value::String(links)) => Some(links.as_str()),
+                Some(_) => continue,
+                None => None,
+            };
+            let build_script =
+                package_has_active_build_script(package, &manifest_dir, &self.inventory);
+            if package_links.is_some() && matches!(build_script, Ok(false)) {
+                continue;
+            }
+            let cfg_authority = match build_script {
+                Ok(true) => Some(digests.cfg_authority.clone()),
+                Ok(false) => match repository_cargo_cfg_authority(
+                    self.source,
+                    &self.inventory,
+                    &manifest_dir,
+                    package_links,
+                ) {
+                    Ok(true) => Some(digests.cfg_authority.clone()),
+                    Ok(false) => None,
+                    Err(reason) => Some(format!("unresolved:cargo-config:{reason}")),
+                },
+                Err(reason) => Some(format!("unresolved:build-script:{reason}")),
+            };
+            if let Some(cfg_authority) = cfg_authority {
+                merge_crate_digest(&mut self.cfg_authority_digests, &crate_name, &cfg_authority);
+            }
+        }
+    }
+
     fn record_implementation_digests(
         &mut self,
         crate_name: &str,
@@ -2022,10 +2119,8 @@ impl<'a> SnapshotBuilder<'a> {
         );
     }
 
-    /// Digests are read only while a package's own items are walked, after
-    /// that package merged its digest in. Dropping them once a crate root
-    /// fails to load therefore reaches only packages recorded later, and each
-    /// of those records its own digest before any of its items read one.
+    /// Binary analysis names are target-scoped and do not share the library
+    /// pre-aggregation map. Drop their digest when their own root cannot load.
     fn forget_implementation_digests(&mut self, crate_name: &str) {
         self.macro_implementation_digests.remove(crate_name);
         self.macro_invocation_implementation_digests
@@ -2157,7 +2252,7 @@ impl<'a> SnapshotBuilder<'a> {
             }
             self.record_implementation_digests(&target.analysis_name, digests);
             let base_dir = parent_repo_path(&target.root_path);
-            if !self.load_module(
+            if self.load_module(
                 &target.analysis_name,
                 Vec::new(),
                 &target.root_path,
@@ -2167,7 +2262,8 @@ impl<'a> SnapshotBuilder<'a> {
                     declared_public: true,
                 },
                 target.cfg_guard.clone(),
-            ) {
+            ) != ModuleLoadOutcome::Loaded
+            {
                 self.native_artifact_crates.remove(&target.analysis_name);
                 self.crate_editions.remove(&target.analysis_name);
                 self.cfg_authority_digests.remove(&target.analysis_name);
@@ -2196,7 +2292,7 @@ impl<'a> SnapshotBuilder<'a> {
         logical_child_base: &str,
         visibility: ModuleVisibilityProof,
         cfg_guard: Vec<String>,
-    ) -> bool {
+    ) -> ModuleLoadOutcome {
         let variant_key = (
             crate_name.to_owned(),
             source_path.to_owned(),
@@ -2216,7 +2312,7 @@ impl<'a> SnapshotBuilder<'a> {
                 &cfg_guard,
                 "module source was reached more than once".to_owned(),
             );
-            return false;
+            return ModuleLoadOutcome::Failed;
         }
         let Some(text) = self.read_utf8(
             Some(crate_name),
@@ -2227,8 +2323,9 @@ impl<'a> SnapshotBuilder<'a> {
             RustApiUnknownKind::SourceNonUtf8,
         ) else {
             self.active_sources.remove(&active_key);
-            self.completed_sources.insert(variant_key, false);
-            return false;
+            self.completed_sources
+                .insert(variant_key, ModuleLoadOutcome::Failed);
+            return ModuleLoadOutcome::Failed;
         };
         let file = match syn::parse_file(&text) {
             Ok(file) => file,
@@ -2242,10 +2339,38 @@ impl<'a> SnapshotBuilder<'a> {
                     error.to_string(),
                 );
                 self.active_sources.remove(&active_key);
-                self.completed_sources.insert(variant_key, false);
-                return false;
+                self.completed_sources
+                    .insert(variant_key, ModuleLoadOutcome::Failed);
+                return ModuleLoadOutcome::Failed;
             }
         };
+        let file_cfg = canonical_cfg(&file.attrs);
+        let mut cfg_guard = cfg_guard;
+        cfg_guard.extend(file_cfg.guards);
+        cfg_guard.sort();
+        cfg_guard.dedup();
+        if guard_requires_test(&cfg_guard) {
+            self.active_sources.remove(&active_key);
+            self.completed_sources
+                .insert(variant_key, ModuleLoadOutcome::CfgExcluded);
+            return ModuleLoadOutcome::CfgExcluded;
+        }
+        if !file_cfg.errors.is_empty() {
+            for evidence in file_cfg.errors {
+                self.unknown_guarded(
+                    RustApiUnknownKind::CfgPredicate,
+                    Some(crate_name),
+                    &module_path,
+                    source_path,
+                    &cfg_guard,
+                    evidence,
+                );
+            }
+            self.active_sources.remove(&active_key);
+            self.completed_sources
+                .insert(variant_key, ModuleLoadOutcome::Failed);
+            return ModuleLoadOutcome::Failed;
+        }
         self.modules.push(RustModuleSnapshot {
             crate_name: crate_name.to_owned(),
             module_path: module_path.clone(),
@@ -2273,8 +2398,9 @@ impl<'a> SnapshotBuilder<'a> {
             &file.items,
         );
         self.active_sources.remove(&active_key);
-        self.completed_sources.insert(variant_key, true);
-        true
+        self.completed_sources
+            .insert(variant_key, ModuleLoadOutcome::Loaded);
+        ModuleLoadOutcome::Loaded
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3169,7 +3295,11 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                         if let Item::Struct(value) = item
                             && !matches!(value.fields, Fields::Named(_))
-                            && value.fields.iter().all(|field| is_public(&field.vis))
+                            && value
+                                .fields
+                                .iter()
+                                .filter(|field| !attrs_require_test(&field.attrs))
+                                .all(|field| is_public(&field.vis))
                         {
                             self.record_symbol(
                                 crate_name,
@@ -5433,8 +5563,55 @@ fn normalized_confirmed_contract_without_item_name(
     mut item: Item,
     derive_ambiguity: &DeriveNameAmbiguity,
 ) -> String {
+    retain_non_test_contract_members(&mut item);
     sanitize_confirmed_contract_attrs(&mut item, derive_ambiguity);
     normalized_contract_without_item_name(item)
+}
+
+fn attrs_require_test(attrs: &[Attribute]) -> bool {
+    guard_requires_test(&canonical_cfg(attrs).guards)
+}
+
+fn retain_non_test_contract_members(item: &mut Item) {
+    let observable = |attrs: &[Attribute]| !attrs_require_test(attrs);
+    let filter_fields = |fields: &mut Fields| match fields {
+        Fields::Named(fields) => {
+            fields.named = std::mem::take(&mut fields.named)
+                .into_iter()
+                .filter(|field| observable(&field.attrs))
+                .collect();
+        }
+        Fields::Unnamed(fields) => {
+            fields.unnamed = std::mem::take(&mut fields.unnamed)
+                .into_iter()
+                .filter(|field| observable(&field.attrs))
+                .collect();
+        }
+        Fields::Unit => {}
+    };
+    match item {
+        Item::Struct(value) => filter_fields(&mut value.fields),
+        Item::Union(value) => {
+            value.fields.named = std::mem::take(&mut value.fields.named)
+                .into_iter()
+                .filter(|field| observable(&field.attrs))
+                .collect();
+        }
+        Item::Enum(value) => {
+            value.variants = std::mem::take(&mut value.variants)
+                .into_iter()
+                .filter(|variant| observable(&variant.attrs))
+                .map(|mut variant| {
+                    filter_fields(&mut variant.fields);
+                    variant
+                })
+                .collect();
+        }
+        Item::Trait(value) => value
+            .items
+            .retain(|member| observable(trait_item_attrs(member))),
+        _ => {}
+    }
 }
 
 fn normalized_macro_contract(item: &syn::ItemMacro) -> String {
@@ -10135,9 +10312,11 @@ impl<'a> CargoInputModel<'a> {
         let manifest = self
             .parsed
             .get(manifest_path)
+            .cloned()
             .ok_or_else(|| format!("manifest {manifest_path} is unreadable or invalid"))?;
-        let targets = cargo_declared_target_paths(manifest)
+        let targets = cargo_declared_target_paths(&manifest)
             .map_err(|reason| format!("{manifest_path}: {reason}"))?;
+        let build_script_sources = self.build_script_source_closure(&manifest, &package_dir)?;
         let inventory = self.inventory;
         let mut walk = CargoInputWalk::default();
         walk.add_subtree(inventory, package_dir.clone());
@@ -10167,11 +10346,13 @@ impl<'a> CargoInputModel<'a> {
                     walk.set.files.insert(target);
                 }
             }
-            for literal in scan.rerun_if_changed {
-                // A target outside the revision cannot be bound; it is part of
-                // the undeclared-input blind spot Cargo shares.
-                if let Ok(target) = safe_join_repo_path(&package_dir, &literal) {
-                    walk.add_watched_path(inventory, target);
+            if build_script_sources.contains(&file) {
+                for literal in scan.rerun_if_changed {
+                    // A target outside the revision cannot be bound; it is part of
+                    // the undeclared-input blind spot Cargo shares.
+                    if let Ok(target) = safe_join_repo_path(&package_dir, &literal) {
+                        walk.add_watched_path(inventory, target);
+                    }
                 }
             }
             let file_dir = parent_repo_path(&file);
@@ -10190,6 +10371,87 @@ impl<'a> CargoInputModel<'a> {
             return Ok(CargoInputSet::repository());
         }
         Ok(walk.set)
+    }
+
+    fn build_script_source_closure(
+        &mut self,
+        manifest: &toml::Value,
+        package_dir: &str,
+    ) -> Result<BTreeSet<String>, String> {
+        let package = manifest
+            .get("package")
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| "package must be a table".to_owned())?;
+        let Some(root) = active_build_script_path(package, package_dir, self.inventory)? else {
+            return Ok(BTreeSet::new());
+        };
+        let mut closure = BTreeSet::new();
+        let mut pending = vec![root];
+        while let Some(file) = pending.pop() {
+            if !closure.insert(file.clone()) {
+                continue;
+            }
+            let scan = self.scan(&file)?;
+            pending.extend(scan.rust_inputs.iter().cloned());
+            for (rust, suffix) in &scan.manifest_dir_inputs {
+                if !rust {
+                    continue;
+                }
+                let relative = suffix.strip_prefix('/').ok_or_else(|| {
+                    format!("{file}: CARGO_MANIFEST_DIR include suffix {suffix:?} has no separator")
+                })?;
+                pending.push(
+                    safe_join_repo_path(package_dir, relative)
+                        .map_err(|reason| format!("{file}: {reason}"))?,
+                );
+            }
+            let file_dir = parent_repo_path(&file);
+            for (ups, rest) in &scan.path_attributes {
+                pending.extend(path_attribute_candidates(
+                    self.inventory,
+                    &file_dir,
+                    *ups,
+                    rest,
+                ));
+            }
+            let stem_base = Path::new(&file)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| !matches!(*stem, "lib" | "main" | "mod" | "build"))
+                .and_then(|stem| safe_join_repo_path(&file_dir, stem).ok());
+            for module_path in &scan.module_declarations {
+                let Some((name, ancestors)) = module_path.split_last() else {
+                    continue;
+                };
+                let mut bases = vec![file_dir.clone()];
+                if let Some(base) = &stem_base {
+                    bases.push(base.clone());
+                }
+                bases.push(package_dir.to_owned());
+                bases.sort();
+                bases.dedup();
+                for base in bases {
+                    let base = if ancestors.is_empty() {
+                        base
+                    } else {
+                        safe_join_repo_path(&base, &ancestors.join("/"))
+                            .expect("parser-derived inline module path stays repository-relative")
+                    };
+                    for suffix in [format!("{name}.rs"), format!("{name}/mod.rs")] {
+                        let candidate = safe_join_repo_path(&base, &suffix)
+                            .expect("parser-derived module name stays repository-relative");
+                        if self
+                            .inventory
+                            .get(&candidate)
+                            .is_some_and(is_live_regular_entry)
+                        {
+                            pending.push(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(closure)
     }
 
     fn scan(&mut self, path: &str) -> Result<RustInputScan, String> {
@@ -10481,6 +10743,8 @@ struct RustInputScan {
     path_attributes: Vec<(usize, String)>,
     /// Literal `cargo:rerun-if-changed=` targets, relative to the package.
     rerun_if_changed: Vec<String>,
+    /// External `mod name;` declarations with their inline-module ancestry.
+    module_declarations: Vec<Vec<String>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -10509,7 +10773,7 @@ fn scan_rust_inputs(path: &str, text: &str) -> Result<RustInputScan, String> {
     let tokens = proc_macro2::TokenStream::from_str(text)
         .map_err(|error| format!("{path}: Rust source does not lex: {error}"))?;
     let mut scan = RustInputScan::default();
-    scan_rust_input_tokens(&parent_repo_path(path), tokens, false, &mut scan)
+    scan_rust_input_tokens(&parent_repo_path(path), tokens, false, &[], &mut scan)
         .map_err(|reason| format!("{path}: {reason}"))?;
     Ok(scan)
 }
@@ -10518,6 +10782,7 @@ fn scan_rust_input_tokens(
     dir: &str,
     tokens: proc_macro2::TokenStream,
     generated: bool,
+    module_path: &[String],
     scan: &mut RustInputScan,
 ) -> Result<(), String> {
     use proc_macro2::{Delimiter, TokenTree};
@@ -10541,12 +10806,38 @@ fn scan_rust_input_tokens(
                         }
                         scan.path_attributes.push(split_relative_path(&value)?);
                     }
-                    scan_rust_input_tokens(dir, attribute.stream(), generated, scan)?;
+                    scan_rust_input_tokens(dir, attribute.stream(), generated, module_path, scan)?;
                     index = next + 1;
                     continue;
                 }
             }
-            TokenTree::Ident(_) => {
+            TokenTree::Ident(ident) => {
+                if !generated
+                    && ident == "mod"
+                    && let Some(TokenTree::Ident(name)) = tokens.get(index + 1)
+                {
+                    let mut child_path = module_path.to_vec();
+                    child_path.push(normalize_identifier(name.to_string()));
+                    match tokens.get(index + 2) {
+                        Some(TokenTree::Punct(end)) if end.as_char() == ';' => {
+                            scan.module_declarations.push(child_path);
+                            index += 3;
+                            continue;
+                        }
+                        Some(TokenTree::Group(body)) if body.delimiter() == Delimiter::Brace => {
+                            scan_rust_input_tokens(
+                                dir,
+                                body.stream(),
+                                generated,
+                                &child_path,
+                                scan,
+                            )?;
+                            index += 3;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some((name, body, end)) = macro_call_at(&tokens, index) {
                     match name.as_str() {
                         "include" | "include_str" | "include_bytes" => {
@@ -10557,16 +10848,22 @@ fn scan_rust_input_tokens(
                         | "quote_spanned"
                         | "parse_quote"
                         | "parse_quote_spanned" => {
-                            scan_rust_input_tokens(dir, body.stream(), true, scan)?;
+                            scan_rust_input_tokens(dir, body.stream(), true, module_path, scan)?;
                         }
-                        _ => scan_rust_input_tokens(dir, body.stream(), generated, scan)?,
+                        _ => scan_rust_input_tokens(
+                            dir,
+                            body.stream(),
+                            generated,
+                            module_path,
+                            scan,
+                        )?,
                     }
                     index = end;
                     continue;
                 }
             }
             TokenTree::Group(group) => {
-                scan_rust_input_tokens(dir, group.stream(), generated, scan)?;
+                scan_rust_input_tokens(dir, group.stream(), generated, module_path, scan)?;
             }
             TokenTree::Literal(literal) => {
                 scan.rerun_if_changed
@@ -11790,22 +12087,34 @@ fn package_has_active_build_script(
     manifest_dir: &str,
     inventory: &BTreeMap<String, RevisionEntry>,
 ) -> Result<bool, String> {
+    active_build_script_path(package, manifest_dir, inventory).map(|path| path.is_some())
+}
+
+fn active_build_script_path(
+    package: &toml::Table,
+    manifest_dir: &str,
+    inventory: &BTreeMap<String, RevisionEntry>,
+) -> Result<Option<String>, String> {
     let declared_build_script = |path: &str| {
         let path = safe_join_repo_path(manifest_dir, path)
             .map_err(|reason| format!("package.build cannot be resolved: {reason}"))?;
         inventory
             .get(&path)
             .is_some_and(is_live_regular_entry)
-            .then_some(true)
+            .then_some(Some(path.clone()))
             .ok_or_else(|| format!("declared build script {path} is unavailable"))
     };
     match package.get("build") {
-        Some(toml::Value::Boolean(false)) => Ok(false),
+        Some(toml::Value::Boolean(false)) => Ok(None),
         Some(toml::Value::Boolean(true)) => declared_build_script("build.rs"),
         Some(toml::Value::String(path)) => declared_build_script(path),
         Some(_) => Err("package.build must be a string or boolean".to_owned()),
-        None => safe_join_repo_path(manifest_dir, "build.rs")
-            .map(|path| inventory.get(&path).is_some_and(is_live_regular_entry)),
+        None => safe_join_repo_path(manifest_dir, "build.rs").map(|path| {
+            inventory
+                .get(&path)
+                .is_some_and(is_live_regular_entry)
+                .then_some(path)
+        }),
     }
 }
 
@@ -14700,6 +15009,112 @@ mod tests {
                 .iter()
                 .all(|module| module.module_path.is_empty())
         );
+    }
+
+    #[test]
+    fn rust_api_snapshot_inner_cfg_test_removes_crate_and_nested_module_surfaces() {
+        let root = snapshot_rust_api(&source(
+            "#![cfg(test)]\npub fn root_only() {}\ngenerated!();\n",
+        ));
+        assert!(root.crates.is_empty(), "{:#?}", root.crates);
+        assert!(root.modules.is_empty(), "{:#?}", root.modules);
+        assert!(root.items.is_empty(), "{:#?}", root.items);
+        assert!(root.declarations.is_empty(), "{:#?}", root.declarations);
+        assert!(root.reexports.is_empty(), "{:#?}", root.reexports);
+        assert!(root.unknowns.is_empty(), "{:#?}", root.unknowns);
+
+        let nested = snapshot_rust_api(&MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", b"pub mod hidden;\npub fn kept() {}\n"),
+            (
+                "src/hidden.rs",
+                b"#![cfg(test)]\npub fn leaked() {}\ngenerated!();\n",
+            ),
+        ]));
+        assert!(names(&nested).iter().any(|name| name == "kept"));
+        assert!(
+            nested
+                .modules
+                .iter()
+                .all(|module| module.module_path != ["hidden"]),
+            "{:#?}",
+            nested.modules
+        );
+        assert!(
+            names(&nested).iter().all(|name| name != "hidden::leaked"),
+            "{:#?}",
+            nested.items
+        );
+        assert!(nested.unknowns.is_empty(), "{:#?}", nested.unknowns);
+    }
+
+    #[test]
+    fn confirmed_parent_contracts_ignore_only_proven_test_members() {
+        let contract = |source: &str| {
+            normalized_confirmed_contract_without_item_name(
+                syn::parse_str::<Item>(source).expect("fixture item"),
+                &DeriveNameAmbiguity::default(),
+            )
+        };
+
+        for (base, with_test_member) in [
+            (
+                "pub struct Named { pub kept: u8 }",
+                "pub struct Named { pub kept: u8, #[cfg(test)] pub helper: u16 }",
+            ),
+            (
+                "pub struct Tuple(pub u8);",
+                "pub struct Tuple(pub u8, #[cfg(test)] u16);",
+            ),
+            (
+                "pub enum Choice { Kept { value: u8 } }",
+                "pub enum Choice { Kept { value: u8, #[cfg(all(unix, test))] helper: u16 }, #[cfg(test)] Helper }",
+            ),
+            (
+                "pub enum TupleChoice { Kept(u8) }",
+                "pub enum TupleChoice { Kept(u8, #[cfg(test)] u16), #[cfg(test)] Helper(u32) }",
+            ),
+            (
+                "pub trait Api { const KEPT: u8; fn kept(&self); type Kept; }",
+                "pub trait Api { const KEPT: u8; fn kept(&self); type Kept; #[cfg(test)] const HELPER: u16; #[cfg(test)] fn helper(&self); #[cfg(test)] type Helper; #[cfg(test)] helper_macro!(); }",
+            ),
+        ] {
+            assert_eq!(
+                contract(base),
+                contract(with_test_member),
+                "{with_test_member}"
+            );
+        }
+
+        for observable_member in [
+            "pub struct Named { pub kept: u8, #[cfg(any(test, unix))] pub helper: u16 }",
+            "pub struct Named { pub kept: u8, #[cfg(feature = \"test\")] pub helper: u16 }",
+        ] {
+            assert_ne!(
+                contract("pub struct Named { pub kept: u8 }"),
+                contract(observable_member),
+                "{observable_member}"
+            );
+        }
+
+        let constructor = |snapshot: &RustApiSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .find(|item| {
+                    item.kind == RustApiItemKind::StructConstructor
+                        && item.key.external_name == "Tuple"
+                })
+                .cloned()
+                .expect("public tuple constructor")
+        };
+        let base = snapshot_rust_api(&source("pub struct Tuple(pub u8);"));
+        let with_private_test_field =
+            snapshot_rust_api(&source("pub struct Tuple(pub u8, #[cfg(test)] u16);"));
+        assert_eq!(constructor(&base), constructor(&with_private_test_field));
     }
 
     #[test]
@@ -19275,6 +19690,44 @@ mod tests {
     }
 
     #[test]
+    fn git_tree_delete_and_rename_change_scoped_raw_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(temp.path().join("watched")).unwrap();
+        fs::write(temp.path().join("watched/schema.json"), "version 1\n").unwrap();
+        let base_oid = commit(temp.path(), "base");
+
+        fs::remove_file(temp.path().join("watched/schema.json")).unwrap();
+        let deleted_oid = commit(temp.path(), "delete watched input");
+
+        run_git(temp.path(), &["checkout", "-q", &base_oid]);
+        fs::rename(
+            temp.path().join("watched/schema.json"),
+            temp.path().join("watched/schema-v2.json"),
+        )
+        .unwrap();
+        let renamed_oid = commit(temp.path(), "rename watched input");
+
+        let repo = Repository::open(temp.path()).unwrap();
+        let digest = |oid: &str| {
+            let source = GitTree::new(&repo, oid).unwrap();
+            let inventory = source
+                .entries()
+                .into_iter()
+                .map(|entry| (entry.path.clone(), entry))
+                .collect::<BTreeMap<_, _>>();
+            let model = CargoInputModel::new(&source, &inventory, &[], &BTreeSet::new());
+            model.raw_digest(&CargoInputSet {
+                subtrees: BTreeSet::from(["watched".to_owned()]),
+                files: BTreeSet::new(),
+            })
+        };
+        let base = digest(&base_oid);
+        assert_ne!(digest(&deleted_oid), base);
+        assert_ne!(digest(&renamed_oid), base);
+    }
+
+    #[test]
     fn opaque_substrate_digest_is_alpha_stable() {
         let manifest = b"[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
         let base_source = b"pub async fn api<T: Default>() { let _: T = T::default(); }\n";
@@ -19544,6 +19997,7 @@ mod tests {
                     (0, "impls/x.rs".to_owned()),
                 ],
                 rerun_if_changed: vec!["proto/api.proto".to_owned(), "../shared".to_owned()],
+                module_declarations: vec![vec!["platform".to_owned()], vec!["x".to_owned()]],
             }
         );
     }
@@ -19742,6 +20196,120 @@ mod tests {
     }
 
     #[test]
+    fn cargo_rerun_if_changed_is_read_only_from_the_build_script_closure() {
+        fn digest(
+            manifest: &str,
+            lib: &str,
+            build_path: Option<&str>,
+            build_source: Option<&str>,
+            closure_source: Option<(&str, &str)>,
+            watched: &str,
+        ) -> PackageImplementationDigests {
+            let mut files = vec![
+                (
+                    "Cargo.toml",
+                    b"[workspace]\nmembers=['pkg']\nresolver='2'\n".as_slice(),
+                ),
+                ("pkg/Cargo.toml", manifest.as_bytes()),
+                ("pkg/src/lib.rs", lib.as_bytes()),
+                ("watched.txt", watched.as_bytes()),
+            ];
+            if let (Some(path), Some(source)) = (build_path, build_source) {
+                files.push((path, source.as_bytes()));
+            }
+            if let Some((path, source)) = closure_source {
+                files.push((path, source.as_bytes()));
+            }
+            package_digests_of(&MemorySource::new(&files))["pkg/Cargo.toml"].clone()
+        }
+
+        let plain_manifest = "[package]\nname='pkg'\nversion='0.0.0'\n";
+        let application = "pub const MESSAGE: &str = \"cargo:rerun-if-changed=../watched.txt\";\n";
+        assert_eq!(
+            digest(plain_manifest, application, None, None, None, "before\n"),
+            digest(plain_manifest, application, None, None, None, "after\n"),
+            "an ordinary Rust literal must not declare a Cargo build-script input"
+        );
+
+        let declaration = "fn main() { println!(\"cargo:rerun-if-changed=../watched.txt\"); }\n";
+        assert_ne!(
+            digest(
+                plain_manifest,
+                "pub fn api() {}\n",
+                Some("pkg/build.rs"),
+                Some(declaration),
+                None,
+                "before\n",
+            ),
+            digest(
+                plain_manifest,
+                "pub fn api() {}\n",
+                Some("pkg/build.rs"),
+                Some(declaration),
+                None,
+                "after\n",
+            ),
+            "the default build script must bind its declared input"
+        );
+
+        let custom_manifest = "[package]\nname='pkg'\nversion='0.0.0'\nbuild='tools/build.rs'\n";
+        assert_ne!(
+            digest(
+                custom_manifest,
+                "pub fn api() {}\n",
+                Some("pkg/tools/build.rs"),
+                Some(declaration),
+                None,
+                "before\n",
+            ),
+            digest(
+                custom_manifest,
+                "pub fn api() {}\n",
+                Some("pkg/tools/build.rs"),
+                Some(declaration),
+                None,
+                "after\n",
+            ),
+            "a custom package.build must bind its declared input"
+        );
+
+        for (build_source, closure_path) in [
+            (
+                "include!(\"build_inputs.rs\");\nfn main() {}\n",
+                "pkg/tools/build_inputs.rs",
+            ),
+            (
+                "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/tools/build_inputs.rs\"));\nfn main() {}\n",
+                "pkg/tools/build_inputs.rs",
+            ),
+            (
+                "mod outer { mod helper; }\nfn main() {}\n",
+                "pkg/tools/outer/helper.rs",
+            ),
+        ] {
+            assert_ne!(
+                digest(
+                    custom_manifest,
+                    "pub fn api() {}\n",
+                    Some("pkg/tools/build.rs"),
+                    Some(build_source),
+                    Some((closure_path, declaration)),
+                    "before\n",
+                ),
+                digest(
+                    custom_manifest,
+                    "pub fn api() {}\n",
+                    Some("pkg/tools/build.rs"),
+                    Some(build_source),
+                    Some((closure_path, declaration)),
+                    "after\n",
+                ),
+                "the active build-script source closure must bind declarations: {build_source}"
+            );
+        }
+    }
+
+    #[test]
     fn unbounded_package_inputs_fall_back_to_the_whole_revision() {
         for api_lib in [
             "pub const X: &str = include_str!(some_path!());\npub async fn api() {}\n",
@@ -19792,6 +20360,69 @@ mod tests {
         assert_eq!(digests["api"], "unresolved:x");
         merge_crate_digest(&mut digests, "api", "sha256:c");
         assert_eq!(digests["api"], "unresolved:x");
+    }
+
+    #[test]
+    fn rust_api_snapshot_same_name_packages_use_the_complete_digest_set() {
+        fn workspace(later_source: &str) -> MemorySource {
+            MemorySource::new(&[
+                (
+                    "Cargo.toml",
+                    b"[workspace]\nmembers=['a','b','c']\nresolver='2'\n",
+                ),
+                ("Cargo.lock", b"version = 4\n"),
+                (
+                    "a/Cargo.toml",
+                    b"[package]\nname='api-a'\nversion='0.0.0'\n[lib]\nname='api'\n",
+                ),
+                ("a/src/lib.rs", b"pub async fn earlier() {}\n"),
+                (
+                    "b/Cargo.toml",
+                    b"[package]\nname='api-b'\nversion='0.0.0'\n[lib]\nname='api'\n",
+                ),
+                ("b/src/lib.rs", b"pub fn broken(\n"),
+                (
+                    "c/Cargo.toml",
+                    b"[package]\nname='api-c'\nversion='0.0.0'\n[lib]\nname='api'\n",
+                ),
+                ("c/src/lib.rs", later_source.as_bytes()),
+            ])
+        }
+        let proof = |snapshot: &RustApiSnapshot| {
+            snapshot
+                .unknowns
+                .iter()
+                .find(|unknown| {
+                    unknown.kind == RustApiUnknownKind::OpaqueReturnAutoTraits
+                        && unknown.source_path == "a/src/lib.rs"
+                })
+                .map(|unknown| unknown.evidence.clone())
+                .inspect(|evidence| {
+                    assert!(
+                        evidence.contains("opaque-implementation-digest:sha256:"),
+                        "proof must be revision-backed: {evidence}"
+                    );
+                })
+                .expect("earlier package opaque proof")
+        };
+
+        let base = snapshot_rust_api(&workspace("pub fn later() {}\n"));
+        let changed = snapshot_rust_api(&workspace(
+            "pub fn later() {}\nfn changed_private_implementation() {}\n",
+        ));
+        assert_ne!(proof(&base), proof(&changed));
+        for snapshot in [&base, &changed] {
+            assert_eq!(
+                snapshot
+                    .unknowns
+                    .iter()
+                    .filter(|unknown| unknown.kind == RustApiUnknownKind::SourceParse)
+                    .count(),
+                1,
+                "{:#?}",
+                snapshot.unknowns
+            );
+        }
     }
 
     #[test]
