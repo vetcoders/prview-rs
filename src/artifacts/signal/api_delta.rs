@@ -9764,21 +9764,25 @@ mod tests {
     fn a_region_projects_through_only_cfg_compatible_public_aliases() {
         let incompatible = compare_rust_api(
             &snapshot_rust_api(&MemorySource::source(
-                "#[cfg(unix)] mod real { pub fn kept() {} }\n\
-                 #[cfg(windows)] mod real { include!(\"generated.rs\"); }\n\
-                 #[cfg(unix)] pub use real as alias;\n\
-                 #[cfg(windows)] pub mod alias {}\n",
+                "#[cfg(unix)] pub mod real { pub fn kept() {} }\n\
+                 #[cfg(windows)] pub mod real { include!(\"generated.rs\"); }\n\
+                 #[cfg(unix)] pub use real as alias;\n",
                 "base",
             )),
             &snapshot_rust_api(&MemorySource::source(
-                "#[cfg(unix)] mod real { pub fn kept() {} }\n\
-                 #[cfg(windows)] mod real {}\n\
+                "#[cfg(unix)] pub mod real { pub fn kept() {} }\n\
+                 #[cfg(windows)] pub mod real {}\n\
                  #[cfg(unix)] pub use real as alias;\n\
                  #[cfg(windows)] pub mod alias { pub fn added() {} }\n",
                 "target",
             )),
         );
-        assert_eq!(incompatible.added.len(), 1, "{:?}", incompatible.findings());
+        assert_eq!(incompatible.added.len(), 2, "{:?}", incompatible.findings());
+        assert!(
+            finding_at(&incompatible.added, &[], "module", "alias").is_some(),
+            "{:?}",
+            incompatible.findings()
+        );
         assert!(
             finding_at(&incompatible.added, &["alias"], "value", "added").is_some(),
             "{:?}",
@@ -9789,15 +9793,26 @@ mod tests {
             "{:?}",
             incompatible.findings()
         );
+        assert_eq!(
+            incompatible.unknown.len(),
+            1,
+            "{:?}",
+            incompatible.findings()
+        );
+        assert!(
+            finding_at(&incompatible.unknown, &["real"], "unknown", "IncludeMacro").is_some(),
+            "{:?}",
+            incompatible.findings()
+        );
 
         let compatible = compare_rust_api(
             &snapshot_rust_api(&MemorySource::source(
-                "#[cfg(windows)] mod real { include!(\"generated.rs\"); }\n\
+                "#[cfg(windows)] pub mod real { include!(\"generated.rs\"); }\n\
                  #[cfg(windows)] pub use real as alias;\n",
                 "base",
             )),
             &snapshot_rust_api(&MemorySource::source(
-                "#[cfg(windows)] mod real { pub fn added() {} }\n\
+                "#[cfg(windows)] pub mod real { pub fn added() {} }\n\
                  #[cfg(windows)] pub use real as alias;\n",
                 "target",
             )),
@@ -9807,17 +9822,28 @@ mod tests {
             "{:?}",
             compatible.findings()
         );
+        assert_eq!(compatible.unknown.len(), 3, "{:?}", compatible.findings());
+        assert!(
+            finding_at(&compatible.unknown, &["real"], "value", "added").is_some(),
+            "{:?}",
+            compatible.findings()
+        );
+        assert!(
+            finding_at(&compatible.unknown, &["real"], "unknown", "IncludeMacro").is_some(),
+            "{:?}",
+            compatible.findings()
+        );
+        let compatible_finding = finding_at(&compatible.unknown, &["alias"], "value", "added")
+            .unwrap_or_else(|| panic!("{:?}", compatible.findings()));
         assert_eq!(
-            compatible
-                .unknown
+            compatible_finding.unknown_reason.as_deref(),
+            Some(BASE_REGION_BLOCKS)
+        );
+        assert!(
+            compatible_finding
+                .evidence
                 .iter()
-                .filter(|finding| {
-                    finding.identity.module_path == ["alias"]
-                        && finding.identity.namespace == "value"
-                        && finding.identity.name == "added"
-                })
-                .count(),
-            1,
+                .any(|line| line == "blocking base region: IncludeMacro in fixture crate::real"),
             "{:?}",
             compatible.findings()
         );
