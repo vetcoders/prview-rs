@@ -2992,7 +2992,10 @@ an overbroad positive when both features can be active. Item aliases, internal
 resolver-only module aliases, externally reachable module aliases (including
 nested `self as alias`), constructors, and chains through `crate`, `self`, and
 `super` resolve in one finite stable-set closure. Internal aliases never enter
-the semantic snapshot.
+the semantic snapshot. Unknown-region projection retains the effective cfg
+guard of each externally reachable module alias. It follows an alias only when
+that guard may overlap both the candidate identity and the source unknown
+region; a Unix-only alias cannot project a Windows-only failure.
 Declaration and every intermediate reexport guard are merged before an alias
 enters the graph. Relative/root candidates that source-level resolution cannot
 select uniquely become `AmbiguousReexport`, not two positives. Module/type,
@@ -3059,8 +3062,12 @@ dependents, integration tests, and doctests link the crate built without it. An
 item whose guard provably requires `test` (the conjunct `test`, or an `all(..)`
 with such an operand) is therefore skipped before any module load, macro, or
 include handling, so `#[cfg(test)] mod tests` contributes neither items nor
-unknowns. Member-level records under `#[cfg(test)]` (impl, trait, or foreign
-members) leave the surface in one final pass together with their unknowns.
+unknowns. Inner file attributes such as `#![cfg(test)]` also apply to crate roots
+and loaded modules before their contents enter the surface. Proven test-only
+struct/union fields, enum variants and their fields, and trait members are
+excluded from their parent canonical contracts. Member-level records under
+`#[cfg(test)]` (impl, trait, or foreign members) leave the surface in one final
+pass together with their unknowns.
 `any(test, ..)`, `not(test)`, and `cfg_attr(test, ..)` stay observable, and the
 predicate re-parses the canonical guard, so a string literal never poses as a
 `test` operand. Moving a public item under `#[cfg(test)]` is reported as a
@@ -3183,7 +3190,8 @@ and opaque return) bind a package's Cargo input scope rather than the whole
 revision. The scope is the package directory, its declared target files, every
 literal `include!`/`include_str!`/`include_bytes!`/`#[path]` target of its Rust
 sources (a fixpoint over the files they pull in), the literal
-`rerun-if-changed` targets of its build script, every Cargo authority file (any
+`rerun-if-changed` targets of its active default or explicitly configured build
+script and the Rust modules/includes it loads, every Cargo authority file (any
 manifest, lock, toolchain pin, or `.cargo` configuration), and the scopes of
 its local path dependencies, dev-dependencies excluded. Sources are lexed, so
 comments and string contents never pose as includes, and `#[path]` resolves to
@@ -3194,11 +3202,12 @@ include argument, an include or `#[path]` inside `macro_rules!`/`quote!`, a
 unresolvable path-dependency graph, a Cargo source override, or a tracked
 symlink. Snapshot-wide preconditions still fail every package alike, a package
 at the repository root keeps the whole revision, and a crate name shared by
-several packages binds all of them. Digests are read only while a package's own
-items are walked, after that package merged its digest in, so dropping the
-digests of a package whose crate root fails to load cannot unbind another
-package of the same crate name. A file outside the scope that a build script or
-proc macro reads without a literal declaration is not bound: Cargo does not
+several packages binds all of them. Same-name package digests are aggregated
+before any crate root is walked, so even the first package's evidence binds
+later packages' inputs. An unloadable root cannot erase another package's
+aggregate. Ordinary application strings that resemble `rerun-if-changed`
+records do not declare build-script inputs. A file outside the scope that a
+build script or proc macro reads without a literal declaration is not bound: Cargo does not
 track it either, and editing only such a file leaves the digest unchanged on
 both sides.
 

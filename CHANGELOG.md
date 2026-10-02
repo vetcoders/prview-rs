@@ -586,12 +586,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   became unknowns (100 of 596 unknown records on the measured Vista range).
   Items whose guard requires `test` now leave the surface; `any(test, ..)`,
   `not(test)`, and `cfg_attr(test, ..)` stay observable, and moving a public
-  item under `#[cfg(test)]` is a removal.
+  item under `#[cfg(test)]` is a removal. Inner file-level test guards apply to
+  crate roots and modules, and proven test-only fields, variants, and trait
+  members also leave their parent canonical contracts.
 - Opaque-return, proc-macro, macro-invocation, and cfg-authority digests bind
   each package's Cargo input scope instead of the whole revision, so an
   unrelated tracked change (docs, a sibling package) no longer turns every such
   proof into an unknown (474 of the 596 measured unknown records). Anything the
-  scope model cannot bound widens that package back to the whole revision. A
+  scope model cannot bound widens that package back to the whole revision.
+  Same-name package digests are aggregated before walking any root, so earlier
+  proofs bind later packages too. Build watch declarations are read from the
+  active build script and its Rust source closure, not application strings. A
   file outside the scope that a build script or proc macro reads without a
   literal declaration is not bound, as Cargo does not track it either.
 - An unknown Rust API region blocks a pair only where its hidden content could
@@ -608,7 +613,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name (`pub use crate::ali::Thing` with `ali` unresolved under `windows`) is
   itself unknown under that guard, even when another cfg variant of `ali`
   resolves, so the narrower block cannot confirm an addition the hidden variant
-  may already provide.
+  may already provide. Named external re-exports follow the same name-bound
+  rule. Unknown-region projection through module aliases retains cfg guards,
+  so a provably disjoint alias cannot hide an unrelated confirmed change.
 
 ## [0.8.0] - 2026-09-13
 

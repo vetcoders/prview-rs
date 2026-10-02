@@ -529,7 +529,14 @@ followed by `, +K more` when there are more; the complete list stays in this
 structure, `BREAKING_CHANGES.json`, and `PUBLIC_API_DIFF.json`, and the named
 IDs join directly to it. An unknown produced because an unknown snapshot region
 blocked a pair carries that region's `unknown_source` and an evidence line
-naming the region's kind, crate, and module.
+naming the region's kind, crate, and module. A named external re-export with
+`bound-name:` evidence blocks that name rather than unrelated module items.
+Projection through a module alias retains its cfg guard and requires potential
+overlap with both the identity and the source region.
+Facts represent the production API: proven file-level `cfg(test)` excludes the
+root/module contents, and proven test-only fields, enum variants, and trait
+members do not enter their parent canonical contracts. Uncertain guards remain
+observable.
 
 `PrivateTypeDependency` findings retain the canonical guarded declaration,
 alias, and impl evidence that produced them. If finite alias resolution is
@@ -561,11 +568,14 @@ declared requirement, including registry checksum or precise Git commit.
 Reachable path manifests and effective Cargo config bytes from every reachable
 manifest invocation context participate in the digest. Each digest binds the
 package's Cargo input scope (its directory, declared targets, literal
-`include*!`/`#[path]` and `rerun-if-changed` targets, Cargo authority files,
+`include*!`/`#[path]` targets, `rerun-if-changed` targets declared by its active
+build script and its Rust source closure, Cargo authority files,
 and the scopes of its local path dependencies), so a change outside that scope
 leaves it unchanged; anything the scope cannot bound widens it to the whole
-revision. A file outside the scope that a build script or proc macro reads
-without a literal declaration is not bound. Unresolved
+revision. Same-name crate packages aggregate their digests before any
+package's proofs are collected. Application strings resembling build watch
+records do not enlarge that scope. A file outside the scope that a build script
+or proc macro reads without a literal declaration is not bound. Unresolved
 manifest/config Cargo source replacement, a stale same-name local lock entry,
 or a tracked symlink (including an overlay
 typechange to symlink) keeps the digest non-neutralizable. Additive derive
