@@ -42,7 +42,9 @@ class SuccessfulLiveCheckTests(unittest.TestCase):
 
 
 class RequiredRunChecksTests(unittest.TestCase):
-    def evaluate_with_checks(self, checks: list[dict]) -> list[str]:
+    def evaluate_with_checks(
+        self, checks: list[dict], resources: dict | None = None
+    ) -> list[str]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         work = pathlib.Path(temp.name)
@@ -56,6 +58,7 @@ class RequiredRunChecksTests(unittest.TestCase):
                         "effective_budget": "safe",
                         "parent_permits": 1,
                         "child_worker_limit": 1,
+                        **(resources or {}),
                     },
                     "checks": checks,
                 }
@@ -99,6 +102,32 @@ class RequiredRunChecksTests(unittest.TestCase):
             {"assert_scope": lambda *_: None},
         )
         return receipt["violations"]
+
+    def test_safe_child_cap_tracks_the_machine_observation(self) -> None:
+        checks = [
+            {"name": name, "status": "passed", "cached": False}
+            for name in MODULE.REQUIRED_RUN_CHECKS.values()
+        ]
+        for cores, load, cap, valid in (
+            (4, 0.49, 2, True),
+            (4, 0.5, 1, True),
+            (3, 0.0, 1, True),
+            (14, None, 1, True),
+            (14, -1.0, 1, True),
+            (14, 0.1, 1, False),
+            (14, 0.8, 2, False),
+            (14, 0.1, 3, False),
+        ):
+            with self.subTest(cores=cores, load=load, cap=cap):
+                violations = self.evaluate_with_checks(
+                    checks,
+                    {
+                        "logical_cores": cores,
+                        "load_per_core": load,
+                        "child_worker_limit": cap,
+                    },
+                )
+                self.assertEqual(not violations, valid, violations)
 
     def test_clippy_and_rustfmt_are_required_live_checks(self) -> None:
         self.assertEqual(MODULE.REQUIRED_RUN_CHECKS["clippy"], "Clippy")

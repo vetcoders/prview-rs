@@ -2158,7 +2158,12 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   `Exclusive` consumes the entire budget for unsupported or unbounded child
   pools. The safe default therefore serializes every whole-machine tool.
 - **The default is intentionally conservative.** `--resource-budget safe` uses
-  one parent permit and one child worker. The opt-in `balanced` plan admits at
+  one parent permit and at most two supported child workers. Two workers require
+  at least four logical cores and a finite, nonnegative one-minute load below
+  `0.5/core`; smaller, busy, or load-unknown hosts retain one. The observation
+  selects a fixed envelope at startup, not a continuously adapting pool. Parent
+  admission remains serialized, including light checks, and stricter inherited
+  or repository child limits are preserved. The opt-in `balanced` plan admits at
   most two capped heavy parents, never creates more parent permits than detected
   logical cores, caps each supported child pool at four, and caps the logical
   permit envelope at eight even on a large host. A one-core host therefore stays

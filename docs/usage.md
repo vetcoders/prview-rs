@@ -245,14 +245,27 @@ prview feature/x main
 ### Resource budget
 
 `prview` defaults to `--resource-budget safe`: at most one whole-machine tool
-runs at a time and supported descendant pools receive one worker. This is the
-recommended setting for ordinary developer machines.
+runs at a time. Supported descendant pools receive up to two workers when the
+machine has at least four logical cores and its observed one-minute load is
+below `0.5/core`; otherwise they receive one. Unknown or invalid load stays
+single-worker. The plan is selected once at startup, and stricter inherited or
+repository worker limits still apply. This is the recommended setting for
+ordinary developer machines.
+
+A standard `--pr` review already skips tests by default, but can still perform
+a full `cargo check`. Its snapshot builds use a separate persistent directory
+at `~/.prview/cargo-target/<repo>`, so the first Rust review can compile a cold
+dependency graph even when the developer's own `target/` is warm. Two workers
+allow independent dependencies to build in parallel without admitting another
+check concurrently. The result cache replays a completed check for the same reviewed commit;
+`--no-cache` disables that replay, but does not clear the Cargo build directory.
 
 Under `safe` the budget is a single permit and admission is fair-FIFO, so
 **every check runs one at a time, light ones included** — a check that has not
 been admitted is waiting for the machine, not stuck. On a large repository the
-whole stage therefore takes roughly the sum of its checks, and a long `--deep`
-run is the contract working rather than a hang.
+whole stage therefore takes roughly the sum of its checks. A queue alone does
+not prove a hang; use each check's elapsed time and the recorded stage timings
+to identify the expensive work.
 
 The progress line reports this directly:
 
@@ -282,8 +295,8 @@ at most two capped heavy parents and never creates more parent permits than the
 detected logical-core count; a one-core host therefore remains single-parent
 and single-worker. Cargo/rustc receive `CARGO_BUILD_JOBS`, Cargo test binaries
 receive `RUST_TEST_THREADS`, and Semgrep receives `--jobs`.
-Vitest remains capped at one CLI worker because a higher CLI value would
-override and raise a repository's stricter `maxWorkers` setting. Tools without
+Vitest remains capped at one CLI worker in both budgets because a higher CLI
+value would override and raise a repository's stricter `maxWorkers` setting. Tools without
 a stable portable cap (including tsc
 and ESLint across supported project versions) remain serialized. High current
 load, or an unavailable load reading, backpressures the effective plan to

@@ -90,7 +90,9 @@ impl ResourcePlan {
         load_average: Option<f64>,
     ) -> Self {
         let logical_cores = logical_cores.max(1);
-        let load_per_core = load_average.map(|load| (load / f64::from(logical_cores)).max(0.0));
+        let load_per_core = load_average
+            .filter(|load| load.is_finite() && *load >= 0.0)
+            .map(|load| load / f64::from(logical_cores));
         // Unknown load is treated as pressure, not as spare capacity. This is
         // intentionally conservative on platforms where no cheap load probe is
         // available.
@@ -109,7 +111,16 @@ impl ResourcePlan {
                 logical_cores,
                 total_budget: 1,
                 heavy_cost: 1,
-                worker_limit: 1,
+                // Serialize parents without serializing every dependency build
+                // on an otherwise idle multi-core host. Never expand a pool
+                // when the load probe cannot establish spare capacity.
+                worker_limit: if logical_cores >= 4
+                    && load_per_core.is_some_and(|ratio| ratio < 0.5)
+                {
+                    2
+                } else {
+                    1
+                },
                 load_per_core,
                 backpressured,
             },
@@ -1162,6 +1173,53 @@ mod tests {
         assert!(pressured.backpressured);
         assert_eq!(pressured.total_budget, 1);
         assert_eq!(pressured.worker_limit, 1);
+    }
+
+    #[test]
+    fn safe_expands_only_a_known_idle_multi_core_child_pool() {
+        for (cores, load, workers) in [
+            (1, Some(0.0), 1),
+            (3, Some(0.0), 1),
+            (4, Some(1.99), 2),
+            (4, Some(2.0), 1),
+            (14, Some(5.38), 2),
+            (64, Some(0.0), 2),
+            (14, Some(10.5), 1),
+            (14, None, 1),
+            (14, Some(f64::NAN), 1),
+            (14, Some(f64::INFINITY), 1),
+            (14, Some(-1.0), 1),
+        ] {
+            let plan = ResourcePlan::from_observation(ResourceBudget::Safe, cores, load);
+            assert_eq!(plan.worker_limit, workers, "cores={cores}, load={load:?}");
+            assert_eq!(plan.effective, ResourceBudget::Safe);
+            assert_eq!(plan.total_budget, 1);
+            let governor = ResourceGovernor::from_plan(plan);
+            assert_eq!(governor.cost(Weight::Heavy), 1);
+            assert_eq!(governor.cost(Weight::Exclusive), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_safe_still_serializes_heavy_parents() {
+        let governor = Arc::new(ResourceGovernor::from_plan(ResourcePlan::from_observation(
+            ResourceBudget::Safe,
+            14,
+            Some(5.38),
+        )));
+        assert_eq!(governor.plan().worker_limit, 2);
+        let first = governor.acquire(Weight::Heavy).await.expect("first parent");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), governor.acquire(Weight::Heavy))
+                .await
+                .is_err(),
+            "expanding a child pool must not admit a second heavy parent"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), governor.acquire(Weight::Heavy))
+            .await
+            .expect("released budget")
+            .expect("second parent");
     }
 
     #[tokio::test]

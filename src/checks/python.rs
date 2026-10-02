@@ -1895,6 +1895,7 @@ mod tests {
         let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
 
         let mut config = create_test_config(true, true, true);
+        config.resource_plan.worker_limit = 1;
         config.repo_root = repo_root.path().to_path_buf();
         config.scan_dir_override = Some(scan_dir.path().to_path_buf());
 
@@ -2709,6 +2710,7 @@ mod tests {
     fn python_run_local_target_is_unchanged() {
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
         let mut config = create_test_config(true, true, true);
+        config.resource_plan.worker_limit = 1;
         config.repo_root = repo_root.path().to_path_buf();
 
         let run = plan_python_run(&config).expect("plan");
