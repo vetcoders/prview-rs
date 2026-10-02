@@ -3593,6 +3593,89 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
+JS/TS `export` lines pair the same way, after the patch is read
+(`pair_js_ts_exports`). Every removed export line used to be a
+`RemovedSymbol`, so a formatter rewriting an unchanged export (an arrow
+function's `=> {` block body turned into an `=>` expression body, as in the
+vbl-190 review) reported it removed. `common::js_ts_export` gives each line the
+binding importers use (the declared name or `default`), whether it lives in
+TypeScript's type namespace (`interface`, `type`), and a comparison form with
+formatting, comments and implementation removed: an arrow function up to its
+`=>` (a later declarator of the same binding, `f = (x) => x, legacy = 1`,
+stays, its own arrow body dropped the same way). The arrow is looked for only
+in a declarator's initializer (`common::js_initializers`): its name and type
+annotation come before its `=`, and there `<` and `>` bracket type parameters,
+so neither a type parameter's default (`: <T = unknown>(x: T) => R = …`) nor a
+function type in a later declarator's annotation (`a = 1, b: () => R = f`) is
+taken for an initializer or its arrow body. The form also drops the body a
+`function` opens or holds, `;` after it or not (a comment may stand on either
+side of that `;`), when that `{` follows the parameter list or a finished
+return type (a `{` after `:`, `=>`, `|` opens a return-type literal, which
+stays); a one-line class's method and static-block implementations while its
+member declarations stay; only the `{` from a class body continued below; and
+parentheses that group an initializer whole (`= ((x) => x)`;
+a comma expression `(a, b)` and a called group `((x) => x)(1)` keep theirs).
+An arrow in a conditional's branch
+(`c ? (x) => 1 : (y) => 2`) is no body to cut at, since the other branch
+follows it, so that line compares whole. The form is built from a line lexer
+(`common::js_lex`) that reads string, template and regular-expression literals
+as opaque units (a template's `${…}` is lexed as code, so a template nested in
+it is part of the outer one) and `//` / `/* */` comments as whitespace. A `/`
+is a division only after an operand: a name that is not a keyword such as
+`return` or `default` (or is one read as a property, `mod.default`), a
+literal, a closing `)` (unless it closes an `if`, `while`, `for` or `with`
+condition, after which a regular expression starts), `]`, a `}` that closes
+an object literal or function-expression body rather than a statement block
+(`common::js_closes_block`: a block's `{` follows a `)`, except when those
+parentheses belong to a `function` expression in expression position, or follows `;`, `{`,
+`}`, `else`, `do`, `try`, `finally` or a name that is no expression keyword;
+therefore `if (x) {} /[{]/` starts a regular expression while `= {} / 2`,
+`return {} / 2` and `= function () {} / 2` divide), a postfix `++` or `--`, or
+TypeScript's non-null `!`.
+Whitespace survives only where the characters on both sides would join into
+another token (`+ +`, `= >`, `/ /`, but not `+ -`). Where the file may write
+JSX (any JavaScript file, and `.tsx`), each JSX element is one opaque unit too
+(`common::opaque_js_jsx`): a `<` where an operand starts (on a binding line,
+inside an initializer), followed by a tag name or a fragment's `>`, and not a
+generic arrow's `<T,>`, `<T extends U>` or `<T = U>`. A bounded reader
+(`common::jsx_element_end`) follows the element's attributes, its `{…}`
+expressions (nested JSX included), its children and its closing tag, and the
+unit ends where the element closes, so a later declarator or the `}` that ends
+a one-line body stays visible. An element still open at the end of the line
+runs to it. JSX the reader cannot follow (a bare `>` or `}` in its text) keeps
+the whole line uncut: noise, never a hidden change. JSX text such as a URL's
+`//` is then no comment, and the unit never equals a string literal of the
+same text. A removal pairs with an addition in
+the same file with the same name and namespace, equal forms first. Equal forms
+report nothing; different forms are one `ChangedSignature`. Re-exports without
+a single identity remain additions or removals whether whitespace or comment
+trivia follows the `export` keyword or the list/star follows it directly.
+
+Each side of a section has its own file (`common::LegacyPatchSides`): removed
+lines take the `--- a/…` path and added lines the `+++ b/…` path read before
+the first hunk, so a modified rename's old-module export is a removal there and
+not paired away by the new path the normalized `diff --git` header carries. A
+copy section (`copy from` in its header, which the JS/TS filter keeps) is
+different: its source still exists, and a removed line only says how the copy
+differs from it, so both analyzers skip a copy's old side. libgit2 prints
+`copy from` only for an unchanged copy; the patch printers
+(`git::push_patch_line`) add it, quoted as Git quotes it, for every copy, as
+Git does. Both analyzers collect the same export lines
+(`common::is_js_ts_export_line`: a line opening with the `export` keyword and a
+declaration, list, star or assignment, or any other spelling
+`common::js_ts_export` reads as a declaration), so the public API diff
+pairs every form the reader recognizes (`export async function`,
+`export declare`, `export abstract class`, `export let`/`var`), not only the
+forms its own prefix list names. A line with no single name
+(`export { a } from`, `export *`, `export =`), an export moved to another
+file, and an export written indented (`common::js_ts_export_is_nested`) stay a
+`RemovedSymbol`, and a removal (or an addition) in the public API diff: an
+indented export
+is a member of a `namespace` or ambient `module` block whose name the line
+does not show, and moving it between blocks breaks consumers of the old
+qualified name. An unindented member of such a block still pairs; that is the
+bound of the line heuristic.
+
 The old Rust limitation below is historical only: a diff-only scanner could not
 see an enum variant, trait method, or public struct field removed beneath an
 unchanged item opener. Production Rust now reads both exact repository trees,
@@ -4187,11 +4270,19 @@ repo-backed Rust `ApiArtifactView` additively. Rust findings are projected only
 for old-reader compatibility; the embedded view is authoritative. Legacy
 analysis receives JS/TS patch sections only.
 
-- `PublicSymbol` struct — name, kind (`Fn`, `Struct`, `Enum`, `Trait`, `Type`, `Const`, `Static`),
-  file path, and whether it was added or removed
-- `compute_public_api_diff(diffs)` — scans added and removed lines in diff patches for
-  `pub` symbol declarations, then pairs added/removed names to identify renames and
-  signature changes. Produces `PUBLIC_API_DIFF.json`.
+- `PublicApiDiff` — the legacy `added` / `removed` (`ApiFinding`: file, symbol
+  type, signature) and `changed` (`ApiSignatureChange`: before/after) rows,
+  plus the embedded Rust view
+- `generate_public_api_diff(dir, patch_texts)` / `write_public_api_diff(...)` —
+  write `PUBLIC_API_DIFF.json` and `.md`
+- `analyze_js_ts_public_api_diff(patch_texts)` — scans added and removed
+  export lines, then pairs the two sides of one declaration (`api_pair_key`):
+  same file (the old path for a removed line, the new one for an added line),
+  symbol type and name, and for JS/TS the same namespace; an indented JS/TS
+  export never pairs. JS/TS lines compare on `common::js_ts_export`'s
+  comparison form, so a formatter rewriting an unchanged export is no change;
+  equal forms are claimed first and report nothing, and a pair that differs is
+  one signature change.
 
 Confirmed Rust facts include namespace, cfg, before/after contracts, source
 paths, provenance, confidence, evidence, and stable IDs. JS/TS remains a bounded

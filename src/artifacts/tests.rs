@@ -1328,36 +1328,474 @@ fn cross_language_ts_to_rust_keeps_only_the_js_removed_side() {
 
 #[test]
 fn quoted_and_unquoted_space_js_paths_survive_both_legacy_adapters() {
-    for patch in [
-        "diff --git \"a/src/quoted\\040api.ts\" \"b/src/quoted\\040api.ts\"\n--- \"a/src/quoted\\040api.ts\"\n+++ \"b/src/quoted\\040api.ts\"\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n",
-        "diff --git a/src/plain old.ts b/src/plain new.ts\n--- a/src/plain old.ts\n+++ b/src/plain new.ts\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n",
-    ] {
-        let filtered = signal::js_ts_patch_sections(patch);
-        assert!(filtered.contains("export function api"));
+    // One file: the same export with other parameter types is one signature
+    // change, reported under the decoded path.
+    let quoted = "diff --git \"a/src/quoted\\040api.ts\" \"b/src/quoted\\040api.ts\"\n--- \"a/src/quoted\\040api.ts\"\n+++ \"b/src/quoted\\040api.ts\"\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n";
+    let filtered = signal::js_ts_patch_sections(quoted);
+    assert!(filtered.contains("export function api"));
 
-        let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
-        assert!(
-            public
-                .removed
-                .iter()
-                .any(|finding| finding.signature.contains("value: number")),
-            "{filtered}"
-        );
-        assert!(
-            public
-                .added
-                .iter()
-                .any(|finding| finding.signature.contains("value: string")),
-            "{filtered}"
-        );
+    let public = signal::analyze_js_ts_public_api_diff(&[quoted.to_owned()]);
+    assert!(
+        public.changed.iter().any(|change| {
+            change.file == "src/quoted api.ts"
+                && change.before.contains("value: number")
+                && change.after.contains("value: string")
+        }),
+        "{filtered}"
+    );
+    assert!(
+        public.removed.is_empty() && public.added.is_empty(),
+        "{filtered}"
+    );
 
-        let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
-        assert!(breaking.iter().any(|finding| {
-            finding.file.ends_with(".ts")
-                && finding.line.contains("value: number")
+    let breaking = signal::analyze_js_ts_breaking_changes(&[quoted.to_owned()]);
+    assert!(breaking.iter().any(|finding| {
+        finding.file == "src/quoted api.ts"
+            && matches!(
+                &finding.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("value: number") && after.contains("value: string")
+            )
+    }));
+
+    // A rename: each side keeps its own spaced path, so the old module's
+    // export is a removal there and the new module's an addition.
+    let renamed = "diff --git a/src/plain old.ts b/src/plain new.ts\n--- a/src/plain old.ts\n+++ b/src/plain new.ts\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n";
+    let filtered = signal::js_ts_patch_sections(renamed);
+    assert!(filtered.contains("export function api"));
+
+    let public = signal::analyze_js_ts_public_api_diff(&[renamed.to_owned()]);
+    assert_eq!(public.removed.len(), 1, "{filtered}");
+    assert_eq!(public.removed[0].file, "src/plain old.ts");
+    assert!(public.removed[0].signature.contains("value: number"));
+    assert_eq!(public.added.len(), 1, "{filtered}");
+    assert_eq!(public.added[0].file, "src/plain new.ts");
+    assert!(public.added[0].signature.contains("value: string"));
+    assert!(public.changed.is_empty(), "{filtered}");
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[renamed.to_owned()]);
+    assert!(breaking.iter().any(|finding| {
+        finding.file == "src/plain old.ts"
+            && finding.line.contains("value: number")
+            && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
+    }));
+}
+
+/// A copy section's `-` lines say how the new copy differs from a source that
+/// still exists: reformatting an export only in the copy removes nothing from
+/// the source, and changes no signature of it.
+#[test]
+fn js_ts_copy_section_reports_no_removal_from_its_source() {
+    let patch = "diff --git a/src/base.ts b/src/copy.ts\nsimilarity index 80%\ncopy from src/base.ts\ncopy to src/copy.ts\n--- a/src/base.ts\n+++ b/src/copy.ts\n@@ -1,3 +1,3 @@\n export const a = 1;\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n export const c = 3;\n";
+
+    let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+    assert!(public.removed.is_empty(), "{:?}", public.removed);
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+    assert!(
+        breaking.iter().all(|finding| finding.file != "src/base.ts"
+            && !matches!(
+                finding.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+        "{breaking:?}"
+    );
+}
+
+#[test]
+fn js_ts_re_exports_keep_their_removal_and_addition_in_both_api_artifacts() {
+    // A re-export binds no single name the pairing could match, so neither
+    // artifact may drop it: what importers of `src/api.ts` can reach changed.
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,8 +1,2 @@\n-export { foo } from './foo';\n-export * from './bar';\n-export{ compact } from './compact';\n-export\t{ tabbed } from './tabbed';\n-export/* list */{ commented } from './commented';\n-export/* star */* from './star';\n-export/* assignment */= legacy;\n+export * from './baz';\n export const a = 1;\n";
+
+    let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+    // Row order is not part of either artifact's contract.
+    let mut removed: Vec<_> = public
+        .removed
+        .iter()
+        .map(|finding| finding.signature.as_str())
+        .collect();
+    removed.sort_unstable();
+    let added: Vec<_> = public
+        .added
+        .iter()
+        .map(|finding| finding.signature.as_str())
+        .collect();
+    let mut expected_removed = [
+        "export * from './bar';",
+        "export\t{ tabbed } from './tabbed';",
+        "export { foo } from './foo';",
+        "export{ compact } from './compact';",
+        "export/* assignment */= legacy;",
+        "export/* list */{ commented } from './commented';",
+        "export/* star */* from './star';",
+    ];
+    expected_removed.sort_unstable();
+    assert_eq!(removed, expected_removed);
+    assert_eq!(added, ["export * from './baz';"]);
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+    let mut removed: Vec<_> = breaking
+        .iter()
+        .filter(|finding| matches!(finding.kind, BreakingKind::RemovedSymbol { .. }))
+        .map(|finding| finding.line.as_str())
+        .collect();
+    removed.sort_unstable();
+    assert_eq!(removed, expected_removed);
+}
+
+/// The export lines of the vbl-190 review: two inventories whose arrow
+/// functions went from a block body to an expression body (the implementation
+/// changed, the exported contract did not), next to real API changes in the
+/// shared utilities module.
+const REFORMATTED_ARROW_EXPORTS_PATCH: &str = r#"diff --git a/scripts/component-manifest/inventory.mjs b/scripts/component-manifest/inventory.mjs
+index 232449e..fd26d1f 100644
+--- a/scripts/component-manifest/inventory.mjs
++++ b/scripts/component-manifest/inventory.mjs
+@@ -22,11 +24,9 @@ const EXCLUDED = [
+ export const isTrackedSource = (file) =>
+   /^src\/.+\.(ts|tsx)$/.test(file) && !EXCLUDED.some((pattern) => pattern.test(file));
+
+-/** Every tracked source on disk, repo-relative and forward-slashed. */
+-export const listTrackedSources = async (cwd) => {
+-  const files = await glob(SOURCE_GLOB, { cwd, nodir: true });
+-  return files.map((file) => file.replace(/\\/g, '/')).filter(isTrackedSource);
+-};
++/** Every tracked source in the git index, repo-relative and forward-slashed. */
++export const listTrackedSources = async (cwd) =>
++  listIndexPaths(cwd).filter(isTrackedSource);
+diff --git a/scripts/manifest-utils.mjs b/scripts/manifest-utils.mjs
+index 1a2b3c4..5d6e7f8 100644
+--- a/scripts/manifest-utils.mjs
++++ b/scripts/manifest-utils.mjs
+@@ -68,5 +68,7 @@ export const sortByPath = (a, b) => a.path.localeCompare(b.path);
+-export const filterGitignored = (files, cwd) => {
++export const listIndexPaths = (cwd) => Array.from(listIndexEntries(cwd).keys());
++export const readIndexBlob = (cwd, path) => readIndexBlobs(cwd, [path]).get(path) ?? null;
++export const readIndexBlobs = (cwd, paths) => {
+diff --git a/scripts/tauri-manifest/inventory.mjs b/scripts/tauri-manifest/inventory.mjs
+index 9a8b7c6..6d5e4f3 100644
+--- a/scripts/tauri-manifest/inventory.mjs
++++ b/scripts/tauri-manifest/inventory.mjs
+@@ -8,15 +8,15 @@ import { glob } from 'glob';
+-export const listTrackedModules = async (cwd) => {
++export const listTrackedModules = async (cwd) =>
+"#;
+
+#[test]
+fn a_reformatted_js_export_is_not_reported_as_removed_and_added() {
+    let patch = REFORMATTED_ARROW_EXPORTS_PATCH.to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    let names = |findings: &[signal::ApiFinding]| {
+        findings
+            .iter()
+            .map(|finding| {
+                let export = finding.signature.split('=').next().unwrap_or_default();
+                (finding.file.clone(), export.trim().to_owned())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(&public.added),
+        [
+            ("scripts/manifest-utils.mjs", "export const listIndexPaths"),
+            ("scripts/manifest-utils.mjs", "export const readIndexBlob"),
+            ("scripts/manifest-utils.mjs", "export const readIndexBlobs"),
+        ]
+        .map(|(file, export)| (file.to_owned(), export.to_owned()))
+    );
+    assert_eq!(
+        names(&public.removed),
+        [(
+            "scripts/manifest-utils.mjs".to_owned(),
+            "export const filterGitignored".to_owned()
+        )]
+    );
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    // The breaking view agrees: only the export that really went away.
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    let reported = breaking
+        .iter()
+        .map(|finding| match &finding.kind {
+            BreakingKind::RemovedSymbol { .. } => format!("removed {}", finding.line),
+            BreakingKind::ChangedSignature { before, after } => {
+                format!("changed {before} -> {after}")
+            }
+            other => format!("{other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reported,
+        ["removed export const filterGitignored = (files, cwd) => {"]
+    );
+}
+
+#[test]
+fn a_js_export_whose_parameters_changed_is_still_a_signature_change() {
+    let patch = "diff --git a/scripts/inventory.mjs b/scripts/inventory.mjs\n--- a/scripts/inventory.mjs\n+++ b/scripts/inventory.mjs\n@@ -1 +1 @@\n-export const listTrackedSources = async (cwd) => {\n+export const listTrackedSources = async (cwd, options) =>\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert!(public.added.is_empty() && public.removed.is_empty());
+    assert_eq!(public.changed.len(), 1);
+    assert_eq!(
+        public.changed[0].before,
+        "export const listTrackedSources = async (cwd) => {"
+    );
+    assert_eq!(
+        public.changed[0].after,
+        "export const listTrackedSources = async (cwd, options) =>"
+    );
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert_eq!(breaking.len(), 1, "{breaking:?}");
+    assert!(matches!(
+        &breaking[0].kind,
+        BreakingKind::ChangedSignature { after, .. } if after.contains("options")
+    ));
+}
+
+#[test]
+fn a_js_export_moved_to_another_module_is_not_paired_away() {
+    // Importers of the old module break, so a move stays a removal there.
+    let patch = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +0,0 @@\n-export function shared(value: string) {\ndiff --git a/src/b.ts b/src/b.ts\n--- a/src/b.ts\n+++ b/src/b.ts\n@@ -0,0 +1 @@\n+export function shared(value: string) {\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert_eq!(public.removed.len(), 1);
+    assert_eq!(public.removed[0].file, "src/a.ts");
+    assert_eq!(public.added.len(), 1);
+    assert_eq!(public.added[0].file, "src/b.ts");
+    assert!(public.changed.is_empty());
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(breaking.iter().any(|finding| {
+        finding.file == "src/a.ts" && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
+    }));
+}
+
+#[test]
+fn a_js_export_reformatted_in_a_renamed_module_stays_removed_from_the_old_path() {
+    // A modified rename, as Git emits it: one section whose removed lines are
+    // the old module's and whose added lines are the new module's. Importers
+    // of `src/old.ts` break even though the export text barely changed.
+    let patch = "diff --git a/src/old.ts b/src/new.ts\nsimilarity index 80%\nrename from src/old.ts\nrename to src/new.ts\nindex 1111111..2222222 100644\n--- a/src/old.ts\n+++ b/src/new.ts\n@@ -1,2 +1,2 @@\n-export const load = (path) => {\n+export const load = (path) =>\n export const keep = 1;\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert_eq!(public.removed.len(), 1, "{public:?}");
+    assert_eq!(public.removed[0].file, "src/old.ts");
+    assert_eq!(public.added.len(), 1, "{public:?}");
+    assert_eq!(public.added[0].file, "src/new.ts");
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert_eq!(breaking.len(), 1, "{breaking:?}");
+    assert_eq!(breaking[0].file, "src/old.ts");
+    assert!(matches!(
+        breaking[0].kind,
+        BreakingKind::RemovedSymbol { .. }
+    ));
+}
+
+#[test]
+fn a_js_export_moved_between_namespaces_is_not_paired_away() {
+    // Consumers of `A.value` break when the line moves to `namespace B`,
+    // although the line itself is unchanged.
+    let patch = "diff --git a/src/ns.ts b/src/ns.ts\n--- a/src/ns.ts\n+++ b/src/ns.ts\n@@ -1,6 +1,6 @@\n export namespace A {\n-  export const value = 1;\n }\n export namespace B {\n+  export const value = 1;\n }\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert_eq!(public.removed.len(), 1, "{public:?}");
+    assert_eq!(public.added.len(), 1, "{public:?}");
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(
+        breaking.iter().any(|finding| {
+            finding.line == "export const value = 1;"
                 && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
-        }));
-    }
+        }),
+        "{breaking:?}"
+    );
+}
+
+#[test]
+fn one_line_js_class_members_and_ambient_return_types_are_contract() {
+    // A method renamed on a one-line class, and an ambient object return type
+    // changed without a `;`: both are changes importers see.
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,2 +1,2 @@\n-export class Client { oldMethod() {} }\n-export declare function load(): { old: string }\n+export class Client { newMethod() {} }\n+export declare function load(): { new: string }\n".to_owned();
+
+    // Both artifacts report both: the `export declare function` form reaches
+    // the public API pairing too.
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert!(public.added.is_empty() && public.removed.is_empty());
+    assert_eq!(
+        public
+            .changed
+            .iter()
+            .map(|change| change.after.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "export class Client { newMethod() {} }",
+            "export declare function load(): { new: string }"
+        ],
+        "{:?}",
+        public.changed
+    );
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    let changed = breaking
+        .iter()
+        .filter_map(|finding| match &finding.kind {
+            BreakingKind::ChangedSignature { after, .. } => Some(after.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changed,
+        [
+            "export class Client { newMethod() {} }",
+            "export declare function load(): { new: string }"
+        ],
+        "{breaking:?}"
+    );
+}
+
+#[test]
+fn one_line_js_implementation_and_comment_rewrites_are_not_api_changes() {
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,2 +1,2 @@\n-export class Client { method() { return 1; } }\n-export const HALF = function () {} / 2; // old\n+export class Client { method() { return 2; } }\n+export const HALF = function () {} / 2; // new\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert!(public.added.is_empty(), "{:?}", public.added);
+    assert!(public.removed.is_empty(), "{:?}", public.removed);
+    assert!(public.changed.is_empty(), "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(breaking.is_empty(), "{breaking:?}");
+}
+
+#[test]
+fn a_binding_dropped_after_an_arrow_declarator_is_not_paired_away() {
+    // `legacy` is exported by the same declaration as `handler`: dropping it
+    // is a change importers see, although `handler`'s arrow is unchanged.
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1 +1 @@\n-export const handler = (x) => x, legacy = 1;\n+export const handler = (x) => x;\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert_eq!(public.changed.len(), 1, "{:?}", public.changed);
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(
+        breaking.iter().any(|finding| matches!(
+            &finding.kind,
+            BreakingKind::ChangedSignature { after, .. } if after == "export const handler = (x) => x;"
+        )),
+        "{breaking:?}"
+    );
+}
+
+#[test]
+fn a_comment_after_dividing_an_object_literal_is_not_contract() {
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1 +1 @@\n-export const VALUE = {} / 2; // old\n+export const VALUE = {} / 2; // new\n".to_owned();
+
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert!(
+        public.changed.is_empty() && public.added.is_empty() && public.removed.is_empty(),
+        "{:?}",
+        public.changed
+    );
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(breaking.is_empty(), "{breaking:?}");
+}
+
+/// A changed export line whose change the pairing must still report, in both
+/// the public API and the breaking-change view.
+fn assert_js_ts_export_changed(file: &str, before: &str, after: &str) {
+    let patch = format!(
+        "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-{before}\n+{after}\n"
+    );
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert_eq!(public.changed.len(), 1, "{:?}", public.changed);
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(
+        breaking.iter().any(|finding| matches!(
+            &finding.kind,
+            BreakingKind::ChangedSignature { after: reported, .. } if reported == after
+        )),
+        "{breaking:?}"
+    );
+}
+
+/// A re-emitted export line the pairing must leave out of both views.
+fn assert_js_ts_export_reemitted(file: &str, before: &str, after: &str) {
+    let patch = format!(
+        "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-{before}\n+{after}\n"
+    );
+    let public = signal::analyze_js_ts_public_api_diff(std::slice::from_ref(&patch));
+    assert!(
+        public.changed.is_empty() && public.added.is_empty() && public.removed.is_empty(),
+        "{:?}",
+        public.changed
+    );
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch]);
+    assert!(breaking.is_empty(), "{breaking:?}");
+}
+
+#[test]
+fn a_template_nested_in_an_interpolation_is_contract() {
+    // The inner template's backticks do not close the outer one, so its `=>`
+    // is no arrow to cut the contract at.
+    assert_js_ts_export_changed(
+        "src/api.ts",
+        "export const T = `outer ${`=>old`}`;",
+        "export const T = `outer ${`=>new`}`;",
+    );
+}
+
+#[test]
+fn jsx_text_is_contract_where_jsx_may_be_written() {
+    // The `//` of a URL in JSX text opens no comment.
+    assert_js_ts_export_changed(
+        "src/view.tsx",
+        "export const footer = <p>See https://a.com</p>;",
+        "export const footer = <p>See https://b.com</p>;",
+    );
+}
+
+#[test]
+fn a_comment_after_a_postfix_update_and_a_division_is_not_contract() {
+    assert_js_ts_export_reemitted(
+        "src/api.ts",
+        "export const NEXT = i++ / 2; // old",
+        "export const NEXT = i++ / 2; // new",
+    );
+}
+
+#[test]
+fn a_grouped_arrow_initializer_is_paired_as_the_arrow() {
+    assert_js_ts_export_reemitted(
+        "src/api.ts",
+        "export const f = ((x) => x);",
+        "export const f = (x) => {",
+    );
+}
+
+#[test]
+fn a_bare_export_default_line_is_still_an_export() {
+    // `export default` with its value on the next line has no trailing space.
+    let removed = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1 @@\n-export default\n-  createStore();\n+const unused = 1;\n".to_owned();
+    let breaking = signal::analyze_js_ts_breaking_changes(&[removed]);
+    assert!(
+        breaking.iter().any(|finding| {
+            finding.line == "export default"
+                && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
+        }),
+        "{breaking:?}"
+    );
+
+    let rewritten = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,2 @@\n-export default\n-  createStore();\n+export default\n+  createStore({ strict: true });\n".to_owned();
+    let breaking = signal::analyze_js_ts_breaking_changes(&[rewritten]);
+    assert!(breaking.is_empty(), "{breaking:?}");
 }
 
 #[test]
