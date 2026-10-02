@@ -3511,6 +3511,7 @@ mod tests {
         let repo = tempfile::tempdir().expect("operator checkout");
         let snapshot = tempfile::tempdir().expect("reviewed snapshot");
         let mut config = rust_config(true, true, true);
+        config.resource_plan.worker_limit = 1;
         config.repo_root = repo.path().to_path_buf();
         config.scan_dir_override = Some(snapshot.path().to_path_buf());
 

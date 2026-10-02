@@ -3956,6 +3956,7 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
 
         let mut config = create_test_config(true, true, true);
+        config.resource_plan.worker_limit = 1;
         config.repo_root = repo_root.path().to_path_buf();
         config.profile.cargo_root = Some(repo_root.path().to_path_buf());
         // No scan_dir_override, and a non-git repo_root: plan_check_run resolves

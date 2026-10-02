@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import pathlib
 import platform
@@ -1081,7 +1082,22 @@ def evaluate(
         resources.get("parent_permits") == 1,
         "safe parent permit count is not one",
     )
-    add_assertion(violations, cap == 1, "safe child worker cap is not one")
+    cores = resources.get("logical_cores")
+    load = resources.get("load_per_core")
+    expected_cap = (
+        2
+        if isinstance(cores, int)
+        and cores >= 4
+        and isinstance(load, (int, float))
+        and math.isfinite(load)
+        and 0 <= load < 0.5
+        else 1
+    )
+    add_assertion(
+        violations,
+        cap == expected_cap,
+        "safe child worker cap does not match the recorded machine observation",
+    )
     add_assertion(
         violations,
         "--deep" in (receipt.get("command") or []),
@@ -1141,11 +1157,13 @@ def evaluate(
             census["max_descendants"]["semgrep_core"] <= cap,
             "Semgrep worker pool exceeded the selected cap",
         )
+    allowed_caps = {str(value) for value in range(1, expected_cap + 1)}
     if platform.system() == "Linux":
         add_assertion(
             violations,
-            census["observed_caps"]["cargo_build_jobs"] == {"1"},
-            "Cargo processes did not consistently expose CARGO_BUILD_JOBS=1",
+            bool(census["observed_caps"]["cargo_build_jobs"])
+            and census["observed_caps"]["cargo_build_jobs"] <= allowed_caps,
+            "Cargo processes did not expose a bounded CARGO_BUILD_JOBS",
         )
     add_assertion(
         violations,
@@ -1154,8 +1172,9 @@ def evaluate(
     )
     add_assertion(
         violations,
-        census["observed_caps"]["semgrep_jobs"] == {"1"},
-        "Semgrep did not expose --jobs 1",
+        bool(census["observed_caps"]["semgrep_jobs"])
+        and census["observed_caps"]["semgrep_jobs"] <= allowed_caps,
+        "Semgrep did not expose a bounded --jobs",
     )
     add_assertion(
         violations,

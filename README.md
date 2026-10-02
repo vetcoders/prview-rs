@@ -129,7 +129,9 @@ prview --tui
 The full flag reference is always one command away: `prview --help`. A written guide lives in [`docs/usage.md`](docs/usage.md).
 
 Deep reviews use a conservative whole-machine resource contract by default:
-one expensive tool and one supported child worker at a time. The preflight names
+one expensive tool at a time, with at most two supported child workers when
+at least four logical cores and a known load below `0.5/core` are available.
+Smaller, busy, or load-unknown machines keep one worker. The preflight names
 the effective budget, expensive checks, and schedule; `balanced` remains capped
 and falls back to `safe` under load. Because `safe` admits one check at a time,
 a big repository's check stage is serialized by design — the progress line

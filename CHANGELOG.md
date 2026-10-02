@@ -132,6 +132,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The default `safe` resource plan keeps one check at a time but allows up to
+  two supported child workers on hosts with at least four logical cores and
+  observed load below `0.5/core`. Busy, smaller, and load-unknown hosts retain
+  one worker, and stricter configured limits are preserved. This avoids forcing
+  cold Cargo dependency builds through one worker on an otherwise idle host.
+
 - **`checks[].tree_state` has a third snapshot value: `snapshot-unproven-deps`.**
   A JS gate's provenance used to have two answers for three facts, so
   `snapshot-borrowed-deps` carried both "these bytes came from outside the

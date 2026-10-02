@@ -112,8 +112,9 @@ explicitly rather than relying on the default profile. It fails when more than
 one whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
 exceeds the selected cap, or when the final pack and its resource metadata do
 not agree. This proves the CLI default itself resolves to the one-parent,
-one-child `safe` envelope; an explicit selector cannot hide default-wiring
-drift. Semgrep RPC coordinators are reported separately from its actual scan
+bounded one-or-two-child `safe` envelope, with the selected child cap checked
+against the recorded core count and load; an explicit selector cannot hide
+default-wiring drift. Semgrep RPC coordinators are reported separately from its actual scan
 workers. The receipt also requires a clean source tree whose `HEAD` is the exact
 candidate SHA. For pull requests, that candidate is GitHub's synthesized merge
 commit, so the acceptance job exercises the PR together with the current base

@@ -2272,7 +2272,10 @@ fn run_json_records_stage_timings() {
     assert_eq!(run["resources"]["requested_budget"], "safe");
     assert_eq!(run["resources"]["effective_budget"], "safe");
     assert_eq!(run["resources"]["parent_permits"], 1);
-    assert_eq!(run["resources"]["child_worker_limit"], 1);
+    assert_eq!(
+        run["resources"]["child_worker_limit"],
+        config.resource_plan.worker_limit
+    );
     assert!(
         run["resources"]["schedule"]
             .as_str()
