@@ -173,8 +173,9 @@ struct SnapshotRegions<'a> {
     /// The origin module of every re-export, per crate, re-exporting module
     /// and external name.
     reexport_origins: BTreeMap<ReexportKey<'a>, Vec<&'a [String]>>,
-    /// Public module aliases as (crate, alias path, target module path).
-    module_aliases: Vec<(&'a str, &'a [String], &'a [String])>,
+    /// Public module aliases as (crate, alias path, target module path, cfg
+    /// guard).
+    module_aliases: Vec<(&'a str, &'a [String], &'a [String], &'a [String])>,
 }
 
 impl<'a> SnapshotRegions<'a> {
@@ -229,6 +230,7 @@ impl<'a> SnapshotRegions<'a> {
                     alias.crate_name.as_str(),
                     alias.module_path.as_slice(),
                     alias.target_module_path.as_slice(),
+                    alias.cfg_guard.as_slice(),
                 )
             })
             .collect();
@@ -1776,6 +1778,16 @@ enum RegionReach {
     Items,
 }
 
+/// The bound name carried by a named use-leaf proof. Snapshot construction
+/// appends this line from parsed path identifiers; other external-resolution
+/// failures do not gain name-scoped reach merely from sharing their kind.
+fn unknown_bound_name(unknown: &RustApiUnknown) -> Option<&str> {
+    unknown
+        .evidence
+        .lines()
+        .find_map(|line| line.strip_prefix("bound-name:"))
+}
+
 /// The reach of the content `unknown` hides, or `None` when it hides no
 /// item: proof gaps about already visible items do not block pairing.
 fn region_reach(unknown: &RustApiUnknown) -> Option<RegionReach> {
@@ -1803,6 +1815,11 @@ fn region_reach(unknown: &RustApiUnknown) -> Option<RegionReach> {
         // binary target) qualifies the whole crate, not one module.
         Kind::UnsupportedExternResolution if declared_by_manifest(unknown) => {
             Some(RegionReach::Crate)
+        }
+        // A named external use leaf binds only its parsed external name. Keep
+        // every other external-resolution failure item-wide below.
+        Kind::UnsupportedExternResolution if unknown_bound_name(unknown).is_some() => {
+            Some(RegionReach::Names)
         }
         Kind::GlobReexport
         | Kind::UnresolvedReexport
@@ -1894,8 +1911,12 @@ fn region_may_cover(
         bound_path.push(identity.name.clone());
     }
     let mut candidates = vec![bound_path];
-    for (alias_crate, alias_path, target_path) in &regions.module_aliases {
-        if *alias_crate == crate_name && candidates[0].starts_with(alias_path) {
+    for (alias_crate, alias_path, target_path, alias_guard) in &regions.module_aliases {
+        if *alias_crate == crate_name
+            && candidates[0].starts_with(alias_path)
+            && guards_may_overlap(alias_guard, &identity.cfg_region)
+            && guards_may_overlap(alias_guard, &unknown.cfg_guard)
+        {
             let mut projected = target_path.to_vec();
             projected.extend_from_slice(&candidates[0][alias_path.len()..]);
             candidates.push(projected);
@@ -1906,10 +1927,7 @@ fn region_may_cover(
     // Only re-export evidence is read for it: that evidence is built from
     // path identifiers, so no source text can forge the line.
     let leaf_name = if reach == RegionReach::Names {
-        unknown
-            .evidence
-            .lines()
-            .find_map(|line| line.strip_prefix("bound-name:"))
+        unknown_bound_name(unknown)
     } else {
         None
     };
@@ -2438,7 +2456,7 @@ fn normalize_delta(delta: &mut ApiDelta) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifacts::signal::api_surface::snapshot_rust_api;
+    use crate::artifacts::signal::api_surface::{RustModuleAlias, snapshot_rust_api};
     use crate::artifacts::signal::breaking::{
         BreakingKind, analyze_all_breaking_changes, historical_scenarios,
         write_breaking_changes_with_api,
@@ -9738,6 +9756,95 @@ mod tests {
     }
 
     #[test]
+    fn a_region_projects_through_only_cfg_compatible_public_aliases() {
+        let incompatible = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[cfg(unix)] mod real { pub fn kept() {} }\n\
+                 #[cfg(windows)] mod real { include!(\"generated.rs\"); }\n\
+                 #[cfg(unix)] pub use real as alias;\n\
+                 #[cfg(windows)] pub mod alias {}\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[cfg(unix)] mod real { pub fn kept() {} }\n\
+                 #[cfg(windows)] mod real {}\n\
+                 #[cfg(unix)] pub use real as alias;\n\
+                 #[cfg(windows)] pub mod alias { pub fn added() {} }\n",
+                "target",
+            )),
+        );
+        assert_eq!(incompatible.added.len(), 1, "{:?}", incompatible.findings());
+        assert!(
+            finding_at(&incompatible.added, &["alias"], "value", "added").is_some(),
+            "{:?}",
+            incompatible.findings()
+        );
+        assert!(
+            finding_at(&incompatible.unknown, &["alias"], "value", "added").is_none(),
+            "{:?}",
+            incompatible.findings()
+        );
+
+        let compatible = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[cfg(windows)] mod real { include!(\"generated.rs\"); }\n\
+                 #[cfg(windows)] pub use real as alias;\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[cfg(windows)] mod real { pub fn added() {} }\n\
+                 #[cfg(windows)] pub use real as alias;\n",
+                "target",
+            )),
+        );
+        assert!(
+            finding_at(&compatible.added, &["alias"], "value", "added").is_none(),
+            "{:?}",
+            compatible.findings()
+        );
+        assert_eq!(
+            compatible
+                .unknown
+                .iter()
+                .filter(|finding| {
+                    finding.identity.module_path == ["alias"]
+                        && finding.identity.namespace == "value"
+                        && finding.identity.name == "added"
+                })
+                .count(),
+            1,
+            "{:?}",
+            compatible.findings()
+        );
+
+        let mut overlapping = snapshot_rust_api(&MemorySource::source(
+            "#[cfg(feature = \"b\")] mod real { include!(\"generated.rs\"); }\n",
+            "base",
+        ));
+        overlapping.module_aliases.push(RustModuleAlias {
+            crate_name: "fixture".to_owned(),
+            module_path: vec!["alias".to_owned()],
+            target_module_path: vec!["real".to_owned()],
+            cfg_guard: vec!["feature = \"a\"".to_owned()],
+            source_path: "src/lib.rs".to_owned(),
+            provenance: overlapping.provenance.clone(),
+            certainty: RustSourceCertainty::Confirmed,
+        });
+        let regions = SnapshotRegions::new(&overlapping);
+        let identity = ApiIdentity {
+            crate_name: "fixture".to_owned(),
+            module_path: vec!["alias".to_owned()],
+            namespace: "value".to_owned(),
+            name: "added".to_owned(),
+            cfg_region: vec!["feature = \"b\"".to_owned()],
+        };
+        assert!(
+            blocking_region(&regions, &identity).is_some(),
+            "independent feature guards may overlap and must stay conservative"
+        );
+    }
+
+    #[test]
     fn only_an_unconditionally_declared_child_module_bounds_a_region() {
         // The hidden root content may declare `gated` under another cfg, or
         // produce the transformed inline module itself.
@@ -9837,6 +9944,77 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: {:?}", delta.findings()));
             assert_eq!(finding.unknown_reason.as_deref(), Some(BASE_REGION_BLOCKS));
         }
+    }
+
+    #[test]
+    fn a_named_external_reexport_hides_only_its_bound_name() {
+        let base = snapshot_rust_api(&MemorySource::source(
+            "pub use serde::Serialize;\npub fn changed(_: u8) {}\n",
+            "base",
+        ));
+        let external = base
+            .unknowns
+            .iter()
+            .find(|unknown| unknown.kind == RustApiUnknownKind::UnsupportedExternResolution)
+            .expect("the external re-export stays a typed unknown");
+        assert_eq!(external.module_path, Vec::<String>::new());
+        assert_eq!(external.evidence, "serde::Serialize\nbound-name:Serialize");
+
+        let target = snapshot_rust_api(&MemorySource::source(
+            "pub use serde::Serialize;\npub fn changed(_: u16) {}\npub fn added() {}\n",
+            "target",
+        ));
+        let delta = compare_rust_api(&base, &target);
+        assert_eq!(delta.added.len(), 1, "{:?}", delta.findings());
+        assert!(finding_at(&delta.added, &[], "value", "added").is_some());
+        assert_eq!(delta.changed.len(), 1, "{:?}", delta.findings());
+        assert!(finding_at(&delta.changed, &[], "value", "changed").is_some());
+        assert!(delta.removed.is_empty(), "{:?}", delta.findings());
+        assert!(delta.relocated.is_empty(), "{:?}", delta.findings());
+        assert!(
+            delta.visibility_changed.is_empty(),
+            "{:?}",
+            delta.findings()
+        );
+        assert!(delta.unknown.is_empty(), "{:?}", delta.findings());
+
+        let bound_name = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source("pub use serde::Serialize;\n", "base")),
+            &snapshot_rust_api(&MemorySource::source("pub struct Serialize;\n", "target")),
+        );
+        assert!(
+            finding_at(&bound_name.added, &[], "type", "Serialize").is_none(),
+            "{:?}",
+            bound_name.findings()
+        );
+        assert_eq!(
+            bound_name
+                .unknown
+                .iter()
+                .filter(|finding| {
+                    finding.identity.module_path.is_empty()
+                        && finding.identity.namespace == "type"
+                        && finding.identity.name == "Serialize"
+                })
+                .count(),
+            1,
+            "{:?}",
+            bound_name.findings()
+        );
+
+        let broad = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub extern crate core;\npub fn changed(_: u8) {}\n",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub extern crate core;\npub fn changed(_: u16) {}\n",
+                "target",
+            )),
+        );
+        assert!(broad.changed.is_empty(), "{:?}", broad.findings());
+        assert_eq!(broad.unknown.len(), 1, "{:?}", broad.findings());
+        assert!(finding_at(&broad.unknown, &[], "value", "changed").is_some());
     }
 
     #[test]
