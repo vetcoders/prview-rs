@@ -4635,3 +4635,14 @@ and unused-symbol counts only for an available scan of at least one file.
 Disabled/absent heuristics display `NOT_RUN`; unavailable/empty scans display
 `NOT_MEASURED`. A measured zero remains zero. Machine-readable counters and
 canonical gate decisions retain their existing contracts.
+
+### Bounded optional context text logs
+
+Large optional context text artifacts (`.txt`/`.log`) retain the beginning and
+end of stdout followed by stderr within the 500,000-byte limit, including a
+marker that states the original byte count and that the middle was omitted.
+Both cut boundaries preserve UTF-8. This keeps late diagnostics visible after
+large traces; the retained artifact is explicitly incomplete. Short text stays
+byte-identical. JSON extraction, command statuses, deadlines, merge gates and
+the artifact manifest contracts retain their existing behavior. Invalid JSON
+diagnostic retention is a separate unresolved issue.

@@ -1527,8 +1527,10 @@ pub(super) fn collect_cmd_output(
 
     let combined = format!("{}\n{}", stdout, stderr);
 
-    // Truncate large outputs
-    let content = if combined.len() > MAX_TSC_TRACE_BYTES {
+    // Preserve the existing JSON extraction path; only text logs use head+tail.
+    let content = if !out_file.ends_with(".json") {
+        bounded_context_text(&combined)
+    } else if combined.len() > MAX_TSC_TRACE_BYTES {
         let truncated = truncate_on_char_boundary(&combined, MAX_TSC_TRACE_BYTES);
         format!(
             "{}\n\n... (truncated, {} total bytes)",
@@ -1549,6 +1551,25 @@ pub(super) fn collect_cmd_output(
     } else if let Err(e) = fs::write(out_dir.join(out_file), &content) {
         eprintln!("  warning: failed to write artifact {out_file}: {e}");
     }
+}
+
+/// Retain both ends of large text logs, including late stderr diagnostics.
+fn bounded_context_text(input: &str) -> String {
+    if input.len() <= MAX_TSC_TRACE_BYTES {
+        return input.to_owned();
+    }
+
+    let marker = format!(
+        "\n\n... (truncated, {} total bytes; middle omitted)\n\n",
+        input.len()
+    );
+    let available = MAX_TSC_TRACE_BYTES - marker.len();
+    let head = truncate_on_char_boundary(input, available / 2);
+    let mut tail_start = input.len() - (available - head.len());
+    while !input.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{head}{marker}{}", &input[tail_start..])
 }
 
 pub(super) fn extract_valid_json(stdout: &str, combined: &str) -> Option<String> {
@@ -1607,6 +1628,57 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use std::time::Instant;
+
+    fn collected_context(stdout: &str, stderr: &str, name: &str) -> String {
+        let dir = tempfile::tempdir().expect("context fixture");
+        let out = dir.path().join("stdout");
+        let err = dir.path().join("stderr");
+        fs::write(&out, stdout).expect("stdout fixture");
+        fs::write(&err, stderr).expect("stderr fixture");
+        super::collect_cmd_output(&out, &err, dir.path(), name);
+        fs::read_to_string(dir.path().join(name)).expect("retained context artifact")
+    }
+
+    #[test]
+    fn context_trace_retains_start_and_final_diagnostic_within_byte_limit() {
+        let stdout = format!("TRACE START\n{}", "resolution detail\n".repeat(40_000));
+        let stderr = "FINAL ERROR: module fixture not found\n";
+        let content = collected_context(&stdout, stderr, "trace.log");
+        assert!(content.starts_with("TRACE START\n"));
+        assert!(content.ends_with(stderr), "final diagnostic was discarded");
+        assert!(
+            content.contains("middle omitted"),
+            "truncation must be explicit"
+        );
+        assert!(content.len() <= super::MAX_TSC_TRACE_BYTES);
+    }
+
+    #[test]
+    fn context_trace_preserves_utf8_at_both_truncation_boundaries() {
+        let stdout = format!("START:🦀\n{}", "ą🦀é".repeat(100_000));
+        let stderr = "KONIEC: błąd 🦀\n";
+        let content = collected_context(&stdout, stderr, "trace.txt");
+        assert!(content.starts_with("START:🦀\n"));
+        assert!(content.ends_with(stderr));
+        assert!(content.len() <= super::MAX_TSC_TRACE_BYTES);
+        assert!(content.contains("middle omitted"));
+    }
+
+    #[test]
+    fn context_trace_keeps_short_output_byte_identical() {
+        assert_eq!(
+            collected_context("small stdout\n", "small stderr\n", "trace.log"),
+            "small stdout\n\nsmall stderr\n"
+        );
+    }
+
+    #[test]
+    fn context_trace_does_not_truncate_valid_json_stdout() {
+        let stdout = serde_json::json!({"payload": "a".repeat(600_000)}).to_string();
+        let content = collected_context(&stdout, "stderr diagnostic", "listing.json");
+        assert_eq!(content, stdout);
+        assert!(serde_json::from_str::<serde_json::Value>(&content).is_ok());
+    }
 
     /// A JS repo whose checked-out `HEAD` is NOT the reviewed target.
     ///
