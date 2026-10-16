@@ -4648,9 +4648,9 @@ the artifact manifest contracts retain their existing behavior. Invalid JSON
 diagnostic retention is a separate unresolved issue.
 
 Timed-out context commands retain their captured diagnostics only after their
-owned process tree has been confirmed terminated. RUN keeps `timed_out`, the
-started flag and the timeout reason; an artifact link is recorded only if the
-output was actually written. Queued commands that never started and ownership
+owned process tree has been confirmed terminated. RUN keeps `timed_out` and
+the timeout reason; an artifact link is recorded only if the output was actually
+written. Queued commands that never started and ownership
 cleanup failures retain their existing behavior.
 
 `cargo-tree.txt` remains available as a diagnostic when truncated, but logs
