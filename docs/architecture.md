@@ -4613,3 +4613,25 @@ fn detect_profile(...) -> Result<DetectedProfile> {
     // Add detection
 }
 ```
+
+### Optional dependency listings and structural measurement status
+
+`REVIEW_SUMMARY.md` labels a retained SBOM context output as a dependency
+listing only when its command completed successfully and the output exists.
+Failed/timed-out output remains linked as a diagnostic log with its status;
+an unstarted command is `NOT_RUN`. A file without command outcome evidence is
+`UNKNOWN`, and a completed command with missing output is also `UNKNOWN`.
+These labels do not change the merge gate or relax incomplete analysis.
+
+For the supported npm/pnpm listing commands, the reviewed tree's
+`packageManager` declaration takes precedence over its lockfile, then the
+existing PATH fallback applies. pnpm uses `list --depth Infinity`; npm uses
+`ls --all`. The compatibility fix adapts the existing local donor `08f7a5d9`.
+Other package managers retain the existing fallback behavior; this is not a
+claim of Yarn/Bun support. Failed commands record their exit status in RUN.
+
+`PR_REVIEW.md` (also embedded in `REVIEW_SUMMARY.md`) reports Loctree twins
+and unused-symbol counts only for an available scan of at least one file.
+Disabled/absent heuristics display `NOT_RUN`; unavailable/empty scans display
+`NOT_MEASURED`. A measured zero remains zero. Machine-readable counters and
+canonical gate decisions retain their existing contracts.

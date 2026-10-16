@@ -449,7 +449,11 @@ pub(crate) fn generate_pr_review(
             writeln!(md, "- Top hotspots: {}", top_hotspots.join(", "))?;
         }
     }
-    if let Some(h) = heuristics {
+    if let Some(h) = heuristics.filter(|h| {
+        config.run_heuristics
+            && h.summary.total_files > 0
+            && h.loctree.as_ref().is_some_and(|loctree| loctree.available)
+    }) {
         writeln!(
             md,
             "- Loctree twins: {} exact twin pair(s) and {} unused symbol(s).",
@@ -478,6 +482,13 @@ pub(crate) fn generate_pr_review(
                 )?;
             }
         }
+    } else {
+        let status = if !config.run_heuristics || heuristics.is_none() {
+            "NOT_RUN"
+        } else {
+            "NOT_MEASURED"
+        };
+        writeln!(md, "- Loctree twins/unused symbols: {status}.")?;
     }
     writeln!(md)?;
 

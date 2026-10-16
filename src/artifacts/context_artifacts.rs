@@ -570,6 +570,37 @@ fn js_exec_cmd(
     }
 }
 
+/// Adapted from the existing local fix 08f7a5d9. Prefer the reviewed tree's
+/// supported package-manager declaration/lockfile over availability on PATH.
+fn dependency_list_cmd(repo_root: &Path, has_pnpm: bool) -> (&'static str, Vec<String>) {
+    let declared = fs::read_to_string(repo_root.join("package.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|json| json["packageManager"].as_str().map(str::to_owned));
+    let use_pnpm = match declared
+        .as_deref()
+        .and_then(|value| value.split('@').next())
+    {
+        Some("pnpm") => true,
+        Some("npm") => false,
+        _ if repo_root.join("pnpm-lock.yaml").is_file() => true,
+        _ if repo_root.join("package-lock.json").is_file()
+            || repo_root.join("npm-shrinkwrap.json").is_file() =>
+        {
+            false
+        }
+        _ => has_pnpm,
+    };
+    if use_pnpm {
+        (
+            "pnpm",
+            vec!["list".into(), "--depth".into(), "Infinity".into()],
+        )
+    } else {
+        ("npm", vec!["ls".into(), "--all".into()])
+    }
+}
+
 /// Run profile-specific context generators with timeouts.
 /// All commands run in parallel with a shared deadline.
 /// Skips tools already executed by the checks system.
@@ -867,11 +898,7 @@ fn plan_context_cmds(
     if config.profile.has_package_json {
         // `npx list` would run the npm package "list" from the registry —
         // the dependency listing lives in npm/pnpm themselves.
-        let (sbom_cmd, sbom_args) = if has_pnpm {
-            ("pnpm", vec!["list".into(), "--all".into()])
-        } else {
-            ("npm", vec!["ls".into(), "--all".into()])
-        };
+        let (sbom_cmd, sbom_args) = dependency_list_cmd(&scan_root, has_pnpm);
         cmds.push(ContextCmd {
             label: "npm sbom".into(),
             gate: None,
@@ -1353,7 +1380,8 @@ fn run_context_cmds_parallel_after_spawn(
                         },
                         started: true,
                         duration_secs: r.started_at.elapsed().as_secs_f32(),
-                        reason: None,
+                        reason: (!exit.success())
+                            .then(|| format!("{} exited with {exit}", r.label)),
                     });
                 }
                 Ok(None) => {
@@ -2303,6 +2331,38 @@ mod tests {
         // No local tauri and no pnpm: skip rather than fall through to
         // npx --no-install, which can hang on a missing CLI (PR #12 review).
         assert!(tauri_info_cmd(tmp.path(), false).is_none());
+    }
+
+    #[test]
+    fn dependency_listing_uses_reviewed_package_manager_and_full_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::dependency_list_cmd(tmp.path(), true),
+            (
+                "pnpm",
+                vec!["list".into(), "--depth".into(), "Infinity".into()]
+            )
+        );
+        assert_eq!(
+            super::dependency_list_cmd(tmp.path(), false),
+            ("npm", vec!["ls".into(), "--all".into()])
+        );
+        fs::write(tmp.path().join("package-lock.json"), "{}").unwrap();
+        assert_eq!(super::dependency_list_cmd(tmp.path(), true).0, "npm");
+        fs::write(tmp.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(super::dependency_list_cmd(tmp.path(), false).0, "pnpm");
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"packageManager":"npm@10.9.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::dependency_list_cmd(tmp.path(), true).0, "npm");
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"packageManager":"pnpm@10.24.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::dependency_list_cmd(tmp.path(), false).0, "pnpm");
     }
 
     // Covers the pnpm-exec-class JS-tool sites (tsc trace, eslint json,
