@@ -2161,6 +2161,78 @@ fn infer_batch_theme_prefers_search_keywords() {
 }
 
 #[test]
+fn pr70_oversized_cargo_tree_keeps_advisory_without_invented_path() {
+    let tmp = tempfile::tempdir().expect("tree fixture");
+    let context = tmp.path().join("30_context");
+    let summary = tmp.path().join("00_summary");
+    std::fs::create_dir_all(&context).unwrap();
+    std::fs::create_dir_all(&summary).unwrap();
+    let stdout = tmp.path().join("stdout");
+    let stderr = tmp.path().join("stderr");
+    let tree = format!(
+        "workspace v1.0.0\n{}└── example-crate v0.3.1\n",
+        "├── rent-04094 v1.0.0\n".repeat(30_000)
+    );
+    std::fs::write(&stdout, tree).unwrap();
+    std::fs::write(&stderr, "").unwrap();
+    super::context_artifacts::collect_cmd_output(&stdout, &stderr, &context, "cargo-tree.txt");
+    let retained = std::fs::read_to_string(context.join("cargo-tree.txt")).unwrap();
+    assert!(retained.contains("middle omitted"));
+    let checks = vec![CheckResult {
+        name: "Cargo audit".into(),
+        status: CheckStatus::Failed,
+        duration: Duration::from_secs(1),
+        output: sample_cargo_audit_output(),
+        cached: false,
+        provenance: None,
+    }];
+    generate_failures_summary(&summary, &checks).unwrap();
+    let content = std::fs::read_to_string(summary.join("FAILURES_SUMMARY.md")).unwrap();
+    assert!(
+        content.contains("RUSTSEC-2024-0001"),
+        "advisory must remain visible"
+    );
+    assert!(
+        !content.contains("Dependency path:"),
+        "incomplete tree invented ancestry: {content}"
+    );
+    assert!(load_cargo_tree_index(tmp.path()).is_none());
+}
+
+#[test]
+fn pr70_legacy_prefix_truncated_cargo_tree_is_not_indexed() {
+    let tmp = tempfile::tempdir().expect("tree fixture");
+    std::fs::create_dir_all(tmp.path().join("30_context")).unwrap();
+    std::fs::write(
+        tmp.path().join("30_context/cargo-tree.txt"),
+        format!(
+            "{}\n\n... (truncated, 600000 total bytes)",
+            sample_cargo_tree_output()
+        ),
+    )
+    .unwrap();
+    assert!(load_cargo_tree_index(tmp.path()).is_none());
+}
+
+#[test]
+fn pr70_complete_cargo_tree_still_provides_dependency_paths() {
+    let tmp = tempfile::tempdir().expect("tree fixture");
+    std::fs::create_dir_all(tmp.path().join("30_context")).unwrap();
+    std::fs::write(
+        tmp.path().join("30_context/cargo-tree.txt"),
+        sample_cargo_tree_output(),
+    )
+    .unwrap();
+    let index = load_cargo_tree_index(tmp.path()).expect("complete tree index");
+    assert!(
+        index
+            .paths_by_package
+            .get(&("example-crate".into(), "0.3.1".into()))
+            .is_some_and(|paths| paths.iter().any(|p| p.starts_with("rmcp-memex v0.1.0")))
+    );
+}
+
+#[test]
 fn cargo_tree_index_extracts_dependency_paths() {
     let index = CargoTreeIndex::from_text(sample_cargo_tree_output());
     let finding = CargoAuditFinding {

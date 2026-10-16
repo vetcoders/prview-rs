@@ -4652,3 +4652,9 @@ owned process tree has been confirmed terminated. RUN keeps `timed_out`, the
 started flag and the timeout reason; an artifact link is recorded only if the
 output was actually written. Queued commands that never started and ownership
 cleanup failures retain their existing behavior.
+
+`cargo-tree.txt` remains available as a diagnostic when truncated, but logs
+with the truncation marker (including the legacy prefix-only marker) are not
+indexed for advisory dependency paths. Neither PR_REVIEW nor FAILURES_SUMMARY
+may infer ancestry across an omitted portion; advisories remain visible without
+those paths. Complete trees keep their existing path enrichment.
