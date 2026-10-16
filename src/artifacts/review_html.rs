@@ -7,7 +7,7 @@ use crate::mdrender::{self, Theme};
 ///
 /// Merges MERGE_GATE.md + PR_REVIEW.md + AI_INDEX.md sections into one file.
 /// Runs AFTER all artifacts exist, so `.exists()` checks are accurate (fixes A4).
-pub(crate) fn generate_review_summary(
+pub(super) fn generate_review_summary(
     out_dir: &Path,
     context_timings: &[ContextCommandTiming],
 ) -> Result<()> {

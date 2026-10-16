@@ -42,7 +42,8 @@ pub(crate) use history::*;
 pub(crate) use lint::*;
 pub(crate) use ownership::*;
 pub(crate) use pr_review::*;
-pub(crate) use review_html::*;
+use review_html::generate_review_summary;
+pub(crate) use review_html::generate_standard_review_html;
 pub(crate) use root_cause::*;
 pub(crate) use verdict::*;
 
