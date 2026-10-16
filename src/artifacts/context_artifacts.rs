@@ -1393,9 +1393,9 @@ fn run_context_cmds_parallel_after_spawn(
                             crate::proc::terminate_and_reap_owned_std_child(r.child.as_mut());
                         r.done = true;
                         governor.unregister_child(&r.registry_key);
-                        let _ = fs::remove_file(&r.stdout_path);
-                        let _ = fs::remove_file(&r.stderr_path);
                         if !tree_reaped {
+                            let _ = fs::remove_file(&r.stdout_path);
+                            let _ = fs::remove_file(&r.stderr_path);
                             timings.push(ContextCommandTiming {
                                 label: r.label.clone(),
                                 artifact: None,
@@ -1413,9 +1413,14 @@ fn run_context_cmds_parallel_after_spawn(
                             ));
                             break;
                         }
+                        // Writers are gone before collecting partial diagnostics.
+                        collect_cmd_output(&r.stdout_path, &r.stderr_path, &r.out_dir, &r.out_file);
+                        let artifact = (!r.out_file.is_empty()
+                            && r.out_dir.join(&r.out_file).is_file())
+                        .then(|| context_artifact_wire_path(&r.out_file));
                         timings.push(ContextCommandTiming {
                             label: r.label.clone(),
-                            artifact: None,
+                            artifact,
                             status: "timed_out",
                             started: true,
                             duration_secs: r.started_at.elapsed().as_secs_f32(),
@@ -2622,6 +2627,64 @@ mod tests {
             ledger.entries()[0].key.substrate.tree_state,
             Some(crate::checks::TreeState::Snapshot),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr70_timeout_retains_actual_reaped_command_diagnostics() {
+        let tmp = tempfile::tempdir().expect("timeout fixture");
+        let cmd = ContextCmd {
+            label: "npm sbom".into(),
+            gate: None,
+            cmd: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf 'TIMEOUT STDOUT\\n'; printf 'TIMEOUT STDERR\\n' >&2; exec sleep 30".into(),
+            ],
+            cwd: tmp.path().to_path_buf(),
+            out_dir: tmp.path().to_path_buf(),
+            out_file: "npm-sbom.txt".into(),
+        };
+        let governor = ResourceGovernor::with_budget(2, 2);
+        let timings = super::run_context_cmds_parallel(&[cmd], 1, false, &governor)
+            .expect("timeout accounting");
+        let timing = &timings[0];
+        assert_eq!(timing.status, "timed_out");
+        assert!(timing.started);
+        assert!(
+            timing
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("timeout"))
+        );
+        assert_eq!(timing.artifact.as_deref(), Some("30_context/npm-sbom.txt"));
+        let content = fs::read_to_string(tmp.path().join("npm-sbom.txt"))
+            .expect("actual timed-out diagnostic artifact");
+        assert!(content.contains("TIMEOUT STDOUT"));
+        assert!(content.contains("TIMEOUT STDERR"));
+        assert!(!tmp.path().join(".context-cmd-0.stdout.tmp").exists());
+        assert!(!tmp.path().join(".context-cmd-0.stderr.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr70_timeout_does_not_report_an_unwritten_artifact() {
+        let tmp = tempfile::tempdir().expect("timeout fixture");
+        let cmd = ContextCmd {
+            label: "npm sbom".into(),
+            gate: None,
+            cmd: "sh".into(),
+            args: vec!["-c".into(), "printf diagnostic; exec sleep 30".into()],
+            cwd: tmp.path().to_path_buf(),
+            out_dir: tmp.path().to_path_buf(),
+            out_file: "absent-parent/npm-sbom.txt".into(),
+        };
+        let governor = ResourceGovernor::with_budget(2, 2);
+        let timings = super::run_context_cmds_parallel(&[cmd], 1, false, &governor)
+            .expect("timeout accounting");
+        assert_eq!(timings[0].status, "timed_out");
+        assert!(timings[0].started);
+        assert!(timings[0].artifact.is_none());
     }
 
     /// A sleeping context command, for the tests that care about scheduling
