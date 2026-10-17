@@ -579,7 +579,11 @@ fn dependency_list_cmd(repo_root: &Path, has_pnpm: bool) -> (&'static str, Vec<S
         .and_then(|json| json["packageManager"].as_str().map(str::to_owned));
     use std::io::Read;
     let lock_has_content = |name: &str| {
-        fs::File::open(repo_root.join(name)).is_ok_and(|file| {
+        let path = repo_root.join(name);
+        if !path.is_file() {
+            return false;
+        }
+        fs::File::open(path).is_ok_and(|file| {
             std::io::BufReader::new(file)
                 .bytes()
                 .map_while(std::result::Result::ok)
@@ -1653,6 +1657,7 @@ struct JsonUnicodeReader<R> {
     utf8_left: u8,
     utf8_range: Option<(u8, u8)>,
     string: JsonUnicodeState,
+    depth: u8,
 }
 
 impl<R> JsonUnicodeReader<R> {
@@ -1662,6 +1667,7 @@ impl<R> JsonUnicodeReader<R> {
             utf8_left: 0,
             utf8_range: None,
             string: JsonUnicodeState::Outside,
+            depth: 0,
         }
     }
 
@@ -1691,6 +1697,23 @@ impl<R> JsonUnicodeReader<R> {
             };
             self.utf8_left = left;
             self.utf8_range = Some((min, max));
+        }
+        // IgnoredAny otherwise grows its nesting scratch without the default
+        // serde Value recursion check (128th container is rejected).
+        if matches!(self.string, JsonUnicodeState::Outside) {
+            match byte {
+                b'[' | b'{' => {
+                    if self.depth >= 127 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "JSON nesting exceeds the serde default limit",
+                        ));
+                    }
+                    self.depth += 1;
+                }
+                b']' | b'}' => self.depth = self.depth.saturating_sub(1),
+                _ => {}
+            }
         }
         use JsonUnicodeState::*;
         self.string = match self.string {
@@ -2137,6 +2160,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pr70_capture_json_depth_rejects_the_existing_serde_limit() {
+        for depth in [128, 4096] {
+            let raw = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            assert!(serde_json::from_str::<serde_json::Value>(&raw).is_err());
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("stdout"), &raw).unwrap();
+            fs::write(dir.path().join("stderr"), "depth diagnostic").unwrap();
+            let capture = super::collect_cmd_output(
+                &dir.path().join("stdout"),
+                &dir.path().join("stderr"),
+                dir.path(),
+                "listing.json",
+            );
+            assert!(
+                capture.failed,
+                "depth {depth} bypassed the existing serde recursion limit"
+            );
+            assert_eq!(
+                capture.artifact.as_deref(),
+                Some("30_context/listing.json.raw.log")
+            );
+            assert!(!dir.path().join("listing.json").exists());
+        }
+    }
+
+    #[test]
+    fn pr70_capture_json_depth_preserves_127_and_ignores_brackets_in_strings() {
+        let nested = format!("{}0{}", "[".repeat(127), "]".repeat(127));
+        let string = serde_json::json!({"brackets": "[{\\\"}]".repeat(2000)}).to_string();
+        for raw in [nested, string] {
+            assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("stdout"), &raw).unwrap();
+            fs::write(dir.path().join("stderr"), "separate diagnostic").unwrap();
+            let capture = super::collect_cmd_output(
+                &dir.path().join("stdout"),
+                &dir.path().join("stderr"),
+                dir.path(),
+                "listing.json",
+            );
+            assert!(!capture.failed);
+            assert_eq!(
+                fs::read_to_string(dir.path().join("listing.json")).unwrap(),
+                raw
+            );
+        }
+    }
+
     fn assert_invalid_utf8_at_tail_boundary(count: usize) {
         let dir = tempfile::tempdir().unwrap();
         let mut stdout = vec![b'a'; 900_000];
@@ -2426,6 +2498,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(super::dependency_list_cmd(dir.path(), false).0, "npm");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr70_capture_dependency_lock_fifo_does_not_select_a_package_manager() {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        let fifo = dir.path().join("pnpm-lock.yaml");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the CString is live and points to this test's temporary path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // A nonblocking peer prevents the old helper's open from hanging, and
+        // supplies enough data for its erroneous choice to be observable.
+        let mut peer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        peer.write_all(b"lockfileVersion: '9.0'\n").unwrap();
+        assert_eq!(super::dependency_list_cmd(dir.path(), true).0, "npm");
+        drop(peer);
     }
 
     #[cfg(unix)]
