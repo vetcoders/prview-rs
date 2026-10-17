@@ -1241,7 +1241,9 @@ fn rust_api_worker_activation_precedes_public_cli_parsing() {
     let worker = main
         .find("match private_worker_mode(")
         .expect("private worker activation");
-    let cli_parse = main.find("Cli::parse()").expect("public CLI parser");
+    let cli_parse = main
+        .find("runtime_command().get_matches()")
+        .expect("public CLI parser");
     assert!(worker < cli_parse);
     assert!(main.contains("run_private_rust_api_worker()"));
 }
