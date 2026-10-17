@@ -910,7 +910,7 @@ impl Config {
             return Ok(());
         }
         let repo = crate::git::Repository::open(&self.repo_root)?;
-        let entries = repo.tree_entries_at_oid(commit_id)?;
+        let entries = repo.tree_entries_with_gitlinks_at_oid(commit_id)?;
         let files: std::collections::BTreeSet<&str> = entries
             .iter()
             .filter(|entry| entry.kind == crate::git::GitTreeEntryKind::RegularFile)
@@ -951,7 +951,11 @@ impl Config {
                 }
             }
             for entry in &entries {
-                if entry.kind != crate::git::GitTreeEntryKind::Tree || entry.path.contains('/') {
+                if !matches!(
+                    entry.kind,
+                    crate::git::GitTreeEntryKind::Tree | crate::git::GitTreeEntryKind::Gitlink
+                ) || entry.path.contains('/')
+                {
                     continue;
                 }
                 let dir = entry.path.as_str();
@@ -2120,6 +2124,9 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod profile_tests;
 
 #[cfg(test)]
 mod tests {

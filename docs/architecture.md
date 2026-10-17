@@ -684,7 +684,12 @@ evidence, and buys no exception anywhere.
 **Rust workspace resolution.** One `cargo metadata --format-version 1 --no-deps
 --frozen` per run, with its own timeout, read from the cargo root **inside the
 reviewed tree**. An exact review detects `profile.cargo_root` in the pinned
-target tree and expresses it relative to the logical repository root. Reading
+target tree and expresses it relative to the logical repository root. Profile
+markers and Cargo-root eligibility include gitlinks recursively at each pinned
+commit, using the same offline object-store resolver as snapshot materialization.
+Only regular Git blobs count as manifests; symlinks are not followed. The
+operator submodule checkout supplies objects, never marker bytes or `HEAD`.
+Reading
 metadata from the operator checkout could describe another revision's members
 and path edges. The detected root is rebased onto the reviewed tree, and a root
 that cannot be placed inside it escalates with that stated reason. This is not

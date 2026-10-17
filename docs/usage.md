@@ -49,6 +49,12 @@ Exact target snapshots expand committed submodules from local pinned Git
 objects without fetching. If the pinned submodule commit is unavailable
 locally, the review stops with its path and object ID rather than scanning an
 empty submodule directory.
+Profile detection and Cargo-root planning expand those same pinned objects,
+including nested gitlinks. A `project.cargo_root = './backend/'` can select a
+regular `Cargo.toml` committed inside the `backend` submodule even when the
+operator has checked out another submodule revision or deleted its manifest.
+Symlink manifests and symlink components of the Cargo root never supply
+project markers, including inside submodules.
 Its header and check list refresh before checks start, including when a later
 analysis in the same TUI session selects a different target.
 An ordinary target-less local review uses the live checkout. `--profile` still

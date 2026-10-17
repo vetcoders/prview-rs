@@ -1380,6 +1380,38 @@ fn materialize_pinned_tree(
     Ok(())
 }
 
+/// Open the local object store used by both exact snapshots and profile
+/// enumeration. The checkout is only a source of objects, never profile bytes.
+pub(super) fn open_pinned_gitlink(
+    source_repo: &git2::Repository,
+    operator_root: &Path,
+    relative: &Path,
+    pinned_oid: git2::Oid,
+) -> Result<git2::Repository> {
+    let operator_submodule = operator_root.join(relative);
+    let module_store = source_repo.commondir().join("modules").join(relative);
+    git2::Repository::open(&operator_submodule)
+        .ok()
+        .filter(|repo| repo.find_commit(pinned_oid).is_ok())
+        .or_else(|| {
+            // An absorbed module store can outlive its checkout. Force a bare
+            // view so libgit2 does not follow a removed core.worktree.
+            git2::Repository::open_ext(
+                &module_store,
+                git2::RepositoryOpenFlags::NO_SEARCH | git2::RepositoryOpenFlags::BARE,
+                &[] as &[&std::ffi::OsStr],
+            )
+            .ok()
+            .filter(|repo| repo.find_commit(pinned_oid).is_ok())
+        })
+        .with_context(|| {
+            format!(
+                "submodule {} has no local object store containing pinned commit {}; exact snapshot cannot fetch it",
+                relative.display(), pinned_oid
+            )
+        })
+}
+
 /// Expand gitlinks from local object stores at their pinned commit IDs. This
 /// never fetches or reads uncommitted submodule contents from the operator's
 /// checkout. Missing objects are a hard error: an empty gitlink directory is
@@ -1403,29 +1435,7 @@ fn materialize_pinned_gitlinks(
             .context("non-UTF-8 submodule path in exact snapshot")?;
         crate::paths::validate_repo_relative_str(relative_str)?;
         let operator_submodule = operator_root.join(&relative);
-        let module_store = source_repo.commondir().join("modules").join(&relative);
-        let sub_repo = git2::Repository::open(&operator_submodule)
-            .ok()
-            .filter(|repo| repo.find_commit(pinned_oid).is_ok())
-            .or_else(|| {
-                // A submodule's administrative repo can outlive its checkout.
-                // Force a bare object-store view: plain `open` follows the
-                // removed core.worktree, while `open_bare` requires the config
-                // itself to declare a bare repository.
-                git2::Repository::open_ext(
-                    &module_store,
-                    git2::RepositoryOpenFlags::NO_SEARCH | git2::RepositoryOpenFlags::BARE,
-                    &[] as &[&std::ffi::OsStr],
-                )
-                    .ok()
-                    .filter(|repo| repo.find_commit(pinned_oid).is_ok())
-            })
-            .with_context(|| {
-                format!(
-                    "submodule {} has no local object store containing pinned commit {}; exact snapshot cannot fetch it",
-                    relative.display(), pinned_oid
-                )
-            })?;
+        let sub_repo = open_pinned_gitlink(source_repo, operator_root, &relative, pinned_oid)?;
         pinned_gitlinks(&sub_repo, pinned_oid, true)?;
 
         let mut destination = snapshot_root.to_path_buf();

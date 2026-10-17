@@ -1015,7 +1015,7 @@ const CARGO_ROOT_DISCOVERY_DEPTH: usize = 2;
 /// free — git trees are not traversed through symlinks, so a root the reviewed
 /// commit replaced with a symlink to an external directory has no entries here
 /// and simply does not resolve. The manifest itself is held to the same standard
-/// by [`crate::git::Repository::regular_file_at_commit`]: a `Cargo.toml` replaced
+/// by [`crate::git::Repository::tree_entries_with_gitlinks_at_oid`]: a `Cargo.toml` replaced
 /// with a link to an external file is not a manifest this review can trust, and
 /// resolving it would let cargo read foreign code under the reviewed commit's
 /// cache key.
@@ -1037,17 +1037,19 @@ fn resolve_reviewed_cargo_root_at(config: &Config, commit: &str) -> ReviewedCarg
     };
 
     let mapped = cargo_root_path(&relative);
+    let Ok(entries) = repo.tree_entries_with_gitlinks_at_oid(commit) else {
+        return ReviewedCargoRoot::Unknown;
+    };
     for candidate in [mapped.as_str(), ""] {
         let path = if candidate.is_empty() {
             "Cargo.toml".to_string()
         } else {
             format!("{candidate}/Cargo.toml")
         };
-        match repo.regular_file_at_commit(commit, &path) {
-            Ok(true) => return ReviewedCargoRoot::Resolved(candidate.to_string()),
-            Ok(false) => {}
-            // The question could not be asked — do not answer it.
-            Err(_) => return ReviewedCargoRoot::Unknown,
+        if entries.iter().any(|entry| {
+            entry.path == path && entry.kind == crate::git::GitTreeEntryKind::RegularFile
+        }) {
+            return ReviewedCargoRoot::Resolved(candidate.to_string());
         }
     }
 
