@@ -159,6 +159,7 @@ pub struct TaskEntry {
 #[derive(Default)]
 pub struct TaskLedger {
     entries: Mutex<Vec<TaskEntry>>,
+    caller_guard: Mutex<Option<Arc<crate::checks::caller_integrity::CallerGuard>>>,
     /// The one target snapshot the run shares. Materialising it stays the
     /// dispatcher's job, but OWNING it is the ledger's: the ledger outlives
     /// every stage, so a snapshot parked here is still on disk when the artifact
@@ -183,6 +184,103 @@ impl TaskLedger {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Freeze the caller before cache selection or external check admission.
+    /// The caller root remains distinct from any shared target snapshot.
+    pub(crate) async fn initialize_caller_guard(
+        &self,
+        root: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let existing = self
+            .caller_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let guard = if let Some(guard) = existing {
+            guard
+        } else {
+            // Resolve on the async caller's thread: tests may scope PRVIEW_HOME
+            // there, and native observation workers must not rediscover it.
+            let diagnostics = crate::config::prview_home().join("diagnostics");
+            let guard = crate::checks::caller_integrity::CallerGuard::capture(
+                root.to_path_buf(),
+                diagnostics,
+            )
+            .await;
+            *self
+                .caller_guard
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&guard));
+            guard
+        };
+        guard.verify("before-checks", None).await
+    }
+
+    /// Synchronous artifact/context bridge. Existing quality-stage baseline
+    /// and first failure survive quick/publication entry points unchanged.
+    pub(crate) fn initialize_caller_guard_sync(
+        &self,
+        root: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let mut slot = self
+            .caller_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let guard = slot
+            .get_or_insert_with(|| {
+                crate::checks::caller_integrity::CallerGuard::capture_sync(
+                    root.to_path_buf(),
+                    crate::config::prview_home().join("diagnostics"),
+                )
+            })
+            .clone();
+        drop(slot);
+        guard.verify_sync("before-artifacts", None)
+    }
+
+    pub(crate) fn verify_caller_sync(
+        &self,
+        phase: &'static str,
+        check: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let guard = self
+            .caller_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(guard) = guard {
+            guard.verify_sync(phase, check)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn verify_caller(
+        &self,
+        phase: &'static str,
+        check: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let guard = self
+            .caller_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(guard) = guard {
+            guard.verify(phase, check).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_caller_valid(&self) -> anyhow::Result<()> {
+        if let Some(guard) = self
+            .caller_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            guard.ensure_valid()?;
+        }
+        Ok(())
     }
 
     /// Record a resolved task.

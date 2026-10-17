@@ -1673,9 +1673,76 @@ Semgrep execution errors capture provenance before its private snapshot is
 dropped, preserving the actual cwd and observed SHA, including a baseline SHA
 left behind by a timeout. They retain the existing `Error` status and error
 reason. Nonzero process outputs retain the scanner's existing classification.
-This isolation does not add a run-wide caller mutation guard: the shared snapshot
-observations below still govern cache reuse, rather than aborting later checks
-when an external writer edits an Ambient checkout.
+The proposed caller boundary guard below is separate from the shared snapshot
+observations: those observations continue to govern snapshot cache reuse.
+
+#### Caller boundary guard — proposed local variant A
+
+A run retains the caller repository's first identity in the task ledger: canonical
+worktree/Git/common directories, symbolic HEAD and resolved commit, raw HEAD/index
+hashes, and streaming hashes/modes of Git-tracked and nonignored untracked source.
+Initial dirty source is a valid baseline. Symlink targets are observed as link
+bytes rather than followed; Unix regular-file reads use anchored no-follow opens.
+Git administration such as owned worktree registrations is outside the source
+walk. Reads stop after the initial file size plus one byte; growth or an unstable
+read is unknown evidence and aborts rather than waiting for a writer to stop.
+
+Both quality dispatchers observe before and after live checks, again after budget
+admission, and before cache writes. Python pre-sync, context command admission and
+completion, and publication use the same retained baseline. Context admission
+rechecks its existing deadline after observation and just before spawn; Python
+pre-sync rechecks existing run cancellation after observation/planning. Artifact generation
+initializes it for quick reviews that skipped the quality dispatcher. A mismatch
+or unreadable observation latches the first error even if source is later restored;
+queued checks are refused and dropping active futures/owned context children uses
+the existing process cleanup rails. A typed fatal error propagates through the
+existing Result path. No merge recommendation, analysis status, security policy,
+verdict enum, or cancellation reason is reclassified.
+
+First-failure evidence is written exclusively under
+`PRVIEW_HOME/diagnostics/caller-drift-*/CALLER_DRIFT.json`, separate from normal
+pack allocation, latest aliases and run history. It records expected/observed
+hashes and changed paths, or an explicit observation error. Diagnostics configured
+inside the caller are refused without a caller write; retention is then honestly
+unconfirmed in the fatal reason. A late artifact-stage mismatch removes the
+existing success-shaped surfaces (including RUN/MERGE_GATE/ZIP), leaves typed
+INCOMPLETE evidence with reason `caller drift`, and rolls back an uncommitted
+latest advertisement before the index commit. After owned child cleanup, early
+caller-drift aborts retain raw `.context-cmd-*.{stdout,stderr}.tmp` captures in the
+partial pack. The fatal reason and INCOMPLETE receipt name that directory; these
+raw bytes are diagnostic evidence, never completed gates.
+
+**Variant A is a local proposal pending contract acceptance:** the whole
+`PRVIEW_HOME` storage namespace (cache, index, latest and runs), plus any explicit
+artifact output and its sibling-publication parent, must be outside the caller
+or in a Git-ignored namespace
+containing no tracked index/HEAD source. Nonignored internal storage or
+`--output-dir` is refused before cache use, artifact allocation or the first
+artifact write, including when explicit output is external. An ignored pack
+whose parent is nonignored is also refused, because latest/lock/staging entries
+are siblings of the pack rather than its children. Read-only parent traversal
+requires an already existing, resolvable directory; missing-component `..` paths
+are refused without allocating their prefixes. No output subtree is silently excluded from caller
+source, and ignored output does not authorize overwriting tracked files. Default
+external `~/.prview` storage keeps its existing success verdicts. Gitlinks are
+explicitly unsupported by this caller token instead of being certified clean;
+that compatibility limit also remains pending acceptance.
+
+Variant A validates planned namespace roots; it does not prove confinement of
+pre-existing writers through descendant symlinks. In particular, a redirected
+cache-check directory or default run subtree can still point into source. The
+subsequent caller boundary detects resulting drift and prevents successful
+publication; a partial pack and writer damage may already exist. This guard
+does not prevent damage by those existing writers. Writer
+confinement remains a separate unresolved boundary, not a claimed property of A.
+
+These are boundary observations, not a continuous watcher: mutation followed by
+restoration entirely between observations can escape detection. Raw-index
+identity is deliberately strict, so even a Git stat-cache refresh can abort a run.
+Hashing costs source bytes per observed boundary, with bounded content buffers;
+there is no claim of a fixed whole-repository observation time. New execution
+controls use synthetic mock checks only; previous Semgrep runtime evidence and
+its interrupted additional repeat remain historical, not proof of this proposal.
 
 `checks::snapshot_integrity::SnapshotObservation` compares the ledger-owned
 worktree with the immutable commit resolved before worktree creation. The shared

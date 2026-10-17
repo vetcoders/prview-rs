@@ -15,6 +15,8 @@ mod merge_gate;
 mod sanity;
 
 use context_artifacts::*;
+#[cfg(test)]
+mod caller_guard_tests;
 use findings::*;
 use git_artifacts::*;
 use merge_gate::*;
@@ -562,6 +564,71 @@ fn publication_failure_after_rollback(
 
 /// Generate all artifacts
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
+    let ledger = input.ledger;
+    // Quick reviews did not pass through the quality dispatcher. Preserve any
+    // existing baseline rather than recertifying a caller after it changed.
+    ledger.initialize_caller_guard_sync(&input.config.repo_root)?;
+    crate::checks::caller_integrity::validate_storage_namespaces(input.config)?;
+    ledger.verify_caller_sync("before-artifact-allocation", None)?;
+    let mut owned_out_dir = None;
+    let result = generate_guarded(input, &mut owned_out_dir);
+    finish_caller_guarded_generation(ledger, owned_out_dir.as_deref(), result)
+}
+
+fn finish_caller_guarded_generation(
+    ledger: &crate::ledger::TaskLedger,
+    out_dir: Option<&Path>,
+    result: Result<PathBuf>,
+) -> Result<PathBuf> {
+    match result {
+        Err(error) => {
+            if ledger.ensure_caller_valid().is_err()
+                && let Some(out_dir) = out_dir
+            {
+                let error = error.context(format!(
+                    "caller drift; partial diagnostics retained at {}",
+                    out_dir.display()
+                ));
+                if let Err(cleanup) = mark_generation_caller_drift(out_dir) {
+                    return Err(error.context(format!(
+                        "caller-drift success-surface cleanup not confirmed: {cleanup:#}"
+                    )));
+                }
+                return Err(error);
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+fn mark_generation_caller_drift(out_dir: &Path) -> Result<()> {
+    let mut failures = Vec::new();
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        if let Err(error) = fs::remove_file(out_dir.join(relative))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            failures.push(format!("{relative}: {error}"));
+        }
+    }
+    let summary = out_dir.join("00_summary");
+    fs::create_dir_all(&summary)?;
+    fs::write(
+        summary.join("INCOMPLETE.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "1.0", "status": "incomplete", "reason": "caller drift", "stage": "caller boundary",
+            "partial_output_dir": out_dir,
+            "raw_context_diagnostics": "30_context/.context-cmd-*.{stdout,stderr}.tmp; partial raw bytes, not completed gates"
+        }))?,
+    )?;
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
+}
+
+fn generate_guarded(
+    input: GenerateInput<'_>,
+    owned_out_dir: &mut Option<PathBuf>,
+) -> Result<PathBuf> {
     let GenerateInput {
         config,
         ledger,
@@ -662,6 +729,8 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         // idempotent only for that internally owned path.
         fs::create_dir_all(&out_dir)?;
     }
+
+    *owned_out_dir = Some(out_dir.clone());
 
     // Open repository once for all generators
     let repo = Repository::open(&config.repo_root)?;
@@ -1253,6 +1322,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         ArtifactGenerationSeam::SharedSnapshotCleanup,
     )?;
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PackPublication)?;
+    ledger.verify_caller_sync("before-pack-publication", None)?;
 
     // Latest + run-index are one publication transaction. Check cancellation
     // before assembling its index row, then hold the shared publication lock
@@ -1330,6 +1400,8 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             }
             Err(error) => return Err(error),
         };
+        // Acquiring the publication lock may wait behind another run.
+        ledger.verify_caller_sync("publication-admitted", None)?;
         let latest_transaction = begin_latest_publication(&publication, &out_dir)?;
         if let Err(error) = ensure_generation_active(
             governor,
@@ -1345,6 +1417,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         if let Err(error) =
             ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)
         {
+            return Err(preserve_primary_error_after_latest_rollback(
+                error,
+                rollback_latest_publication(&latest_transaction),
+            ));
+        }
+
+        if let Err(error) = ledger.verify_caller_sync("before-index-commit", None) {
             return Err(preserve_primary_error_after_latest_rollback(
                 error,
                 rollback_latest_publication(&latest_transaction),
