@@ -79,7 +79,7 @@ dirs = "7"
 # File operations
 walkdir = "2"
 glob = "0.3"
-zip = "8"
+zip = "9.0.4"
 which = "8"
 notify = "8.2"
 
@@ -110,7 +110,8 @@ schemars = "1.2.1"
 # (syntect-fancy) avoids the onig C dependency, and disabling defaults drops the
 # comrak CLI/clap/xdg surface we do not use.
 comrak = { version = "0.55", default-features = false, features = ["syntect-fancy"] }
-ammonia = "4"
+# Keep the patched 4.1 line: a caret here would also admit affected 4.2.0–4.2.2.
+ammonia = "~4.1.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
