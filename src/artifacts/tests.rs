@@ -1119,7 +1119,13 @@ fn junk_files_excluded_from_zip_and_manifest() {
     let mut zip = zip::ZipArchive::new(File::open(out.join("artifacts.zip")).expect("open zip"))
         .expect("read zip");
     let zip_names: Vec<String> = (0..zip.len())
-        .map(|i| zip.by_index(i).expect("zip entry").name().to_string())
+        .map(|i| {
+            zip.by_index(i)
+                .expect("zip entry")
+                .name()
+                .expect("valid ZIP filename")
+                .into_owned()
+        })
         .collect();
     assert!(
         zip_names.iter().any(|n| n.ends_with("RUN.json")),
@@ -1147,6 +1153,33 @@ fn junk_files_excluded_from_zip_and_manifest() {
             "artifacts.zip must contain {required}, got {zip_names:?}"
         );
     }
+}
+
+#[test]
+fn create_zip_preserves_unicode_names_and_binary_payloads() {
+    use std::io::Read;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path();
+    fs::create_dir_all(out.join("00_summary")).expect("summary directory");
+    fs::create_dir_all(out.join("30_context")).expect("context directory");
+    let path = "30_context/zażółć-🦀.bin";
+    let payload: Vec<u8> = (0..=255).cycle().take(4096).collect();
+    fs::write(out.join(path), &payload).expect("binary artifact");
+    fs::write(out.join("00_summary/RUN.json"), b"{}").expect("run metadata");
+    generate_manifest(out).expect("manifest");
+    fs::write(out.join("00_summary/SANITY.json"), b"{\"valid\":true}").expect("sanity");
+    create_zip(out, false).expect("zip with required metadata");
+
+    let mut archive = zip::ZipArchive::new(File::open(out.join("artifacts.zip")).expect("zip"))
+        .expect("read archive");
+    let mut entry = archive.by_name(path).expect("exact Unicode filename");
+    assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
+    let mut restored = Vec::new();
+    entry
+        .read_to_end(&mut restored)
+        .expect("read compressed bytes");
+    assert_eq!(restored, payload);
 }
 
 #[test]

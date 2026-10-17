@@ -2811,7 +2811,7 @@ fn verify_zip_contains_metadata(zip_path: &Path) -> Result<()> {
     let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for i in 0..archive.len() {
         if let Ok(entry) = archive.by_index(i) {
-            names.insert(entry.name().replace('\\', "/"));
+            names.insert(entry.name()?.replace('\\', "/"));
         }
     }
 
