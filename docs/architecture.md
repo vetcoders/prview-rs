@@ -483,8 +483,15 @@ The proof reads the files as they are when the gate is written, so it describes
 only an audit executed in this run. `CargoAuditCheck` declines every cached
 status except `Passed` (`Check::replays_cached`, asked on both the write and the
 lookup, so an entry an older prview stored is not replayed either): a clean
-report has nothing to downgrade, and a failing or warning one runs live, because
-the audit's key binds the lockfile and the day but not `.cargo/audit.toml`. R3-14
+report has nothing to downgrade, and a failing or warning one runs live. The
+audit's versioned key binds the lockfile, day, and effective audit policy: the
+cargo root's `.cargo/audit.toml`, or Cargo home's `audit.toml` when the former
+is absent. Exact-target reviews use the target's policy blob and still hash an
+external fallback live. Case-variant target policy paths, unreadable or
+non-regular policies disable replay;
+relative Cargo homes without a target-local policy also disable replay because
+they resolve inside an ephemeral snapshot. This changes cache identity only,
+not advisory classification, freshness windows, or downgrade policy. R3-14
 (`--current-only`) and R4-20 (no resolvable base diff) still veto the downgrade
 upstream of the proof. A newly published advisory against an unchanged lock is
 therefore reported as pre-existing debt newly revealed, not as debt this change
@@ -4493,6 +4500,14 @@ pub fn rust_hash(root: &Path) -> String {
     // Cargo.toml/Cargo.lock hash + Rust source hash, 16-byte digest segments
 }
 ```
+
+Cargo file fingerprints frame each relative filename and content length before
+hashing its bytes. Moving bytes between manifests or renaming a Rust source
+file therefore invalidates the cache even when concatenated contents match.
+The versioned framing also separates these keys from older unframed entries.
+This bounded fix does not claim a complete fingerprint of compiler/tool versions,
+Cargo configuration, environment, external path dependencies, or advisory database
+updates within the existing daily audit window.
 
 A hit also reports `age_secs`: how long ago the entry was published, read from
 the entry file's mtime — an entry is published by a single `rename`, so its mtime

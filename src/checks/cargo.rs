@@ -1547,6 +1547,77 @@ fn cargo_root_token(relative: &Path) -> String {
     cache::key_token(&path)
 }
 
+/// The audit policy actually selected by cargo-audit: a cwd-local file wins,
+/// otherwise Cargo home's audit.toml. A commit pins only its own policy, not
+/// the operator's fallback. Unreadable/non-regular inputs disable replay.
+fn cargo_audit_policy_key(config: &Config) -> Option<String> {
+    let home = std::env::var_os("CARGO_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| cargo_operator_home().map(|path| path.join(".cargo")));
+    cargo_audit_policy_key_with_home(config, home.as_deref())
+}
+
+fn cargo_audit_policy_key_with_home(config: &Config, home: Option<&Path>) -> Option<String> {
+    match review_substrate(config).ok()? {
+        ReviewSubstrate::ExactTarget(target) => {
+            let relative = match resolve_reviewed_cargo_root(config) {
+                ReviewedCargoRoot::Resolved(relative) => relative,
+                ReviewedCargoRoot::Unavailable(_) => return None,
+                ReviewedCargoRoot::Unknown => cargo_root_path(&repo_relative_cargo_root(
+                    cargo_cache_root(config),
+                    &config.repo_root,
+                )?),
+            };
+            let path = if relative.is_empty() {
+                ".cargo/audit.toml".to_string()
+            } else {
+                format!("{relative}/.cargo/audit.toml")
+            };
+            let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+            // Git's exact spelling is not the lookup a case-insensitive
+            // filesystem performs. A variant may even resolve an external link.
+            if repo.case_variant_at_commit(&target.commit_id, &path).ok()? {
+                return None;
+            }
+            if let Some(blob) = repo.regular_blob_at_commit(&target.commit_id, &path).ok()? {
+                return Some(format!("blob-{blob}"));
+            }
+            // Relative homes resolve inside the ephemeral snapshot. Its path
+            // and untracked contents are not a stable commit input.
+            if home.is_some_and(|path| !path.is_absolute()) {
+                return None;
+            }
+        }
+        ReviewSubstrate::Ambient => {
+            let policy = cargo_cache_root(config).join(".cargo/audit.toml");
+            if policy.try_exists().ok()? {
+                return audit_policy_file_key(&policy);
+            }
+        }
+    }
+    let Some(home) = home else {
+        return Some("no-home".to_string());
+    };
+    let home = if home.is_absolute() {
+        home.to_path_buf()
+    } else {
+        cargo_cache_root(config).join(home)
+    };
+    audit_policy_file_key(&home.join("audit.toml"))
+}
+
+fn audit_policy_file_key(path: &Path) -> Option<String> {
+    let path_key = cache::key_token(&path.to_string_lossy());
+    match read_bounded_regular_cargo_config(path) {
+        Ok(contents) => Some(format!("file-{path_key}-{}", cache::key_token(&contents))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(format!("missing-{path_key}"))
+        }
+        Err(_) => None,
+    }
+}
+
 /// Source hash for source-only cargo checks (rustfmt): the reviewed commit when
 /// one is being analysed, the local tree hash otherwise.
 fn cargo_source_hash(config: &Config) -> Option<String> {
@@ -2059,16 +2130,13 @@ impl Check for CargoAuditCheck {
             )?,
             ReviewSubstrate::Ambient => cache::cargo_lock_hash(cargo_cache_root(config)),
         };
-        Some(format!("audit-{lock}-{day}"))
+        let policy = cargo_audit_policy_key(config)?;
+        Some(format!("audit-v2-{lock}-policy-{policy}-{day}"))
     }
 
     fn replays_cached(&self, status: CheckStatus) -> bool {
-        // Only a clean report is replayed. A failing or warning report is what
-        // the pre-existing downgrade reads, and the lock proof it rests on is
-        // taken from the files as they are now — but the key above does not
-        // bind the audit config, so a replay can be a report an earlier config
-        // produced. A clean report needs no downgrade, so it cannot mislead
-        // one; everything else runs live.
+        // Preserve the live-only treatment of non-clean reports: their
+        // pre-existing-debt proof is captured during this run, not a replay.
         status == CheckStatus::Passed
     }
 
@@ -3364,6 +3432,129 @@ mod tests {
     }
 
     #[test]
+    fn audit_policy_change_invalidates_a_cached_pass_without_lock_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".cargo")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let lock = "version = 4\n";
+        std::fs::write(root.join("Cargo.lock"), lock).unwrap();
+        let policy = root.join(".cargo/audit.toml");
+        std::fs::write(&policy, "[advisories]\nignore = [\"RUSTSEC-2021-0145\"]\n").unwrap();
+        let config = config_with_cargo_root(root, root, true);
+        let cache = cache::Cache::with_dir(root.join("cache"), true);
+        let check = CargoAuditCheck;
+        let key = check.cache_key(&config).unwrap();
+        cache
+            .set(check.name(), &key, "passed", Some("clean report"), None)
+            .unwrap();
+        assert!(
+            super::super::load_cached_result(&check, &config, &cache)
+                .unwrap()
+                .0
+                .cached
+        );
+        std::fs::write(&policy, "[advisories]\nignore = []\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock")).unwrap(),
+            lock
+        );
+        assert!(
+            super::super::load_cached_result(&check, &config, &cache).is_none(),
+            "removing an audit exception must not replay the earlier PASS"
+        );
+    }
+
+    #[test]
+    fn audit_policy_key_tracks_selection_creation_deletion_and_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let config = config_with_cargo_root(&root, &root, true);
+        let key = || cargo_audit_policy_key_with_home(&config, Some(&home)).unwrap();
+        let missing = key();
+        std::fs::write(home.join("audit.toml"), "[advisories]\nignore = []\n").unwrap();
+        let fallback = key();
+        assert_ne!(missing, fallback);
+        std::fs::write(
+            root.join(".cargo/audit.toml"),
+            "[output]\ndeny = [\"warnings\"]\n",
+        )
+        .unwrap();
+        let local = key();
+        assert_ne!(fallback, local);
+        std::fs::write(home.join("audit.toml"), "[output]\nquiet = true\n").unwrap();
+        assert_eq!(key(), local, "an overridden fallback is not an audit input");
+        std::fs::remove_file(root.join(".cargo/audit.toml")).unwrap();
+        assert_ne!(key(), local);
+        assert_ne!(key(), fallback);
+        std::fs::remove_file(home.join("audit.toml")).unwrap();
+        assert_eq!(key(), missing);
+        std::fs::create_dir(home.join("audit.toml")).unwrap();
+        assert!(cargo_audit_policy_key_with_home(&config, Some(&home)).is_none());
+    }
+
+    #[test]
+    fn audit_policy_key_uses_the_target_policy_and_live_external_fallback() {
+        let (tmp, _) = repo_with_two_commits_containing(&["Cargo.toml"]);
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo/audit.toml"),
+            "[advisories]\nignore = []\n",
+        )
+        .unwrap();
+        commit_all(root, "policy");
+        let mut config = config_with_cargo_root(root, root, true);
+        config.target = Some(head_sha(root));
+        let key =
+            cargo_audit_policy_key_with_home(&config, Some(Path::new("relative-home"))).unwrap();
+        std::fs::write(root.join(".cargo/audit.toml"), "[output]\nquiet = true\n").unwrap();
+        assert_eq!(cargo_audit_policy_key_with_home(&config, None), Some(key));
+        std::fs::remove_file(root.join(".cargo/audit.toml")).unwrap();
+        commit_all(root, "remove policy");
+        config.target = Some(head_sha(root));
+        assert!(
+            cargo_audit_policy_key_with_home(&config, Some(Path::new("relative-home"))).is_none()
+        );
+        let home = tempfile::tempdir().unwrap();
+        let before = cargo_audit_policy_key_with_home(&config, Some(home.path())).unwrap();
+        std::fs::write(
+            home.path().join("audit.toml"),
+            "[output]\ndeny = [\"warnings\"]\n",
+        )
+        .unwrap();
+        assert_ne!(
+            cargo_audit_policy_key_with_home(&config, Some(home.path())).unwrap(),
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_policy_key_declines_target_case_variants_and_symlinks() {
+        use std::os::unix::fs::symlink;
+        for spelling in [".cargo", ".Cargo"] {
+            let (tmp, _) = repo_with_two_commits_containing(&["Cargo.toml"]);
+            let root = tmp.path();
+            let external = tempfile::tempdir().unwrap();
+            let policy = external.path().join("audit.toml");
+            std::fs::write(&policy, "[advisories]\nignore = []\n").unwrap();
+            std::fs::create_dir(root.join(spelling)).unwrap();
+            symlink(&policy, root.join(spelling).join("audit.toml")).unwrap();
+            commit_all(root, "linked policy");
+            let mut config = config_with_cargo_root(root, root, true);
+            config.target = Some(head_sha(root));
+            assert!(
+                cargo_audit_policy_key_with_home(&config, None).is_none(),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
     fn test_cargo_audit_cache_key_is_day_scoped() {
         // The audit key must carry the current day so a freshly published
         // advisory invalidates a cached "passed" within a day, rather than being
@@ -3381,10 +3572,8 @@ mod tests {
 
     #[test]
     fn cargo_audit_replays_only_a_clean_report_from_cache() {
-        // The pre-existing downgrade reads a failing or warning report against
-        // a lock proof taken from the files as they are now, and the audit key
-        // does not bind `.cargo/audit.toml`. Only a report that needs no
-        // downgrade may come back from cache.
+        // The pre-existing downgrade requires this run's lock proof. Only a
+        // clean report, which needs no downgrade, may come back from cache.
         let check = CargoAuditCheck;
         assert!(check.replays_cached(CheckStatus::Passed));
         for status in [
