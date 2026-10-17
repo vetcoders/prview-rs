@@ -1823,8 +1823,14 @@ fn read_context_capture(
         }
         Ok(bytes)
     };
-    let (mut head, mut tail, lookbehind) = if marker.is_empty() && total <= budget as u64 {
-        (range(0, total as usize)?, Vec::new(), Vec::new())
+    let (mut head, mut tail, lookbehind, lookahead) = if marker.is_empty() && total <= budget as u64
+    {
+        (
+            range(0, total as usize)?,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     } else {
         let head_len = budget / 2;
         let tail_start = total - (budget - head_len) as u64;
@@ -1833,6 +1839,7 @@ fn read_context_capture(
             range(0, head_len)?,
             range(tail_start, budget - head_len)?,
             range(lookbehind_start, (tail_start - lookbehind_start) as usize)?,
+            range(head_len as u64, 3.min((total - head_len as u64) as usize))?,
         )
     };
     // A valid UTF-8 code point split by a window edge is omitted with the
@@ -1840,6 +1847,7 @@ fn read_context_capture(
     if !tail.is_empty() {
         if let Err(error) = std::str::from_utf8(&head)
             && error.error_len().is_none()
+            && valid_utf8_tail_prefix(&head[error.valid_up_to()..], &lookahead) > 0
         {
             head.truncate(error.valid_up_to());
         }
@@ -2181,6 +2189,77 @@ mod tests {
                 let budget = super::MAX_TSC_TRACE_BYTES - marker.len();
                 let tail_start = total - (budget - budget / 2);
                 stdout[tail_start - split..tail_start - split + character.len()]
+                    .copy_from_slice(character.as_bytes());
+                fs::write(dir.path().join("stdout"), stdout).unwrap();
+                fs::write(dir.path().join("stderr"), "").unwrap();
+                super::collect_cmd_output(
+                    &dir.path().join("stdout"),
+                    &dir.path().join("stderr"),
+                    dir.path(),
+                    "trace.log",
+                );
+                let retained = fs::read_to_string(dir.path().join("trace.log")).unwrap();
+                assert!(
+                    !retained.contains("invalid UTF-8"),
+                    "valid {character} split at {split} claimed corruption"
+                );
+                assert!(!retained.contains('\u{fffd}'));
+                assert!(retained.contains("middle omitted"));
+                assert!(retained.len() <= super::MAX_TSC_TRACE_BYTES);
+            }
+        }
+    }
+
+    fn assert_incomplete_utf8_at_head_boundary(prefix: &[u8]) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stdout = vec![b'a'; 900_000];
+        let total = stdout.len() + 1;
+        let marker = format!("\n\n... (truncated, {total} total bytes; middle omitted)\n\n");
+        let head_len = (super::MAX_TSC_TRACE_BYTES - marker.len()) / 2;
+        stdout[head_len - prefix.len()..head_len].copy_from_slice(prefix);
+        fs::write(dir.path().join("stdout"), stdout).unwrap();
+        fs::write(dir.path().join("stderr"), "").unwrap();
+        super::collect_cmd_output(
+            &dir.path().join("stdout"),
+            &dir.path().join("stderr"),
+            dir.path(),
+            "trace.log",
+        );
+        let retained = fs::read_to_string(dir.path().join("trace.log")).unwrap();
+        assert!(
+            retained.contains("invalid UTF-8"),
+            "invalid {prefix:?} followed by ASCII was silently erased at the head boundary"
+        );
+        assert!(retained.contains("middle omitted"));
+        assert!(retained.len() <= super::MAX_TSC_TRACE_BYTES);
+    }
+
+    #[test]
+    fn pr70_capture_utf8_head_boundary_invalid_one_byte_is_detected() {
+        assert_incomplete_utf8_at_head_boundary(&"é".as_bytes()[..1]);
+    }
+
+    #[test]
+    fn pr70_capture_utf8_head_boundary_invalid_two_bytes_are_detected() {
+        assert_incomplete_utf8_at_head_boundary(&"€".as_bytes()[..2]);
+    }
+
+    #[test]
+    fn pr70_capture_utf8_head_boundary_invalid_three_bytes_are_detected() {
+        assert_incomplete_utf8_at_head_boundary(&"🦀".as_bytes()[..3]);
+    }
+
+    #[test]
+    fn pr70_capture_utf8_head_boundary_valid_codepoints_do_not_claim_corruption() {
+        for character in ["é", "€", "🦀"] {
+            for split in 1..character.len() {
+                let dir = tempfile::tempdir().unwrap();
+                let mut stdout = vec![b'a'; 900_000];
+                let total = stdout.len() + 1;
+                let marker =
+                    format!("\n\n... (truncated, {total} total bytes; middle omitted)\n\n");
+                let head_len = (super::MAX_TSC_TRACE_BYTES - marker.len()) / 2;
+                stdout[head_len - split..head_len - split + character.len()]
                     .copy_from_slice(character.as_bytes());
                 fs::write(dir.path().join("stdout"), stdout).unwrap();
                 fs::write(dir.path().join("stderr"), "").unwrap();
