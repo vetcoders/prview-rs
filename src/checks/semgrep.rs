@@ -2,7 +2,7 @@
 
 use super::{
     Check, CheckEligibility, CheckResult, CheckStatus, ProvenanceBuilder, ReviewSubstrate,
-    review_substrate, run_command,
+    review_substrate, run_command_without_git_context,
 };
 use crate::Config;
 use crate::git::{Repository, ResolvedRef, WorktreeSnapshot, create_worktree_snapshot};
@@ -46,11 +46,10 @@ impl Check for SemgrepCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        // A remote-target run (`--pr` / `--remote`) analyses a fetched commit
-        // that is NOT the working tree. Scanning `config.repo_root` in place
-        // would analyse the WRONG tree, so materialise the target in an
-        // ephemeral detached worktree and scan that instead. `_snapshot` keeps
-        // the worktree alive (and is cleaned up on drop) for the whole scan.
+        // Exact targets and Ambient baseline scans own a detached worktree.
+        // Semgrep's baseline handler can reset its cwd to the merge-base; it
+        // must never perform that transition in the operator checkout.
+        // `_snapshot` keeps the isolated tree alive through provenance capture.
         let plan = match plan_semgrep_scan(config) {
             Ok(plan) => plan,
             Err(reason) => {
@@ -87,14 +86,58 @@ impl Check for SemgrepCheck {
         // Windows Command only adds .exe during PATH lookup. Use the same
         // discovery policy as eligibility, including .cmd fixtures.
         #[cfg(windows)]
-        let executable_path = which::which("semgrep")?;
+        let executable_path = match which::which("semgrep") {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(semgrep_execution_error_result(
+                    config,
+                    cwd,
+                    "semgrep",
+                    &args_ref,
+                    error.into(),
+                    start,
+                    &started_at,
+                ));
+            }
+        };
         #[cfg(windows)]
-        let executable = executable_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Semgrep executable path is not UTF-8"))?;
+        let executable = match executable_path.to_str() {
+            Some(executable) => executable,
+            None => {
+                return Ok(semgrep_execution_error_result(
+                    config,
+                    cwd,
+                    "semgrep",
+                    &args_ref,
+                    anyhow::anyhow!("Semgrep executable path is not UTF-8"),
+                    start,
+                    &started_at,
+                ));
+            }
+        };
         #[cfg(not(windows))]
         let executable = "semgrep";
-        let output = run_command(executable, &args_ref, cwd).await?;
+        let output = match run_command_without_git_context(
+            executable,
+            &args_ref,
+            cwd,
+            super::CHECK_TIMEOUT_SECS,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return Ok(semgrep_execution_error_result(
+                    config,
+                    cwd,
+                    executable,
+                    &args_ref,
+                    error,
+                    start,
+                    &started_at,
+                ));
+            }
+        };
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -136,6 +179,43 @@ impl Check for SemgrepCheck {
                 .build(),
             ),
         })
+    }
+}
+
+/// Capture execution errors while the owned scan tree still exists. The
+/// dispatcher cannot reconstruct this cwd after the private snapshot is dropped;
+/// in particular a killed baseline handler may have left it at the base SHA.
+fn semgrep_execution_error_result(
+    config: &Config,
+    cwd: &Path,
+    executable: &str,
+    args: &[&str],
+    error: anyhow::Error,
+    start: std::time::Instant,
+    started_at: &str,
+) -> CheckResult {
+    let reason = error.to_string();
+    let finished_at = Local::now().to_rfc3339();
+    let provenance = ProvenanceBuilder {
+        check: SemgrepCheck.name(),
+        cmd: executable,
+        args,
+        cwd,
+        repo_root: &config.repo_root,
+        exit_code: None,
+        combined_output: &reason,
+        started_at,
+        finished_at: &finished_at,
+        cache_key: None,
+    }
+    .build();
+    CheckResult {
+        name: SemgrepCheck.name().to_string(),
+        status: CheckStatus::Error,
+        duration: start.elapsed(),
+        output: reason,
+        cached: false,
+        provenance: Some(provenance),
     }
 }
 
@@ -392,7 +472,7 @@ fn build_semgrep_args(
 /// A resolved plan for where a semgrep scan runs and how it is baselined.
 struct SemgrepScanPlan {
     /// Directory to run semgrep in — the working tree in place, or an ephemeral
-    /// worktree snapshot of a remote target.
+    /// detached snapshot of an exact target or Ambient baseline target.
     scan_dir: PathBuf,
     /// Merge-base for a diff-scoped `--baseline-commit` scan, or `None` for a
     /// full scan.
@@ -404,13 +484,15 @@ struct SemgrepScanPlan {
 
 /// Decide where semgrep should scan.
 ///
-/// Ambient reviews scan the working tree in place. Exact-target reviews always
+/// Ambient reviews with a baseline scan an owned detached snapshot: Semgrep
+/// may reset that cwd while comparing the baseline. Ambient full scans retain
+/// the working tree (including dirty/untracked inputs). Exact-target reviews always
 /// scan an ephemeral detached worktree, including when the requested commit is
 /// the checked-out `HEAD`; otherwise uncommitted and untracked operator files
 /// would leak into a scan advertised as that commit. When the dispatcher already
 /// owns the shared snapshot, Semgrep reuses it instead of creating a twin.
 ///
-/// Returns `Err(reason)` when a remote target cannot be materialised, so the
+/// Returns `Err(reason)` when the required snapshot cannot be materialised, so the
 /// caller can fail loud (SKIPPED) rather than scan the wrong tree.
 fn plan_semgrep_scan(config: &Config) -> std::result::Result<SemgrepScanPlan, String> {
     let repo_root = config.repo_root.clone();
@@ -418,10 +500,25 @@ fn plan_semgrep_scan(config: &Config) -> std::result::Result<SemgrepScanPlan, St
         format!("semgrep: the exact review target is unavailable for scan planning: {error:#}")
     })?;
     let ReviewSubstrate::ExactTarget(target) = substrate else {
+        let Some((target, baseline)) = semgrep_baseline_commit(config, &repo_root)? else {
+            return Ok(SemgrepScanPlan {
+                baseline_commit: None,
+                scan_dir: repo_root,
+                _snapshot: None,
+            });
+        };
+        let snapshot =
+            create_worktree_snapshot(&repo_root, &target.commit_id).map_err(|error| {
+                format!(
+                    "semgrep: could not isolate the Ambient baseline scan at {} ({error}); \
+                 skipping instead of allowing baseline checkout in the operator tree",
+                    short_oid(&target.commit_id),
+                )
+            })?;
         return Ok(SemgrepScanPlan {
-            baseline_commit: semgrep_baseline_commit(config, &repo_root)?,
-            scan_dir: repo_root,
-            _snapshot: None,
+            baseline_commit: Some(baseline),
+            scan_dir: snapshot.worktree_path.clone(),
+            _snapshot: Some(snapshot),
         });
     };
 
@@ -454,14 +551,16 @@ fn plan_semgrep_scan(config: &Config) -> std::result::Result<SemgrepScanPlan, St
     })
 }
 
-/// Baseline commit for a scan whose working tree IS the target (in place). The
-/// merge-base enables a diff-scoped `--baseline-commit` scan; `Ok(None)` forces
+/// Capture the exact target together with its allowed Ambient baseline. The
+/// target must not be re-resolved after checking cleanliness: a ref can move
+/// before snapshot creation. The merge-base enables an isolated diff-scoped
+/// `--baseline-commit` scan; `Ok(None)` forces
 /// a full scan (dirty worktree, `--security-full`, or no distinct base).
 /// `Err(reason)` is a refusal to guess the range — see `merge_base_for_baseline`.
 fn semgrep_baseline_commit(
     config: &Config,
     cwd: &Path,
-) -> std::result::Result<Option<String>, String> {
+) -> std::result::Result<Option<(ResolvedRef, String)>, String> {
     let Ok(repo) = Repository::open(cwd) else {
         return Ok(None);
     };
@@ -483,7 +582,7 @@ fn semgrep_baseline_commit(
         return Ok(None);
     }
 
-    merge_base_for_baseline(&repo, config, &target)
+    Ok(merge_base_for_baseline(&repo, config, &target)?.map(|base| (target, base)))
 }
 
 /// Baseline commit for an ephemeral worktree snapshot of a remote target. The
@@ -1069,6 +1168,430 @@ mod tests {
             1,
             "worktree must be deregistered on drop"
         );
+    }
+
+    fn issue69_ambient_fixture() -> (tempfile::TempDir, Config, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        write_commit(tmp.path(), "operator.md", "operator note\n");
+        let base = write_commit(tmp.path(), "source.js", "const source = 'BASE';\n");
+        run_git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+        let target = write_commit(tmp.path(), "source.js", "const source = 'CANDIDATE';\n");
+        let mut config = test_config();
+        config.repo_root = tmp.path().to_path_buf();
+        config.target = None;
+        config.bases = vec!["main".into()];
+        config.pinned_target = Some(ResolvedRef {
+            name: "feature".into(),
+            commit_id: target.clone(),
+            is_remote: false,
+        });
+        config.pinned_diff_bases = Some(vec![ResolvedRef {
+            name: "main".into(),
+            commit_id: base.clone(),
+            is_remote: false,
+        }]);
+        assert!(matches!(
+            review_substrate(&config).unwrap(),
+            ReviewSubstrate::Ambient
+        ));
+        (tmp, config, base, target)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Issue69CallerIdentity {
+        head: Vec<u8>,
+        branch: Vec<u8>,
+        index: Vec<u8>,
+        source: Vec<u8>,
+        operator: Vec<u8>,
+        untracked: Option<Vec<u8>>,
+    }
+
+    fn issue69_caller_identity(root: &Path) -> Issue69CallerIdentity {
+        Issue69CallerIdentity {
+            head: std::fs::read(root.join(".git/HEAD")).unwrap(),
+            branch: std::fs::read(root.join(".git/refs/heads/feature")).unwrap(),
+            index: std::fs::read(root.join(".git/index")).unwrap(),
+            source: std::fs::read(root.join("source.js")).unwrap(),
+            operator: std::fs::read(root.join("operator.md")).unwrap(),
+            untracked: std::fs::read(root.join("operator-new.txt")).ok(),
+        }
+    }
+
+    #[test]
+    fn issue69_ambient_baseline_owns_a_detached_snapshot() {
+        let (tmp, config, base, target) = issue69_ambient_fixture();
+        let before = issue69_caller_identity(tmp.path());
+        let plan = plan_semgrep_scan(&config).unwrap();
+        assert_eq!(plan.baseline_commit.as_deref(), Some(base.as_str()));
+        assert_ne!(
+            plan.scan_dir, config.repo_root,
+            "diff-aware Ambient Semgrep must not reset the caller checkout"
+        );
+        assert!(plan._snapshot.is_some());
+        let scanned = git2::Repository::open(&plan.scan_dir).unwrap();
+        assert!(scanned.head_detached().unwrap());
+        assert_eq!(
+            scanned
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id()
+                .to_string(),
+            target
+        );
+        assert_eq!(issue69_caller_identity(tmp.path()), before);
+    }
+
+    #[test]
+    fn issue69_ambient_baseline_refuses_unsafe_in_place_fallback() {
+        let (tmp, config, _, _) = issue69_ambient_fixture();
+        // Registration cannot succeed, but the caller remains a valid clean
+        // repository. Only this owned fixture's Git administration is changed.
+        std::fs::write(tmp.path().join(".git/worktrees"), "not a directory").unwrap();
+        let before = issue69_caller_identity(tmp.path());
+        let reason = match plan_semgrep_scan(&config) {
+            Ok(_) => panic!("failed isolation must never fall back to the caller"),
+            Err(reason) => reason,
+        };
+        assert!(reason.contains("could not isolate the Ambient baseline scan"));
+        assert_eq!(issue69_caller_identity(tmp.path()), before);
+    }
+
+    #[test]
+    fn issue69_ambient_baseline_preserves_writes_after_planning() {
+        let (tmp, config, base, _) = issue69_ambient_fixture();
+        let plan = plan_semgrep_scan(&config).unwrap();
+        // The caller was clean at planning. A later operator write must not be
+        // discarded if the external scanner checks out its baseline afterward.
+        std::fs::write(tmp.path().join("operator.md"), "concurrent staged edit\n").unwrap();
+        std::fs::write(
+            tmp.path().join("operator-new.txt"),
+            "concurrent untracked edit\n",
+        )
+        .unwrap();
+        run_git(tmp.path(), &["add", "operator.md"]);
+        let after_writer = issue69_caller_identity(tmp.path());
+        run_git(&plan.scan_dir, &["reset", "--hard", &base]);
+        assert_eq!(
+            issue69_caller_identity(tmp.path()),
+            after_writer,
+            "baseline reset changed caller HEAD/ref/index or discarded concurrent files"
+        );
+    }
+
+    #[test]
+    fn issue69_dirty_full_and_current_only_keep_ambient_bytes() {
+        let (tmp, mut config, _, _) = issue69_ambient_fixture();
+        for current_only in [false, true] {
+            config.current_only = current_only;
+            config.security_full = !current_only;
+            let plan = plan_semgrep_scan(&config).unwrap();
+            assert_eq!(plan.scan_dir, config.repo_root);
+            assert!(plan.baseline_commit.is_none());
+        }
+        config.current_only = false;
+        config.security_full = false;
+        std::fs::write(tmp.path().join("source.js"), "dirty ambient violation\n").unwrap();
+        std::fs::write(
+            tmp.path().join("operator-new.txt"),
+            "untracked ambient input\n",
+        )
+        .unwrap();
+        let before = issue69_caller_identity(tmp.path());
+        let plan = plan_semgrep_scan(&config).unwrap();
+        assert_eq!(plan.scan_dir, config.repo_root);
+        assert!(plan.baseline_commit.is_none());
+        assert_eq!(issue69_caller_identity(tmp.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue69_ambient_baseline_timeout_preserves_caller() {
+        let (tmp, config, base, _) = issue69_ambient_fixture();
+        let plan = plan_semgrep_scan(&config).unwrap();
+        let before = issue69_caller_identity(tmp.path());
+        let result = crate::checks::run_command_with_timeout(
+            "sh",
+            &[
+                "-c",
+                "git reset --hard \"$1\"; exec sleep 30",
+                "issue69",
+                &base,
+            ],
+            &plan.scan_dir,
+            1,
+        )
+        .await;
+        let error = result.expect_err("real owned command must time out");
+        let result = semgrep_execution_error_result(
+            &config,
+            &plan.scan_dir,
+            "sh",
+            &["baseline fixture"],
+            error,
+            std::time::Instant::now(),
+            &Local::now().to_rfc3339(),
+        );
+        assert_eq!(result.status, CheckStatus::Error);
+        let provenance = result.provenance.unwrap();
+        assert_eq!(Path::new(&provenance.cwd), plan.scan_dir);
+        assert_eq!(
+            provenance.target_sha.as_deref(),
+            Some(base.as_str()),
+            "record the observed baseline SHA, not the configured candidate"
+        );
+        assert_eq!(provenance.exit_code, None);
+        assert_eq!(
+            issue69_caller_identity(tmp.path()),
+            before,
+            "timeout/SIGKILL left the caller at Semgrep's baseline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue69_ambient_cancellation_keeps_reader_and_writer_isolated() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (tmp, config, base, _) = issue69_ambient_fixture();
+        let signal = tempfile::tempdir().unwrap();
+        let ready = signal.path().join("baseline-entered");
+        let plan = plan_semgrep_scan(&config).unwrap();
+        let before = issue69_caller_identity(tmp.path());
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let source = tmp.path().join("source.js");
+        let reader = std::thread::spawn(move || {
+            let mut seen = std::collections::BTreeSet::new();
+            while !reader_stop.load(Ordering::SeqCst) {
+                seen.insert(std::fs::read(&source).unwrap());
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            seen
+        });
+        let scan_dir = plan.scan_dir.clone();
+        let ready_arg = ready.to_str().unwrap().to_owned();
+        let task = tokio::spawn(async move {
+            crate::checks::run_command_with_timeout(
+                "sh",
+                &[
+                    "-c",
+                    "git reset --hard \"$1\"; printf ready > \"$2\"; exec sleep 30",
+                    "issue69",
+                    &base,
+                    &ready_arg,
+                ],
+                &scan_dir,
+                30,
+            )
+            .await
+        });
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let while_running = issue69_caller_identity(tmp.path());
+        std::fs::write(tmp.path().join("operator.md"), "concurrent staged edit\n").unwrap();
+        std::fs::write(
+            tmp.path().join("operator-new.txt"),
+            "concurrent untracked edit\n",
+        )
+        .unwrap();
+        run_git(tmp.path(), &["add", "operator.md"]);
+        let after_writer = issue69_caller_identity(tmp.path());
+        task.abort();
+        let cancelled = task.await.unwrap_err().is_cancelled();
+        stop.store(true, Ordering::SeqCst);
+        let observed = reader.join().unwrap();
+        assert!(entered, "synthetic baseline command never entered");
+        assert!(cancelled);
+        assert_eq!(
+            while_running, before,
+            "caller changed while baseline context was active"
+        );
+        assert_eq!(
+            issue69_caller_identity(tmp.path()),
+            after_writer,
+            "cancellation discarded operator writes or changed the caller index/ref"
+        );
+        assert_eq!(
+            observed,
+            std::collections::BTreeSet::from([before.source]),
+            "concurrent reader consumed baseline source bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue69_semgrep_error_records_owned_snapshot_before_drop() {
+        const CHILD_ROOT: &str = "PRVIEW_ISSUE69_ERROR_REPO";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let base = std::env::var("PRVIEW_ISSUE69_ERROR_BASE").unwrap();
+            let target = std::env::var("PRVIEW_ISSUE69_ERROR_TARGET").unwrap();
+            let mut config = test_config();
+            config.repo_root = root.clone();
+            config.target = None;
+            config.bases = vec!["main".into()];
+            config.pinned_target = Some(ResolvedRef {
+                name: "feature".into(),
+                commit_id: target.clone(),
+                is_remote: false,
+            });
+            config.pinned_diff_bases = Some(vec![ResolvedRef {
+                name: "main".into(),
+                commit_id: base,
+                is_remote: false,
+            }]);
+            let before = issue69_caller_identity(&root);
+            let result = SemgrepCheck.run(&config).await.expect(
+                "a Semgrep execution error must retain its real substrate before snapshot drop",
+            );
+            assert_eq!(result.status, CheckStatus::Error);
+            let provenance = result.provenance.expect("actual failed scan provenance");
+            assert_ne!(Path::new(&provenance.cwd), root);
+            assert_eq!(provenance.target_sha.as_deref(), Some(target.as_str()));
+            assert_eq!(provenance.exit_code, None);
+            assert!(provenance.command.starts_with("semgrep "));
+            assert_eq!(issue69_caller_identity(&root), before);
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (repo, _, base, target) = issue69_ambient_fixture();
+        let fixture = tempfile::tempdir().unwrap();
+        let executable = fixture.path().join("semgrep");
+        // This is discoverable and executable but cannot be spawned. Unlike a
+        // killed child returning Output, it exercises the real execution Err.
+        std::fs::write(&executable, "#!/prview-issue69-missing-interpreter\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![fixture.path().to_path_buf()];
+        paths.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "checks::semgrep::tests::issue69_semgrep_error_records_owned_snapshot_before_drop",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, repo.path())
+            .env("PRVIEW_ISSUE69_ERROR_BASE", base)
+            .env("PRVIEW_ISSUE69_ERROR_TARGET", target)
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue69_semgrep_strips_inherited_git_context_only_in_child() {
+        const CHILD_ROOT: &str = "PRVIEW_ISSUE69_ENV_REPO";
+        const CONTEXT_VARS: [&str; 6] = [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+        ];
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let base = std::env::var("PRVIEW_ISSUE69_ENV_BASE").unwrap();
+            let target = std::env::var("PRVIEW_ISSUE69_ENV_TARGET").unwrap();
+            let mut config = test_config();
+            config.repo_root = root.clone();
+            config.target = None;
+            config.bases = vec!["main".into()];
+            config.pinned_target = Some(ResolvedRef {
+                name: "feature".into(),
+                commit_id: target,
+                is_remote: false,
+            });
+            config.pinned_diff_bases = Some(vec![ResolvedRef {
+                name: "main".into(),
+                commit_id: base,
+                is_remote: false,
+            }]);
+            let inherited: Vec<_> = CONTEXT_VARS.iter().map(std::env::var_os).collect();
+            let before = issue69_caller_identity(&root);
+            let result = SemgrepCheck.run(&config).await.unwrap();
+            assert_eq!(result.status, CheckStatus::Passed, "{}", result.output);
+            assert_eq!(
+                issue69_caller_identity(&root),
+                before,
+                "inherited Git context redirected Semgrep's baseline into its caller"
+            );
+            let mut decoder = serde_json::Deserializer::from_str(result.output.trim());
+            let payload = serde_json::Value::deserialize(&mut decoder).unwrap();
+            assert_eq!(payload["inherited_git_context"], serde_json::json!([]));
+            assert_eq!(payload["ordinary_env"], "retained");
+            for (name, value) in CONTEXT_VARS.iter().zip(inherited) {
+                assert_eq!(std::env::var_os(name), value, "parent environment changed");
+            }
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        for case in 0..=CONTEXT_VARS.len() {
+            let (repo, _, base, target) = issue69_ambient_fixture();
+            let fixture = tempfile::tempdir().unwrap();
+            let executable = fixture.path().join("semgrep");
+            let program = if let Some(python) = std::env::var_os("PRVIEW_ISSUE69_REAL_PYTHON") {
+                // Optional local proof uses the installed Semgrep BaselineHandler,
+                // while ordinary CI has the same Git reset via a hermetic shell.
+                format!(
+                    "#!{}\nimport json, os\nfrom semgrep.git import BaselineHandler\nwith BaselineHandler(os.environ['PRVIEW_ISSUE69_ENV_BASE'], is_mergebase=True).baseline_context():\n print(json.dumps({{'results': [], 'inherited_git_context': [k for k in {} if k in os.environ], 'ordinary_env': os.environ.get('PRVIEW_ISSUE69_ORDINARY')}}))\n",
+                    PathBuf::from(python).display(),
+                    serde_json::to_string(&CONTEXT_VARS).unwrap()
+                )
+            } else {
+                "#!/bin/sh\ngit reset --hard \"$PRVIEW_ISSUE69_ENV_BASE\" >/dev/null 2>&1 || exit 2\nprintf '{\"results\":[],\"inherited_git_context\":['\nsep=''\nfor key in GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR; do\n if printenv \"$key\" >/dev/null; then printf '%s\"%s\"' \"$sep\" \"$key\"; sep=','; fi\ndone\nprintf '],\"ordinary_env\":\"%s\"}\\n' \"$PRVIEW_ISSUE69_ORDINARY\"\n".to_string()
+            };
+            std::fs::write(&executable, program).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "checks::semgrep::tests::issue69_semgrep_strips_inherited_git_context_only_in_child", "--nocapture"])
+                .env(CHILD_ROOT, repo.path())
+                .env("PRVIEW_ISSUE69_ENV_BASE", base)
+                .env("PRVIEW_ISSUE69_ENV_TARGET", target)
+                .env("PRVIEW_ISSUE69_ORDINARY", "retained")
+                .env("PATH", std::env::join_paths([fixture.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap());
+            for name in CONTEXT_VARS {
+                command.env_remove(name);
+            }
+            for (index, name) in CONTEXT_VARS.iter().enumerate() {
+                if case != index && case != CONTEXT_VARS.len() {
+                    continue;
+                }
+                let value = match *name {
+                    "GIT_WORK_TREE" => repo.path().to_path_buf(),
+                    "GIT_INDEX_FILE" => repo.path().join(".git/index"),
+                    "GIT_OBJECT_DIRECTORY" | "GIT_ALTERNATE_OBJECT_DIRECTORIES" => {
+                        repo.path().join(".git/objects")
+                    }
+                    _ => repo.path().join(".git"),
+                };
+                command.env(name, value);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

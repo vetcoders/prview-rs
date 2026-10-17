@@ -221,7 +221,8 @@ pub fn create_file_within(root: &Path, requested: &Path) -> Result<File> {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed creating parent directory: {}", parent.display()))?;
     }
-    File::create(&resolved).with_context(|| format!("Failed creating file: {}", resolved.display()))
+    crate::owned_output::create(&resolved)
+        .with_context(|| format!("Failed creating file: {}", resolved.display()))
 }
 
 pub fn metadata_within(root: &Path, requested: &Path) -> Result<Metadata> {

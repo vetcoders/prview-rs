@@ -24,7 +24,11 @@ pub const CHECK_TIMEOUT_SECS: u64 = 300;
 /// Timeout for test commands (15 minutes - ML projects with model loading need this)
 pub const TEST_TIMEOUT_SECS: u64 = 900;
 
+#[cfg(test)]
+pub(crate) mod caller_guard_tests;
+pub(crate) mod caller_integrity;
 mod cargo;
+mod managed_scratch;
 mod pytest_home;
 mod python;
 pub mod scope;
@@ -760,6 +764,7 @@ async fn run_all_checks(
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::io::Write;
 
+    ledger.initialize_caller_guard_config(config).await?;
     let cache = Arc::new(cache);
     let emit = !config.json && !config.quiet;
 
@@ -847,7 +852,14 @@ async fn run_all_checks(
         .iter()
         .any(|c| matches!(c.name(), "Ruff" | "Mypy" | "Pytest"));
     if has_python_checks && config.profile.runs_python_checks() && which::which("uv").is_ok() {
-        presync_python_venv(&config, governor, emit).await?;
+        ledger
+            .verify_caller("before-presync", Some("Python pre-sync"))
+            .await?;
+        let outcome = presync_python_venv_guarded(&config, governor, emit, Some(ledger)).await;
+        ledger
+            .verify_caller("after-presync", Some("Python pre-sync"))
+            .await?;
+        outcome?;
     }
 
     if !runnable_checks.is_empty() {
@@ -884,16 +896,23 @@ async fn run_all_checks(
                 let queued_at = std::time::Instant::now();
                 let queued_name = check.name().to_string();
                 async move {
+                    ledger.ensure_caller_valid()?;
                     let (started_at, _admission) =
                         admit_check(check.as_ref(), &cargo_lock, &governor, &board).await?;
+                    // Re-observe AFTER waiting for both resource permits. A
+                    // queued check must not start on a caller that drifted.
+                    ledger
+                        .verify_caller("before-check", Some(&queued_name))
+                        .await?;
                     let result = crate::governor::with_child_scope(
                         governor,
                         &queued_name,
                         execute_live_check(check, config.as_ref(), cache.as_ref(), Some(ledger)),
                     )
                     .await;
+                    ledger.ensure_caller_valid()?;
                     record_completed_check(&result, ledger, queued_at, started_at);
-                    Ok::<_, Cancelled>((queued_name, result))
+                    Ok::<_, anyhow::Error>((queued_name, result))
                 }
             })
             .collect();
@@ -1014,6 +1033,7 @@ async fn run_all_checks(
         println!();
     }
 
+    ledger.verify_caller("after-checks", None).await?;
     Ok((results, skipped))
 }
 
@@ -1028,22 +1048,39 @@ async fn run_all_checks(
 ///
 /// Refuses to start at all on an already-cancelled run — the checks that would
 /// consume the venv are never going to run.
+#[cfg(test)]
 async fn presync_python_venv(
     config: &Config,
     governor: &Arc<ResourceGovernor>,
     emit: bool,
 ) -> Result<(), Cancelled> {
+    presync_python_venv_guarded(config, governor, emit, None)
+        .await
+        .map_err(|_| Cancelled)
+}
+
+async fn presync_python_venv_guarded(
+    config: &Config,
+    governor: &Arc<ResourceGovernor>,
+    emit: bool,
+    ledger: Option<&TaskLedger>,
+) -> Result<()> {
     use colored::Colorize;
     use std::io::Write;
 
     if governor.is_cancelled() {
-        return Err(Cancelled);
+        return Err(Cancelled.into());
     }
 
     // A cold environment may compile several source distributions. Admit it as
     // Exclusive before spawning, and pass the same descendant cap the run
     // advertises to uv's download/build/install pools.
     let _budget = governor.acquire(Weight::Exclusive).await?;
+    if let Some(ledger) = ledger {
+        ledger
+            .verify_caller("presync-admitted", Some("Python pre-sync"))
+            .await?;
+    }
     let plan = match plan_python_presync(config) {
         Ok(plan) => plan,
         Err(error) => {
@@ -1059,6 +1096,13 @@ async fn presync_python_venv(
         let _ = std::io::stdout().flush();
     }
 
+    if let Some(ledger) = ledger {
+        ledger.ensure_caller_valid()?;
+    }
+    // Observation/planning may outlast the whole-run deadline after admission.
+    if governor.is_cancelled() {
+        return Err(Cancelled.into());
+    }
     let outcome = crate::governor::with_child_scope(
         Arc::clone(governor),
         "uv sync",
@@ -1100,7 +1144,7 @@ async fn presync_python_venv(
     // going on to start the gates it was preparing for would be worse than
     // saying so.
     if governor.is_cancelled() {
-        return Err(Cancelled);
+        return Err(Cancelled.into());
     }
     Ok(())
 }
@@ -1238,6 +1282,7 @@ async fn run_all_checks_with_events<F>(
 where
     F: Fn(CheckEvent) + Send + Sync,
 {
+    ledger.initialize_caller_guard_config(config).await?;
     let mut results = Vec::new();
     let mut skipped = Vec::new();
     let mut runnable_checks: Vec<Box<dyn Check>> = Vec::new();
@@ -1307,7 +1352,14 @@ where
         .any(|c| matches!(c.name(), "Ruff" | "Mypy" | "Pytest"));
     if has_python_checks && config.profile.runs_python_checks() && which::which("uv").is_ok() {
         // `emit: false` — the TUI owns the screen; progress reaches it as events.
-        presync_python_venv(&config, governor, false).await?;
+        ledger
+            .verify_caller("before-presync", Some("Python pre-sync"))
+            .await?;
+        let outcome = presync_python_venv_guarded(&config, governor, false, Some(ledger)).await;
+        ledger
+            .verify_caller("after-presync", Some("Python pre-sync"))
+            .await?;
+        outcome?;
     }
 
     // Second pass: run checks in parallel, fire events as they complete.
@@ -1342,8 +1394,14 @@ where
                 let queued_at = std::time::Instant::now();
                 let queued_name = check.name().to_string();
                 async move {
+                    ledger.ensure_caller_valid()?;
                     let (started_at, _admission) =
                         admit_check(check.as_ref(), &cargo_lock, &governor, &board).await?;
+                    // Re-observe AFTER waiting for both resource permits. A
+                    // queued check must not start on a caller that drifted.
+                    ledger
+                        .verify_caller("before-check", Some(&queued_name))
+                        .await?;
                     on_event(CheckEvent::Running {
                         name: queued_name.clone(),
                     });
@@ -1353,8 +1411,9 @@ where
                         execute_live_check(check, config.as_ref(), cache.as_ref(), Some(ledger)),
                     )
                     .await;
+                    ledger.ensure_caller_valid()?;
                     record_completed_check(&result, ledger, queued_at, started_at);
-                    Ok::<_, Cancelled>((queued_name, result))
+                    Ok::<_, anyhow::Error>((queued_name, result))
                 }
             })
             .collect();
@@ -1395,6 +1454,7 @@ where
         }
     }
 
+    ledger.verify_caller("after-checks", None).await?;
     Ok((results, skipped))
 }
 
@@ -1629,6 +1689,22 @@ async fn execute_live_check(
             .observe_snapshot_async("before-check", Some(&name))
             .await;
     }
+    // The snapshot observation above awaited native work. Another running
+    // check may have latched caller drift during that wait. Never cross the
+    // execution seam after that latch; the dispatcher propagates its typed
+    // fatal error before recording this internal, unstamped result.
+    if let Some(ledger) = ledger
+        && let Err(error) = ledger.ensure_caller_valid()
+    {
+        return CheckResult {
+            name,
+            status: CheckStatus::Error,
+            duration: start.elapsed(),
+            output: error.to_string(),
+            cached: false,
+            provenance: None,
+        };
+    }
     let outcome = check.run(config).await;
     if let Some(ledger) = ledger {
         ledger
@@ -1638,7 +1714,16 @@ async fn execute_live_check(
     // Any non-clean observation while this check was running makes its source
     // unsuitable for a cache entry under the original target key. Another
     // concurrent check can supply that observation; no writer is inferred.
-    let source_stable = initial_epoch == ledger.map(TaskLedger::snapshot_integrity_epoch);
+    let caller_stable = if let Some(ledger) = ledger {
+        ledger
+            .verify_caller("after-check", Some(&name))
+            .await
+            .is_ok()
+    } else {
+        true
+    };
+    let source_stable =
+        caller_stable && initial_epoch == ledger.map(TaskLedger::snapshot_integrity_epoch);
     match outcome {
         Ok(mut result) => {
             if matches!(result.status, CheckStatus::Passed | CheckStatus::Warnings)
@@ -1655,6 +1740,7 @@ async fn execute_live_check(
             // transient miss for the whole hash lifetime, so a later run with
             // the tool present still reports Skipped (PR #12 review #14).
             if source_stable
+                && ledger.is_none_or(|ledger| ledger.ensure_caller_valid().is_ok())
                 && result.status != CheckStatus::Skipped
                 && check.replays_cached(result.status)
                 && let Some(key) = cache_key.clone()
@@ -1666,6 +1752,9 @@ async fn execute_live_check(
                     .provenance
                     .as_ref()
                     .and_then(|prov| serde_json::to_string(prov).ok());
+                // No writer authority exists during external Check::run.
+                // The same run guard is scoped only over this synchronous API.
+                let _output_scope = ledger.and_then(|ledger| ledger.output_scope(None));
                 if let Err(e) = cache.set(
                     &name,
                     &key,
@@ -2237,6 +2326,20 @@ pub async fn run_command_with_env(
     run_command_with_timeout_and_env(cmd, args, cwd, CHECK_TIMEOUT_SECS, env).await
 }
 
+/// Run a Git-aware scanner in its actual cwd, without inherited repository
+/// selectors redirecting its nested Git processes into the operator checkout.
+pub(crate) async fn run_command_without_git_context(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout_secs: u64,
+) -> Result<Output> {
+    let mut command = Command::new(cmd);
+    command.args(args).current_dir(cwd);
+    crate::git::cmd::remove_git_context(command.as_std_mut());
+    capture_check_command(command, cmd, timeout_secs).await
+}
+
 /// Helper to run a command with custom timeout and extra environment variables.
 pub async fn run_command_with_timeout_and_env(
     cmd: &str,
@@ -2250,6 +2353,10 @@ pub async fn run_command_with_timeout_and_env(
     for (key, value) in env {
         command.env(key, value);
     }
+    capture_check_command(command, cmd, timeout_secs).await
+}
+
+async fn capture_check_command(command: Command, cmd: &str, timeout_secs: u64) -> Result<Output> {
     // Shared rails (stdin-null, kill_on_drop, own process group) + concurrent
     // output drain + group-SIGKILL on timeout live in crate::proc.
     crate::proc::run_capture_with_timeout(command, Duration::from_secs(timeout_secs), cmd, || {

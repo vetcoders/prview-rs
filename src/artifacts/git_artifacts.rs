@@ -115,6 +115,12 @@ fn restore_latest_target_unlocked(
     if current.as_os_str() != our_target {
         return Ok(());
     }
+    if crate::owned_output::active_guard().is_some()
+        && !crate::owned_output::is_mutable_owned(&latest_link)
+    {
+        validate_recovery_pack_identity(&parent.join(&current))?;
+        crate::owned_output::admit_validated_mutable(&latest_link)?;
+    }
     if let Some(name) = previous {
         replace_latest_target(parent, name)
     } else {
@@ -209,21 +215,26 @@ fn write_latest_publication_record(record: &LatestPublicationRecord) -> Result<(
 
 #[cfg(unix)]
 fn write_latest_publication_record_at(path: &Path, record: &LatestPublicationRecord) -> Result<()> {
-    use std::io::Write;
-
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("publication transaction has no parent"))?;
     fs::create_dir_all(parent)?;
-    let (temp, mut file) = crate::storage::create_owned_temp_file(parent, "publication-journal")?;
+    if crate::owned_output::active_guard().is_some() {
+        if path.exists() {
+            let _: LatestPublicationRecord =
+                serde_json::from_slice(&read_bounded_publication_journal(path)?)?;
+        }
+        crate::owned_output::admit_validated_mutable(path)?;
+    }
+    let (temp, file) = crate::storage::create_owned_temp_file(parent, "publication-journal")?;
+    drop(file);
     let write_result = (|| -> Result<()> {
-        serde_json::to_writer(&mut file, record)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        file.sync_all()?;
+        let mut bytes = serde_json::to_vec(record)?;
+        bytes.push(b'\n');
+        fs::write(&temp, bytes)?;
+        File::open(&temp)?.sync_all()?;
         Ok(())
     })();
-    drop(file);
     if let Err(error) = write_result {
         let _ = fs::remove_file(&temp);
         return Err(error);
@@ -262,7 +273,25 @@ fn quarantine_invalid_latest_publication_record(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("publication transaction has no parent"))?;
-    let source_is_dir = fs::symlink_metadata(path)?.file_type().is_dir();
+    anyhow::ensure!(
+        !crate::owned_output::namespace_source_visible(path)?,
+        "invalid caller-visible publication journal retained unchanged: {reason:#}"
+    );
+    let source_metadata = fs::symlink_metadata(path)?;
+    // The namespace query resolves roots. Quarantining a final symlink moves
+    // the link itself: do not rename a caller leaf merely because its target
+    // is external. Preserve that unknown caller link without following it.
+    if source_metadata.file_type().is_symlink()
+        && let Some(guard) = crate::owned_output::active_guard()
+    {
+        let caller = fs::canonicalize(guard.root())?;
+        let leaf = fs::canonicalize(parent)?.join(path.file_name().context("journal leaf name")?);
+        anyhow::ensure!(
+            !leaf.starts_with(caller),
+            "invalid caller journal link retained unchanged"
+        );
+    }
+    let source_is_dir = source_metadata.file_type().is_dir();
     let quarantine = if source_is_dir {
         crate::storage::create_owned_temp_dir(parent, "publication-transaction.invalid")?
     } else {
@@ -271,7 +300,14 @@ fn quarantine_invalid_latest_publication_record(
         drop(placeholder);
         quarantine
     };
-    if let Err(error) = fs::rename(path, &quarantine) {
+    // Existing typed quarantine for a proven non-source object; no adoption
+    // of the old payload into the run's exact own-leaf registry.
+    let rename = if crate::owned_output::is_owned(path) {
+        fs::rename(path, &quarantine)
+    } else {
+        std::fs::rename(path, &quarantine)
+    };
+    if let Err(error) = rename {
         if source_is_dir {
             let _ = fs::remove_dir(&quarantine);
         } else {
@@ -338,6 +374,8 @@ pub(crate) fn recover_latest_publication(
             return Ok(());
         }
     };
+
+    crate::owned_output::admit_validated_mutable(&path)?;
 
     // Index I/O or parse failure is not evidence that the publication journal
     // is invalid. Preserve the journal and stop so a later healthy process can
@@ -505,10 +543,52 @@ pub(crate) fn finish_latest_publication(_transaction: &LatestPublication) -> Res
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) fn revoke_committed_latest_after_drift(
+    publication: &crate::storage::RunPublicationLock,
+    transaction: &LatestPublication,
+    out_dir: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        restore_native_path(transaction.record.out_dir.clone()) == out_dir,
+        "late revocation does not match publication transaction"
+    );
+    let guard = crate::owned_output::active_guard()
+        .context("late latest revocation has no caller guard")?;
+    guard.revoke_committed_latest_after_drift(publication, out_dir)
+}
+#[cfg(not(unix))]
+pub(crate) fn revoke_committed_latest_after_drift(
+    _publication: &crate::storage::RunPublicationLock,
+    _transaction: &LatestPublication,
+    _out_dir: &Path,
+) -> Result<()> {
+    Ok(())
+}
+
 /// Resolve an aborted or failed publication from the index while the shared
 /// lock is still held, then clear its durable intent.
 #[cfg(unix)]
 pub(crate) fn rollback_latest_publication(transaction: &LatestPublication) -> Result<()> {
+    if let Some(guard) = crate::owned_output::active_guard()
+        && guard.ensure_valid().is_err()
+    {
+        let out_dir = restore_native_path(transaction.record.out_dir.clone());
+        let previous = transaction
+            .record
+            .previous_target
+            .clone()
+            .map(restore_native_path);
+        if let Some(previous) = previous.as_ref() {
+            validate_latest_target_name(previous.as_os_str())?;
+        }
+        return guard.rollback_latest_after_drift(
+            &out_dir,
+            previous.as_deref().map(Path::as_os_str),
+            &latest_publication_record_path(),
+        );
+    }
+
     // This record was built in this process from the live output path. Pack
     // identity validation is for a journal read back after a crash; applying it
     // here can prevent the cancellation rollback it is meant to protect.
@@ -559,12 +639,24 @@ fn replace_latest_target(parent: &Path, target: &std::ffi::OsStr) -> Result<()> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    if crate::owned_output::active_guard().is_some() {
+        // An already-admitted mutable alias is protected by its recorded
+        // postimage below. Cancellation may have removed that own pack's RUN
+        // before rollback; requiring it again would prevent the required undo.
+        if !crate::owned_output::is_mutable_owned(&latest_link)
+            && let Ok(previous) = fs::read_link(&latest_link)
+        {
+            validate_latest_target_name(previous.as_os_str())?;
+            validate_recovery_pack_identity(&parent.join(previous))?;
+        }
+        crate::owned_output::admit_validated_mutable(&latest_link)?;
+    }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let staged = parent.join(format!(".latest.{}.{nonce}", std::process::id()));
-    std::os::unix::fs::symlink(target, &staged)?;
+    crate::owned_output::create_latest_link(&staged, target)?;
     if let Err(error) = fs::rename(&staged, &latest_link) {
         let _ = fs::remove_file(&staged);
         return Err(error.into());

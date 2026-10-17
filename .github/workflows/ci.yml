@@ -127,6 +127,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Compile Windows process-tree tests
         run: cargo test --lib --no-run
+      - name: Prove caller output accounting on Windows
+        timeout-minutes: 3
+        run: cargo test --lib issue72_review_ -- --skip checks::semgrep::tests::issue69_semgrep_strips_inherited_git_context_only_in_child --nocapture
       - name: Prove cancellation owns first and late process trees
         timeout-minutes: 2
         run: cargo test --lib governor::tests::windows_cancellation_reaps_first_cancel_and_late_registration_trees -- --exact

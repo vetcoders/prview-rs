@@ -2,10 +2,10 @@
 
 use super::common::parse_patch_new_start;
 use crate::git::{Diff, Repository};
+use crate::owned_output::fs;
 use crate::regression::tests::is_test_file;
 use anyhow::Result;
 use std::collections::HashSet;
-use std::fs;
 use std::path::Path;
 
 /// A pattern match found in a diff patch.

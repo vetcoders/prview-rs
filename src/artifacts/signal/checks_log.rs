@@ -1,10 +1,10 @@
 //! Filtered checks log — errors/warnings only, no compilation noise.
 
 use crate::checks::{CheckResult, CheckStatus};
+use crate::owned_output::fs;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
-use std::fs;
 use std::path::Path;
 
 /// Generate `checks-errors.log` — only errors/warnings, no compilation noise.

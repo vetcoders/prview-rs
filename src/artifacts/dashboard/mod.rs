@@ -61,7 +61,7 @@ pub fn generate(
         pr_review: &pr_review,
         regression,
     });
-    std::fs::write(dir.join("dashboard.html"), html)?;
+    crate::owned_output::fs::write(dir.join("dashboard.html"), html)?;
     Ok(())
 }
 

@@ -170,8 +170,10 @@ fn plan_python_tool_run_with_env(
         env.push(cargo_jobs);
     }
     if use_uv && plan.scan_dir != config.repo_root {
-        let env_dir = config.uv_env_dir_for(&reviewed_env_token(config, &plan.scan_dir));
-        mark_and_prune_uv_envs(&config.uv_env_root(), &env_dir);
+        let env_root =
+            super::managed_scratch::snapshot_root(config, config.uv_env_root(), "uv-env")?;
+        let env_dir = env_root.join(reviewed_env_token(config, &plan.scan_dir));
+        mark_and_prune_uv_envs(&env_root, &env_dir);
         env.push((
             "UV_PROJECT_ENVIRONMENT".to_string(),
             env_dir.display().to_string(),
