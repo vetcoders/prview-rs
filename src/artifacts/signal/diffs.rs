@@ -2,10 +2,10 @@
 
 use super::common::HOTSPOT_THRESHOLD;
 use crate::git::{Diff, Repository};
+use crate::owned_output::fs;
 use anyhow::Result;
 use std::cmp::Reverse;
 use std::fmt::Write as FmtWrite;
-use std::fs;
 use std::path::Path;
 
 /// Avoid exploding artifact size on very large PRs.

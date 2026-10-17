@@ -2,10 +2,10 @@
 
 use crate::checks::{CheckResult, CheckStatus};
 use crate::git::{Diff, FileStatus};
+use crate::owned_output::fs;
 use crate::paths::normalize_path_display;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
-use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 

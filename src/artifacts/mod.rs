@@ -17,6 +17,8 @@ use review_range::ReviewRange;
 mod sanity;
 
 use context_artifacts::*;
+#[cfg(test)]
+mod caller_guard_tests;
 use findings::*;
 use git_artifacts::*;
 use merge_gate::*;
@@ -55,6 +57,7 @@ use crate::git::git_cmd;
 use crate::git::{Diff, Repository, ResolvedRef};
 use crate::heuristics::HeuristicsResult;
 use crate::ledger::TaskLedger;
+use crate::owned_output::fs;
 use crate::paths::{read_dir_within, read_to_string_within, read_within};
 use crate::policy::{GateClass, PolicySeverity};
 use crate::regression;
@@ -66,7 +69,7 @@ use signal::{
 };
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
-use std::fs;
+#[cfg(unix)]
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -565,6 +568,110 @@ fn publication_failure_after_rollback(
 
 /// Generate all artifacts
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
+    let ledger = input.ledger;
+    // Quick reviews did not pass through the quality dispatcher. Preserve any
+    // existing baseline rather than recertifying a caller after it changed.
+    ledger.initialize_caller_guard_config_sync(input.config)?;
+    let _output_scope = ledger.output_scope(None);
+    ledger.verify_caller_sync("before-artifact-allocation", None)?;
+    let mut owned_out_dir = None;
+    let result = generate_guarded(input, &mut owned_out_dir);
+    finish_caller_guarded_generation(ledger, owned_out_dir.as_deref(), result)
+}
+
+fn finish_caller_guarded_generation(
+    ledger: &crate::ledger::TaskLedger,
+    out_dir: Option<&Path>,
+    result: Result<PathBuf>,
+) -> Result<PathBuf> {
+    let result = match result {
+        Ok(path) => ledger.ensure_caller_valid().map(|()| path),
+        error => error,
+    };
+    match result {
+        Err(error) => {
+            if ledger.ensure_caller_valid().is_err()
+                && let Some(out_dir) = out_dir
+            {
+                let error = error.context(format!(
+                    "caller drift; partial diagnostics retained at {}",
+                    out_dir.display()
+                ));
+                let _cleanup_scope = ledger.output_scope(Some(out_dir.to_path_buf()));
+                if let Err(cleanup) = mark_generation_caller_drift(out_dir) {
+                    return Err(error.context(format!(
+                        "caller-drift success-surface cleanup not confirmed: {cleanup:#}"
+                    )));
+                }
+                return Err(error);
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+// Journal cleanup can reveal a foreign change after the durable index commit.
+// Revoke only advertisements still matching our recorded postimages; retained
+// predecessors may already have been pruned and must never be resurrected.
+fn finish_committed_publication(
+    publication: &crate::storage::RunPublicationLock,
+    transaction: &LatestPublication,
+    ledger: &TaskLedger,
+    out_dir: &Path,
+) -> Result<()> {
+    let cleanup = finish_latest_publication(transaction);
+    if let Err(error) = ledger.verify_caller_sync("after-publication-cleanup", None) {
+        let index = crate::storage::revoke_committed_index_after_drift(publication, out_dir);
+        let latest = revoke_committed_latest_after_drift(publication, transaction, out_dir);
+        let failures: Vec<_> = [index, latest]
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|e| format!("{e:#}"))
+            .collect();
+        if failures.is_empty() {
+            return Err(error.context(
+                "late caller drift; own committed advertisements revoked; foreign state preserved",
+            ));
+        }
+        return Err(error.context(format!(
+            "late caller drift; revocation unconfirmed: {}; foreign state retained",
+            failures.join("; ")
+        )));
+    }
+    if let Err(error) = cleanup {
+        eprintln!("prview: publication committed; durable journal cleanup deferred: {error:#}");
+    }
+    Ok(())
+}
+
+fn mark_generation_caller_drift(out_dir: &Path) -> Result<()> {
+    let mut failures = Vec::new();
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        if let Err(error) = crate::owned_output::remove_owned_after_abort(&out_dir.join(relative))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            failures.push(format!("{relative}: {error}"));
+        }
+    }
+    let summary = out_dir.join("00_summary");
+    fs::create_dir_all(&summary)?;
+    crate::owned_output::write_incomplete_after_abort(
+        &summary.join("INCOMPLETE.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "1.0", "status": "incomplete", "reason": "caller drift", "stage": "caller boundary",
+            "partial_output_dir": out_dir,
+            "raw_context_diagnostics": "30_context/.context-cmd-*.{stdout,stderr}.tmp; partial raw bytes, not completed gates"
+        }))?.as_slice(),
+    )?;
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
+}
+
+fn generate_guarded(
+    input: GenerateInput<'_>,
+    owned_out_dir: &mut Option<PathBuf>,
+) -> Result<PathBuf> {
     let GenerateInput {
         config,
         ledger,
@@ -665,6 +772,9 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         // idempotent only for that internally owned path.
         fs::create_dir_all(&out_dir)?;
     }
+
+    *owned_out_dir = Some(out_dir.clone());
+    let _pack_scope = ledger.output_scope(Some(out_dir.clone()));
 
     // Open repository once for all generators
     let repo = Repository::open(&config.repo_root)?;
@@ -1275,6 +1385,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         ArtifactGenerationSeam::SharedSnapshotCleanup,
     )?;
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PackPublication)?;
+    ledger.verify_caller_sync("before-pack-publication", None)?;
 
     // Latest + run-index are one publication transaction. Check cancellation
     // before assembling its index row, then hold the shared publication lock
@@ -1352,6 +1463,8 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             }
             Err(error) => return Err(error),
         };
+        // Acquiring the publication lock may wait behind another run.
+        ledger.verify_caller_sync("publication-admitted", None)?;
         let latest_transaction = begin_latest_publication(&publication, &out_dir)?;
         if let Err(error) = ensure_generation_active(
             governor,
@@ -1367,6 +1480,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         if let Err(error) =
             ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)
         {
+            return Err(preserve_primary_error_after_latest_rollback(
+                error,
+                rollback_latest_publication(&latest_transaction),
+            ));
+        }
+
+        if let Err(error) = ledger.verify_caller_sync("before-index-commit", None) {
             return Err(preserve_primary_error_after_latest_rollback(
                 error,
                 rollback_latest_publication(&latest_transaction),
@@ -1400,10 +1520,8 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
                 governor,
                 &out_dir,
             ));
-        } else if let Err(error) = finish_latest_publication(&latest_transaction) {
-            // Index and alias are already consistent. Keep the journal for the
-            // next publisher, which will reconcile it idempotently.
-            eprintln!("prview: publication committed; durable journal cleanup deferred: {error:#}");
+        } else {
+            finish_committed_publication(&publication, &latest_transaction, ledger, &out_dir)?;
         }
         #[cfg(test)]
         publication_commit_test_hook::observe_and_maybe_cancel(governor);
@@ -1491,6 +1609,51 @@ pub(crate) fn reserve_mcp_output_dir(out_dir: &Path, nonce: &str) -> Result<()> 
     file.write_all(nonce.as_bytes())?;
     file.sync_all()?;
     Ok(())
+}
+
+pub(crate) fn caller_launcher_outputs(config: &Config) -> Result<Vec<PathBuf>> {
+    let Some(nonce) = std::env::var_os(MCP_OUTPUT_RESERVATION_ENV) else {
+        return Ok(Vec::new());
+    };
+    let nonce = nonce
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("invalid MCP reservation encoding"))?;
+    let out_dir = config
+        .output_dir
+        .as_deref()
+        .context("MCP reservation requires an explicit output directory")?;
+    validate_mcp_reservation(out_dir, &nonce)
+}
+
+fn validate_mcp_reservation(out_dir: &Path, nonce: &str) -> Result<Vec<PathBuf>> {
+    let reservation = out_dir.join(MCP_OUTPUT_RESERVATION_FILE);
+    let metadata = std::fs::symlink_metadata(&reservation)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 8192,
+        "invalid MCP reservation sentinel"
+    );
+    anyhow::ensure!(
+        std::fs::read_to_string(&reservation)? == nonce,
+        "MCP reservation nonce mismatch"
+    );
+    for entry in std::fs::read_dir(out_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let allowed = name == std::ffi::OsStr::new(MCP_OUTPUT_RESERVATION_FILE)
+            || MCP_CONTROL_FILES
+                .iter()
+                .any(|value| name == std::ffi::OsStr::new(value));
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        anyhow::ensure!(
+            allowed && metadata.is_file() && !metadata.file_type().is_symlink(),
+            "MCP reservation contains an unowned entry: {:?}",
+            name
+        );
+    }
+    Ok(std::iter::once(MCP_OUTPUT_RESERVATION_FILE)
+        .chain(MCP_CONTROL_FILES.iter().copied())
+        .map(|name| out_dir.join(name))
+        .collect())
 }
 
 /// Claim one explicit pack path. Existing directories are rejected unless the
@@ -2776,7 +2939,8 @@ fn create_zip(dir: &Path, emit_human_stdout: bool) -> Result<()> {
         }
     }
 
-    zip.finish()?;
+    let mut completed_zip = zip.finish()?;
+    crate::owned_output::finish_producer(&zip_path, &mut completed_zip)?;
 
     // Verify the shipped archive actually carries the pack metadata a consumer
     // needs to validate it standalone. Zipping before these files existed used

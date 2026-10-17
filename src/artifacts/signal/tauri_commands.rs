@@ -1,10 +1,10 @@
 use crate::git::{Diff, FileStatus, Repository};
+use crate::owned_output::fs;
 use crate::paths::read_to_string_within;
 use anyhow::Result;
 use regex::Regex;
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
-use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 

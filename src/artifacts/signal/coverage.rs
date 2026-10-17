@@ -2,12 +2,12 @@
 
 use super::common::{contains_token_match, is_non_code_file};
 use crate::git::{Diff, FileChange, Repository};
+use crate::owned_output::fs;
 use crate::paths::normalize_path_display;
 use crate::regression::tests::is_test_file;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
-use std::fs;
 use std::path::Path;
 
 // ── Coverage match tiers ─────────────────────────────────────────────

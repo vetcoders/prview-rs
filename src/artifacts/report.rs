@@ -77,7 +77,7 @@ pub struct ReportInput<'a> {
 pub fn generate(input: &ReportInput<'_>) -> Result<()> {
     let report = build_report(input);
     let json = serde_json::to_string_pretty(&report)?;
-    std::fs::write(input.dir.join("report.json"), json)?;
+    crate::owned_output::fs::write(input.dir.join("report.json"), json)?;
     Ok(())
 }
 

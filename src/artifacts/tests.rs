@@ -1171,8 +1171,9 @@ fn create_zip_preserves_unicode_names_and_binary_payloads() {
     fs::write(out.join("00_summary/SANITY.json"), b"{\"valid\":true}").expect("sanity");
     create_zip(out, false).expect("zip with required metadata");
 
-    let mut archive = zip::ZipArchive::new(File::open(out.join("artifacts.zip")).expect("zip"))
-        .expect("read archive");
+    let mut archive =
+        zip::ZipArchive::new(std::fs::File::open(out.join("artifacts.zip")).expect("zip"))
+            .expect("read archive");
     let mut entry = archive.by_name(path).expect("exact Unicode filename");
     assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
     let mut restored = Vec::new();

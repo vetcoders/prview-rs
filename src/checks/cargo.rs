@@ -101,7 +101,11 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
 
     // Cargo creates the target directory itself, so nothing is materialised
     // here — resolving the path stays free of filesystem side effects.
-    let target_dir = config.cargo_build_cache_dir();
+    let target_dir = super::managed_scratch::snapshot_root(
+        config,
+        config.cargo_build_cache_dir(),
+        "cargo-target",
+    )?;
 
     let cwd = match resolve_reviewed_cargo_root(config) {
         // The reviewed commit's own tree said where its manifest is.
