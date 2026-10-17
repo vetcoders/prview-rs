@@ -792,6 +792,16 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
             .raise_to(crate::policy::engine::EnforcementDisposition::WarningsOnly);
     }
 
+    // Canonical review signals must reach human stdout and CLI JSON as well
+    // as gate JSON. A generic "1 review signal" hides what was not reviewed.
+    if let Some(review_caveats) = decision.get("review_caveats").and_then(Value::as_array) {
+        for caveat in review_caveats.iter().filter_map(Value::as_str) {
+            if !caveats.iter().any(|existing| existing == caveat) {
+                caveats.push(caveat.to_owned());
+            }
+        }
+    }
+
     Ok(MergeGateSummary {
         verdict: verdict.to_string(),
         enforcement_disposition,

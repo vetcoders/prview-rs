@@ -337,6 +337,12 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         }
     }
 
+    let review_range = ReviewRange::assess(config, resolved_target, resolved_bases, diffs);
+    review_caveats.extend(review_range.apply_review(&mut worst_confidence, &mut worst_merge));
+    if review_range.requires_review() {
+        enforcement_disposition.raise_to(EnforcementDisposition::ReviewRequired);
+    }
+
     // Fail-honest backstop for any typed ratchet added above without an
     // explicit disposition update. The warnings-only exception remains
     // representable only when that exact typed disposition was already set.
@@ -479,6 +485,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         // axes rest on may not describe the reviewed commit, and every row is
         // also carried as a review signal so no reader has to parse this array
         // to see it.
+        "review_range": review_range,
         "provenance_contradictions": provenance.contradictions,
         "decision": {
             "enforcement_disposition": enforcement_disposition,
@@ -948,6 +955,20 @@ mod tests {
         )
     }
 
+    // These fixtures test signals after a comparison, not omitted ranges.
+    fn compared_fixture_diff() -> Diff {
+        let (target, bases) = resolved_refs();
+        Diff {
+            base: bases[0].name.clone(),
+            target: target.name,
+            base_commit_id: bases[0].commit_id.clone(),
+            target_commit_id: target.commit_id,
+            files: vec![],
+            stats: crate::git::DiffStats::default(),
+            commits: vec![],
+        }
+    }
+
     fn review_signal_documents(count: usize) -> (String, String, Vec<String>) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let summary = tmp.path().join("00_summary");
@@ -980,7 +1001,7 @@ mod tests {
             breaking: &[],
             rust_api_delta: None,
             coverage: &coverage,
-            diffs: &[],
+            diffs: &[compared_fixture_diff()],
             skipped_checks: &skipped,
             resolved_target: &target,
             resolved_bases: &bases,
@@ -1079,7 +1100,7 @@ mod tests {
             breaking: &[],
             rust_api_delta: None,
             coverage: &empty_coverage(),
-            diffs: &[],
+            diffs: &[compared_fixture_diff()],
             skipped_checks: &[],
             resolved_target: &target,
             resolved_bases: &bases,
@@ -1243,6 +1264,7 @@ mod tests {
             dashboard_findings: vec![],
         };
         let dashboard = build_dashboard_context(DashboardContextInput {
+            review_range: &ReviewRange::default(),
             config: &config,
             scope: None,
             checks: &checks,
@@ -1813,6 +1835,7 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
         let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse gate json");
         let dashboard = build_dashboard_context(DashboardContextInput {
+            review_range: &ReviewRange::default(),
             config: &config,
             scope: None,
             checks: &[],
@@ -1883,6 +1906,7 @@ mod tests {
         let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse gate json");
 
         let dashboard = build_dashboard_context(DashboardContextInput {
+            review_range: &ReviewRange::default(),
             config: &config,
             scope: None,
             checks: &[],

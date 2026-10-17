@@ -208,7 +208,13 @@ impl App {
 
         // 3. Check for update mode
         self.ensure_not_cancelled()?;
+        // A previous target-tree result cannot satisfy an explicit request to
+        // compare the target with itself, even when HEAD is unchanged.
+        let explicit_self_diff = !self.config.current_only
+            && (self.config.explicit_bases || self.config.required_base.is_some())
+            && bases.iter().any(|base| base.commit_id == target.commit_id);
         if self.config.update_mode
+            && !explicit_self_diff
             && let Some(prev_run) = self.find_previous_run()?
             && let Some(report) =
                 self.reuse_unchanged_run(&target, &bases, prev_run, emit_human_stdout)?
@@ -897,6 +903,32 @@ impl App {
     ) -> Result<Option<output::Report>> {
         use colored::Colorize;
 
+        self.ensure_not_cancelled()?;
+        // New packs record comparison coverage. Reuse may not carry an
+        // explicit self-diff assessment into an automatic/current-only run, or
+        // an automatic PASS into a different requested comparison.
+        let previous_range =
+            crate::paths::read_to_string_within(&prev_run, std::path::Path::new("report.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|report| report.get("review_range").cloned());
+        if let Some(range) = previous_range {
+            let same_modes = range["current_only"].as_bool() == Some(self.config.current_only)
+                && range["explicit_bases"].as_bool()
+                    == Some(self.config.explicit_bases || self.config.required_base.is_some());
+            let same_bases = range["comparisons"].as_array().is_some_and(|comparisons| {
+                comparisons.len() == bases.len()
+                    && comparisons.iter().zip(bases).all(|(previous, base)| {
+                        previous["base"].as_str() == Some(base.name.as_str())
+                            && previous["requested_base_sha"].as_str()
+                                == Some(base.commit_id.as_str())
+                            && previous["target_sha"].as_str() == Some(target.commit_id.as_str())
+                    })
+            });
+            if !same_modes || !same_bases {
+                return Ok(None);
+            }
+        }
         let prev_head = self.read_previous_head(&prev_run)?;
         let current_head = target.commit_id.clone();
 
@@ -950,6 +982,19 @@ impl App {
     }
 
     fn read_previous_head(&self, prev_run: &std::path::Path) -> Result<String> {
+        // Older empty-diff packs omitted HEAD from the text metadata, but their
+        // provenance still captured the resolved target. Prefer that identity.
+        if let Some(target) = crate::paths::read_to_string_within(
+            prev_run,
+            std::path::Path::new("00_summary/PROVENANCE.json"),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|provenance| provenance["target_sha"].as_str().map(str::to_owned))
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Ok(target);
+        }
         // Try new layout first, fall back to legacy path
         let metadata_file = {
             let new_path = prev_run.join("00_summary/pr-metadata.txt");

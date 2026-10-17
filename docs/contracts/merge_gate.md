@@ -1268,3 +1268,43 @@ no shared snapshot and could not capture the operator checkout at all — an unb
 `HEAD`, or a checkout that moved while provenance was being read, which the
 capture discards rather than certify — fails there too: an unknown checkout
 identity is not a known-matching one.
+
+### Comparison coverage and explicit self-diffs
+
+Checks on a target tree do not prove that a change was reviewed. An explicitly
+selected base resolving to the target commit adds a `No change reviewed` caveat,
+sets analysis to `incomplete`, and raises the existing merge recommendation and
+enforcement disposition to at least `review_required`. The verdict is therefore
+at least `CONDITIONAL`; an existing `BLOCK` remains `BLOCK`. The existing exit
+mapping applies: advisory `gate` exits 0, `gate --strict` exits 2 for this signal.
+`--update` cannot reuse an earlier PASS in place of this assessment.
+
+`MERGE_GATE.json`, `PROVENANCE.json`, and root `report.json` carry the same
+additive `review_range` object: `current_only`, `explicit_bases`, and a
+`comparisons` array. Each comparison names the requested base SHA, effective
+base SHA, target SHA, base name, and status:
+
+- `self_diff`: requested base and target are the same commit. Only explicit
+  selection raises the review-required signal.
+- `merge_base_equals_target`: the requested base differs, but normalizing the
+  comparison yields the target; no change was reviewed against that base.
+- `equal_trees`: different effective commits were compared and their trees
+  produced no changed files.
+- `compared`: the comparison contains changed files.
+
+Automatic discovery of a base equal to the target remains a valid empty run,
+with a coverage caveat but no new verdict ratchet. MCP preserves whether the
+caller selected the base or it was automatically discovered. `--current-only`
+has no comparisons and does not claim review of a change. Mixed-base runs retain
+all comparison records, including skipped self-diffs alongside real diffs;
+one explicit self-diff still requires review. `PROVENANCE.json`'s existing
+`bases`/`base_sha` describe effective baselines, including target for a skipped
+comparison, rather than substituting a descendant's requested tip. These rules
+do not change the global PASS/CONDITIONAL/BLOCK or process-exit mappings.
+
+Empty comparisons retain `HEAD` in `pr-metadata.txt`. Update mode compares the
+recorded comparison modes and requested identities before reusing a modern
+pack; a prior self-diff assessment cannot become an automatic or current-only
+assessment merely because HEAD stayed unchanged. Legacy empty packs can recover
+their target SHA from `PROVENANCE.json`; legacy packs without readable comparison
+coverage retain the earlier reuse behavior, with the explicit-self guard applied.

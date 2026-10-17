@@ -7985,7 +7985,16 @@ fn write_provenance_fixture(
     out: &Path,
     checks: &[CheckResult],
 ) -> serde_json::Value {
-    write_provenance_fixture_with_diffs(repo_root, out, checks, &[])
+    let diff = Diff {
+        base: "origin/main".to_string(),
+        target: "feature/provenance".to_string(),
+        base_commit_id: PROVENANCE_BASE_TIP.to_string(),
+        target_commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        files: vec![],
+        stats: DiffStats::default(),
+        commits: vec![],
+    };
+    write_provenance_fixture_with_diffs(repo_root, out, checks, &[diff])
 }
 
 /// Base tip the operator names, distinct from the merge base a diverged branch
@@ -8041,6 +8050,7 @@ fn write_provenance_fixture_with_capture(
     );
 
     generate_provenance_json(ProvenanceJsonInput {
+        config: &crate::config::test_config(),
         dir: out,
         checks,
         skipped_checks,
@@ -8310,10 +8320,9 @@ fn provenance_json_records_every_baseline_of_a_multi_base_run() {
 }
 
 #[test]
-fn provenance_json_bases_fall_back_to_resolved_refs_without_a_diff() {
-    // No diff at all (`--current-only`, or a base pointing at the target): the
-    // resolved refs are then the only baselines there are, and the array must
-    // still agree with the scalar.
+fn provenance_json_omitted_comparison_uses_target_as_effective_baseline() {
+    // generate_diffs omits an effective self-base. A requested descendant tip
+    // can differ from that effective baseline; the scalar and array name target.
     let (repo_tmp, _head) = provenance_fixture_repo();
     let out = tempfile::tempdir().expect("out tempdir");
 
@@ -8322,8 +8331,8 @@ fn provenance_json_bases_fall_back_to_resolved_refs_without_a_diff() {
     let bases = json["bases"].as_array().expect("bases array");
     assert_eq!(bases.len(), 1);
     assert_eq!(bases[0]["name"], "origin/main");
-    assert_eq!(bases[0]["sha"], PROVENANCE_BASE_TIP);
-    assert_eq!(json["base_sha"], PROVENANCE_BASE_TIP);
+    assert_eq!(bases[0]["sha"], json["target_sha"]);
+    assert_eq!(json["base_sha"], json["target_sha"]);
 }
 
 #[test]
@@ -8488,6 +8497,7 @@ fn informational_notes_keep_current_and_historical_counts_comparable() {
 
     let context_for = |out_dir: &Path| {
         build_dashboard_context(DashboardContextInput {
+            review_range: &ReviewRange::default(),
             config: &config,
             scope: None,
             checks: &[],
@@ -8683,6 +8693,7 @@ fn snapshot_integrity_gate_preserves_check_results_and_dashboard_parity() {
         })
         .unwrap();
         let dashboard = build_dashboard_context(DashboardContextInput {
+            review_range: &ReviewRange::default(),
             config: &config,
             scope: None,
             checks: &checks,

@@ -1410,3 +1410,14 @@ Make sure `tsconfig.json` exists and `pnpm`/`npm` are available.
 ### Cargo check fails
 
 Check that `cargo` is on PATH and `Cargo.toml` is valid.
+
+### Explicit self-diffs
+
+`prview HEAD HEAD` and `prview gate --base HEAD` cannot establish review of a
+change. They still run target-tree checks, but emit `CONDITIONAL` with a
+`No change reviewed` explanation in CLI output and the review pack. Use an
+actual earlier base, for example `prview gate --base HEAD^ --strict`, to review
+that change. Existing gate policy applies: `--strict` rejects the self-diff with
+exit 2; advisory gate mode reports it with exit 0. Automatic base discovery,
+`--current-only`, and different commits with identical trees remain distinct
+cases in the pack's `review_range` metadata.
