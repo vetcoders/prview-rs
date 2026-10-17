@@ -4617,17 +4617,25 @@ fn detect_profile(...) -> Result<DetectedProfile> {
 ### Optional dependency listings and structural measurement status
 
 `REVIEW_SUMMARY.md` labels a retained SBOM context output as a dependency
-listing only when its command completed successfully and the output exists.
+listing only when its command completed successfully and its readable output
+has no truncation marker (current head/tail or legacy prefix-only). Truncated
+output is an INCOMPLETE diagnostic even after exit code zero.
 Failed/timed-out output remains linked as a diagnostic log with its status;
 an unstarted command is `NOT_RUN`. A file without command outcome evidence is
 `UNKNOWN`, and a completed command with missing output is also `UNKNOWN`.
 These labels do not change the merge gate or relax incomplete analysis.
 
 For the supported npm/pnpm listing commands, the reviewed tree's
-`packageManager` declaration takes precedence over its lockfile, then the
-existing PATH fallback applies. pnpm uses `list --depth Infinity`; npm uses
+`packageManager` declaration takes precedence over its lockfile. Without a
+supported declaration, nonempty lockfiles can select the manager; empty or
+whitespace-only files are ignored. If both lockfiles are nonempty, the existing
+pnpm-first order is retained; this is not validation of lockfile syntax. An
+explicit unsupported manager bypasses lockfile inference and retains the
+existing PATH fallback. pnpm uses `list --depth Infinity`; npm uses
 `ls --all`. The compatibility fix adapts the existing local donor `08f7a5d9`.
-Other package managers retain the existing fallback behavior; this is not a
+The command label identifies npm or pnpm; the existing `npm-sbom.txt` filename
+remains compatible for both. Other package managers retain the existing fallback
+behavior; this is not a
 claim of Yarn/Bun support. Failed commands record their exit status in RUN.
 
 `PR_REVIEW.md` (also embedded in `REVIEW_SUMMARY.md`) reports Loctree twins
@@ -4641,11 +4649,22 @@ canonical gate decisions retain their existing contracts.
 Large optional context text artifacts (`.txt`/`.log`) retain the beginning and
 end of stdout followed by stderr within the 500,000-byte limit, including a
 marker that states the original byte count and that the middle was omitted.
-Both cut boundaries preserve UTF-8. This keeps late diagnostics visible after
-large traces; the retained artifact is explicitly incomplete. Short text stays
-byte-identical. JSON extraction, command statuses, deadlines, merge gates and
-the artifact manifest contracts retain their existing behavior. Invalid JSON
-diagnostic retention is a separate unresolved issue.
+Both cut boundaries preserve UTF-8. The collector seeks to bounded windows
+before allocating text, so retained-log memory does not grow with source size.
+Invalid UTF-8 in retained bytes is decoded lossily with an explicit marker.
+This keeps late diagnostics visible after large traces; the retained artifact is
+explicitly incomplete. Short valid UTF-8 text stays byte-identical.
+
+JSON is validated as a stream without constructing an in-memory value, then
+copied in full (including stdout larger than 500 KB). Invalid JSON is retained
+as bounded text in an additive `<requested-name>.raw.log` sibling, for example
+`eslint.json.raw.log`, with a format warning and the final diagnostic. It is
+never written under the requested `.json` name. A normal exit with invalid JSON
+is `failed`; a timeout remains `timed_out`. Reasons retain the command failure
+or timeout and explain the diagnostic fallback. Read/write errors have no
+artifact link and an explicit reason. RUN links the file actually written on
+both normal exit and timeout. Deadlines, ownership, merge gates, RUN schema and
+the artifact manifest contracts retain their existing behavior.
 
 Timed-out context commands retain their captured diagnostics only after their
 owned process tree has been confirmed terminated. RUN keeps `timed_out` and
