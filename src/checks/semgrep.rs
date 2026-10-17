@@ -1524,10 +1524,7 @@ mod tests {
                 commit_id: base,
                 is_remote: false,
             }]);
-            let inherited: Vec<_> = CONTEXT_VARS
-                .iter()
-                .map(std::env::var_os)
-                .collect();
+            let inherited: Vec<_> = CONTEXT_VARS.iter().map(std::env::var_os).collect();
             let before = issue69_caller_identity(&root);
             let result = SemgrepCheck.run(&config).await.unwrap();
             assert_eq!(result.status, CheckStatus::Passed, "{}", result.output);
