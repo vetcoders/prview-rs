@@ -9640,3 +9640,63 @@ fn pr_review_does_not_claim_zero_twins_when_heuristics_did_not_measure() {
         );
     }
 }
+
+#[test]
+fn review_summary_sbom_truncated_output_is_diagnostic() {
+    for marker in [
+        "... (truncated, 900000 total bytes; middle omitted)",
+        "... (truncated, 900000 total bytes)",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("30_context")).unwrap();
+        fs::write(
+            tmp.path().join("30_context/npm-sbom.txt"),
+            format!("listing head\n{marker}\nlisting tail"),
+        )
+        .unwrap();
+        let timings = [ContextCommandTiming {
+            label: "npm sbom".into(),
+            artifact: Some("30_context/npm-sbom.txt".into()),
+            status: "completed",
+            started: true,
+            duration_secs: 0.1,
+            reason: None,
+        }];
+        generate_review_summary(tmp.path(), &timings).unwrap();
+        let summary = fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).unwrap();
+        assert!(
+            summary.contains("diagnostic log (INCOMPLETE: output truncated)"),
+            "{summary}"
+        );
+        assert!(!summary.contains("SBOM (COMPLETED)"), "{summary}");
+    }
+}
+
+#[test]
+fn review_summary_sbom_identifies_pnpm_even_without_output() {
+    for present in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        if present {
+            fs::create_dir(tmp.path().join("30_context")).unwrap();
+            fs::write(tmp.path().join("30_context/npm-sbom.txt"), "listing").unwrap();
+        }
+        let timings = [ContextCommandTiming {
+            label: "pnpm sbom".into(),
+            artifact: present.then(|| "30_context/npm-sbom.txt".into()),
+            status: if present { "completed" } else { "spawn_failed" },
+            started: present,
+            duration_secs: 0.1,
+            reason: None,
+        }];
+        generate_review_summary(tmp.path(), &timings).unwrap();
+        let summary = fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).unwrap();
+        assert!(
+            summary.contains(if present {
+                "dependency SBOM (COMPLETED)"
+            } else {
+                "pnpm sbom — NOT_RUN (spawn_failed)"
+            }),
+            "{summary}"
+        );
+    }
+}

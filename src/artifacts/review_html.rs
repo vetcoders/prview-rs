@@ -108,13 +108,23 @@ fn append_sbom_summary(
     description: &str,
 ) -> Result<()> {
     use std::fmt::Write;
-    let timing = timings.iter().find(|timing| timing.label == label);
+    let timing = timings.iter().find(|timing| {
+        timing.label == label
+            || timing.artifact.as_deref() == Some(path)
+            || (label == "npm sbom" && timing.label == "pnpm sbom")
+    });
+    let label = timing.map_or(label, |timing| timing.label.as_str());
     let exists = out_dir.join(path).is_file();
     if !exists && timing.is_none() {
         return Ok(());
     }
+    let content = read_to_string_within(out_dir, Path::new(path)).ok();
+    let truncated = content.as_ref().is_some_and(|text| {
+        text.lines()
+            .any(|line| line.trim_start().starts_with("... (truncated, "))
+    });
     match timing {
-        Some(timing) if timing.status == "completed" && exists => {
+        Some(timing) if timing.status == "completed" && content.is_some() && !truncated => {
             writeln!(md, "- `{path}` — {description} (COMPLETED)")?;
         }
         Some(timing) if !timing.started => {
@@ -122,7 +132,11 @@ fn append_sbom_summary(
         }
         _ => {
             let status = timing.map_or("UNKNOWN".to_owned(), |timing| {
-                if timing.status == "completed" {
+                if timing.status == "completed" && truncated {
+                    "INCOMPLETE: output truncated".to_owned()
+                } else if timing.status == "completed" && exists {
+                    "UNKNOWN (output unreadable)".to_owned()
+                } else if timing.status == "completed" {
                     "UNKNOWN (expected output missing)".to_owned()
                 } else {
                     timing.status.to_ascii_uppercase()
