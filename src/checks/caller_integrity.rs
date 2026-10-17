@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct SourceEntry {
@@ -70,7 +70,42 @@ pub(crate) struct CallerGuard {
 #[derive(Clone)]
 struct OwnedLeaf {
     mutable: bool,
-    expected: Option<SourceEntry>,
+    state: OwnedState,
+    held_publication_file: Option<Weak<Mutex<File>>>,
+}
+
+#[derive(Clone)]
+enum OwnedState {
+    ActiveProducer,
+    Complete(SourceEntry),
+    Absent,
+}
+impl OwnedState {
+    fn settled(expected: Option<SourceEntry>) -> Self {
+        expected.map(Self::Complete).unwrap_or(Self::Absent)
+    }
+    fn expected(&self) -> Option<&SourceEntry> {
+        match self {
+            Self::Complete(entry) => Some(entry),
+            Self::ActiveProducer | Self::Absent => None,
+        }
+    }
+}
+impl OwnedLeaf {
+    fn active() -> Self {
+        Self {
+            mutable: false,
+            state: OwnedState::ActiveProducer,
+            held_publication_file: None,
+        }
+    }
+    fn settled(mutable: bool, expected: Option<SourceEntry>) -> Self {
+        Self {
+            mutable,
+            state: OwnedState::settled(expected),
+            held_publication_file: None,
+        }
+    }
 }
 
 impl CallerGuard {
@@ -139,13 +174,7 @@ impl CallerGuard {
                 "tracked source cannot be a launcher output: {}",
                 path.display()
             );
-            owned.insert(
-                path,
-                OwnedLeaf {
-                    mutable: false,
-                    expected: None,
-                },
-            );
+            owned.insert(path, OwnedLeaf::active());
         }
         Ok(())
     }
@@ -239,8 +268,11 @@ impl CallerGuard {
             .owned_outputs
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let known = owned.contains_key(&path);
-        if !known
+        let registered = owned.contains_key(&path);
+        let known = owned
+            .get(&path)
+            .is_some_and(|leaf| !matches!(leaf.state, OwnedState::Absent));
+        if !registered
             && self.baseline_contains_output(&path).map_err(|error| {
                 std::io::Error::other(self.latch_output_unknown("new-output-baseline", error))
             })?
@@ -253,19 +285,19 @@ impl CallerGuard {
             )));
         }
         if let Some(leaf) = owned.get(&path) {
-            self.check_mutable_preimage(&path, leaf)
+            self.check_owned_preimage(&path, leaf)
                 .map_err(std::io::Error::other)?;
         }
-        if !known && fs::symlink_metadata(&path).is_ok() {
+        if !registered && fs::symlink_metadata(&path).is_ok() {
             drop(owned);
             self.reject_new_foreign_collision(&path)
                 .map_err(std::io::Error::other)?;
-            return Err(std::io::Error::other(format!(
-                "unowned output collision: {}",
-                path.display()
-            )));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("unowned output collision: {}", path.display()),
+            ));
         }
-        if !known && !allow_new {
+        if !registered && !allow_new {
             return Err(std::io::Error::other(format!(
                 "no exact output capability for {}",
                 path.display()
@@ -274,12 +306,8 @@ impl CallerGuard {
         let mut file = open(&path, !known)?;
         if known {
             if let Some(leaf) = owned.get(&path)
-                && leaf.mutable
+                && let Some(expected) = leaf.state.expected()
             {
-                let expected = leaf
-                    .expected
-                    .as_ref()
-                    .ok_or_else(|| std::io::Error::other("mutable file preimage is absent"))?;
                 let observed = hash_file(file.try_clone()?).map_err(|error| {
                     std::io::Error::other(self.latch_output_unknown("output-handle-read", error))
                 })?;
@@ -304,13 +332,16 @@ impl CallerGuard {
                     ));
                 }
             }
+            if let Some(leaf) = owned.get_mut(&path) {
+                leaf.state = OwnedState::ActiveProducer;
+            }
             file.seek(SeekFrom::Start(0))?;
             file.set_len(0)?;
         }
-        owned.entry(path).or_insert(OwnedLeaf {
-            mutable: false,
-            expected: None,
-        });
+        owned
+            .entry(path)
+            .and_modify(|leaf| leaf.state = OwnedState::ActiveProducer)
+            .or_insert(OwnedLeaf::active());
         Ok(file)
     }
 
@@ -344,7 +375,7 @@ impl CallerGuard {
             .unwrap_or_else(|error| error.into_inner())
             .get_mut(&path)
         {
-            leaf.expected = Some(expected);
+            leaf.state = OwnedState::Complete(expected);
         }
         Ok(())
     }
@@ -356,6 +387,14 @@ impl CallerGuard {
             .observation_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        self.admit_mutable_output_locked(path, None)
+    }
+
+    fn admit_mutable_output_locked(
+        &self,
+        path: &Path,
+        held: Option<&Arc<Mutex<File>>>,
+    ) -> Result<()> {
         self.ensure_valid()?;
         let path = output_leaf_path(path)
             .map_err(|error| self.latch_output_unknown("shared-output-resolution", error))?;
@@ -366,8 +405,11 @@ impl CallerGuard {
             "tracked shared-state collision: {}",
             path.display()
         );
-        let actual = output_state(&self.root, &path)
-            .map_err(|error| self.latch_output_unknown("shared-output-read", error))?;
+        let actual = match held {
+            Some(file) => held_publication_state(&self.root, &path, file),
+            None => output_state(&self.root, &path),
+        }
+        .map_err(|error| self.latch_output_unknown("shared-output-read", error))?;
         let root = fs::canonicalize(&self.root)
             .map_err(|error| self.latch_output_unknown("output-root-observation", error))?;
         let key = path.strip_prefix(&root).ok().map(path_key);
@@ -377,7 +419,9 @@ impl CallerGuard {
             .unwrap_or_else(|error| error.into_inner());
         let previous = owned.get(&path);
         let expected = match previous {
-            Some(leaf) if leaf.mutable => leaf.expected.clone(),
+            Some(leaf) if !matches!(leaf.state, OwnedState::ActiveProducer) => {
+                leaf.state.expected().cloned()
+            }
             Some(_) => actual.clone(), // already-created own output, not caller source
             None => key
                 .as_ref()
@@ -392,7 +436,10 @@ impl CallerGuard {
                     .ok()
                     .is_some_and(|b| b.sources.contains_key(key))
             }) || (key.is_some() && actual.is_some() && !git_ignored_output(&root, &path)?);
-        if (visible || previous.is_some_and(|leaf| leaf.mutable)) && expected != actual {
+        if (visible
+            || previous.is_some_and(|leaf| !matches!(leaf.state, OwnedState::ActiveProducer)))
+            && expected != actual
+        {
             drop(owned);
             return self.reject_observation(
                 "shared-output-preimage",
@@ -403,13 +450,81 @@ impl CallerGuard {
                 )),
             );
         }
-        owned.insert(
-            path,
-            OwnedLeaf {
-                mutable: true,
-                expected: actual,
-            },
-        );
+        let mut leaf = OwnedLeaf::settled(true, actual);
+        leaf.held_publication_file = held.map(Arc::downgrade);
+        owned.insert(path, leaf);
+        Ok(())
+    }
+
+    /// The publication rail supplies its already-locked original handle and
+    /// the exact role-validated prior bytes. No second content handle is opened.
+    pub(crate) fn write_locked_publication_file(
+        &self,
+        path: &Path,
+        file: &Arc<Mutex<File>>,
+        previous: &[u8],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.admit_mutable_output_locked(path, Some(file))?;
+        let path = output_leaf_path(path)?;
+        let mut owned = self.owned_outputs.lock().unwrap_or_else(|e| e.into_inner());
+        let leaf = owned
+            .get_mut(&path)
+            .context("publication lock was not admitted")?;
+        self.check_owned_preimage(&path, leaf)?;
+        if leaf
+            .state
+            .expected()
+            .and_then(|entry| entry.sha256.as_ref())
+            != Some(&hex(&Sha256::digest(previous)))
+        {
+            return Err(self.latch_output_unknown(
+                "publication-lock-preimage",
+                "publication lock changed after its role was validated",
+            ));
+        }
+        let mut file = file.lock().map_err(|_| {
+            self.latch_output_unknown("publication-lock-handle", "poisoned held handle")
+        })?;
+        let controlled_mode = mode(&file.metadata()?);
+        file.rewind()?;
+        file.set_len(0)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        leaf.state = OwnedState::Complete(SourceEntry {
+            path: output_entry_name(&self.root, &path)?,
+            kind: "file",
+            mode: controlled_mode,
+            sha256: Some(hex(&Sha256::digest(bytes))),
+        });
+        Ok(())
+    }
+
+    /// Seal only the original producer handle, after the owner has finished.
+    /// Active streams have no completed postimage; completed/absent leaves do.
+    pub(crate) fn finish_output_producer(&self, path: &Path, file: &mut File) -> Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.ensure_valid()?;
+        let path =
+            output_leaf_path(path).map_err(|e| self.latch_output_unknown("producer-path", e))?;
+        ensure_untracked_output(self, &path)?;
+        let mut owned = self.owned_outputs.lock().unwrap_or_else(|e| e.into_inner());
+        let leaf = owned
+            .get_mut(&path)
+            .context("producer has no exact output claim")?;
+        if !matches!(leaf.state, OwnedState::ActiveProducer) {
+            return self.check_owned_preimage(&path, leaf);
+        }
+        let entry = producer_file_state(&self.root, &path, file)
+            .map_err(|e| self.latch_output_unknown("producer-completion", e))?;
+        leaf.state = OwnedState::Complete(entry);
         Ok(())
     }
 
@@ -431,12 +546,16 @@ impl CallerGuard {
         }))
     }
 
-    fn check_mutable_preimage(&self, path: &Path, leaf: &OwnedLeaf) -> Result<()> {
-        if leaf.mutable
-            && leaf.expected
-                != output_state(&self.root, path)
-                    .map_err(|error| self.latch_output_unknown("mutable-output-read", error))?
-        {
+    fn check_owned_preimage(&self, path: &Path, leaf: &OwnedLeaf) -> Result<()> {
+        if matches!(leaf.state, OwnedState::ActiveProducer) {
+            return Ok(());
+        }
+        let actual = match leaf.held_publication_file.as_ref().and_then(Weak::upgrade) {
+            Some(file) => held_publication_state(&self.root, path, &file),
+            None => output_state(&self.root, path),
+        }
+        .map_err(|error| self.latch_output_unknown("owned-output-read", error))?;
+        if leaf.state.expected() != actual.as_ref() {
             return self.reject_observation(
                 "shared-output-preimage",
                 None,
@@ -489,7 +608,7 @@ impl CallerGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(leaf) = owned.get(&path) {
-            self.check_mutable_preimage(&path, leaf)
+            self.check_owned_preimage(&path, leaf)
                 .map_err(std::io::Error::other)?;
         }
         if !owned.contains_key(&path) {
@@ -512,7 +631,7 @@ impl CallerGuard {
         }
         fs::remove_file(&path)?;
         if let Some(leaf) = owned.get_mut(&path) {
-            leaf.expected = None;
+            leaf.state = OwnedState::Absent;
         }
         Ok(())
     }
@@ -540,11 +659,11 @@ impl CallerGuard {
             .unwrap_or_else(|error| error.into_inner());
         ensure_untracked_output(self, &source).map_err(std::io::Error::other)?;
         if let Some(leaf) = owned.get(&source) {
-            self.check_mutable_preimage(&source, leaf)
+            self.check_owned_preimage(&source, leaf)
                 .map_err(std::io::Error::other)?;
         }
         if let Some(leaf) = owned.get(&destination) {
-            self.check_mutable_preimage(&destination, leaf)
+            self.check_owned_preimage(&destination, leaf)
                 .map_err(std::io::Error::other)?;
         }
         if !owned.contains_key(&source) {
@@ -573,7 +692,9 @@ impl CallerGuard {
                 return Err(std::io::Error::other("unowned output rename destination"));
             }
         }
-        let mut intended = owned.get(&source).and_then(|leaf| leaf.expected.clone());
+        let mut intended = owned
+            .get(&source)
+            .and_then(|leaf| leaf.state.expected().cloned());
         if owned.get(&destination).is_some_and(|leaf| leaf.mutable) && intended.is_none() {
             return Err(std::io::Error::other(
                 "shared replacement has no writer-supplied intended bytes",
@@ -584,13 +705,15 @@ impl CallerGuard {
                 output_entry_name(&self.root, &destination).map_err(std::io::Error::other)?;
         }
         fs::rename(&source, &destination)?;
-        let destination_leaf = owned.entry(destination.clone()).or_insert(OwnedLeaf {
-            mutable: false,
-            expected: None,
-        });
-        destination_leaf.expected = intended;
+        let destination_leaf = owned
+            .entry(destination.clone())
+            .or_insert(OwnedLeaf::active());
+        destination_leaf.state = match intended {
+            Some(entry) => OwnedState::Complete(entry),
+            None => OwnedState::ActiveProducer,
+        };
         if let Some(leaf) = owned.get_mut(&source) {
-            leaf.expected = None;
+            leaf.state = OwnedState::Absent;
         }
         Ok(())
     }
@@ -631,13 +754,7 @@ impl CallerGuard {
         self.owned_outputs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                path,
-                OwnedLeaf {
-                    mutable: false,
-                    expected: Some(entry),
-                },
-            );
+            .insert(path, OwnedLeaf::settled(false, Some(entry)));
         Ok(())
     }
 
@@ -675,7 +792,7 @@ impl CallerGuard {
                 leaf.mutable,
                 "rollback path is not an admitted transaction role"
             );
-            self.check_mutable_preimage(path, leaf)?;
+            self.check_owned_preimage(path, leaf)?;
         }
         let current = fs::read_link(&latest)?;
         ensure!(
@@ -695,13 +812,7 @@ impl CallerGuard {
                 "rollback stage collides with baseline userdata"
             );
             std::os::unix::fs::symlink(previous, &staged)?;
-            owned.insert(
-                staged.clone(),
-                OwnedLeaf {
-                    mutable: false,
-                    expected: None,
-                },
-            );
+            owned.insert(staged.clone(), OwnedLeaf::active());
             let expected = SourceEntry {
                 path: output_entry_name(&self.root, &latest)?,
                 kind: "symlink",
@@ -712,22 +823,179 @@ impl CallerGuard {
                 let _ = fs::remove_file(&staged);
                 return Err(error.into());
             }
+            if let Some(leaf) = owned.get_mut(&staged) {
+                leaf.state = OwnedState::Absent;
+            }
             Some(expected)
         } else {
             fs::remove_file(&latest)?;
             None
         };
         if let Some(leaf) = owned.get_mut(&latest) {
-            leaf.expected = expected;
+            leaf.state = OwnedState::settled(expected);
         }
         File::open(parent)?.sync_all()?;
         fs::remove_file(&journal)?;
         if let Some(leaf) = owned.get_mut(&journal) {
-            leaf.expected = None;
+            leaf.state = OwnedState::Absent;
         }
         if let Some(parent) = journal.parent() {
             File::open(parent)?.sync_all()?;
         }
+        Ok(())
+    }
+
+    /// Revoke only this run's still-owned index row after a late fatal drift.
+    /// The publication lock stays held; no predecessor is resurrected.
+    pub(crate) fn revoke_publication_index_after_drift(
+        &self,
+        _publication: &crate::storage::RunPublicationLock,
+        path: &Path,
+        out_dir: &Path,
+    ) -> Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            self.ensure_valid().is_err(),
+            "late revocation requires sticky drift"
+        );
+        let path = output_leaf_path(path)?;
+        ensure!(
+            path.file_name() == Some(std::ffi::OsStr::new("index.jsonl")),
+            "not a publication index role"
+        );
+        ensure_untracked_output(self, &path)?;
+        let parent = path.parent().context("publication index parent")?;
+        let mut owned = self.owned_outputs.lock().unwrap_or_else(|e| e.into_inner());
+        let leaf = owned
+            .get(&path)
+            .context("index has no last-own publication state")?;
+        ensure!(leaf.mutable, "index is not a mutable publication role");
+        let length = fs::symlink_metadata(&path)?.len();
+        self.check_owned_preimage(&path, leaf)?;
+        let expected = leaf
+            .state
+            .expected()
+            .context("published index has no completed bytes")?;
+        ensure!(
+            expected.kind == "file",
+            "published index is not a regular file"
+        );
+        let file = open_source_file(parent, Path::new(path.file_name().context("index leaf")?))?;
+        let mut before = Vec::new();
+        file.take(length.checked_add(1).context("index size overflow")?)
+            .read_to_end(&mut before)?;
+        ensure!(
+            before.len() as u64 == length
+                && expected.sha256.as_ref() == Some(&hex(&Sha256::digest(&before))),
+            "index changed while deriving late revocation"
+        );
+        let (after, removed) = crate::storage::remove_run_row_bytes(&before, out_dir)?;
+        if removed == 0 {
+            return Ok(());
+        }
+        let mut staged = None;
+        for attempt in 0..16 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let candidate = output_leaf_path(&parent.join(format!(
+                ".caller-drift-index.{}.{nonce}.{attempt}.tmp",
+                std::process::id()
+            )))?;
+            ensure_untracked_output(self, &candidate)?;
+            ensure!(
+                !self.baseline_contains_output(&candidate)?,
+                "index revoke stage collides with initial userdata"
+            );
+            match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    staged = Some((candidate, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let (staged, mut file) =
+            staged.context("could not allocate exact index revocation stage")?;
+        owned.insert(staged.clone(), OwnedLeaf::active());
+        let controlled_mode = mode(&file.metadata()?);
+        file.write_all(&after)?;
+        file.sync_all()?;
+        drop(file);
+        let intended = SourceEntry {
+            path: output_entry_name(&self.root, &path)?,
+            kind: "file",
+            mode: controlled_mode,
+            sha256: Some(hex(&Sha256::digest(&after))),
+        };
+        if let Some(leaf) = owned.get_mut(&staged) {
+            let mut staged_intent = intended.clone();
+            staged_intent.path = output_entry_name(&self.root, &staged)?;
+            leaf.state = OwnedState::Complete(staged_intent);
+        }
+        self.check_owned_preimage(
+            &staged,
+            owned
+                .get(&staged)
+                .context("index revoke stage disappeared")?,
+        )?;
+        self.check_owned_preimage(&path, owned.get(&path).context("index role disappeared")?)?;
+        fs::rename(&staged, &path)?;
+        if let Some(leaf) = owned.get_mut(&path) {
+            leaf.state = OwnedState::Complete(intended);
+        }
+        if let Some(leaf) = owned.get_mut(&staged) {
+            leaf.state = OwnedState::Absent;
+        }
+        #[cfg(unix)]
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn revoke_committed_latest_after_drift(
+        &self,
+        _publication: &crate::storage::RunPublicationLock,
+        out_dir: &Path,
+    ) -> Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            self.ensure_valid().is_err(),
+            "late revocation requires sticky drift"
+        );
+        let parent = out_dir.parent().context("committed publication parent")?;
+        let latest = output_leaf_path(&parent.join("latest"))?;
+        ensure_untracked_output(self, &latest)?;
+        let mut owned = self.owned_outputs.lock().unwrap_or_else(|e| e.into_inner());
+        let leaf = owned
+            .get(&latest)
+            .context("latest has no last-own publication state")?;
+        ensure!(leaf.mutable, "latest is not a mutable publication role");
+        self.check_owned_preimage(&latest, leaf)?;
+        if matches!(leaf.state, OwnedState::Absent) {
+            return Ok(());
+        }
+        ensure!(
+            Some(fs::read_link(&latest)?.as_os_str()) == out_dir.file_name(),
+            "latest no longer advertises this run; foreign alias retained"
+        );
+        fs::remove_file(&latest)?;
+        if let Some(leaf) = owned.get_mut(&latest) {
+            leaf.state = OwnedState::Absent;
+        }
+        File::open(parent)?.sync_all()?;
         Ok(())
     }
 
@@ -740,7 +1008,7 @@ impl CallerGuard {
         ensure_untracked_output(self, &path).map_err(std::io::Error::other)?;
         let mut owned = self.owned_outputs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(leaf) = owned.get(&path) {
-            self.check_mutable_preimage(&path, leaf)
+            self.check_owned_preimage(&path, leaf)
                 .map_err(std::io::Error::other)?;
         }
         if !owned.contains_key(&path) {
@@ -751,7 +1019,7 @@ impl CallerGuard {
         }
         fs::remove_file(&path)?;
         if let Some(leaf) = owned.get_mut(&path) {
-            leaf.expected = None;
+            leaf.state = OwnedState::Absent;
         }
         Ok(())
     }
@@ -782,15 +1050,23 @@ impl CallerGuard {
         self.owned_outputs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                path,
-                OwnedLeaf {
-                    mutable: false,
-                    expected: None,
-                },
-            );
+            .insert(path.clone(), OwnedLeaf::active());
         file.write_all(bytes)?;
-        file.sync_all()
+        file.sync_all()?;
+        if let Some(leaf) = self
+            .owned_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&path)
+        {
+            leaf.state = OwnedState::Complete(SourceEntry {
+                path: output_entry_name(&self.root, &path).map_err(std::io::Error::other)?,
+                kind: "file",
+                mode: mode(&file.metadata()?),
+                sha256: Some(hex(&Sha256::digest(bytes))),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn verify_sync(&self, phase: &'static str, check: Option<&str>) -> Result<()> {
@@ -866,7 +1142,7 @@ impl CallerGuard {
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         for (path, leaf) in &leaves {
-            self.check_mutable_preimage(path, leaf)?;
+            self.check_owned_preimage(path, leaf)?;
         }
         let observed = match &self.baseline {
             Ok(_) => capture_token(&self.root, &owned).map_err(|error| format!("{error:#}")),
@@ -1219,7 +1495,25 @@ fn path_key(path: &Path) -> String {
     }
     #[cfg(not(unix))]
     {
-        hex(path.to_string_lossy().as_bytes())
+        hex(git_relative_text(path).as_bytes())
+    }
+}
+
+#[cfg(not(unix))]
+fn git_relative_text(path: &Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+fn source_entry_name(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        format!("{path:?}")
+    }
+    #[cfg(not(unix))]
+    {
+        format!("{:?}", git_relative_text(path))
     }
 }
 
@@ -1228,7 +1522,70 @@ fn output_entry_name(root: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(&root)
         .unwrap_or_else(|_| Path::new(path.file_name().unwrap_or_default()));
-    Ok(format!("{relative:?}"))
+    Ok(source_entry_name(relative))
+}
+
+fn held_publication_state(
+    root: &Path,
+    path: &Path,
+    held: &Arc<Mutex<File>>,
+) -> Result<Option<SourceEntry>> {
+    let mut file = held
+        .lock()
+        .map_err(|_| anyhow::anyhow!("poisoned publication handle"))?;
+    Ok(Some(producer_file_state(root, path, &mut file)?))
+}
+
+fn producer_file_state(root: &Path, path: &Path, file: &mut File) -> Result<SourceEntry> {
+    let before = file.metadata()?;
+    let at_path = fs::symlink_metadata(path)?;
+    ensure!(
+        before.is_file() && at_path.is_file() && !at_path.file_type().is_symlink(),
+        "producer path is not its regular leaf"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            before.nlink() == 1 && before.dev() == at_path.dev() && before.ino() == at_path.ino(),
+            "producer pathname no longer names its original handle"
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            at_path.file_attributes() & 0x400 == 0,
+            "producer path is a reparse point"
+        );
+        // A held v2 lock was opened without FILE_SHARE_DELETE, so its leaf
+        // cannot be removed/replaced while this original handle is alive.
+        ensure!(
+            before.len() == at_path.len() && before.modified()? == at_path.modified()?,
+            "producer path metadata changed"
+        );
+    }
+    let position = file.stream_position()?;
+    let observation = (|| -> Result<String> {
+        file.rewind()?;
+        hash_bounded(file, before.len())
+    })();
+    let restored = file.seek(SeekFrom::Start(position));
+    let digest = observation?;
+    restored?;
+    let after = file.metadata()?;
+    ensure!(
+        before.len() == after.len()
+            && before.modified()? == after.modified()?
+            && mode(&before) == mode(&after),
+        "producer changed while completing"
+    );
+    Ok(SourceEntry {
+        path: output_entry_name(root, path)?,
+        kind: "file",
+        mode: mode(&before),
+        sha256: Some(digest),
+    })
 }
 
 fn output_state(root: &Path, path: &Path) -> Result<Option<SourceEntry>> {
@@ -1279,7 +1636,7 @@ fn source_entry(root: &Path, relative: &Path) -> Result<SourceEntry> {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(SourceEntry {
-                    path: format!("{relative:?}"),
+                    path: source_entry_name(relative),
                     kind: "missing",
                     mode: 0,
                     sha256: None,
@@ -1291,7 +1648,7 @@ fn source_entry(root: &Path, relative: &Path) -> Result<SourceEntry> {
         };
         if metadata.file_type().is_symlink() {
             return Ok(SourceEntry {
-                path: format!("{relative:?}"),
+                path: source_entry_name(relative),
                 kind: if components.peek().is_some() {
                     "ancestor-symlink"
                 } else {
@@ -1317,7 +1674,7 @@ fn source_entry(root: &Path, relative: &Path) -> Result<SourceEntry> {
         let file = open_source_file(root, relative)?;
         let (sha256, observed_mode) = hash_file(file)?;
         return Ok(SourceEntry {
-            path: format!("{relative:?}"),
+            path: source_entry_name(relative),
             kind: "file",
             mode: observed_mode,
             sha256: Some(sha256),

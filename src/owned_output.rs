@@ -49,7 +49,7 @@ pub(crate) fn create(path: &Path) -> io::Result<std::fs::File> {
 fn open_output(path: &Path, new: bool) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options
-        .read(!new)
+        .read(true)
         .write(true)
         .create_new(new)
         .truncate(false);
@@ -57,6 +57,11 @@ fn open_output(path: &Path, new: bool) -> io::Result<std::fs::File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0x1 | 0x2); // original producer leaf cannot be replaced while held
     }
     options.open(path)
 }
@@ -69,7 +74,8 @@ pub(crate) fn create_shared_new_with(
     match current() {
         Some(context) => context.guard.create_output(path, true, |path, new| {
             if !new {
-                return Err(io::Error::other(
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
                     "shared create-new destination already owned",
                 ));
             }
@@ -101,10 +107,44 @@ pub(crate) fn active_guard() -> Option<Arc<CallerGuard>> {
     current().map(|context| context.guard)
 }
 
+pub(crate) fn write_locked_publication_file(
+    path: &Path,
+    file: &Arc<std::sync::Mutex<std::fs::File>>,
+    previous: &[u8],
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    if let Some(context) = current() {
+        context
+            .guard
+            .write_locked_publication_file(path, file, previous, bytes)?;
+    } else {
+        use std::io::{Seek, Write};
+        let mut file = file
+            .lock()
+            .map_err(|_| io::Error::other("poisoned publication handle"))?;
+        file.rewind()?;
+        file.set_len(0)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+    }
+    Ok(())
+}
+pub(crate) fn finish_producer(path: &Path, file: &mut std::fs::File) -> io::Result<()> {
+    // Nonguarded callers can supply write-only fixture files; never read them.
+    if let Some(context) = current() {
+        context
+            .guard
+            .finish_output_producer(path, file)
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
 /// A single external file producer must receive its exact leaf before spawn.
-pub(crate) fn reserve_external_leaf(path: &Path) -> io::Result<()> {
+pub(crate) fn reserve_external_leaf(path: &Path) -> io::Result<std::fs::File> {
     let file = create(path)?;
-    file.sync_all()
+    file.sync_all()?;
+    Ok(file)
 }
 
 pub(crate) fn namespace_source_visible(path: &Path) -> anyhow::Result<bool> {
@@ -436,5 +476,245 @@ mod tests {
                 .verify_sync("after-external-state-restored", None)
                 .is_err()
         );
+    }
+    #[test]
+    fn issue72_review_completed_output_foreign_edits_are_protected() {
+        for action in ["verify", "rewrite", "rename", "remove", "abort-remove"] {
+            let (root, diagnostics, config) = crate::checks::caller_guard_tests::fixture();
+            let guard =
+                CallerGuard::capture_sync(config.repo_root, diagnostics.path().join("diagnostics"));
+            let pack = root.path().join("pack");
+            std::fs::create_dir(&pack).unwrap();
+            let _scope = enter(Arc::clone(&guard), Some(pack.clone()));
+            let leaf = pack.join("report.json");
+            fs::write(&leaf, b"own complete output").unwrap();
+            guard.verify_sync("own-output-completed", None).unwrap();
+            std::fs::write(&leaf, b"foreign edit").unwrap();
+            let rejected = match action {
+                "verify" => guard.verify_sync("foreign-completed-output", None).is_err(),
+                "rewrite" => fs::write(&leaf, b"overwrite").is_err(),
+                "rename" => fs::rename(&leaf, pack.join("moved.json")).is_err(),
+                "remove" => fs::remove_file(&leaf).is_err(),
+                "abort-remove" => {
+                    std::fs::write(root.path().join("source.txt"), b"foreign source").unwrap();
+                    assert!(guard.verify_sync("source-drift", None).is_err());
+                    remove_owned_after_abort(&leaf).is_err()
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                rejected,
+                "completed output foreign edit accepted by {action}"
+            );
+            assert_eq!(
+                std::fs::read(&leaf).unwrap(),
+                b"foreign edit",
+                "{action} replaced foreign bytes"
+            );
+            assert!(guard.ensure_valid().is_err());
+        }
+    }
+
+    #[test]
+    fn issue72_review_existing_create_new_retains_already_exists() {
+        for internal in [false, true] {
+            let (root, diagnostics, config) = crate::checks::caller_guard_tests::fixture();
+            let path = if internal {
+                root.path().join("initial-user-file")
+            } else {
+                diagnostics.path().join("external-legacy-lock")
+            };
+            std::fs::write(&path, b"preexisting owner").unwrap();
+            let guard =
+                CallerGuard::capture_sync(config.repo_root, diagnostics.path().join("diagnostics"));
+            let _scope = enter(Arc::clone(&guard), None);
+            let error = create_shared_new(&path).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&path).unwrap(), b"preexisting owner");
+            guard.ensure_valid().unwrap();
+            guard
+                .verify_sync("unchanged-existing-collision", None)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn issue72_review_guarded_cache_overwrite_preserves_admitted_destination() {
+        let (_root, diagnostics, config) = crate::checks::caller_guard_tests::fixture();
+        let cache = crate::cache::Cache::with_dir(diagnostics.path().join("cache"), true);
+        let dir = diagnostics.path().join("cache/check");
+        std::fs::create_dir_all(&dir).unwrap();
+        for number in 0..6 {
+            let path = dir.join(format!("key-{number}"));
+            std::fs::write(&path, "passed\n").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1000 + number),
+                )
+                .unwrap();
+        }
+        let guard =
+            CallerGuard::capture_sync(config.repo_root, diagnostics.path().join("diagnostics"));
+        let _scope = enter(Arc::clone(&guard), None);
+        let result = cache.set("check", "key-0", "warning", Some("new output"), None);
+        assert!(
+            result.is_ok(),
+            "own eviction invalidated admitted destination: {result:?}"
+        );
+        assert_eq!(cache.get("check", "key-0").unwrap().status, "warning");
+        guard
+            .verify_sync("after-guarded-cache-overwrite", None)
+            .unwrap();
+    }
+    #[test]
+    fn issue72_review_followup_completed_reopen_can_start_and_finish_new_producer() {
+        use std::io::Write;
+        let (root, diagnostics, config) = crate::checks::caller_guard_tests::fixture();
+        let guard =
+            CallerGuard::capture_sync(config.repo_root, diagnostics.path().join("diagnostics"));
+        let pack = root.path().join("reopen-pack");
+        std::fs::create_dir(&pack).unwrap();
+        let _scope = enter(Arc::clone(&guard), Some(pack.clone()));
+        let leaf = pack.join("report.json");
+        fs::write(&leaf, b"first completed bytes").unwrap();
+        let mut file = create(&leaf).unwrap();
+        file.write_all(b"second producer bytes").unwrap();
+        guard
+            .verify_sync("while-reopened-own-producer", None)
+            .unwrap();
+        finish_producer(&leaf, &mut file).unwrap();
+        guard
+            .verify_sync("after-reopened-own-producer", None)
+            .unwrap();
+        assert_eq!(std::fs::read(&leaf).unwrap(), b"second producer bytes");
+        std::fs::write(&leaf, b"foreign replacement").unwrap();
+        assert!(
+            guard
+                .verify_sync("foreign-after-producer-completed", None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn issue72_review_followup_owned_create_new_preserves_kind_and_completed_state() {
+        let (root, diagnostics, config) = crate::checks::caller_guard_tests::fixture();
+        let guard =
+            CallerGuard::capture_sync(config.repo_root, diagnostics.path().join("diagnostics"));
+        let pack = root.path().join("create-new-pack");
+        std::fs::create_dir(&pack).unwrap();
+        let _scope = enter(Arc::clone(&guard), Some(pack.clone()));
+        let leaf = pack.join("owned-file.json");
+        fs::write(&leaf, b"complete own bytes").unwrap();
+        assert_eq!(
+            create_shared_new(&leaf).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&leaf).unwrap(), b"complete own bytes");
+        guard
+            .verify_sync("after-failed-own-create-new", None)
+            .unwrap();
+        std::fs::write(&leaf, b"foreign edit after rejected collision").unwrap();
+        assert!(
+            guard
+                .verify_sync("failed-create-new-must-not-reopen-producer", None)
+                .is_err()
+        );
+    }
+    #[test]
+    fn issue72_review_cache_current_guard_entries_can_be_evicted() {
+        let (_root, diagnostics, config) = crate::checks::caller_guard_tests::fixture();
+        let guard =
+            CallerGuard::capture_sync(config.repo_root, diagnostics.path().join("diagnostics"));
+        let cache = crate::cache::Cache::with_dir(diagnostics.path().join("cache"), true);
+        let _scope = enter(Arc::clone(&guard), None);
+        for number in 0..7 {
+            cache
+                .set(
+                    "check",
+                    &format!("current-key-{number}"),
+                    "passed",
+                    None,
+                    None,
+                )
+                .unwrap();
+            guard
+                .verify_sync("after-current-guard-cache-entry", None)
+                .unwrap();
+        }
+        assert!(cache.get("check", "current-key-6").is_some());
+    }
+
+    #[test]
+    fn issue72_review_producer_and_absent_lifecycles_keep_foreign_resurrection_visible() {
+        use std::io::Write;
+        let (root, diagnostics, config) = crate::checks::caller_guard_tests::fixture();
+        let guard =
+            CallerGuard::capture_sync(config.repo_root, diagnostics.path().join("diagnostics"));
+        let pack = root.path().join("lifecycle-pack");
+        std::fs::create_dir(&pack).unwrap();
+        let _scope = enter(Arc::clone(&guard), Some(pack.clone()));
+        let leaf = pack.join("active.log");
+        let mut file = create(&leaf).unwrap();
+        file.write_all(b"first active bytes").unwrap();
+        guard
+            .verify_sync("while-own-producer-active", None)
+            .unwrap();
+        file.write_all(b" and more").unwrap();
+        finish_producer(&leaf, &mut file).unwrap();
+        drop(file);
+        guard
+            .verify_sync("after-own-producer-completion", None)
+            .unwrap();
+        fs::remove_file(&leaf).unwrap();
+        guard.verify_sync("after-owned-file-removed", None).unwrap();
+        let mut recreated = create_shared_new(&leaf).unwrap();
+        recreated.write_all(b"legal own recreation").unwrap();
+        finish_producer(&leaf, &mut recreated).unwrap();
+        drop(recreated);
+        guard
+            .verify_sync("after-owned-file-recreated", None)
+            .unwrap();
+        fs::remove_file(&leaf).unwrap();
+        std::fs::write(&leaf, b"foreign resurrection").unwrap();
+        assert!(
+            guard
+                .verify_sync("after-foreign-resurrection", None)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&leaf).unwrap(), b"foreign resurrection");
+        assert!(create_shared_new(&leaf).is_err());
+        assert_eq!(std::fs::read(&leaf).unwrap(), b"foreign resurrection");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue72_review_windows_producer_handle_prevents_leaf_replacement() {
+        use std::io::Write;
+        let (root, diagnostics, config) = crate::checks::caller_guard_tests::fixture();
+        let guard =
+            CallerGuard::capture_sync(config.repo_root, diagnostics.path().join("diagnostics"));
+        let pack = root.path().join("producer-pack");
+        std::fs::create_dir(&pack).unwrap();
+        let _scope = enter(Arc::clone(&guard), Some(pack.clone()));
+        let leaf = pack.join("active.log");
+        let replacement = pack.join("replacement.log");
+        fs::write(&replacement, b"other own leaf").unwrap();
+        let mut file = create(&leaf).unwrap();
+        file.write_all(b"original handle bytes").unwrap();
+        assert!(std::fs::remove_file(&leaf).is_err());
+        assert!(std::fs::rename(&replacement, &leaf).is_err());
+        guard
+            .verify_sync("while-windows-producer-active", None)
+            .unwrap();
+        finish_producer(&leaf, &mut file).unwrap();
+        drop(file);
+        fs::remove_file(&leaf).unwrap();
+        guard
+            .verify_sync("after-windows-producer-close-and-unlink", None)
+            .unwrap();
     }
 }

@@ -581,6 +581,10 @@ fn finish_caller_guarded_generation(
     out_dir: Option<&Path>,
     result: Result<PathBuf>,
 ) -> Result<PathBuf> {
+    let result = match result {
+        Ok(path) => ledger.ensure_caller_valid().map(|()| path),
+        error => error,
+    };
     match result {
         Err(error) => {
             if ledger.ensure_caller_valid().is_err()
@@ -602,6 +606,40 @@ fn finish_caller_guarded_generation(
         }
         result => result,
     }
+}
+
+// Journal cleanup can reveal a foreign change after the durable index commit.
+// Revoke only advertisements still matching our recorded postimages; retained
+// predecessors may already have been pruned and must never be resurrected.
+fn finish_committed_publication(
+    publication: &crate::storage::RunPublicationLock,
+    transaction: &LatestPublication,
+    ledger: &TaskLedger,
+    out_dir: &Path,
+) -> Result<()> {
+    let cleanup = finish_latest_publication(transaction);
+    if let Err(error) = ledger.verify_caller_sync("after-publication-cleanup", None) {
+        let index = crate::storage::revoke_committed_index_after_drift(publication, out_dir);
+        let latest = revoke_committed_latest_after_drift(publication, transaction, out_dir);
+        let failures: Vec<_> = [index, latest]
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|e| format!("{e:#}"))
+            .collect();
+        if failures.is_empty() {
+            return Err(error.context(
+                "late caller drift; own committed advertisements revoked; foreign state preserved",
+            ));
+        }
+        return Err(error.context(format!(
+            "late caller drift; revocation unconfirmed: {}; foreign state retained",
+            failures.join("; ")
+        )));
+    }
+    if let Err(error) = cleanup {
+        eprintln!("prview: publication committed; durable journal cleanup deferred: {error:#}");
+    }
+    Ok(())
 }
 
 fn mark_generation_caller_drift(out_dir: &Path) -> Result<()> {
@@ -1460,10 +1498,8 @@ fn generate_guarded(
                 governor,
                 &out_dir,
             ));
-        } else if let Err(error) = finish_latest_publication(&latest_transaction) {
-            // Index and alias are already consistent. Keep the journal for the
-            // next publisher, which will reconcile it idempotently.
-            eprintln!("prview: publication committed; durable journal cleanup deferred: {error:#}");
+        } else {
+            finish_committed_publication(&publication, &latest_transaction, ledger, &out_dir)?;
         }
         #[cfg(test)]
         publication_commit_test_hook::observe_and_maybe_cancel(governor);
@@ -2880,7 +2916,8 @@ fn create_zip(dir: &Path, emit_human_stdout: bool) -> Result<()> {
         }
     }
 
-    zip.finish()?;
+    let mut completed_zip = zip.finish()?;
+    crate::owned_output::finish_producer(&zip_path, &mut completed_zip)?;
 
     // Verify the shipped archive actually carries the pack metadata a consumer
     // needs to validate it standalone. Zipping before these files existed used

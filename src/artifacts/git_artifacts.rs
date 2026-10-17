@@ -115,6 +115,12 @@ fn restore_latest_target_unlocked(
     if current.as_os_str() != our_target {
         return Ok(());
     }
+    if crate::owned_output::active_guard().is_some()
+        && !crate::owned_output::is_mutable_owned(&latest_link)
+    {
+        validate_recovery_pack_identity(&parent.join(&current))?;
+        crate::owned_output::admit_validated_mutable(&latest_link)?;
+    }
     if let Some(name) = previous {
         replace_latest_target(parent, name)
     } else {
@@ -296,7 +302,12 @@ fn quarantine_invalid_latest_publication_record(
     };
     // Existing typed quarantine for a proven non-source object; no adoption
     // of the old payload into the run's exact own-leaf registry.
-    if let Err(error) = std::fs::rename(path, &quarantine) {
+    let rename = if crate::owned_output::is_owned(path) {
+        fs::rename(path, &quarantine)
+    } else {
+        std::fs::rename(path, &quarantine)
+    };
+    if let Err(error) = rename {
         if source_is_dir {
             let _ = fs::remove_dir(&quarantine);
         } else {
@@ -529,6 +540,29 @@ pub(crate) fn finish_latest_publication(_transaction: &LatestPublication) -> Res
 
 #[cfg(not(unix))]
 pub(crate) fn finish_latest_publication(_transaction: &LatestPublication) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn revoke_committed_latest_after_drift(
+    publication: &crate::storage::RunPublicationLock,
+    transaction: &LatestPublication,
+    out_dir: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        restore_native_path(transaction.record.out_dir.clone()) == out_dir,
+        "late revocation does not match publication transaction"
+    );
+    let guard = crate::owned_output::active_guard()
+        .context("late latest revocation has no caller guard")?;
+    guard.revoke_committed_latest_after_drift(publication, out_dir)
+}
+#[cfg(not(unix))]
+pub(crate) fn revoke_committed_latest_after_drift(
+    _publication: &crate::storage::RunPublicationLock,
+    _transaction: &LatestPublication,
+    _out_dir: &Path,
+) -> Result<()> {
     Ok(())
 }
 

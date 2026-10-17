@@ -1171,6 +1171,7 @@ fn run_context_cmds_parallel_inner(
         out_file: String,
         stdout_path: PathBuf,
         stderr_path: PathBuf,
+        producers: Vec<(PathBuf, fs::File)>,
         done: bool,
     }
 
@@ -1255,6 +1256,7 @@ fn run_context_cmds_parallel_inner(
             let stderr_file = match crate::owned_output::create(&stderr_path) {
                 Ok(file) => file,
                 Err(error) => {
+                    drop(stdout_file);
                     let _ = fs::remove_file(&stdout_path);
                     timings.push(ContextCommandTiming {
                         label: cmd.label.clone(),
@@ -1272,12 +1274,18 @@ fn run_context_cmds_parallel_inner(
                 }
             };
 
+            let mut producers = vec![
+                (stdout_path.clone(), stdout_file.try_clone()?),
+                (stderr_path.clone(), stderr_file.try_clone()?),
+            ];
             // esbuild writes this exact file itself; claim it before the child
             // can write, rather than adopting a discovered file afterwards.
             if cmd.label == "esbuild meta" {
                 for argument in &cmd.args {
                     if let Some(path) = argument.strip_prefix("--metafile=") {
-                        crate::owned_output::reserve_external_leaf(Path::new(path))?;
+                        let path = PathBuf::from(path);
+                        let file = crate::owned_output::reserve_external_leaf(&path)?;
+                        producers.push((path, file));
                     }
                 }
             }
@@ -1305,6 +1313,8 @@ fn run_context_cmds_parallel_inner(
             if governor.is_cancelled() || Instant::now() >= stage_deadline {
                 // Return this not-started command to the pending list, whose
                 // existing timeout/cancel reconciliation reports it honestly.
+                drop(command);
+                drop(producers);
                 let _ = fs::remove_file(&stdout_path);
                 let _ = fs::remove_file(&stderr_path);
                 pending.push_front((idx, cmd));
@@ -1318,8 +1328,12 @@ fn run_context_cmds_parallel_inner(
                     if !governor.register_child(registry_key.clone(), child.id()) {
                         let tree_reaped =
                             crate::proc::terminate_and_reap_owned_std_child(child.as_mut());
-                        let _ = fs::remove_file(&stdout_path);
-                        let _ = fs::remove_file(&stderr_path);
+                        drop(child);
+                        drop(producers);
+                        if tree_reaped {
+                            let _ = fs::remove_file(&stdout_path);
+                            let _ = fs::remove_file(&stderr_path);
+                        }
                         timings.push(ContextCommandTiming {
                             label: cmd.label.clone(),
                             artifact: None,
@@ -1352,10 +1366,12 @@ fn run_context_cmds_parallel_inner(
                         out_file: cmd.out_file.clone(),
                         stdout_path,
                         stderr_path,
+                        producers,
                         done: false,
                     });
                 }
                 Err(error) => {
+                    drop(producers);
                     let _ = fs::remove_file(&stdout_path);
                     let _ = fs::remove_file(&stderr_path);
                     // Command not available: record it instead of skipping
@@ -1396,8 +1412,11 @@ fn run_context_cmds_parallel_inner(
             for r in running.iter_mut().filter(|r| !r.done) {
                 let tree_reaped = crate::proc::terminate_and_reap_owned_std_child(r.child.as_mut());
                 governor.unregister_child(&r.registry_key);
-                let _ = fs::remove_file(&r.stdout_path);
-                let _ = fs::remove_file(&r.stderr_path);
+                r.producers.clear();
+                if tree_reaped {
+                    let _ = fs::remove_file(&r.stdout_path);
+                    let _ = fs::remove_file(&r.stderr_path);
+                }
                 r.done = true;
                 timings.push(ContextCommandTiming {
                     label: r.label.clone(),
@@ -1454,8 +1473,8 @@ fn run_context_cmds_parallel_inner(
                     r.done = true;
                     governor.unregister_child(&r.registry_key);
                     if !tree_reaped {
-                        let _ = fs::remove_file(&r.stdout_path);
-                        let _ = fs::remove_file(&r.stderr_path);
+                        // Ownership is unconfirmed: retain raw diagnostics and
+                        // do not certify any producer as completed.
                         timings.push(ContextCommandTiming {
                             label: r.label.clone(),
                             artifact: None,
@@ -1472,6 +1491,9 @@ fn run_context_cmds_parallel_inner(
                             r.label
                         ));
                         break;
+                    }
+                    for (path, mut file) in r.producers.drain(..) {
+                        crate::owned_output::finish_producer(&path, &mut file)?;
                     }
                     context_caller_boundary(ledger, "after-context-command", Some(&r.label))?;
                     // Collect output
@@ -1510,8 +1532,7 @@ fn run_context_cmds_parallel_inner(
                         r.done = true;
                         governor.unregister_child(&r.registry_key);
                         if !tree_reaped {
-                            let _ = fs::remove_file(&r.stdout_path);
-                            let _ = fs::remove_file(&r.stderr_path);
+                            // Ownership is unconfirmed; retain raw diagnostics.
                             timings.push(ContextCommandTiming {
                                 label: r.label.clone(),
                                 artifact: None,
@@ -1528,6 +1549,9 @@ fn run_context_cmds_parallel_inner(
                                 r.label
                             ));
                             break;
+                        }
+                        for (path, mut file) in r.producers.drain(..) {
+                            crate::owned_output::finish_producer(&path, &mut file)?;
                         }
                         context_caller_boundary(ledger, "after-context-timeout", Some(&r.label))?;
                         // Writers are gone before collecting partial diagnostics.
@@ -1583,6 +1607,9 @@ fn run_context_cmds_parallel_inner(
                         ));
                         break;
                     }
+                    for (path, mut file) in r.producers.drain(..) {
+                        crate::owned_output::finish_producer(&path, &mut file)?;
+                    }
                     context_caller_boundary(ledger, "after-context-error", Some(&r.label))?;
                     let _ = fs::remove_file(&r.stdout_path);
                     let _ = fs::remove_file(&r.stderr_path);
@@ -1600,10 +1627,14 @@ fn run_context_cmds_parallel_inner(
 
         if let Some(error) = fatal_ownership_error {
             for running in running.iter_mut().filter(|running| !running.done) {
-                crate::proc::terminate_and_reap_owned_std_child(running.child.as_mut());
+                let tree_reaped =
+                    crate::proc::terminate_and_reap_owned_std_child(running.child.as_mut());
                 governor.unregister_child(&running.registry_key);
-                let _ = fs::remove_file(&running.stdout_path);
-                let _ = fs::remove_file(&running.stderr_path);
+                running.producers.clear();
+                if tree_reaped {
+                    let _ = fs::remove_file(&running.stdout_path);
+                    let _ = fs::remove_file(&running.stderr_path);
+                }
                 running.done = true;
             }
             return Err(anyhow::anyhow!(error));
@@ -1689,6 +1720,7 @@ pub(super) fn collect_cmd_output(
                             &mut output,
                         )?;
                     }
+                    crate::owned_output::finish_producer(&destination, &mut output)?;
                     Ok(())
                 })();
                 if let Err(error) = result {

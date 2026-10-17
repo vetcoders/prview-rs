@@ -1710,10 +1710,17 @@ journal leaves require their explicit writer role and a preimage matching the
 baseline or last own state. Known-byte writes retain the observation lock through
 preimage checking, a nontruncating opened-handle check and the write, and record
 the supplied content’s hash rather than adopting a fresh pathname read. Atomic
-replacements carry the staged writer intent. Mutable expected state is checked
-before excluding its key at later boundaries. Growing raw captures are admitted
-before the child writes and skipped before hashing. esbuild’s exact metafile is
-claimed before spawn. MCP nonce/sentinel validation seeds only the reservation’s
+replacements carry the staged writer intent. Each exact leaf has an explicit
+ActiveProducer, Complete or Absent state. All completed postimages, including
+pack files, are checked before exclusion, overwrite, rename and removal. Removed
+leaves must remain absent; a successful own recreation starts a new producer.
+Growing raw captures and esbuild’s exact metafile are claimed before spawn and
+remain active while their writers run. After the whole owned tree is reaped,
+the original claimed handles are boundedly hashed and sealed, then closed before
+collection or unlink. ZIP and streamed valid JSON use the same completion seam.
+On Windows, claimed handles deny delete-sharing until closed; the held v2
+publication lock is read and written through its original mutex-protected handle,
+including guard observations, without reopening the locked region. MCP nonce/sentinel validation seeds only the reservation’s
 exact control/log leaves before the first observation, preserving its existing
 one-shot handoff and rejecting tracked collisions or foreign reservation files.
 
@@ -1745,8 +1752,12 @@ reason and marker name the partial directory; raw bytes are diagnostics, never
 completed gates. Existing uncommitted latest rollback remains in use. After a
 sticky failure, only that transaction’s registered alias/journal may be undone,
 and only while their current postimages still match the run’s recorded intent;
-foreign replacements are preserved. The exact own legacy lock sentinel can be
-released without clearing the fatal source observation.
+foreign replacements are preserved. Drift detected after an index commit revokes
+only this run’s still-owned index row and latest alias under the publication
+lock. Other index rows retain their bytes; pruned predecessors are never restored.
+Foreign journals, index contents and aliases are preserved, and any inability to
+confirm revocation remains a fatal unconfirmed outcome. The exact own legacy lock
+sentinel can be released without clearing the fatal source observation.
 
 These are boundary observations, not a continuous watcher. Mutation/restoration
 entirely between boundaries may escape. Raw-index identity is deliberately

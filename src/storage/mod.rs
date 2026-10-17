@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 thread_local! {
@@ -256,7 +257,7 @@ impl RunIndex {
                 writeln!(bytes, "{}", line)?;
             }
             fs::write(&temp, &bytes)?;
-            fs::File::open(&temp)?.sync_all()?;
+            open_regular_lock_file(&temp, false, false)?.sync_all()?;
             Ok(())
         })();
         if let Err(error) = write_result {
@@ -444,7 +445,7 @@ impl RunIndex {
 
 #[derive(Debug)]
 pub struct LockGuard {
-    v2_file: fs::File,
+    v2_file: Arc<Mutex<fs::File>>,
     legacy_path: PathBuf,
     legacy_token: String,
 }
@@ -465,12 +466,22 @@ impl Drop for LockGuard {
         // sees our live legacy sentinel and backs off; an old contender does the
         // same. Removing the sentinel before unlocking v2 would instead let an
         // old binary enter while this guard still owned the new protocol.
-        let _ = fs::File::unlock(&self.v2_file);
-        if let Ok(mut file) = open_regular_lock_file(&self.legacy_path, false, false) {
-            let mut content = String::new();
-            if file.read_to_string(&mut content).is_ok() && content.trim() == self.legacy_token {
-                let _ = crate::owned_output::remove_owned_after_abort(&self.legacy_path);
+        {
+            let file = self.v2_file.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = fs::File::unlock(&*file);
+        } // Release the file mutex before any guarded legacy cleanup.
+
+        let owns_legacy = {
+            match open_regular_lock_file(&self.legacy_path, false, false) {
+                Ok(mut file) => {
+                    let mut content = String::new();
+                    file.read_to_string(&mut content).is_ok() && content.trim() == self.legacy_token
+                }
+                Err(_) => false,
             }
+        }; // Windows reader also denies DELETE: close it before the accounted unlink.
+        if owns_legacy {
+            let _ = crate::owned_output::remove_owned_after_abort(&self.legacy_path);
         }
     }
 }
@@ -594,26 +605,7 @@ pub fn acquire_lock_at(path: &Path) -> Result<LockGuard> {
     .with_context(|| format!("Failed to open lock {}", v2_path.display()))?;
 
     match v2_file.try_lock() {
-        Ok(()) => {
-            if crate::owned_output::active_guard().is_some() {
-                let mut previous = String::new();
-                v2_file.read_to_string(&mut previous)?;
-                anyhow::ensure!(
-                    previous.trim().is_empty()
-                        || previous.trim().split(':').all(
-                            |part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
-                        ),
-                    "unrecognized publication lock preimage"
-                );
-                crate::owned_output::admit_validated_mutable(&v2_path)?;
-                fs::write(&v2_path, token.as_bytes())?;
-            } else {
-                v2_file.set_len(0)?;
-                v2_file.rewind()?;
-                v2_file.write_all(token.as_bytes())?;
-                v2_file.flush()?;
-            }
-        }
+        Ok(()) => {}
         Err(fs::TryLockError::WouldBlock) => {
             let _ = v2_file.rewind();
             let mut owner = String::new();
@@ -628,6 +620,26 @@ pub fn acquire_lock_at(path: &Path) -> Result<LockGuard> {
             return Err(error).with_context(|| format!("Failed to lock {}", v2_path.display()));
         }
     }
+    let mut previous = String::new();
+    v2_file.rewind()?;
+    v2_file.read_to_string(&mut previous)?;
+    if crate::owned_output::active_guard().is_some() {
+        anyhow::ensure!(
+            previous.trim().is_empty()
+                || previous
+                    .trim()
+                    .split(':')
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+            "unrecognized publication lock preimage"
+        );
+    }
+    let v2_file = Arc::new(Mutex::new(v2_file));
+    crate::owned_output::write_locked_publication_file(
+        &v2_path,
+        &v2_file,
+        previous.as_bytes(),
+        token.as_bytes(),
+    )?;
 
     if let Err(error) = acquire_legacy_sentinel(&path, &token) {
         // `flock`/LockFileEx ownership is normally released when `v2_file`
@@ -635,7 +647,10 @@ pub fn acquire_lock_at(path: &Path) -> Result<LockGuard> {
         // particular, a caller performing documented manual legacy recovery
         // must be able to retry immediately on macOS rather than observe this
         // same process as a transient v2 owner.
-        let _ = fs::File::unlock(&v2_file);
+        {
+            let file = v2_file.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = fs::File::unlock(&*file);
+        }
         return Err(error);
     }
     Ok(LockGuard {
@@ -670,6 +685,7 @@ fn acquire_legacy_sentinel(path: &Path, token: &str) -> Result<()> {
         Ok(mut file) => {
             file.write_all(token.as_bytes())?;
             file.flush()?;
+            crate::owned_output::finish_producer(path, &mut file)?;
             Ok(())
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
@@ -719,6 +735,9 @@ fn open_regular_lock_file(
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        // This persistent lock leaf must keep naming this handle while held.
+        // Byte-range locking alone does not prevent rename/replacement.
+        options.share_mode(0x1 | 0x2); // FILE_SHARE_READ | FILE_SHARE_WRITE, no DELETE
     }
 
     let file = options.open(path)?;
@@ -1172,6 +1191,35 @@ pub(crate) fn create_owned_temp_dir(parent: &Path, prefix: &str) -> Result<PathB
         "failed to create a unique owned temp directory in {}",
         parent.display()
     )
+}
+
+// Preserve every nonmatching row byte-for-byte; this is revocation of one
+// immutable run path, not a rewrite/recovery of unrelated index history.
+pub(crate) fn remove_run_row_bytes(before: &[u8], out_dir: &Path) -> Result<(Vec<u8>, usize)> {
+    let mut after = Vec::new();
+    let mut removed = 0;
+    for line in before.split_inclusive(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            after.extend_from_slice(line);
+            continue;
+        }
+        let entry: RunEntry = serde_json::from_slice(line)?;
+        if entry.path == out_dir {
+            removed += 1;
+        } else {
+            after.extend_from_slice(line);
+        }
+    }
+    Ok((after, removed))
+}
+
+pub(crate) fn revoke_committed_index_after_drift(
+    publication: &RunPublicationLock,
+    out_dir: &Path,
+) -> Result<()> {
+    let guard =
+        crate::owned_output::active_guard().context("late index revocation has no caller guard")?;
+    guard.revoke_publication_index_after_drift(publication, &index_path(), out_dir)
 }
 
 /// Atomically publish an owned temp file over its destination.
@@ -1986,27 +2034,27 @@ fn stage_pruned_paths(pruned: &[PathBuf], abort: &impl Fn() -> bool) -> Result<V
             });
         }
         if let Err(error) = write_prune_manifest(&transaction_dir, &manifest) {
-            let _ = fs::remove_dir_all(&transaction_dir);
-            rollback_staged_prunes(&staged)?;
-            return Err(error);
+            return Err(cleanup_failed_prune_stage(&transaction_dir, &staged, error));
         }
         if let Err(error) = fsync_directory(&trash) {
-            let _ = fs::remove_dir_all(&transaction_dir);
-            rollback_staged_prunes(&staged)?;
-            return Err(error).context("Failed to persist prune transaction directory");
+            return Err(cleanup_failed_prune_stage(
+                &transaction_dir,
+                &staged,
+                error.context("Failed to persist prune transaction directory"),
+            ));
         }
 
         let tombstone = transaction_dir.join(PRUNE_PAYLOAD_DIR);
         if let Err(error) = fs::rename(original, &tombstone) {
-            let _ = fs::remove_dir_all(&transaction_dir);
-            rollback_staged_prunes(&staged)?;
-            return Err(error).with_context(|| {
-                format!(
+            return Err(cleanup_failed_prune_stage(
+                &transaction_dir,
+                &staged,
+                anyhow::Error::from(error).context(format!(
                     "Failed to stage retained run {} as {}",
                     original.display(),
                     tombstone.display()
-                )
-            });
+                )),
+            ));
         }
         staged.push(StagedPrune {
             original: original.clone(),
@@ -2024,6 +2072,20 @@ fn stage_pruned_paths(pruned: &[PathBuf], abort: &impl Fn() -> bool) -> Result<V
         }
     }
     Ok(staged)
+}
+
+fn cleanup_failed_prune_stage(
+    transaction_dir: &Path,
+    staged: &[StagedPrune],
+    mut primary: anyhow::Error,
+) -> anyhow::Error {
+    if let Err(error) = remove_dir_all_cancellable(transaction_dir, &|| false) {
+        primary = primary.context(format!("Prune transaction cleanup unconfirmed: {error:#}"));
+    }
+    if let Err(error) = rollback_staged_prunes(staged) {
+        primary = primary.context(format!("Prior prune rollback unconfirmed: {error:#}"));
+    }
+    primary
 }
 
 fn rollback_staged_prunes(staged: &[StagedPrune]) -> Result<()> {
@@ -2056,7 +2118,7 @@ fn rollback_staged_prunes(staged: &[StagedPrune]) -> Result<()> {
             fsync_rename_parents(&prune.tombstone, &prune.original)?;
         }
         if prune.transaction_dir.exists() {
-            fs::remove_dir_all(&prune.transaction_dir).with_context(|| {
+            remove_dir_all_cancellable(&prune.transaction_dir, &|| false).with_context(|| {
                 format!(
                     "Failed to remove prune transaction {}",
                     prune.transaction_dir.display()
@@ -2131,6 +2193,7 @@ fn write_prune_manifest(transaction_dir: &Path, manifest: &PruneTransactionManif
         writeln!(file)?;
         file.flush()?;
         file.sync_all()?;
+        crate::owned_output::finish_producer(&temp, &mut file)?;
         Ok(())
     })();
     drop(file);
@@ -2488,7 +2551,14 @@ fn remove_dir_all_cancellable(path: &Path, abort: &impl Fn() -> bool) -> Result<
         let entry = entry?;
         let child = entry.path();
         let metadata = fs::symlink_metadata(&child)?;
-        if is_owned_regular_dir(&metadata) {
+        if crate::owned_output::is_owned(&child) {
+            crate::owned_output::fs::remove_file(&child).with_context(|| {
+                format!(
+                    "Failed to remove owned prune tombstone file {}",
+                    child.display()
+                )
+            })?;
+        } else if is_owned_regular_dir(&metadata) {
             remove_dir_all_cancellable(&child, abort)?;
         } else if is_reparse_point(&metadata) {
             // Never recurse through a Windows junction/mount-point. Removing
@@ -4116,5 +4186,97 @@ mod tests {
                 "cleanup must be gated on the lock; stale entry must remain: {ids:?}"
             );
         });
+    }
+    #[test]
+    fn issue72_review_retention_completed_manifest_cleanup_and_rollback_are_accounted() {
+        for rollback in [true, false] {
+            let (_root, home, config) = crate::checks::caller_guard_tests::fixture();
+            let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+            let original = home.path().join("old-pack");
+            std::fs::create_dir_all(original.join("00_summary")).unwrap();
+            std::fs::write(original.join("payload.txt"), b"original retained payload").unwrap();
+            std::fs::write(
+                original.join("00_summary/RUN.json"),
+                serde_json::to_vec(&serde_json::json!({"artifacts_root": original})).unwrap(),
+            )
+            .unwrap();
+            let guard = crate::checks::caller_integrity::CallerGuard::capture_sync(
+                config.repo_root,
+                home.path().join("diagnostics"),
+            );
+            let _scope = crate::owned_output::enter(std::sync::Arc::clone(&guard), None);
+            let staged = stage_pruned_paths(std::slice::from_ref(&original), &|| false).unwrap();
+            let transaction = &staged[0].transaction_dir;
+            let manifest = read_prune_manifest(transaction).unwrap();
+            write_prune_manifest(transaction, &manifest).unwrap();
+            guard
+                .verify_sync("after-repeated-manifest-write", None)
+                .unwrap();
+            assert!(remove_dir_all_cancellable(transaction, &|| true).is_err());
+            assert!(transaction.join(PRUNE_MANIFEST_FILE).is_file());
+            guard
+                .verify_sync("after-cleanup-cancellation", None)
+                .unwrap();
+            if rollback {
+                rollback_staged_prunes(&staged).unwrap();
+                assert_eq!(
+                    std::fs::read(original.join("payload.txt")).unwrap(),
+                    b"original retained payload"
+                );
+            } else {
+                mark_staged_prunes_committed(&staged).unwrap();
+                guard
+                    .verify_sync("after-committed-manifest-write", None)
+                    .unwrap();
+                cleanup_committed_prunes(&RunIndex { entries: vec![] }, &|| false).unwrap();
+                assert!(!original.exists());
+            }
+            assert!(!transaction.exists());
+            guard.verify_sync("after-retention-cleanup", None).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue72_review_retention_foreign_manifest_is_preserved() {
+        for rollback in [true, false] {
+            let (_root, home, config) = crate::checks::caller_guard_tests::fixture();
+            let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+            let original = home.path().join("old-pack");
+            std::fs::create_dir_all(original.join("00_summary")).unwrap();
+            std::fs::write(original.join("payload.txt"), b"original retained payload").unwrap();
+            std::fs::write(
+                original.join("00_summary/RUN.json"),
+                serde_json::to_vec(&serde_json::json!({"artifacts_root": original})).unwrap(),
+            )
+            .unwrap();
+            let guard = crate::checks::caller_integrity::CallerGuard::capture_sync(
+                config.repo_root,
+                home.path().join("diagnostics"),
+            );
+            let _scope = crate::owned_output::enter(std::sync::Arc::clone(&guard), None);
+            let staged = stage_pruned_paths(std::slice::from_ref(&original), &|| false).unwrap();
+            let transaction = &staged[0].transaction_dir;
+            let manifest_path = transaction.join(PRUNE_MANIFEST_FILE);
+            let previous = std::fs::read(&manifest_path).unwrap();
+            let foreign = b"foreign manifest bytes: preserve exactly\n";
+            std::fs::write(&manifest_path, foreign).unwrap();
+            let result = if rollback {
+                rollback_staged_prunes(&staged)
+            } else {
+                remove_dir_all_cancellable(transaction, &|| false)
+            };
+            assert!(
+                result.is_err(),
+                "foreign manifest must refuse retention cleanup"
+            );
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), foreign);
+            assert!(guard.ensure_valid().is_err(), "observed drift must latch");
+            std::fs::write(&manifest_path, previous).unwrap();
+            assert!(
+                guard
+                    .verify_sync("after-foreign-manifest-restored", None)
+                    .is_err()
+            );
+        }
     }
 }

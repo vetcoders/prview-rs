@@ -147,7 +147,7 @@ impl Cache {
         }
 
         // Clean old entries (keep last 5)
-        self.cleanup(&cache_dir, 5)?;
+        self.cleanup(&cache_dir, 5, &destination)?;
 
         let entry = serde_json::to_string(&CacheEntry {
             status: status.to_string(),
@@ -177,22 +177,22 @@ impl Cache {
         // whole truth, and leaving them behind would keep a previous run's
         // output and provenance on disk under a live key.
         let legacy = sidecar(&cache_dir, key, LOG_SUFFIX);
-        if !crate::owned_output::namespace_source_visible(&cache_dir)? {
-            let _ = std::fs::remove_file(legacy);
-        } else if crate::owned_output::is_owned(&legacy) {
+        if crate::owned_output::is_owned(&legacy) {
             let _ = fs::remove_file(legacy);
+        } else if !crate::owned_output::namespace_source_visible(&cache_dir)? {
+            let _ = std::fs::remove_file(legacy);
         }
         let legacy = sidecar(&cache_dir, key, PROVENANCE_SUFFIX);
-        if !crate::owned_output::namespace_source_visible(&cache_dir)? {
-            let _ = std::fs::remove_file(legacy);
-        } else if crate::owned_output::is_owned(&legacy) {
+        if crate::owned_output::is_owned(&legacy) {
             let _ = fs::remove_file(legacy);
+        } else if !crate::owned_output::namespace_source_visible(&cache_dir)? {
+            let _ = std::fs::remove_file(legacy);
         }
 
         Ok(())
     }
 
-    fn cleanup(&self, dir: &Path, keep: usize) -> Result<()> {
+    fn cleanup(&self, dir: &Path, keep: usize, destination: &Path) -> Result<()> {
         if crate::owned_output::namespace_source_visible(dir)? {
             // A prior run's files have no exact current-run ownership proof.
             return Ok(());
@@ -216,19 +216,33 @@ impl Cache {
         });
 
         if entries.len() > keep {
-            for entry in entries.iter().take(entries.len() - keep) {
-                let _ = std::fs::remove_file(entry.path());
+            for entry in entries
+                .iter()
+                .filter(|entry| entry.path() != destination)
+                .take(entries.len() - keep)
+            {
+                let _ = remove_accounted_cache_leaf(&entry.path());
                 // Suffix-append, not `with_extension`: a key carrying a dot
                 // (`audit-<lock>-2026-08-22` style keys are dot-free today, but
                 // nothing enforces it) would otherwise have its own tail
                 // replaced and leave the sidecars orphaned.
                 let key = entry.file_name().to_string_lossy().to_string();
-                let _ = std::fs::remove_file(sidecar(dir, &key, LOG_SUFFIX));
-                let _ = std::fs::remove_file(sidecar(dir, &key, PROVENANCE_SUFFIX));
+                let _ = remove_accounted_cache_leaf(&sidecar(dir, &key, LOG_SUFFIX));
+                let _ = remove_accounted_cache_leaf(&sidecar(dir, &key, PROVENANCE_SUFFIX));
             }
         }
 
         Ok(())
+    }
+}
+
+// Called only in the validated non-source maintenance namespace. New/current
+// owned leaves still require their recorded preimage and absence transition.
+fn remove_accounted_cache_leaf(path: &Path) -> std::io::Result<()> {
+    if crate::owned_output::is_owned(path) {
+        fs::remove_file(path)
+    } else {
+        std::fs::remove_file(path)
     }
 }
 

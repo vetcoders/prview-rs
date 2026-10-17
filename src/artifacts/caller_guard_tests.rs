@@ -303,3 +303,292 @@ fn issue69_caller_guard_external_invalid_journal_quarantine_keeps_source_valid()
     assert!(!home.path().join("index.jsonl.lock").exists());
     ledger.ensure_caller_valid().unwrap();
 }
+
+#[test]
+fn issue72_review_success_result_cannot_hide_latched_caller_drift() {
+    let (root, home, config) = fixture();
+    let _home = crate::config::override_test_prview_home(home.path());
+    let ledger = TaskLedger::new();
+    ledger.initialize_caller_guard_config_sync(&config).unwrap();
+    let pack = home.path().join("pack");
+    let _scope = ledger.output_scope(Some(pack.clone()));
+    std::fs::create_dir_all(pack.join("00_summary")).unwrap();
+    crate::owned_output::fs::write(pack.join("00_summary/RUN.json"), b"own success").unwrap();
+    std::fs::write(root.path().join("source.txt"), b"foreign source").unwrap();
+    assert!(
+        ledger
+            .verify_caller_sync("late-cleanup-drift", None)
+            .is_err()
+    );
+    let result = finish_caller_guarded_generation(&ledger, Some(&pack), Ok(pack.clone()));
+    assert!(
+        result.is_err(),
+        "latched drift must override successful inner result"
+    );
+    assert!(!pack.join("00_summary/RUN.json").exists());
+    assert!(pack.join("00_summary/INCOMPLETE.json").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn issue72_review_recovery_removes_uncommitted_first_latest() {
+    use std::os::unix::ffi::OsStrExt;
+    let (_root, home, config) = fixture();
+    let _home = crate::config::override_test_prview_home(home.path());
+    let pack = home.path().join("first-pack");
+    std::fs::create_dir_all(pack.join("00_summary")).unwrap();
+    std::fs::write(
+        pack.join("00_summary/RUN.json"),
+        serde_json::to_vec(&serde_json::json!({"artifacts_root":pack})).unwrap(),
+    )
+    .unwrap();
+    let latest = home.path().join("latest");
+    std::os::unix::fs::symlink("first-pack", &latest).unwrap();
+    let journal = home.path().join("publication-transaction.json");
+    std::fs::write(&journal, serde_json::to_vec(&serde_json::json!({"schema":1,"out_dir":pack.as_os_str().as_bytes(),"previous_target":null})).unwrap()).unwrap();
+    let ledger = TaskLedger::new();
+    ledger.initialize_caller_guard_config_sync(&config).unwrap();
+    let _scope = ledger.output_scope(None);
+    let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+    recover_latest_publication(&publication).unwrap();
+    assert!(
+        !latest.exists(),
+        "first uncommitted publication must not stay advertised"
+    );
+    assert!(!journal.exists());
+    ledger
+        .verify_caller_sync("after-first-publication-recovery", None)
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn issue72_review_parseable_invalid_journal_quarantine_updates_accounting() {
+    use std::os::unix::ffi::OsStrExt;
+    let (_root, home, config) = fixture();
+    let _home = crate::config::override_test_prview_home(home.path());
+    let pack = home.path().join("unknown-schema-pack");
+    let journal = home.path().join("publication-transaction.json");
+    let payload = serde_json::to_vec(&serde_json::json!({"schema":2,"out_dir":pack.as_os_str().as_bytes(),"previous_target":null})).unwrap();
+    std::fs::write(&journal, &payload).unwrap();
+    let ledger = TaskLedger::new();
+    ledger.initialize_caller_guard_config_sync(&config).unwrap();
+    let _scope = ledger.output_scope(None);
+    let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+    recover_latest_publication(&publication).unwrap();
+    assert!(!journal.exists());
+    let preserved: Vec<_> = std::fs::read_dir(home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".publication-transaction.invalid.")
+        })
+        .map(|entry| std::fs::read(entry.path()).unwrap())
+        .collect();
+    assert_eq!(preserved, vec![payload]);
+    ledger
+        .verify_caller_sync("after-admitted-invalid-journal-quarantine", None)
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn issue72_review_followup_late_committed_drift_revokes_own_advertisements() {
+    for foreign_role in ["journal", "index", "latest"] {
+        let (_root, home, config) = fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let pack = home.path().join("committed-pack");
+        std::fs::create_dir_all(pack.join("00_summary")).unwrap();
+        let ledger = TaskLedger::new();
+        ledger.initialize_caller_guard_config_sync(&config).unwrap();
+        let _scope = ledger.output_scope(Some(pack.clone()));
+        crate::owned_output::fs::write(
+            pack.join("00_summary/RUN.json"),
+            serde_json::to_vec(&serde_json::json!({"artifacts_root":pack})).unwrap(),
+        )
+        .unwrap();
+        let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+        let transaction = begin_latest_publication(&publication, &pack).unwrap();
+        let entry: crate::storage::RunEntry = serde_json::from_value(serde_json::json!({
+            "id":"own-run", "repo":"fixture", "branch":"main", "commit":"fixture", "path":pack,
+            "created_at":"2026-10-17T00:00:00Z", "quality_pass":true, "merge_status":"PASS", "policy_mode":"warn",
+            "checks_passed":0, "checks_failed":0, "files_changed":0, "size_bytes":0, "has_dashboard":false
+        })).unwrap();
+        crate::storage::register_and_prune_locked(&publication, &pack, entry, false, || false)
+            .unwrap();
+        let index_path = home.path().join("index.jsonl");
+        let journal = home.path().join("publication-transaction.json");
+        let latest = home.path().join("latest");
+        let mut foreign_index = std::fs::read(&index_path).unwrap();
+        foreign_index.extend_from_slice(b"\n");
+        if foreign_role == "index" {
+            std::fs::write(&index_path, &foreign_index).unwrap();
+        }
+        if foreign_role == "latest" {
+            std::fs::remove_file(&latest).unwrap();
+            std::os::unix::fs::symlink("foreign-pack", &latest).unwrap();
+        }
+        let foreign_journal = b"foreign journal diagnostic\n";
+        std::fs::write(&journal, foreign_journal).unwrap();
+        let inner = finish_committed_publication(&publication, &transaction, &ledger, &pack)
+            .map(|()| pack.clone());
+        let result = finish_caller_guarded_generation(&ledger, Some(&pack), inner);
+        assert!(
+            result.is_err(),
+            "late committed drift cannot return success"
+        );
+        let detail = format!("{:#}", result.unwrap_err());
+        assert!(!pack.join("00_summary/RUN.json").exists());
+        assert!(pack.join("00_summary/INCOMPLETE.json").exists());
+        assert_eq!(std::fs::read(&journal).unwrap(), foreign_journal);
+        if foreign_role == "index" {
+            assert_eq!(std::fs::read(&index_path).unwrap(), foreign_index);
+            assert!(detail.contains("revocation unconfirmed"));
+        } else {
+            assert!(
+                !crate::storage::RunIndex::load_strict()
+                    .unwrap()
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path == pack),
+                "own committed row remains advertised"
+            );
+        }
+        if foreign_role == "latest" {
+            assert_eq!(
+                std::fs::read_link(&latest).unwrap(),
+                Path::new("foreign-pack")
+            );
+            assert!(detail.contains("revocation unconfirmed"));
+        } else {
+            assert!(
+                std::fs::symlink_metadata(&latest).is_err(),
+                "own committed alias remains advertised"
+            );
+        }
+        ledger.ensure_caller_valid().unwrap_err();
+    }
+}
+
+#[cfg(windows)]
+fn windows_review_entry(pack: &Path) -> crate::storage::RunEntry {
+    serde_json::from_value(serde_json::json!({
+        "id":"windows-own-run", "repo":"fixture", "branch":"main", "commit":"fixture", "path":pack,
+        "created_at":"2026-10-17T00:00:00Z", "quality_pass":true, "merge_status":"PASS", "policy_mode":"warn",
+        "checks_passed":0, "checks_failed":0, "files_changed":0, "size_bytes":0, "has_dashboard":false
+    })).unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn issue72_review_windows_index_sync_uses_writable_handle() {
+    let (_root, home, _config) = fixture();
+    let _home = crate::config::override_test_prview_home(home.path());
+    let mut index = crate::storage::RunIndex::load_strict().unwrap();
+    index.append(windows_review_entry(&home.path().join("pack")));
+    index.save().unwrap();
+    index.save().unwrap();
+    assert_eq!(
+        crate::storage::RunIndex::load_strict()
+            .unwrap()
+            .entries()
+            .len(),
+        1
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn issue72_review_windows_internal_output_and_held_publication_handle_are_accounted() {
+    let (root, _diagnostics, config) = fixture();
+    let home = root.path().join("internal-home");
+    std::fs::create_dir(&home).unwrap();
+    let _home = crate::config::override_test_prview_home(&home);
+    let pack = root.path().join("pack/00_summary");
+    std::fs::create_dir_all(&pack).unwrap();
+    let ledger = TaskLedger::new();
+    ledger.initialize_caller_guard_config_sync(&config).unwrap();
+    let _scope = ledger.output_scope(Some(root.path().join("pack")));
+    crate::owned_output::fs::write(pack.join("report.json"), b"own nested report").unwrap();
+    ledger
+        .verify_caller_sync("windows-git-relative-owned-filter", None)
+        .unwrap();
+    let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+    ledger
+        .verify_caller_sync("windows-held-lock-content-observation", None)
+        .unwrap();
+    let mut index = crate::storage::RunIndex::load_strict().unwrap();
+    index.append(windows_review_entry(&root.path().join("pack")));
+    index.save().unwrap();
+    let v2 = home.join("index.jsonl.lock.v2");
+    let replacement = pack.join("replacement-lock");
+    crate::owned_output::fs::write(&replacement, b"own replacement candidate").unwrap();
+    assert!(std::fs::remove_file(&v2).is_err());
+    assert!(std::fs::rename(&v2, home.join("moved-v2")).is_err());
+    assert!(std::fs::rename(&replacement, &v2).is_err());
+    ledger
+        .verify_caller_sync("windows-held-lock-after-replacement-refusals", None)
+        .unwrap();
+    drop(publication);
+    assert!(!home.join("index.jsonl.lock").exists());
+    ledger
+        .verify_caller_sync("windows-publication-released", None)
+        .unwrap();
+    let again = crate::storage::acquire_publication_lock(|| false).unwrap();
+    ledger
+        .verify_caller_sync("windows-publication-reacquired", None)
+        .unwrap();
+    drop(again);
+    assert!(!home.join("index.jsonl.lock").exists());
+    ledger
+        .verify_caller_sync("windows-publication-released-again", None)
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn issue72_review_windows_failed_context_admission_closes_raw_handles() {
+    for fail_stderr in [false, true] {
+        let (root, diagnostics, config) = fixture();
+        let pack = root.path().join("context-pack");
+        std::fs::create_dir(&pack).unwrap();
+        let stderr = pack.join(".context-cmd-0.stderr.tmp");
+        if fail_stderr {
+            std::fs::write(&stderr, b"initial user diagnostics").unwrap();
+        }
+        let guard = crate::checks::caller_integrity::CallerGuard::capture_sync(
+            config.repo_root,
+            diagnostics.path().join("diagnostics"),
+        );
+        let _scope = crate::owned_output::enter(Arc::clone(&guard), Some(pack.clone()));
+        let command = context_artifacts::ContextCmd {
+            label: "missing owned context executable".to_owned(),
+            gate: None,
+            cmd: pack
+                .join("nonexistent-context-executable.exe")
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![],
+            cwd: root.path().to_path_buf(),
+            out_dir: pack.clone(),
+            out_file: String::new(),
+        };
+        let governor = crate::governor::ResourceGovernor::new();
+        let timings =
+            context_artifacts::run_context_cmds_parallel(&[command], 3, false, &governor).unwrap();
+        assert_eq!(timings.len(), 1);
+        assert_eq!(timings[0].status, "spawn_failed");
+        assert!(!pack.join(".context-cmd-0.stdout.tmp").exists());
+        if fail_stderr {
+            assert_eq!(std::fs::read(&stderr).unwrap(), b"initial user diagnostics");
+        } else {
+            assert!(!stderr.exists());
+        }
+        guard
+            .verify_sync("after-windows-context-failure-cleanup", None)
+            .unwrap();
+    }
+}
