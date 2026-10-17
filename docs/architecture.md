@@ -4628,3 +4628,69 @@ fn detect_profile(...) -> Result<DetectedProfile> {
     // Add detection
 }
 ```
+
+### Optional dependency listings and structural measurement status
+
+`REVIEW_SUMMARY.md` labels a retained SBOM context output as a dependency
+listing only when its command completed successfully and its readable output
+has no truncation marker (current head/tail or legacy prefix-only). Truncated
+output is an INCOMPLETE diagnostic even after exit code zero.
+Failed/timed-out output remains linked as a diagnostic log with its status;
+an unstarted command is `NOT_RUN`. A file without command outcome evidence is
+`UNKNOWN`, and a completed command with missing output is also `UNKNOWN`.
+These labels do not change the merge gate or relax incomplete analysis.
+
+For the supported npm/pnpm listing commands, the reviewed tree's
+`packageManager` declaration takes precedence over its lockfile. Without a
+package-manager declaration, nonempty lockfiles can select the manager; empty or
+whitespace-only files are ignored. If both lockfiles are nonempty, the existing
+pnpm-first order is retained; this is not validation of lockfile syntax. An
+explicit unsupported manager bypasses lockfile inference and retains the
+existing PATH fallback. pnpm uses `list --depth Infinity`; npm uses
+`ls --all`. The compatibility fix adapts the existing local donor `08f7a5d9`.
+The command label identifies npm or pnpm; the existing `npm-sbom.txt` filename
+remains compatible for both. Other package managers retain the existing fallback
+behavior; this is not a claim of Yarn/Bun support. Failed commands record their exit status in RUN.
+
+`PR_REVIEW.md` (also embedded in `REVIEW_SUMMARY.md`) reports Loctree twins
+and unused-symbol counts only for an available scan of at least one file.
+Disabled/absent heuristics display `NOT_RUN`; unavailable/empty scans display
+`NOT_MEASURED`. A measured zero remains zero. Machine-readable counters and
+canonical gate decisions retain their existing contracts.
+
+### Bounded optional context text logs
+
+Large optional context text artifacts (`.txt`/`.log`) retain the beginning and
+end of stdout followed by stderr within the 500,000-byte limit, including a
+marker that states the original byte count and that the middle was omitted.
+Both cut boundaries preserve UTF-8. The collector seeks to bounded windows
+before allocating text, so retained-log memory does not grow with source size.
+Invalid UTF-8 in retained bytes is decoded lossily with an explicit marker.
+This keeps late diagnostics visible after large traces; the retained artifact is
+explicitly incomplete. Short valid UTF-8 text stays byte-identical.
+
+Object/array JSON is validated as a stream without constructing an in-memory value, then
+copied byte-for-byte (including surrounding whitespace and stdout larger than
+500 KB). Validation checks JSON syntax, UTF-8 and paired Unicode escapes; it
+does not convert numbers to f64 or impose that numeric range. Downstream
+consumers may have narrower numeric limits. Invalid JSON is retained
+as bounded text in an additive `<requested-name>.raw.log` sibling, for example
+`eslint.json.raw.log`, with a format warning and the final diagnostic. It is
+never written under the requested `.json` name. A normal exit with invalid JSON
+is `failed`; a timeout remains `timed_out`. Reasons retain the command failure
+or timeout and explain the diagnostic fallback. Read/write errors have no
+artifact link and an explicit reason. RUN links the file actually written on
+both normal exit and timeout. Deadlines, ownership, merge gates, RUN schema and
+the artifact manifest contracts retain their existing behavior.
+
+Timed-out context commands retain their captured diagnostics only after their
+owned process tree has been confirmed terminated. RUN keeps `timed_out` and
+the timeout reason; an artifact link is recorded only if the output was actually
+written. Queued commands that never started and ownership
+cleanup failures retain their existing behavior.
+
+`cargo-tree.txt` remains available as a diagnostic when truncated, but logs
+with the truncation marker (including the legacy prefix-only marker) are not
+indexed for advisory dependency paths. Neither PR_REVIEW nor FAILURES_SUMMARY
+may infer ancestry across an omitted portion; advisories remain visible without
+those paths. Complete trees keep their existing path enrichment.

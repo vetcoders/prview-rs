@@ -83,6 +83,14 @@ pub(crate) fn parse_cargo_tree_package(label: &str) -> Option<(String, String)> 
 pub(crate) fn load_cargo_tree_index(root_dir: &Path) -> Option<CargoTreeIndex> {
     let cargo_tree_path = root_dir.join("30_context/cargo-tree.txt");
     let cargo_tree = fs::read_to_string(cargo_tree_path).ok()?;
+    // A retained tail has no trustworthy ancestors. This also covers the
+    // legacy prefix-only truncation marker; the raw log remains available.
+    if cargo_tree
+        .lines()
+        .any(|line| line.trim_start().starts_with("... (truncated, "))
+    {
+        return None;
+    }
     Some(CargoTreeIndex::from_text(&cargo_tree))
 }
 

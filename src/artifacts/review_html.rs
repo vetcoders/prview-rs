@@ -7,7 +7,10 @@ use crate::mdrender::{self, Theme};
 ///
 /// Merges MERGE_GATE.md + PR_REVIEW.md + AI_INDEX.md sections into one file.
 /// Runs AFTER all artifacts exist, so `.exists()` checks are accurate (fixes A4).
-pub(crate) fn generate_review_summary(out_dir: &Path) -> Result<()> {
+pub(super) fn generate_review_summary(
+    out_dir: &Path,
+    context_timings: &[ContextCommandTiming],
+) -> Result<()> {
     use std::fmt::Write;
 
     let mut md = String::new();
@@ -59,14 +62,22 @@ pub(crate) fn generate_review_summary(out_dir: &Path) -> Result<()> {
         )?;
     }
 
-    if out_dir.join("30_context/cargo-sbom.txt").exists() {
-        writeln!(
-            available,
-            "- `30_context/cargo-sbom.txt` — dependency/license SBOM"
+    for (label, path, description) in [
+        (
+            "cargo sbom",
+            "30_context/cargo-sbom.txt",
+            "dependency/license SBOM",
+        ),
+        ("npm sbom", "30_context/npm-sbom.txt", "dependency SBOM"),
+    ] {
+        append_sbom_summary(
+            &mut available,
+            out_dir,
+            context_timings,
+            label,
+            path,
+            description,
         )?;
-    }
-    if out_dir.join("30_context/npm-sbom.txt").exists() {
-        writeln!(available, "- `30_context/npm-sbom.txt` — dependency SBOM")?;
     }
 
     if out_dir.join("30_context/INLINE_FINDINGS.sarif").exists() {
@@ -83,6 +94,64 @@ pub(crate) fn generate_review_summary(out_dir: &Path) -> Result<()> {
     }
 
     fs::write(out_dir.join("REVIEW_SUMMARY.md"), md)?;
+    Ok(())
+}
+
+/// A diagnostic file is retained evidence even when its command failed. File
+/// existence alone cannot establish that a dependency listing succeeded.
+fn append_sbom_summary(
+    md: &mut String,
+    out_dir: &Path,
+    timings: &[ContextCommandTiming],
+    label: &str,
+    path: &str,
+    description: &str,
+) -> Result<()> {
+    use std::fmt::Write;
+    let timing = timings.iter().find(|timing| {
+        timing.label == label
+            || timing.artifact.as_deref() == Some(path)
+            || (label == "npm sbom" && timing.label == "pnpm sbom")
+    });
+    let label = timing.map_or(label, |timing| timing.label.as_str());
+    let exists = out_dir.join(path).is_file();
+    if !exists && timing.is_none() {
+        return Ok(());
+    }
+    let content = read_to_string_within(out_dir, Path::new(path)).ok();
+    let truncated = content.as_ref().is_some_and(|text| {
+        text.lines()
+            .any(|line| line.trim_start().starts_with("... (truncated, "))
+    });
+    match timing {
+        Some(timing) if timing.status == "completed" && content.is_some() && !truncated => {
+            writeln!(md, "- `{path}` — {description} (COMPLETED)")?;
+        }
+        Some(timing) if !timing.started => {
+            writeln!(md, "- {label} — NOT_RUN ({})", timing.status)?;
+        }
+        _ => {
+            let status = timing.map_or("UNKNOWN".to_owned(), |timing| {
+                if timing.status == "completed" && truncated {
+                    "INCOMPLETE: output truncated".to_owned()
+                } else if timing.status == "completed" && exists {
+                    "UNKNOWN (output unreadable)".to_owned()
+                } else if timing.status == "completed" {
+                    "UNKNOWN (expected output missing)".to_owned()
+                } else {
+                    timing.status.to_ascii_uppercase()
+                }
+            });
+            if exists {
+                writeln!(
+                    md,
+                    "- `{path}` — diagnostic log ({status}); dependency listing not established"
+                )?;
+            } else {
+                writeln!(md, "- {label} — {status}; no dependency listing produced")?;
+            }
+        }
+    }
     Ok(())
 }
 
