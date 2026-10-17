@@ -1635,9 +1635,137 @@ pub(super) fn collect_cmd_output(
     })
 }
 
+#[derive(Clone, Copy)]
+enum JsonUnicodeState {
+    Outside,
+    Text,
+    Escape,
+    Hex { digits: u8, value: u16, low: bool },
+    LowSlash,
+    LowU,
+}
+
+/// IgnoredAny skips Unicode validation inside strings. Validate raw UTF-8
+/// and escaped surrogate pairs with constant state before serde checks JSON
+/// syntax; no string, object or array is materialized.
+struct JsonUnicodeReader<R> {
+    inner: R,
+    utf8_left: u8,
+    utf8_range: Option<(u8, u8)>,
+    string: JsonUnicodeState,
+}
+
+impl<R> JsonUnicodeReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            utf8_left: 0,
+            utf8_range: None,
+            string: JsonUnicodeState::Outside,
+        }
+    }
+
+    fn validate_byte(&mut self, byte: u8) -> std::io::Result<()> {
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid JSON string Unicode",
+            )
+        };
+        if self.utf8_left > 0 {
+            let (min, max) = self.utf8_range.take().unwrap_or((0x80, 0xbf));
+            if !(min..=max).contains(&byte) {
+                return Err(invalid());
+            }
+            self.utf8_left -= 1;
+        } else if byte > 0x7f {
+            let (left, min, max) = match byte {
+                0xc2..=0xdf => (1, 0x80, 0xbf),
+                0xe0 => (2, 0xa0, 0xbf),
+                0xe1..=0xec | 0xee..=0xef => (2, 0x80, 0xbf),
+                0xed => (2, 0x80, 0x9f),
+                0xf0 => (3, 0x90, 0xbf),
+                0xf1..=0xf3 => (3, 0x80, 0xbf),
+                0xf4 => (3, 0x80, 0x8f),
+                _ => return Err(invalid()),
+            };
+            self.utf8_left = left;
+            self.utf8_range = Some((min, max));
+        }
+        use JsonUnicodeState::*;
+        self.string = match self.string {
+            Outside if byte == b'"' => Text,
+            Outside => Outside,
+            Text if byte == b'"' => Outside,
+            Text if byte == b'\\' => Escape,
+            Text => Text,
+            Escape if byte == b'u' => Hex {
+                digits: 0,
+                value: 0,
+                low: false,
+            },
+            Escape => Text, // serde still checks allowed escapes and control bytes.
+            Hex { digits, value, low } => {
+                let hex = match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    b'A'..=b'F' => byte - b'A' + 10,
+                    _ => return Err(invalid()),
+                };
+                let value = (value << 4) | u16::from(hex);
+                if digits < 3 {
+                    Hex {
+                        digits: digits + 1,
+                        value,
+                        low,
+                    }
+                } else if low {
+                    if !(0xdc00..=0xdfff).contains(&value) {
+                        return Err(invalid());
+                    }
+                    Text
+                } else if (0xd800..=0xdbff).contains(&value) {
+                    LowSlash
+                } else if (0xdc00..=0xdfff).contains(&value) {
+                    return Err(invalid());
+                } else {
+                    Text
+                }
+            }
+            LowSlash if byte == b'\\' => LowU,
+            LowU if byte == b'u' => Hex {
+                digits: 0,
+                value: 0,
+                low: true,
+            },
+            LowSlash | LowU => return Err(invalid()),
+        };
+        Ok(())
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for JsonUnicodeReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let len = self.inner.read(buffer)?;
+        if len == 0 && (self.utf8_left != 0 || !matches!(self.string, JsonUnicodeState::Outside)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "incomplete JSON string Unicode",
+            ));
+        }
+        for &byte in &buffer[..len] {
+            self.validate_byte(byte)?;
+        }
+        Ok(len)
+    }
+}
+
 fn valid_json_capture(reader: impl std::io::Read) -> bool {
     use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(reader);
+    let mut reader = std::io::BufReader::new(JsonUnicodeReader::new(reader));
     loop {
         let Ok(bytes) = reader.fill_buf() else {
             return false;
@@ -1919,6 +2047,86 @@ mod tests {
         assert!(retained.contains("invalid UTF-8"));
         assert!(retained.ends_with("�"));
         assert!(retained.len() <= super::MAX_TSC_TRACE_BYTES);
+    }
+
+    fn assert_rejected_json_unicode(raw: &[u8]) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("stdout"), raw).unwrap();
+        fs::write(dir.path().join("stderr"), "FINAL JSON DIAGNOSTIC\n").unwrap();
+        let capture = super::collect_cmd_output(
+            &dir.path().join("stdout"),
+            &dir.path().join("stderr"),
+            dir.path(),
+            "eslint.json",
+        );
+        assert!(
+            capture.failed,
+            "invalid Unicode was accepted as JSON: {raw:?}"
+        );
+        assert_eq!(
+            capture.artifact.as_deref(),
+            Some("30_context/eslint.json.raw.log")
+        );
+        assert!(!dir.path().join("eslint.json").exists());
+        let diagnostic = fs::read_to_string(dir.path().join("eslint.json.raw.log")).unwrap();
+        assert!(diagnostic.contains("invalid JSON"));
+        assert!(diagnostic.ends_with("FINAL JSON DIAGNOSTIC\n"));
+    }
+
+    #[test]
+    fn pr70_capture_json_unicode_rejects_invalid_utf8_value() {
+        assert_rejected_json_unicode(b"{\"message\":\"\xff\"}");
+    }
+
+    #[test]
+    fn pr70_capture_json_unicode_rejects_invalid_utf8_key() {
+        assert_rejected_json_unicode(b"{\"\xff\":\"message\"}");
+    }
+
+    #[test]
+    fn pr70_capture_json_unicode_rejects_unpaired_high_surrogate() {
+        assert_rejected_json_unicode(br#"{"message":"\uD800"}"#);
+    }
+
+    #[test]
+    fn pr70_capture_json_unicode_rejects_unpaired_low_surrogate() {
+        assert_rejected_json_unicode(br#"{"message":"\uDC00"}"#);
+    }
+
+    #[test]
+    fn pr70_capture_json_unicode_preserves_valid_pairs_literals_and_chunk_boundaries() {
+        let mut crossing = format!(r#"{{"message":"{}"#, "a".repeat(8191 - 12)).into_bytes();
+        crossing.extend_from_slice("🦀".as_bytes());
+        crossing.extend_from_slice(br#"\uD83E\uDD80"}"#);
+        for raw in [
+            br#"{"message":"\uD83E\uDD80"}"#.to_vec(),
+            br#"{"message":"\\uD800"}"#.to_vec(),
+            "{\"🦀\":\"é€🦀\"}".as_bytes().to_vec(),
+            crossing,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("stdout"), &raw).unwrap();
+            fs::write(dir.path().join("stderr"), "separate diagnostic").unwrap();
+            let capture = super::collect_cmd_output(
+                &dir.path().join("stdout"),
+                &dir.path().join("stderr"),
+                dir.path(),
+                "valid.json",
+            );
+            assert!(!capture.failed, "valid Unicode was rejected: {raw:?}");
+            assert_eq!(fs::read(dir.path().join("valid.json")).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn pr70_capture_json_unicode_number_range_is_syntax_not_f64() {
+        assert!(serde_json::from_str::<serde_json::Value>(r#"{"n":1e400}"#).is_err());
+        assert!(super::valid_json_capture(std::io::Cursor::new(
+            br#"{"n":1e400}"#
+        )));
+        for invalid in [br#"{"n":NaN}"#.as_slice(), br#"{"n":Infinity}"#.as_slice()] {
+            assert!(!super::valid_json_capture(std::io::Cursor::new(invalid)));
+        }
     }
 
     fn assert_invalid_utf8_at_tail_boundary(count: usize) {
