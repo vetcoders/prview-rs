@@ -1699,8 +1699,12 @@ fatal Result path, without changing verdicts, statuses or cancellation reasons.
 Internal nonignored `PRVIEW_HOME` and `--output-dir` remain supported. Only exact
 leaves created by the run’s concrete writers are excluded; no directory prefix,
 WalkDir result or final manifest grants ownership. An exclusive new-file open and
-registration are serialized with observations. Tracked HEAD/index paths are
-always protected. An unclaimed preexisting pack leaf is refused before writing;
+registration are serialized with observations. Literal tracked HEAD/index paths
+and existing filesystem aliases are refused before writes, including aliases
+whose spelling lies outside the caller prefix. Existing identity uses Unix
+device/inode or Windows volume/file-index values, without changing Git keys or
+guessing case-folding rules. This is not a resolver for differently spelled
+missing leaves. An unclaimed preexisting pack leaf is refused before writing;
 a disappeared baseline leaf or newly observed foreign collision latches drift.
 Foreign siblings remain visible, including inside the allocated pack.
 

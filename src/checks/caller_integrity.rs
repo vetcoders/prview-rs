@@ -202,13 +202,32 @@ impl CallerGuard {
 
     fn output_is_tracked(&self, path: &Path) -> Result<bool> {
         let root = fs::canonicalize(&self.root)?;
-        let Ok(relative) = path.strip_prefix(&root) else {
-            return Ok(false);
-        };
         let repo = git2::Repository::open(&root)?;
-        Ok(tracked_paths(&repo)?
-            .iter()
-            .any(|bytes| git_path(bytes).is_ok_and(|p| p == relative)))
+        let tracked = tracked_paths(&repo)?;
+        if let Ok(relative) = path.strip_prefix(&root)
+            && tracked
+                .iter()
+                .any(|bytes| git_path(bytes).is_ok_and(|p| p == relative))
+        {
+            return Ok(true);
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let identity = match existing_leaf_identity(path) {
+                Ok(identity) => identity,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            for bytes in tracked {
+                match existing_leaf_identity(&root.join(git_path(&bytes)?)) {
+                    Ok(tracked_identity) if tracked_identity == identity => return Ok(true),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn owns_output(&self, path: &Path) -> bool {
@@ -1464,6 +1483,35 @@ fn capture_token(root: &Path, owned: &BTreeSet<String>) -> Result<CallerToken> {
         raw_index_sha256,
         sources,
     })
+}
+
+#[cfg(unix)]
+fn existing_leaf_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn existing_leaf_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((
+        u64::from(information.dwVolumeSerialNumber),
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
 }
 
 fn ensure_untracked_output(guard: &CallerGuard, path: &Path) -> Result<()> {

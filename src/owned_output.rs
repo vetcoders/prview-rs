@@ -717,4 +717,74 @@ mod tests {
             .verify_sync("after-windows-producer-close-and-unlink", None)
             .unwrap();
     }
+    #[test]
+    fn issue72_review_existing_tracked_cache_alias_is_refused_before_write() {
+        let (root, diagnostics, config) = crate::checks::caller_guard_tests::fixture();
+        let cache_root = root.path().join(".internal-cache");
+        let dir = cache_root.join("check");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = dir.join("CACHEKEY");
+        let requested = dir.join("cachekey");
+        std::fs::write(&tracked, b"passed\n").unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            ".generated/\n.internal-cache/\n",
+        )
+        .unwrap();
+        let repo = git2::Repository::open(root.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(".gitignore")).unwrap();
+        index
+            .add_path(std::path::Path::new(".internal-cache/check/CACHEKEY"))
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "tracked cache fixture",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        let aliases_existing = requested.exists();
+        eprintln!("tracked cache fixture: case_insensitive_existing_alias={aliases_existing}");
+        let guard =
+            CallerGuard::capture_sync(config.repo_root, diagnostics.path().join("diagnostics"));
+        let _scope = enter(Arc::clone(&guard), None);
+        let cache = crate::cache::Cache::with_dir(cache_root, true);
+        let result = cache.set(
+            "check",
+            "cachekey",
+            "warning",
+            Some("own cache output"),
+            None,
+        );
+        if aliases_existing {
+            assert!(
+                result.is_err(),
+                "existing tracked alias must be refused before writing"
+            );
+        } else {
+            result.expect("distinct case-sensitive untracked leaf remains allowed");
+            assert_eq!(cache.get("check", "cachekey").unwrap().status, "warning");
+        }
+        assert_eq!(
+            std::fs::read(&tracked).unwrap(),
+            b"passed\n",
+            "tracked bytes must never be overwritten"
+        );
+        guard
+            .verify_sync("after-tracked-cache-alias-refusal", None)
+            .unwrap();
+        cache
+            .set("check", "unrelated-own-key", "passed", None, None)
+            .unwrap();
+        guard
+            .verify_sync("after-unrelated-own-cache-write", None)
+            .unwrap();
+    }
 }
