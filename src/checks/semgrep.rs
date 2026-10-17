@@ -1526,7 +1526,7 @@ mod tests {
             }]);
             let inherited: Vec<_> = CONTEXT_VARS
                 .iter()
-                .map(|name| std::env::var_os(name))
+                .map(std::env::var_os)
                 .collect();
             let before = issue69_caller_identity(&root);
             let result = SemgrepCheck.run(&config).await.unwrap();
