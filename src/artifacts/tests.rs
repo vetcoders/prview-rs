@@ -2161,6 +2161,78 @@ fn infer_batch_theme_prefers_search_keywords() {
 }
 
 #[test]
+fn pr70_oversized_cargo_tree_keeps_advisory_without_invented_path() {
+    let tmp = tempfile::tempdir().expect("tree fixture");
+    let context = tmp.path().join("30_context");
+    let summary = tmp.path().join("00_summary");
+    std::fs::create_dir_all(&context).unwrap();
+    std::fs::create_dir_all(&summary).unwrap();
+    let stdout = tmp.path().join("stdout");
+    let stderr = tmp.path().join("stderr");
+    let tree = format!(
+        "workspace v1.0.0\n{}└── example-crate v0.3.1\n",
+        "├── rent-04094 v1.0.0\n".repeat(30_000)
+    );
+    std::fs::write(&stdout, tree).unwrap();
+    std::fs::write(&stderr, "").unwrap();
+    super::context_artifacts::collect_cmd_output(&stdout, &stderr, &context, "cargo-tree.txt");
+    let retained = std::fs::read_to_string(context.join("cargo-tree.txt")).unwrap();
+    assert!(retained.contains("middle omitted"));
+    let checks = vec![CheckResult {
+        name: "Cargo audit".into(),
+        status: CheckStatus::Failed,
+        duration: Duration::from_secs(1),
+        output: sample_cargo_audit_output(),
+        cached: false,
+        provenance: None,
+    }];
+    generate_failures_summary(&summary, &checks).unwrap();
+    let content = std::fs::read_to_string(summary.join("FAILURES_SUMMARY.md")).unwrap();
+    assert!(
+        content.contains("RUSTSEC-2024-0001"),
+        "advisory must remain visible"
+    );
+    assert!(
+        !content.contains("Dependency path:"),
+        "incomplete tree invented ancestry: {content}"
+    );
+    assert!(load_cargo_tree_index(tmp.path()).is_none());
+}
+
+#[test]
+fn pr70_legacy_prefix_truncated_cargo_tree_is_not_indexed() {
+    let tmp = tempfile::tempdir().expect("tree fixture");
+    std::fs::create_dir_all(tmp.path().join("30_context")).unwrap();
+    std::fs::write(
+        tmp.path().join("30_context/cargo-tree.txt"),
+        format!(
+            "{}\n\n... (truncated, 600000 total bytes)",
+            sample_cargo_tree_output()
+        ),
+    )
+    .unwrap();
+    assert!(load_cargo_tree_index(tmp.path()).is_none());
+}
+
+#[test]
+fn pr70_complete_cargo_tree_still_provides_dependency_paths() {
+    let tmp = tempfile::tempdir().expect("tree fixture");
+    std::fs::create_dir_all(tmp.path().join("30_context")).unwrap();
+    std::fs::write(
+        tmp.path().join("30_context/cargo-tree.txt"),
+        sample_cargo_tree_output(),
+    )
+    .unwrap();
+    let index = load_cargo_tree_index(tmp.path()).expect("complete tree index");
+    assert!(
+        index
+            .paths_by_package
+            .get(&("example-crate".into(), "0.3.1".into()))
+            .is_some_and(|paths| paths.iter().any(|p| p.starts_with("rmcp-memex v0.1.0")))
+    );
+}
+
+#[test]
 fn cargo_tree_index_extracts_dependency_paths() {
     let index = CargoTreeIndex::from_text(sample_cargo_tree_output());
     let finding = CargoAuditFinding {
@@ -5675,8 +5747,13 @@ fn pr_review_counts_code_test_and_non_code_separately() {
     }];
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let config = create_test_config(PolicyConfig::default());
+    let mut config = create_test_config(PolicyConfig::default());
+    config.run_heuristics = true;
     let heuristics = HeuristicsResult {
+        summary: crate::heuristics::HeuristicsSummary {
+            total_files: 1,
+            ..Default::default()
+        },
         loctree: Some(LoctreeAnalysis {
             twins: TwinsAnalysis {
                 exact_twins: serde_json::from_value(serde_json::json!([{
@@ -7280,7 +7357,7 @@ fn the_human_artifacts_state_the_test_scope_in_every_mode() {
             None,
         )
         .expect("pr review");
-        generate_review_summary(tmp.path()).expect("review summary");
+        generate_review_summary(tmp.path(), &[]).expect("review summary");
         (
             fs::read_to_string(tmp.path().join("PR_REVIEW.md")).expect("read review"),
             fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).expect("read summary"),
@@ -7388,7 +7465,7 @@ fn review_summary_includes_gate_and_checks() {
     fs::write(out.join("30_context/DEPS_DELTA.json"), "{}").unwrap();
     fs::write(out.join("report.json"), "{}").unwrap();
 
-    generate_review_summary(out).unwrap();
+    generate_review_summary(out, &[]).unwrap();
 
     let summary = fs::read_to_string(out.join("REVIEW_SUMMARY.md")).unwrap();
     assert!(summary.contains("# PR Review Summary"));
@@ -7408,7 +7485,7 @@ fn review_summary_handles_missing_files() {
     let out = tmp.path();
 
     // No input files exist — function should still succeed
-    generate_review_summary(out).unwrap();
+    generate_review_summary(out, &[]).unwrap();
 
     let summary = fs::read_to_string(out.join("REVIEW_SUMMARY.md")).unwrap();
     assert!(summary.contains("# PR Review Summary"));
@@ -7438,7 +7515,7 @@ fn review_summary_partial_sources_gate_only() {
     )
     .unwrap();
 
-    generate_review_summary(out).unwrap();
+    generate_review_summary(out, &[]).unwrap();
 
     let summary = fs::read_to_string(out.join("REVIEW_SUMMARY.md")).unwrap();
     assert!(summary.contains("## Gate Decision"));
@@ -7463,7 +7540,7 @@ fn review_summary_preserves_each_available_artifact() {
         let tmp = tempfile::tempdir().expect("tempdir");
         fs::create_dir(tmp.path().join("30_context")).unwrap();
         fs::write(tmp.path().join(present), "fixture").unwrap();
-        generate_review_summary(tmp.path()).unwrap();
+        generate_review_summary(tmp.path(), &[]).unwrap();
         let summary = fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).unwrap();
         assert!(!summary.contains("## Artifact Map"));
         assert_eq!(summary.matches("## Available Artifacts").count(), 1);
@@ -9458,4 +9535,168 @@ fn a_target_without_a_lockfile_keeps_cargo_audit_on_the_blocking_list() {
     assert_eq!(report["gate"]["status"], decision["verdict"]);
     assert_eq!(report["gate"]["quality_pass"], decision["quality_pass"]);
     assert_dashboard_verdict(&dashboard, decision["verdict"].as_str().unwrap());
+}
+
+#[test]
+fn review_summary_sbom_requires_successful_command_evidence() {
+    for (status, started, present, expected) in [
+        ("failed", true, true, "diagnostic log (FAILED)"),
+        ("timed_out", true, true, "diagnostic log (TIMED_OUT)"),
+        ("spawn_failed", false, false, "NOT_RUN (spawn_failed)"),
+        ("timed_out", false, false, "NOT_RUN (timed_out)"),
+        ("completed", true, true, "dependency SBOM (COMPLETED)"),
+        (
+            "completed",
+            true,
+            false,
+            "UNKNOWN (expected output missing)",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("30_context")).unwrap();
+        if present {
+            fs::write(
+                tmp.path().join("30_context/npm-sbom.txt"),
+                "diagnostic or listing",
+            )
+            .unwrap();
+        }
+        let timings = [ContextCommandTiming {
+            label: "npm sbom".into(),
+            artifact: present.then(|| "30_context/npm-sbom.txt".into()),
+            status,
+            started,
+            duration_secs: 0.1,
+            reason: None,
+        }];
+        generate_review_summary(tmp.path(), &timings).unwrap();
+        let summary = fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).unwrap();
+        assert!(summary.contains(expected), "{summary}");
+        assert_eq!(
+            summary.contains("— dependency SBOM"),
+            status == "completed" && present
+        );
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir(tmp.path().join("30_context")).unwrap();
+    fs::write(
+        tmp.path().join("30_context/npm-sbom.txt"),
+        "ERROR Unknown option: all",
+    )
+    .unwrap();
+    generate_review_summary(tmp.path(), &[]).unwrap();
+    let summary = fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).unwrap();
+    assert!(summary.contains("diagnostic log (UNKNOWN)"));
+    assert!(!summary.contains("— dependency SBOM"));
+}
+
+#[test]
+fn pr_review_does_not_claim_zero_twins_when_heuristics_did_not_measure() {
+    use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
+    for (enabled, available, total_files, expected) in [
+        (false, false, 0, "NOT_RUN"),
+        (false, true, 1, "NOT_RUN"),
+        (true, false, 0, "NOT_MEASURED"),
+        (true, true, 0, "NOT_MEASURED"),
+        (true, true, 1, "0 exact twin pair(s) and 0 unused symbol(s)"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = create_test_config(PolicyConfig::default());
+        config.run_heuristics = enabled;
+        let heuristics = HeuristicsResult {
+            loctree: Some(LoctreeAnalysis {
+                available,
+                ..Default::default()
+            }),
+            summary: HeuristicsSummary {
+                total_files,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        generate_pr_review(
+            tmp.path(),
+            &config,
+            &[],
+            &[],
+            &[],
+            &CoverageDelta {
+                total_source: 0,
+                covered_count: 0,
+                pct: None,
+                uncovered: vec![],
+                covered: vec![],
+                non_code_count: 0,
+                ghost_tests: vec![],
+            },
+            Some(&heuristics),
+        )
+        .unwrap();
+        let summary = fs::read_to_string(tmp.path().join("PR_REVIEW.md")).unwrap();
+        assert!(summary.contains(expected), "{summary}");
+        assert_eq!(
+            summary.contains("0 exact twin pair(s)"),
+            enabled && available && total_files > 0
+        );
+    }
+}
+
+#[test]
+fn review_summary_sbom_truncated_output_is_diagnostic() {
+    for marker in [
+        "... (truncated, 900000 total bytes; middle omitted)",
+        "... (truncated, 900000 total bytes)",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("30_context")).unwrap();
+        fs::write(
+            tmp.path().join("30_context/npm-sbom.txt"),
+            format!("listing head\n{marker}\nlisting tail"),
+        )
+        .unwrap();
+        let timings = [ContextCommandTiming {
+            label: "npm sbom".into(),
+            artifact: Some("30_context/npm-sbom.txt".into()),
+            status: "completed",
+            started: true,
+            duration_secs: 0.1,
+            reason: None,
+        }];
+        generate_review_summary(tmp.path(), &timings).unwrap();
+        let summary = fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).unwrap();
+        assert!(
+            summary.contains("diagnostic log (INCOMPLETE: output truncated)"),
+            "{summary}"
+        );
+        assert!(!summary.contains("SBOM (COMPLETED)"), "{summary}");
+    }
+}
+
+#[test]
+fn review_summary_sbom_identifies_pnpm_even_without_output() {
+    for present in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        if present {
+            fs::create_dir(tmp.path().join("30_context")).unwrap();
+            fs::write(tmp.path().join("30_context/npm-sbom.txt"), "listing").unwrap();
+        }
+        let timings = [ContextCommandTiming {
+            label: "pnpm sbom".into(),
+            artifact: present.then(|| "30_context/npm-sbom.txt".into()),
+            status: if present { "completed" } else { "spawn_failed" },
+            started: present,
+            duration_secs: 0.1,
+            reason: None,
+        }];
+        generate_review_summary(tmp.path(), &timings).unwrap();
+        let summary = fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).unwrap();
+        assert!(
+            summary.contains(if present {
+                "dependency SBOM (COMPLETED)"
+            } else {
+                "pnpm sbom — NOT_RUN (spawn_failed)"
+            }),
+            "{summary}"
+        );
+    }
 }

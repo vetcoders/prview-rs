@@ -42,7 +42,8 @@ pub(crate) use history::*;
 pub(crate) use lint::*;
 pub(crate) use ownership::*;
 pub(crate) use pr_review::*;
-pub(crate) use review_html::*;
+use review_html::generate_review_summary;
+pub(crate) use review_html::generate_standard_review_html;
 pub(crate) use root_cause::*;
 pub(crate) use verdict::*;
 
@@ -1114,7 +1115,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     // One browser entry: dashboard by default, static review only when the
     // dashboard is explicitly disabled. Both consume the same review evidence.
     let t = Instant::now();
-    generate_review_summary(&out_dir)?;
+    generate_review_summary(&out_dir, &context_command_timings)?;
     generate_ai_index(&out_dir, config, diffs, &all_checks, &coverage_delta)?;
     if !config.create_dashboard {
         generate_standard_review_html(&out_dir)?;

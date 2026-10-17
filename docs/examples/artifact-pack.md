@@ -36,8 +36,8 @@ A typical artifact pack looks like this:
 ├── 30_context/
 │   ├── INLINE_FINDINGS.sarif # Optional SARIF output for findings
 │   ├── cargo-tree.txt        # Dependency tree
-│   ├── cargo-sbom.json       # Generated SBOM
-│   └── npm-sbom.json         # Generated SBOM
+│   ├── cargo-sbom.txt        # Optional dependency/license listing or diagnostic
+│   └── npm-sbom.txt          # Optional npm/pnpm listing or diagnostic
 ├── dashboard.html            # Visual HTML summary
 └── artifacts.zip             # Everything zipped
 ```
