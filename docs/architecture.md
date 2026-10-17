@@ -1651,9 +1651,24 @@ collapse onto the target and reduce the scanned delta to nothing while the pack
 diff stays non-empty. A pinned target carrying no captured base is the same class
 of planning refusal as an unavailable pinned commit, never a symbolic fallback.
 Multi-base and `--current-only` runs still fall back to a full scan (R3-15).
-Only ambient target-less local invocations keep the operator checkout; an
-explicit local target matching `HEAD` still uses the exact snapshot. Each new
-watch iteration resolves its target anew.
+An Ambient local invocation with an allowed baseline now owns a detached
+snapshot of the target captured by the baseline decision. Semgrep's baseline
+handler may temporarily reset its cwd to the base; neither normal completion nor
+cancellation requires restoring the operator checkout. A write made in that
+checkout after planning remains outside the scanner's reset scope. Snapshot
+creation failure retains the reason-carrying planning refusal; it never falls
+back to a baseline scan in the operator tree. Ambient scans without a baseline
+(including dirty, `--security-full`, and `--current-only` runs) still scan the live
+working tree. An explicit local target matching `HEAD` uses the exact snapshot.
+Each new watch iteration resolves its target anew.
+
+Semgrep execution errors capture provenance before its private snapshot is
+dropped, preserving the actual cwd and observed SHA, including a baseline SHA
+left behind by a timeout. They retain the existing `Error` status and error
+reason. Nonzero process outputs retain the scanner's existing classification.
+This isolation does not add a run-wide caller mutation guard: the shared snapshot
+observations below still govern cache reuse, rather than aborting later checks
+when an external writer edits an Ambient checkout.
 
 `checks::snapshot_integrity::SnapshotObservation` compares the ledger-owned
 worktree with the immutable commit resolved before worktree creation. The shared
