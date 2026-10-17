@@ -1695,13 +1695,16 @@ fn read_context_capture(
         }
         Ok(bytes)
     };
-    let (mut head, mut tail) = if marker.is_empty() && total <= budget as u64 {
-        (range(0, total as usize)?, Vec::new())
+    let (mut head, mut tail, lookbehind) = if marker.is_empty() && total <= budget as u64 {
+        (range(0, total as usize)?, Vec::new(), Vec::new())
     } else {
         let head_len = budget / 2;
+        let tail_start = total - (budget - head_len) as u64;
+        let lookbehind_start = tail_start.saturating_sub(3);
         (
             range(0, head_len)?,
-            range(total - (budget - head_len) as u64, budget - head_len)?,
+            range(tail_start, budget - head_len)?,
+            range(lookbehind_start, (tail_start - lookbehind_start) as usize)?,
         )
     };
     // A valid UTF-8 code point split by a window edge is omitted with the
@@ -1712,11 +1715,7 @@ fn read_context_capture(
         {
             head.truncate(error.valid_up_to());
         }
-        let continuation = tail
-            .iter()
-            .take(3)
-            .take_while(|byte| (**byte & 0xc0) == 0x80)
-            .count();
+        let continuation = valid_utf8_tail_prefix(&lookbehind, &tail);
         tail.drain(..continuation);
     }
     let head = String::from_utf8_lossy(&head);
@@ -1731,6 +1730,27 @@ fn read_context_capture(
     Ok(bounded_context_text(&format!(
         "{note}{encoding}{head}{marker}{tail}"
     )))
+}
+
+/// Omit a tail prefix only if the original bytes prove it is the rest of
+/// one valid code point crossing the window edge. Stray continuation bytes
+/// must reach lossy decoding and its explicit encoding notice instead.
+fn valid_utf8_tail_prefix(lookbehind: &[u8], tail: &[u8]) -> usize {
+    let mut bridge = [0; 6];
+    let before = lookbehind.len().min(3);
+    let after = tail.len().min(3);
+    bridge[..before].copy_from_slice(&lookbehind[lookbehind.len() - before..]);
+    bridge[before..before + after].copy_from_slice(&tail[..after]);
+    for start in 0..before {
+        for prefix in 1..=after {
+            if std::str::from_utf8(&bridge[start..before + prefix])
+                .is_ok_and(|text| text.chars().count() == 1)
+            {
+                return prefix;
+            }
+        }
+    }
+    0
 }
 
 /// Also cap the constant-size UTF-8 replacement expansion, retaining both ends.
@@ -1899,6 +1919,79 @@ mod tests {
         assert!(retained.contains("invalid UTF-8"));
         assert!(retained.ends_with("�"));
         assert!(retained.len() <= super::MAX_TSC_TRACE_BYTES);
+    }
+
+    fn assert_invalid_utf8_at_tail_boundary(count: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stdout = vec![b'a'; 900_000];
+        let total = stdout.len() + 1; // collector's stdout + newline + empty stderr
+        let marker = format!("\n\n... (truncated, {total} total bytes; middle omitted)\n\n");
+        let budget = super::MAX_TSC_TRACE_BYTES - marker.len();
+        let tail_start = total - (budget - budget / 2);
+        stdout[tail_start..tail_start + count].fill(0x80);
+        fs::write(dir.path().join("stdout"), stdout).unwrap();
+        fs::write(dir.path().join("stderr"), "").unwrap();
+        super::collect_cmd_output(
+            &dir.path().join("stdout"),
+            &dir.path().join("stderr"),
+            dir.path(),
+            "trace.log",
+        );
+        let retained = fs::read_to_string(dir.path().join("trace.log")).unwrap();
+        assert!(
+            retained.contains("invalid UTF-8"),
+            "{count} genuinely invalid bytes were silently erased at the window boundary"
+        );
+        assert!(retained.contains("middle omitted"));
+        assert!(retained.len() <= super::MAX_TSC_TRACE_BYTES);
+    }
+
+    #[test]
+    fn pr70_capture_utf8_boundary_invalid_one_byte_is_retained() {
+        assert_invalid_utf8_at_tail_boundary(1);
+    }
+
+    #[test]
+    fn pr70_capture_utf8_boundary_invalid_two_bytes_are_retained() {
+        assert_invalid_utf8_at_tail_boundary(2);
+    }
+
+    #[test]
+    fn pr70_capture_utf8_boundary_invalid_three_bytes_are_retained() {
+        assert_invalid_utf8_at_tail_boundary(3);
+    }
+
+    #[test]
+    fn pr70_capture_utf8_boundary_valid_codepoints_do_not_claim_corruption() {
+        for character in ["é", "€", "🦀"] {
+            for split in 1..character.len() {
+                let dir = tempfile::tempdir().unwrap();
+                let mut stdout = vec![b'a'; 900_000];
+                let total = stdout.len() + 1;
+                let marker =
+                    format!("\n\n... (truncated, {total} total bytes; middle omitted)\n\n");
+                let budget = super::MAX_TSC_TRACE_BYTES - marker.len();
+                let tail_start = total - (budget - budget / 2);
+                stdout[tail_start - split..tail_start - split + character.len()]
+                    .copy_from_slice(character.as_bytes());
+                fs::write(dir.path().join("stdout"), stdout).unwrap();
+                fs::write(dir.path().join("stderr"), "").unwrap();
+                super::collect_cmd_output(
+                    &dir.path().join("stdout"),
+                    &dir.path().join("stderr"),
+                    dir.path(),
+                    "trace.log",
+                );
+                let retained = fs::read_to_string(dir.path().join("trace.log")).unwrap();
+                assert!(
+                    !retained.contains("invalid UTF-8"),
+                    "valid {character} split at {split} claimed corruption"
+                );
+                assert!(!retained.contains('\u{fffd}'));
+                assert!(retained.contains("middle omitted"));
+                assert!(retained.len() <= super::MAX_TSC_TRACE_BYTES);
+            }
+        }
     }
 
     #[cfg(unix)]
