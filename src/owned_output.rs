@@ -93,6 +93,7 @@ pub(crate) fn admit_validated_mutable(path: &Path) -> anyhow::Result<()> {
 pub(crate) fn is_owned(path: &Path) -> bool {
     current().is_some_and(|context| context.guard.owns_output(path))
 }
+#[cfg(unix)]
 pub(crate) fn is_mutable_owned(path: &Path) -> bool {
     current().is_some_and(|context| context.guard.owns_mutable_output(path))
 }

@@ -67,6 +67,7 @@ use signal::{
 };
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
+#[cfg(unix)]
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;

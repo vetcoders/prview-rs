@@ -191,6 +191,7 @@ impl CallerGuard {
         })
     }
 
+    #[cfg(unix)]
     pub(crate) fn owns_mutable_output(&self, path: &Path) -> bool {
         output_leaf_path(path).is_ok_and(|path| {
             self.owned_outputs
@@ -289,10 +290,10 @@ impl CallerGuard {
                     )));
                 }
             }
-            let metadata = file.metadata()?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
+                let metadata = file.metadata()?;
                 let at_path = fs::symlink_metadata(&path)?;
                 if metadata.nlink() != 1
                     || metadata.dev() != at_path.dev()
