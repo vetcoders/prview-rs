@@ -2,7 +2,7 @@
 
 use super::{
     Check, CheckEligibility, CheckResult, CheckStatus, ProvenanceBuilder, ReviewSubstrate,
-    review_substrate, run_command,
+    review_substrate, run_command_without_git_context,
 };
 use crate::Config;
 use crate::git::{Repository, ResolvedRef, WorktreeSnapshot, create_worktree_snapshot};
@@ -117,7 +117,14 @@ impl Check for SemgrepCheck {
         };
         #[cfg(not(windows))]
         let executable = "semgrep";
-        let output = match run_command(executable, &args_ref, cwd).await {
+        let output = match run_command_without_git_context(
+            executable,
+            &args_ref,
+            cwd,
+            super::CHECK_TIMEOUT_SECS,
+        )
+        .await
+        {
             Ok(output) => output,
             Err(error) => {
                 return Ok(semgrep_execution_error_result(
@@ -1485,6 +1492,109 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue69_semgrep_strips_inherited_git_context_only_in_child() {
+        const CHILD_ROOT: &str = "PRVIEW_ISSUE69_ENV_REPO";
+        const CONTEXT_VARS: [&str; 6] = [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+        ];
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let base = std::env::var("PRVIEW_ISSUE69_ENV_BASE").unwrap();
+            let target = std::env::var("PRVIEW_ISSUE69_ENV_TARGET").unwrap();
+            let mut config = test_config();
+            config.repo_root = root.clone();
+            config.target = None;
+            config.bases = vec!["main".into()];
+            config.pinned_target = Some(ResolvedRef {
+                name: "feature".into(),
+                commit_id: target,
+                is_remote: false,
+            });
+            config.pinned_diff_bases = Some(vec![ResolvedRef {
+                name: "main".into(),
+                commit_id: base,
+                is_remote: false,
+            }]);
+            let inherited: Vec<_> = CONTEXT_VARS
+                .iter()
+                .map(|name| std::env::var_os(name))
+                .collect();
+            let before = issue69_caller_identity(&root);
+            let result = SemgrepCheck.run(&config).await.unwrap();
+            assert_eq!(result.status, CheckStatus::Passed, "{}", result.output);
+            assert_eq!(
+                issue69_caller_identity(&root),
+                before,
+                "inherited Git context redirected Semgrep's baseline into its caller"
+            );
+            let mut decoder = serde_json::Deserializer::from_str(result.output.trim());
+            let payload = serde_json::Value::deserialize(&mut decoder).unwrap();
+            assert_eq!(payload["inherited_git_context"], serde_json::json!([]));
+            assert_eq!(payload["ordinary_env"], "retained");
+            for (name, value) in CONTEXT_VARS.iter().zip(inherited) {
+                assert_eq!(std::env::var_os(name), value, "parent environment changed");
+            }
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        for case in 0..=CONTEXT_VARS.len() {
+            let (repo, _, base, target) = issue69_ambient_fixture();
+            let fixture = tempfile::tempdir().unwrap();
+            let executable = fixture.path().join("semgrep");
+            let program = if let Some(python) = std::env::var_os("PRVIEW_ISSUE69_REAL_PYTHON") {
+                // Optional local proof uses the installed Semgrep BaselineHandler,
+                // while ordinary CI has the same Git reset via a hermetic shell.
+                format!(
+                    "#!{}\nimport json, os\nfrom semgrep.git import BaselineHandler\nwith BaselineHandler(os.environ['PRVIEW_ISSUE69_ENV_BASE'], is_mergebase=True).baseline_context():\n print(json.dumps({{'results': [], 'inherited_git_context': [k for k in {} if k in os.environ], 'ordinary_env': os.environ.get('PRVIEW_ISSUE69_ORDINARY')}}))\n",
+                    PathBuf::from(python).display(),
+                    serde_json::to_string(&CONTEXT_VARS).unwrap()
+                )
+            } else {
+                "#!/bin/sh\ngit reset --hard \"$PRVIEW_ISSUE69_ENV_BASE\" >/dev/null 2>&1 || exit 2\nprintf '{\"results\":[],\"inherited_git_context\":['\nsep=''\nfor key in GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR; do\n if printenv \"$key\" >/dev/null; then printf '%s\"%s\"' \"$sep\" \"$key\"; sep=','; fi\ndone\nprintf '],\"ordinary_env\":\"%s\"}\\n' \"$PRVIEW_ISSUE69_ORDINARY\"\n".to_string()
+            };
+            std::fs::write(&executable, program).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "checks::semgrep::tests::issue69_semgrep_strips_inherited_git_context_only_in_child", "--nocapture"])
+                .env(CHILD_ROOT, repo.path())
+                .env("PRVIEW_ISSUE69_ENV_BASE", base)
+                .env("PRVIEW_ISSUE69_ENV_TARGET", target)
+                .env("PRVIEW_ISSUE69_ORDINARY", "retained")
+                .env("PATH", std::env::join_paths([fixture.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap());
+            for name in CONTEXT_VARS {
+                command.env_remove(name);
+            }
+            for (index, name) in CONTEXT_VARS.iter().enumerate() {
+                if case != index && case != CONTEXT_VARS.len() {
+                    continue;
+                }
+                let value = match *name {
+                    "GIT_WORK_TREE" => repo.path().to_path_buf(),
+                    "GIT_INDEX_FILE" => repo.path().join(".git/index"),
+                    "GIT_OBJECT_DIRECTORY" | "GIT_ALTERNATE_OBJECT_DIRECTORIES" => {
+                        repo.path().join(".git/objects")
+                    }
+                    _ => repo.path().join(".git"),
+                };
+                command.env(name, value);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

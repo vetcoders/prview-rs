@@ -2237,6 +2237,20 @@ pub async fn run_command_with_env(
     run_command_with_timeout_and_env(cmd, args, cwd, CHECK_TIMEOUT_SECS, env).await
 }
 
+/// Run a Git-aware scanner in its actual cwd, without inherited repository
+/// selectors redirecting its nested Git processes into the operator checkout.
+pub(crate) async fn run_command_without_git_context(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout_secs: u64,
+) -> Result<Output> {
+    let mut command = Command::new(cmd);
+    command.args(args).current_dir(cwd);
+    crate::git::cmd::remove_git_context(command.as_std_mut());
+    capture_check_command(command, cmd, timeout_secs).await
+}
+
 /// Helper to run a command with custom timeout and extra environment variables.
 pub async fn run_command_with_timeout_and_env(
     cmd: &str,
@@ -2250,6 +2264,10 @@ pub async fn run_command_with_timeout_and_env(
     for (key, value) in env {
         command.env(key, value);
     }
+    capture_check_command(command, cmd, timeout_secs).await
+}
+
+async fn capture_check_command(command: Command, cmd: &str, timeout_secs: u64) -> Result<Output> {
     // Shared rails (stdin-null, kill_on_drop, own process group) + concurrent
     // output drain + group-SIGKILL on timeout live in crate::proc.
     crate::proc::run_capture_with_timeout(command, Duration::from_secs(timeout_secs), cmd, || {

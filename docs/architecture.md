@@ -1662,6 +1662,13 @@ back to a baseline scan in the operator tree. Ambient scans without a baseline
 working tree. An explicit local target matching `HEAD` uses the exact snapshot.
 Each new watch iteration resolves its target anew.
 
+The Semgrep child also removes the same six inherited Git repository selectors
+as `git_cmd` (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`).
+A detached cwd alone cannot isolate a baseline handler if inherited selectors
+redirect its nested Git commands to the caller. Removal is child-only; ordinary
+environment, caller environment, and other checks' command behavior are retained.
+
 Semgrep execution errors capture provenance before its private snapshot is
 dropped, preserving the actual cwd and observed SHA, including a baseline SHA
 left behind by a timeout. They retain the existing `Error` status and error

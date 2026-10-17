@@ -40,6 +40,14 @@ const GIT_ENV_VARS: &[&str] = &[
     "GIT_COMMON_DIR",
 ];
 
+/// Strip repository selectors from one child command, including tools such as
+/// Semgrep that invoke Git internally. The parent environment is unchanged.
+pub(crate) fn remove_git_context(command: &mut Command) {
+    for var in GIT_ENV_VARS {
+        command.env_remove(var);
+    }
+}
+
 /// Create a `Command` for git with inherited repo context stripped.
 ///
 /// Use this instead of `Command::new("git")` everywhere — production and test code alike.
@@ -62,9 +70,7 @@ pub fn git_cmd() -> Command {
     );
     #[cfg(not(all(test, unix)))]
     let mut cmd = Command::new("git");
-    for var in GIT_ENV_VARS {
-        cmd.env_remove(var);
-    }
+    remove_git_context(&mut cmd);
     // prview is a non-interactive tool: git must fail fast instead of
     // prompting for credentials (fetch/ls-remote over https on a repo the
     // operator is not authenticated for would otherwise hang the run on an
