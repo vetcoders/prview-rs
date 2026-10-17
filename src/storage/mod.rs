@@ -468,7 +468,7 @@ impl Drop for LockGuard {
         // old binary enter while this guard still owned the new protocol.
         {
             let file = self.v2_file.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = fs::File::unlock(&*file);
+            let _ = fs::File::unlock(&file);
         } // Release the file mutex before any guarded legacy cleanup.
 
         let owns_legacy = {
@@ -649,7 +649,7 @@ pub fn acquire_lock_at(path: &Path) -> Result<LockGuard> {
         // same process as a transient v2 owner.
         {
             let file = v2_file.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = fs::File::unlock(&*file);
+            let _ = fs::File::unlock(&file);
         }
         return Err(error);
     }
