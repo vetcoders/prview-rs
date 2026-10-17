@@ -958,7 +958,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     ));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::MergeGate)?;
 
-    let review_range = ReviewRange::assess(config, resolved_target, resolved_bases, diffs);
+    let review_range = ReviewRange::assess(
+        config,
+        ledger.explicit_bases(),
+        resolved_target,
+        resolved_bases,
+        diffs,
+    );
     // Root-level content generators
     let t = Instant::now();
     generate_checks_status_json(&out_dir, config, &all_checks, &skipped_checks)?;
@@ -1106,20 +1112,23 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
 
     // Root-level report.json (generated first so dashboard can embed it)
     let t = Instant::now();
-    report::generate(&report::ReportInput {
-        dir: &out_dir,
-        config,
-        diffs,
-        checks: &all_checks,
-        resolved_target,
-        resolved_bases,
-        ctx: &dash_ctx,
-        run_started_at: &run_started_at,
-        heuristics,
-        regression: Some(&regression_report),
-        provenance: &provenance_consistency,
-        scope,
-    })?;
+    report::generate_for_range(
+        &report::ReportInput {
+            dir: &out_dir,
+            config,
+            diffs,
+            checks: &all_checks,
+            resolved_target,
+            resolved_bases,
+            ctx: &dash_ctx,
+            run_started_at: &run_started_at,
+            heuristics,
+            regression: Some(&regression_report),
+            provenance: &provenance_consistency,
+            scope,
+        },
+        &review_range,
+    )?;
     generate_consistency_check(&summary_dir, &out_dir, diffs, &provenance_consistency)?;
     stage_timings.push(finish_timing(emit_human_stdout, "report.json", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::ReportJson)?;
@@ -1143,7 +1152,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     // RUN.json/MANIFEST so the manifest hashes it like any other pack file.
     let t = Instant::now();
     generate_provenance_json(ProvenanceJsonInput {
-        config,
+        review_range: &review_range,
         dir: &summary_dir,
         checks: &all_checks,
         skipped_checks: &skipped_checks,
@@ -1915,7 +1924,7 @@ fn generate_heuristics_gate_result(
 }
 
 struct ProvenanceJsonInput<'a> {
-    config: &'a Config,
+    review_range: &'a ReviewRange,
     dir: &'a Path,
     checks: &'a [CheckResult],
     /// Checks that were configured but never executed. They are gates too: a
@@ -1977,7 +1986,7 @@ fn provenance_bases<'a>(
 fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
     use serde_json::json;
     let ProvenanceJsonInput {
-        config,
+        review_range,
         dir,
         checks,
         skipped_checks,
@@ -2031,7 +2040,7 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
 
     let provenance = json!({
         "schema_version": "2.0",
-        "review_range": ReviewRange::assess(config, resolved_target, resolved_bases, diffs),
+        "review_range": review_range,
         "generated_at": chrono::Local::now().to_rfc3339(),
         // Commit whose tree the pack judges.
         "target_sha": resolved_target.commit_id,

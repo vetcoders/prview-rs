@@ -502,7 +502,6 @@ impl TuiState {
     pub fn finish_base_selection(&mut self) {
         if !self.branch_selector.selected_bases.is_empty() {
             self.base_branches = self.branch_selector.selected_bases.clone();
-            self.config.explicit_bases = true;
             self.config.bases = self.branch_selector.selected_bases.clone();
         }
         self.wizard_mode = WizardMode::None;

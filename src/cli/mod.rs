@@ -73,10 +73,6 @@ pub struct Cli {
     #[arg(index = 2, num_args = 0..)]
     pub bases: Vec<String>,
 
-    /// Internal MCP transport: positional bases were selected automatically.
-    #[arg(long, hide = true)]
-    pub auto_selected_bases: bool,
-
     // === Presets ===
     /// Quick mode: skip tests, lint, bundle, and heuristics
     #[arg(long, conflicts_with_all = ["deep", "ci", "ai_only"])]
@@ -672,7 +668,6 @@ mod tests {
             command: None,
             target: None,
             bases: vec![],
-            auto_selected_bases: false,
             quick: false,
             deep: false,
             ci: false,

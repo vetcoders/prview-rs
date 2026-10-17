@@ -173,8 +173,6 @@ pub struct Config {
     /// Internal runtime state, never a manifest override; set by
     /// `prview gate --base <REF> --exact-base`.
     pub required_base_exact: bool,
-    /// The caller selected bases, rather than accepting automatic discovery.
-    pub explicit_bases: bool,
     pub bases: Vec<String>,
     pub profile: DetectedProfile,
     /// `Some` opts into deriving the run profile from the reviewed tree after
@@ -895,6 +893,11 @@ fn cargo_manifest_path(root: &str) -> String {
 }
 
 impl Config {
+    /// A PR or required base is explicit regardless of an automatic override.
+    pub(crate) fn bases_were_explicitly_selected(&self, selected: bool) -> bool {
+        selected || self.pr_number.is_some() || self.required_base.is_some()
+    }
+
     /// Detect an exact review profile from regular blobs in the pinned Git
     /// tree. A materialized snapshot may contain symlinks into the operator's
     /// filesystem, so filesystem marker probes cannot establish this profile.
@@ -1071,7 +1074,6 @@ impl Config {
             pinned_diff_bases: None,
             required_base: None,
             required_base_exact: false,
-            explicit_bases: false,
             bases: vec![],
             profile,
             requested_profile: None,
@@ -1254,8 +1256,6 @@ impl Config {
 
         config.target = target;
         config.bases = bases;
-        config.explicit_bases =
-            (!cli.bases.is_empty() && !cli.auto_selected_bases) || cli.pr.is_some();
         config.security_full = cli.security_full;
         config.execution_mode = cli.execution_mode();
         config.enforcement_mode = EnforcementMode::from_ci_flags(cli.ci, cli.fail_on_warnings);

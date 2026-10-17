@@ -102,6 +102,8 @@ pub struct App {
     /// The signal handler in `main` needs it too, and can only reach it through
     /// something that outlives the run future.
     governor: std::sync::Arc<governor::ResourceGovernor>,
+    /// Selection intent belongs to this run, outside the exhaustive Config API.
+    explicit_bases: bool,
 }
 
 impl App {
@@ -116,7 +118,8 @@ impl App {
     /// Create new App instance from CLI arguments
     pub fn new(cli: &Cli) -> Result<Self> {
         let config = Config::from_cli(cli)?;
-        Self::from_config(config)
+        Ok(Self::from_config(config)?
+            .with_explicit_bases(!cli.bases.is_empty() || cli.pr.is_some()))
     }
 
     /// Create new App instance from Config
@@ -126,11 +129,23 @@ impl App {
             std::sync::Arc::new(governor::ResourceGovernor::from_plan(config.resource_plan));
 
         Ok(Self {
+            explicit_bases: config.pr_number.is_some(),
             config,
             repo,
             start_time: Instant::now(),
             governor,
         })
+    }
+
+    /// Preserve caller selection intent without changing the public Config shape.
+    ///
+    /// `from_config` retains its historical automatic classification: a Config
+    /// alone cannot distinguish explicit bases from materialized CLI defaults.
+    /// `new` records CLI intent; other callers can supply it with this builder.
+    #[must_use]
+    pub fn with_explicit_bases(mut self, explicit_bases: bool) -> Self {
+        self.explicit_bases = explicit_bases;
+        self
     }
 
     /// This run's resource governor, for a supervisor that has to cancel it.
@@ -215,7 +230,9 @@ impl App {
         // A previous target-tree result cannot satisfy an explicit request to
         // compare the target with itself, even when HEAD is unchanged.
         let explicit_self_diff = !self.config.current_only
-            && (self.config.explicit_bases || self.config.required_base.is_some())
+            && self
+                .config
+                .bases_were_explicitly_selected(self.explicit_bases)
             && bases.iter().any(|base| base.commit_id == target.commit_id);
         if self.config.update_mode
             && !explicit_self_diff
@@ -237,7 +254,10 @@ impl App {
         // The ledger is the run's record of what work was considered and how it
         // resolved. It also OWNS the run's shared target snapshot, so it must
         // outlive artifact generation (step 7), which reads that snapshot.
-        let ledger = ledger::TaskLedger::new();
+        let ledger = ledger::TaskLedger::new().with_explicit_bases(
+            self.config
+                .bases_were_explicitly_selected(self.explicit_bases),
+        );
         let mut run_config = self.config.clone();
         run_config.pinned_target = Some(target.clone());
         // Profile detection at CLI startup sees the operator checkout. An
@@ -665,7 +685,10 @@ impl App {
         // still needs the reviewed tree. An exact target keeps its snapshot in
         // the ledger through artifact generation; an ambient watch iteration
         // reads the live working tree it is watching.
-        let ledger = ledger::TaskLedger::new();
+        let ledger = ledger::TaskLedger::new().with_explicit_bases(
+            self.config
+                .bases_were_explicitly_selected(self.explicit_bases),
+        );
         let mut run_config = self.config.clone();
         run_config.pinned_target = Some(target.clone());
         run_headless_sync_stage(&self.governor, || {
@@ -917,7 +940,10 @@ impl App {
         if let Some(range) = previous_range {
             let same_modes = range["current_only"].as_bool() == Some(self.config.current_only)
                 && range["explicit_bases"].as_bool()
-                    == Some(self.config.explicit_bases || self.config.required_base.is_some());
+                    == Some(
+                        self.config
+                            .bases_were_explicitly_selected(self.explicit_bases),
+                    );
             let same_bases = range["comparisons"].as_array().is_some_and(|comparisons| {
                 comparisons.len() == bases.len()
                     && diff_bases.len() == bases.len()
@@ -1476,6 +1502,53 @@ mod tests {
         assert_eq!(gate["profile"], "Js", "{gate}");
     }
 
+    #[tokio::test]
+    async fn tui_and_watch_quick_runs_publish_the_captured_base_selection() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(repo.path(), out.path());
+        config.target = Some("main".to_owned());
+        config.run_lint = false;
+        config.run_tests = false;
+        for (index, explicit) in [false, true, true].into_iter().enumerate() {
+            config.output_dir = Some(out.path().join(format!("tui-{index}")));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::from_plan(
+                config.resource_plan,
+            ));
+            crate::tui::run_analysis_with_explicit_bases(config.clone(), tx, governor, explicit)
+                .await
+                .unwrap();
+            let read = |name: &str| -> serde_json::Value {
+                serde_json::from_slice(
+                    &std::fs::read(config.output_dir.as_ref().unwrap().join(name)).unwrap(),
+                )
+                .unwrap()
+            };
+            let gate = read("00_summary/MERGE_GATE.json");
+            assert_eq!(gate["review_range"]["explicit_bases"], explicit);
+            assert_eq!(gate["review_range"], read("report.json")["review_range"]);
+            assert_eq!(
+                gate["review_range"],
+                read("00_summary/PROVENANCE.json")["review_range"]
+            );
+        }
+        let mut app = crate::App::from_config(config)
+            .unwrap()
+            .with_explicit_bases(true);
+        // run_watch delegates every iteration to this same quick entry point.
+        for index in 0..2 {
+            // Each immutable pack needs its own explicit output directory.
+            app.config.output_dir = Some(out.path().join(format!("quick-watch-{index}")));
+            let report = app.run_quick().await.unwrap();
+            let gate: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(report.artifacts_dir.join("00_summary/MERGE_GATE.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(gate["review_range"]["explicit_bases"], true);
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn ambient_review_keeps_external_manifest_cargo_root() {
@@ -1956,7 +2029,6 @@ mod tests {
         let other = rev_parse(tmp.path(), "HEAD");
         git_run(tmp.path(), &["checkout", "-q", "feature"]);
         config.bases = vec!["other".to_owned()];
-        config.explicit_bases = true;
         let mut requested = resolved(&other);
         requested.name = "other".to_owned();
         config.required_base = Some(requested);

@@ -1302,6 +1302,17 @@ one explicit self-diff still requires review. `PROVENANCE.json`'s existing
 comparison, rather than substituting a descendant's requested tip. These rules
 do not change the global PASS/CONDITIONAL/BLOCK or process-exit mappings.
 
+The exhaustive public Rust `Config` and `Cli` structs retain their field sets.
+Selection intent is private run state: `App::new(&cli)` captures CLI selection,
+and `App::from_config(config).with_explicit_bases(true)` records an explicit
+library request. A `Config` alone cannot distinguish caller-selected bases from
+materialized defaults, so `from_config` retains historical automatic
+classification unless a PR or required base identifies an explicit request.
+Direct artifact callers can record the same fact with
+`TaskLedger::new().with_explicit_bases(true)`; it then feeds all pack surfaces.
+The TUI commits explicit intent only after confirming a nonempty base selection;
+an abandoned wizard does not change the preceding run intent.
+
 Empty comparisons retain `HEAD` in `pr-metadata.txt`. Update mode compares the
 recorded comparison modes, requested identities and effective base SHAs before
 reusing a modern pack; a prior self-diff assessment cannot become an automatic or current-only

@@ -3,14 +3,14 @@
 use super::*;
 use crate::policy::engine::{AnalysisStatus, MergeRecommendation};
 
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub(super) struct ReviewRange {
     pub current_only: bool,
     pub explicit_bases: bool,
     pub comparisons: Vec<ReviewComparison>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(super) struct ReviewComparison {
     pub base: String,
     pub requested_base_sha: String,
@@ -22,6 +22,7 @@ pub(super) struct ReviewComparison {
 impl ReviewRange {
     pub fn assess(
         config: &Config,
+        explicit_bases: bool,
         target: &ResolvedRef,
         bases: &[ResolvedRef],
         diffs: &[Diff],
@@ -56,7 +57,7 @@ impl ReviewRange {
             .collect();
         Self {
             current_only: config.current_only,
-            explicit_bases: config.explicit_bases || config.required_base.is_some(),
+            explicit_bases: config.bases_were_explicitly_selected(explicit_bases),
             comparisons,
         }
     }

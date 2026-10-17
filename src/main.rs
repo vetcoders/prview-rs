@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
 use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use colored::Colorize;
 use prview::cli::{GateArgs, McpArgs};
 use prview::git::git_cmd;
@@ -24,6 +26,17 @@ use std::process::Command;
 /// of branching on `cfg(windows)`: Unix's 8 MiB default never overflowed, and a
 /// larger reservation there costs nothing.
 const ROOT_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+// Internal child transport extends the binary parser, not the exhaustive Cli
+// struct consumed by downstream Rust callers.
+fn runtime_command() -> clap::Command {
+    Cli::command().arg(
+        clap::Arg::new("auto-selected-bases")
+            .long("auto-selected-bases")
+            .hide(true)
+            .action(clap::ArgAction::SetTrue),
+    )
+}
 
 fn main() {
     let root = std::thread::Builder::new()
@@ -134,7 +147,10 @@ async fn run() -> Result<()> {
         None => {}
     }
 
-    let cli = Cli::parse();
+    let matches = runtime_command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let explicit_bases =
+        (!cli.bases.is_empty() && !matches.get_flag("auto-selected-bases")) || cli.pr.is_some();
 
     if cli.build_source_sha {
         // Build-script provenance is intentionally a private binary probe, not
@@ -194,11 +210,11 @@ async fn run() -> Result<()> {
     // supervisor before raw mode, then the event loop receives Ctrl-C as a key
     // and owns analysis cancellation/terminal cleanup.
     if cli.tui {
-        prview::tui::run_tui(config).await?;
+        prview::tui::run_tui_with_explicit_bases(config, explicit_bases).await?;
         return Ok(());
     }
 
-    let app = App::from_config(config)?;
+    let app = App::from_config(config)?.with_explicit_bases(explicit_bases);
     let governor = app.governor();
 
     // Watch mode. Deliberately unbounded: the deadline bounds ONE review, and
@@ -395,7 +411,8 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
         args.fail_on_warnings,
     );
     config.apply_gate_profile(enforcement_mode, prview::config::resolve_gate_deadline(cli));
-    let mut app = App::from_config(config)?;
+    let mut app = App::from_config(config)?
+        .with_explicit_bases(!run_cli.bases.is_empty() || run_cli.pr.is_some());
     if let Some(base) = &args.base {
         pin_explicit_gate_base(&mut app, base, args.exact_base)?;
     }

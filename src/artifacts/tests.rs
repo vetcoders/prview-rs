@@ -8083,7 +8083,13 @@ fn write_provenance_fixture_with_capture(
     );
 
     generate_provenance_json(ProvenanceJsonInput {
-        config: &crate::config::test_config(),
+        review_range: &ReviewRange::assess(
+            &crate::config::test_config(),
+            false,
+            &resolved_target,
+            &resolved_bases,
+            diffs,
+        ),
         dir: out,
         checks,
         skipped_checks,

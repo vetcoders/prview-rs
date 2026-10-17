@@ -337,7 +337,13 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         }
     }
 
-    let review_range = ReviewRange::assess(config, resolved_target, resolved_bases, diffs);
+    let review_range = ReviewRange::assess(
+        config,
+        ledger.explicit_bases(),
+        resolved_target,
+        resolved_bases,
+        diffs,
+    );
     review_caveats.extend(review_range.apply_review(&mut worst_confidence, &mut worst_merge));
     if review_range.requires_review() {
         enforcement_disposition.raise_to(EnforcementDisposition::ReviewRequired);

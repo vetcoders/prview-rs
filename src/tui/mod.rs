@@ -45,7 +45,11 @@ tokio::task_local! {
 }
 
 impl AnalysisTask {
-    fn spawn(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -> Self {
+    fn spawn_with_explicit_bases(
+        config: Config,
+        tx: mpsc::UnboundedSender<TuiEvent>,
+        explicit_bases: bool,
+    ) -> Self {
         let governor = Arc::new(crate::governor::ResourceGovernor::from_plan(
             config.resource_plan,
         ));
@@ -55,7 +59,7 @@ impl AnalysisTask {
         let handle = tokio::spawn(async move {
             crate::governor::with_run_scope(
                 run_governor,
-                run_analysis(config, tx, analysis_governor),
+                run_analysis_with_explicit_bases(config, tx, analysis_governor, explicit_bases),
             )
             .await
         });
@@ -133,6 +137,12 @@ async fn wait_for_deadline_termination(mut termination: tokio::task::JoinHandle<
 
 /// Run the TUI application
 pub async fn run_tui(config: Config) -> Result<()> {
+    run_tui_with_explicit_bases(config, false).await
+}
+
+/// Run the TUI with the entry point's explicit versus automatic base selection.
+/// The existing Config and TuiState remain usable by exhaustive Rust callers.
+pub async fn run_tui_with_explicit_bases(config: Config, explicit_bases: bool) -> Result<()> {
     // Preflight can fetch and resolve refs. Do it before raw mode, but under a
     // real Ctrl-C supervisor: otherwise the terminal stops translating ^C
     // into a signal before the key-event loop exists, leaving both prview and
@@ -178,7 +188,15 @@ pub async fn run_tui(config: Config) -> Result<()> {
         let mut analysis = None;
 
         // Run event loop
-        run_event_loop(&mut terminal, &mut state, &tx, &mut rx, &mut analysis).await
+        run_event_loop_with_explicit_bases(
+            &mut terminal,
+            &mut state,
+            &tx,
+            &mut rx,
+            &mut analysis,
+            explicit_bases,
+        )
+        .await
     }
     .await;
 
@@ -282,7 +300,21 @@ async fn run_event_loop<B: Backend>(
 where
     B::Error: Send + Sync + 'static,
 {
-    let result = run_event_loop_inner(terminal, state, tx, rx, analysis).await;
+    run_event_loop_with_explicit_bases(terminal, state, tx, rx, analysis, false).await
+}
+
+async fn run_event_loop_with_explicit_bases<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut TuiState,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+    rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
+    analysis: &mut Option<AnalysisTask>,
+    explicit_bases: bool,
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    let result = run_event_loop_inner(terminal, state, tx, rx, analysis, explicit_bases).await;
     join_cancelled_analysis(result, analysis).await
 }
 
@@ -292,6 +324,7 @@ async fn run_event_loop_inner<B: Backend>(
     tx: &mpsc::UnboundedSender<TuiEvent>,
     rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
     analysis: &mut Option<AnalysisTask>,
+    mut explicit_bases: bool,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -325,9 +358,13 @@ where
                 state.running = true;
                 state.start_time = Some(std::time::Instant::now());
                 state.message = "Starting analysis...".to_string();
-                *analysis = Some(AnalysisTask::spawn(state.config.clone(), tx.clone()));
+                *analysis = Some(AnalysisTask::spawn_with_explicit_bases(
+                    state.config.clone(),
+                    tx.clone(),
+                    explicit_bases,
+                ));
             } else {
-                keys::handle_key(state, key, tx).await?;
+                handle_selection_key(state, key, tx, &mut explicit_bases).await?;
             }
             if state.should_quit {
                 break;
@@ -345,6 +382,22 @@ where
         }
     }
 
+    Ok(())
+}
+
+async fn handle_selection_key(
+    state: &mut TuiState,
+    key: crossterm::event::KeyEvent,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+    explicit_bases: &mut bool,
+) -> Result<()> {
+    let commits_base_selection = state.wizard_mode == WizardMode::SelectBase
+        && key.code == crossterm::event::KeyCode::Enter
+        && !state.branch_selector.selected_bases.is_empty();
+    keys::handle_key(state, key, tx).await?;
+    if commits_base_selection && state.wizard_mode == WizardMode::None {
+        *explicit_bases = true;
+    }
     Ok(())
 }
 
@@ -659,8 +712,18 @@ pub async fn run_analysis(
     tx: mpsc::UnboundedSender<TuiEvent>,
     governor: Arc<crate::governor::ResourceGovernor>,
 ) -> Result<()> {
+    run_analysis_with_explicit_bases(config, tx, governor, false).await
+}
+
+pub(crate) async fn run_analysis_with_explicit_bases(
+    config: Config,
+    tx: mpsc::UnboundedSender<TuiEvent>,
+    governor: Arc<crate::governor::ResourceGovernor>,
+    explicit_bases: bool,
+) -> Result<()> {
     let t_start = std::time::Instant::now();
-    let ledger = crate::ledger::TaskLedger::new();
+    let ledger = crate::ledger::TaskLedger::new()
+        .with_explicit_bases(config.bases_were_explicitly_selected(explicit_bases));
 
     // --- Sync phase: all git2 (non-Send) work happens here ---
     // `blocking_stage` keeps a one-worker runtime able to poll q/Escape while
@@ -870,6 +933,62 @@ mod tests {
 
     fn default_config() -> Config {
         test_config()
+    }
+
+    #[tokio::test]
+    async fn base_selection_intent_commits_only_on_confirmation_and_survives_later_runs() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = TuiState::new(default_config());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut explicit = false;
+        state.start_base_wizard();
+        state.branch_selector.selected_bases = vec!["main".to_owned()];
+        handle_selection_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+            &mut explicit,
+        )
+        .await
+        .unwrap();
+        assert!(!explicit, "an abandoned working selection is not a request");
+        state.start_base_wizard();
+        handle_selection_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+            &mut explicit,
+        )
+        .await
+        .unwrap();
+        assert!(!explicit, "an empty confirmation changes no bases");
+        state.start_base_wizard();
+        state.branch_selector.selected_bases = vec!["main".to_owned()];
+        handle_selection_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+            &mut explicit,
+        )
+        .await
+        .unwrap();
+        assert!(explicit);
+        assert_eq!(state.config.bases, ["main"]);
+        state.start_base_wizard();
+        state.branch_selector.selected_bases = vec!["other".to_owned()];
+        handle_selection_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+            &mut explicit,
+        )
+        .await
+        .unwrap();
+        assert!(
+            explicit,
+            "a later cancelled wizard preserves committed intent"
+        );
+        assert_eq!(state.config.bases, ["main"]);
     }
 
     #[tokio::test]

@@ -158,6 +158,8 @@ pub struct TaskEntry {
 /// task must not turn the whole ledger into a run-ending error.
 #[derive(Default)]
 pub struct TaskLedger {
+    /// Immutable selection intent captured by the run's entry point.
+    explicit_bases: bool,
     entries: Mutex<Vec<TaskEntry>>,
     /// The one target snapshot the run shares. Materialising it stays the
     /// dispatcher's job, but OWNING it is the ledger's: the ledger outlives
@@ -183,6 +185,17 @@ impl TaskLedger {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record explicit versus automatic base selection before starting the run.
+    #[must_use]
+    pub fn with_explicit_bases(mut self, explicit_bases: bool) -> Self {
+        self.explicit_bases = explicit_bases;
+        self
+    }
+
+    pub(crate) fn explicit_bases(&self) -> bool {
+        self.explicit_bases
     }
 
     /// Record a resolved task.

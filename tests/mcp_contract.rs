@@ -877,6 +877,57 @@ fn run_review_without_base_uses_origin_head_default_branch() {
 }
 
 #[test]
+fn run_review_distinguishes_automatic_and_explicit_same_origin_base() {
+    let repo = fixture_repo_with_base("main", true);
+    run_git(repo.path(), &["checkout", "main"]);
+    std::fs::write(
+        repo.path().join(".prview-policy.yml"),
+        "version: 1\nmode: warn\ndefault_severity: ignore\n",
+    )
+    .unwrap();
+    run_git(repo.path(), &["add", ".prview-policy.yml"]);
+    run_git(
+        repo.path(),
+        &["commit", "-m", "ignore unrelated fixture signals"],
+    );
+    run_git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    for explicit in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+        let mut args = serde_json::json!({"repo":repo.path(), "profile":"quick"});
+        if explicit {
+            args["base"] = "origin/main".into();
+        }
+        let result = s.call_tool("run_review", args);
+        assert!(!is_error(&result), "{result}");
+        let body = tool_body(&result);
+        assert_eq!(body["base_used"], serde_json::json!(["origin/main"]));
+        let pack = Path::new(body["artifact_paths"]["pack"].as_str().unwrap());
+        let read = |name: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(pack.join(name)).unwrap()).unwrap()
+        };
+        let gate = read("00_summary/MERGE_GATE.json");
+        assert_eq!(gate["review_range"]["explicit_bases"], explicit);
+        assert_eq!(
+            gate["review_range"]["comparisons"][0]["status"],
+            "self_diff"
+        );
+        assert_eq!(
+            gate["decision"]["verdict"],
+            if explicit { "CONDITIONAL" } else { "PASS" }
+        );
+        assert_eq!(gate["review_range"], read("report.json")["review_range"]);
+        assert_eq!(
+            gate["review_range"],
+            read("00_summary/PROVENANCE.json")["review_range"]
+        );
+    }
+}
+
+#[test]
 fn run_review_without_base_uses_remote_origin_head_not_stale_local_main() {
     let home = tempfile::tempdir().unwrap();
     let repo = fixture_repo_with_stale_local_default();

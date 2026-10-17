@@ -73,10 +73,23 @@ pub struct ReportInput<'a> {
 }
 
 /// Generate `report.json` in the artifact root directory.
+#[cfg(test)]
 pub fn generate(input: &ReportInput<'_>) -> Result<()> {
     let report = build_report(input);
     let json = serde_json::to_string_pretty(&report)?;
     std::fs::write(input.dir.join("report.json"), json)?;
+    Ok(())
+}
+
+pub(super) fn generate_for_range(
+    input: &ReportInput<'_>,
+    review_range: &super::review_range::ReviewRange,
+) -> Result<()> {
+    let report = build_report_for_range(input, Some(review_range));
+    std::fs::write(
+        input.dir.join("report.json"),
+        serde_json::to_string_pretty(&report)?,
+    )?;
     Ok(())
 }
 
@@ -675,7 +688,15 @@ struct UiHints {
 // Builder
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn build_report(input: &ReportInput<'_>) -> Report {
+    build_report_for_range(input, None)
+}
+
+fn build_report_for_range(
+    input: &ReportInput<'_>,
+    review_range: Option<&super::review_range::ReviewRange>,
+) -> Report {
     let ReportInput {
         config,
         diffs,
@@ -1239,12 +1260,15 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         .collect();
 
     Report {
-        review_range: super::review_range::ReviewRange::assess(
-            config,
-            resolved_target,
-            resolved_bases,
-            diffs,
-        ),
+        review_range: review_range.cloned().unwrap_or_else(|| {
+            super::review_range::ReviewRange::assess(
+                config,
+                false,
+                resolved_target,
+                resolved_bases,
+                diffs,
+            )
+        }),
         // 3.0: `quality.breaking_changes.md_path` is nullable and
         // `gate.status` carries the canonical
         // PASS/CONDITIONAL/BLOCK verdict. Readers must migrate from 2.0.
