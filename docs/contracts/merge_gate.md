@@ -1303,8 +1303,8 @@ comparison, rather than substituting a descendant's requested tip. These rules
 do not change the global PASS/CONDITIONAL/BLOCK or process-exit mappings.
 
 Empty comparisons retain `HEAD` in `pr-metadata.txt`. Update mode compares the
-recorded comparison modes and requested identities before reusing a modern
-pack; a prior self-diff assessment cannot become an automatic or current-only
+recorded comparison modes, requested identities and effective base SHAs before
+reusing a modern pack; a prior self-diff assessment cannot become an automatic or current-only
 assessment merely because HEAD stayed unchanged. Legacy empty packs can recover
 their target SHA from `PROVENANCE.json`; legacy packs without readable comparison
 coverage retain the earlier reuse behavior, with the explicit-self guard applied.

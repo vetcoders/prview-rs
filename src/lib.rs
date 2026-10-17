@@ -183,27 +183,31 @@ impl App {
         // 1-2. Refresh and resolve refs. These operations are synchronous and
         // libgit2-backed; on a one-worker runtime they must yield the worker to
         // the separately spawned Ctrl-C supervisor just like the TUI sync phase.
-        let (worktree, target, bases) = run_headless_sync_stage(&self.governor, || {
-            self.ensure_not_cancelled()?;
-            // Capture source provenance only after the run-wide Ctrl-C scope is
-            // installed. `git2::statuses` can block on a large worktree, and
-            // doing it in `from_config` starved a one-worker runtime before its
-            // interrupt supervisor had ever been polled. This remains the first
-            // tree read of the run, before ref refresh, checks, or artifacts.
-            let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
-            self.ensure_not_cancelled()?;
-            self.repo.prepare_refs(&self.config)?;
-            self.ensure_not_cancelled()?;
+        let (worktree, target, bases, diff_bases) =
+            run_headless_sync_stage(&self.governor, || {
+                self.ensure_not_cancelled()?;
+                // Capture source provenance only after the run-wide Ctrl-C scope is
+                // installed. `git2::statuses` can block on a large worktree, and
+                // doing it in `from_config` starved a one-worker runtime before its
+                // interrupt supervisor had ever been polled. This remains the first
+                // tree read of the run, before ref refresh, checks, or artifacts.
+                let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
+                self.ensure_not_cancelled()?;
+                self.repo.prepare_refs(&self.config)?;
+                self.ensure_not_cancelled()?;
 
-            let target = self.repo.resolve_target(&self.config)?;
-            let bases = if self.config.current_only {
-                Vec::new()
-            } else {
-                self.repo.resolve_bases(&self.config)?
-            };
-            self.ensure_not_cancelled()?;
-            Ok((worktree, target, bases))
-        })?;
+                let target = self.repo.resolve_target(&self.config)?;
+                let bases = if self.config.current_only {
+                    Vec::new()
+                } else {
+                    self.repo.resolve_bases(&self.config)?
+                };
+                // Capture the effective comparison before update reuse as well as
+                // diff generation: exact and merge-base modes can share both tips.
+                let diff_bases = self.repo.resolve_diff_bases(&self.config, &target, &bases);
+                self.ensure_not_cancelled()?;
+                Ok((worktree, target, bases, diff_bases))
+            })?;
         self.ensure_not_cancelled()?;
 
         // 3. Check for update mode
@@ -217,18 +221,15 @@ impl App {
             && !explicit_self_diff
             && let Some(prev_run) = self.find_previous_run()?
             && let Some(report) =
-                self.reuse_unchanged_run(&target, &bases, prev_run, emit_human_stdout)?
+                self.reuse_unchanged_run(&target, &bases, &diff_bases, prev_run, emit_human_stdout)?
         {
             return Ok(report);
         }
 
         // 4. Generate diffs
-        let (diff_bases, diffs) = run_headless_sync_stage(&self.governor, || {
-            let diff_bases = self.repo.resolve_diff_bases(&self.config, &target, &bases);
-            let diffs = self
-                .repo
-                .generate_diffs(&target, &diff_bases, self.config.quiet)?;
-            Ok((diff_bases, diffs))
+        let diffs = run_headless_sync_stage(&self.governor, || {
+            self.repo
+                .generate_diffs(&target, &diff_bases, self.config.quiet)
         })?;
         self.ensure_not_cancelled()?;
 
@@ -898,6 +899,7 @@ impl App {
         &self,
         target: &git::ResolvedRef,
         bases: &[git::ResolvedRef],
+        diff_bases: &[git::ResolvedRef],
         prev_run: std::path::PathBuf,
         emit_human_stdout: bool,
     ) -> Result<Option<output::Report>> {
@@ -918,12 +920,18 @@ impl App {
                     == Some(self.config.explicit_bases || self.config.required_base.is_some());
             let same_bases = range["comparisons"].as_array().is_some_and(|comparisons| {
                 comparisons.len() == bases.len()
-                    && comparisons.iter().zip(bases).all(|(previous, base)| {
-                        previous["base"].as_str() == Some(base.name.as_str())
-                            && previous["requested_base_sha"].as_str()
-                                == Some(base.commit_id.as_str())
-                            && previous["target_sha"].as_str() == Some(target.commit_id.as_str())
-                    })
+                    && diff_bases.len() == bases.len()
+                    && comparisons.iter().zip(bases.iter().zip(diff_bases)).all(
+                        |(previous, (base, diff_base))| {
+                            previous["base"].as_str() == Some(base.name.as_str())
+                                && previous["requested_base_sha"].as_str()
+                                    == Some(base.commit_id.as_str())
+                                && previous["effective_base_sha"].as_str()
+                                    == Some(diff_base.commit_id.as_str())
+                                && previous["target_sha"].as_str()
+                                    == Some(target.commit_id.as_str())
+                        },
+                    )
             });
             if !same_modes || !same_bases {
                 return Ok(None);
@@ -1936,6 +1944,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn update_reuse_checks_effective_bases_in_both_normalization_directions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(tmp.path(), out.path());
+        let ancestor = rev_parse(tmp.path(), "main");
+        git_run(tmp.path(), &["checkout", "-q", "-b", "other", "main"]);
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn keep() {}\n// edit\n").unwrap();
+        git_run(tmp.path(), &["commit", "-qam", "divergent equal tree"]);
+        let other = rev_parse(tmp.path(), "HEAD");
+        git_run(tmp.path(), &["checkout", "-q", "feature"]);
+        config.bases = vec!["other".to_owned()];
+        config.explicit_bases = true;
+        let mut requested = resolved(&other);
+        requested.name = "other".to_owned();
+        config.required_base = Some(requested);
+        let prev = tempfile::tempdir().unwrap();
+        std::fs::create_dir(prev.path().join("00_summary")).unwrap();
+
+        for exact in [false, true] {
+            config.required_base_exact = exact;
+            let app = crate::App::from_config(config.clone()).unwrap();
+            let target = app.repo.resolve_target(&app.config).unwrap();
+            let bases = app.repo.resolve_bases(&app.config).unwrap();
+            let effective = app.repo.resolve_diff_bases(&app.config, &target, &bases);
+            let expected = if exact { &other } else { &ancestor };
+            let different = if exact { &ancestor } else { &other };
+            assert_eq!(&effective[0].commit_id, expected);
+            std::fs::write(
+                prev.path().join("00_summary/pr-metadata.txt"),
+                format!("HEAD: feature ({})\n", target.commit_id),
+            )
+            .unwrap();
+            for previous_effective in [different, expected] {
+                std::fs::write(
+                    prev.path().join("report.json"),
+                    serde_json::json!({"review_range": {
+                        "current_only": false, "explicit_bases": true,
+                        "comparisons": [{"base": "other", "requested_base_sha": other,
+                            "effective_base_sha": previous_effective,
+                            "target_sha": target.commit_id}]
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+                let reused = app
+                    .reuse_unchanged_run(
+                        &target,
+                        &bases,
+                        &effective,
+                        prev.path().to_path_buf(),
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    reused.is_some(),
+                    previous_effective == expected,
+                    "exact={exact}"
+                );
+            }
+        }
+    }
+
     /// `--update` is the one path that returns a report without running a
     /// single stage, and so the one that reached `main` with a verdict while
     /// the operator was pressing Ctrl-C. Even after `git fetch` is registered
@@ -1969,7 +2040,7 @@ mod tests {
 
         // Uncancelled, the seam does what `--update` exists to do.
         let reused = app
-            .reuse_unchanged_run(&target, &[], prev.path().to_path_buf(), false)
+            .reuse_unchanged_run(&target, &[], &[], prev.path().to_path_buf(), false)
             .unwrap()
             .expect("HEAD has not moved, so the previous pack is reused");
         assert!(reused.unchanged, "the reused report is the unchanged one");
@@ -1977,7 +2048,7 @@ mod tests {
 
         app.governor().cancel();
         let err = app
-            .reuse_unchanged_run(&target, &[], prev.path().to_path_buf(), false)
+            .reuse_unchanged_run(&target, &[], &[], prev.path().to_path_buf(), false)
             .expect_err("a cancelled run must not hand back a pack to take a verdict from");
         assert!(
             crate::governor::is_cancellation(&err),

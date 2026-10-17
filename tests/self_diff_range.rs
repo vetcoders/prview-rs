@@ -321,6 +321,85 @@ fn update_cannot_reuse_auto_pass_for_explicit_self_diff() {
 }
 
 #[test]
+fn update_compares_effective_base_without_disabling_identical_range_reuse() {
+    let repo = fixture();
+    git(repo.path(), &["checkout", "-b", "other", "main"]);
+    fs::write(repo.path().join("README.md"), "base\nchange\n").unwrap();
+    git(
+        repo.path(),
+        &["commit", "-am", "same tree on divergent base"],
+    );
+    git(repo.path(), &["checkout", "feature"]);
+    let env = support::ContractEnvironment::new();
+    let (exact, exact_gate, _) = run(
+        &env,
+        repo.path(),
+        &["gate", "--base", "other", "--exact-base", "--json"],
+        0,
+    );
+    let exact_range = &exact_gate["review_range"]["comparisons"][0];
+    assert_eq!(exact_range["status"], "equal_trees");
+    assert_ne!(exact_range["requested_base_sha"], exact_range["target_sha"]);
+    let args = [
+        "feature",
+        "other",
+        "--update",
+        "--quick",
+        "--skip-security",
+        "--json",
+        "--no-fetch",
+        "--no-zip",
+    ];
+    let (normalized, normalized_gate, _) = run(&env, repo.path(), &args, 0);
+    assert_ne!(
+        normalized["output_dir"], exact["output_dir"],
+        "an unchanged requested tip cannot reuse a different effective comparison"
+    );
+    let normalized_range = &normalized_gate["review_range"]["comparisons"][0];
+    assert_eq!(normalized_range["status"], "compared");
+    assert_eq!(
+        normalized_range["requested_base_sha"],
+        exact_range["requested_base_sha"]
+    );
+    assert_ne!(
+        normalized_range["effective_base_sha"],
+        exact_range["effective_base_sha"]
+    );
+    // Keep only the current seed eligible, independent of timestamp ordering.
+    fs::remove_dir_all(Path::new(exact["output_dir"].as_str().unwrap())).unwrap();
+    let (unchanged, _, _) = run(&env, repo.path(), &args, 0);
+    assert_eq!(unchanged["output_dir"], normalized["output_dir"]);
+
+    // Exact and normalized modes may still reuse when the effective range agrees.
+    let env = support::ContractEnvironment::new();
+    let (ancestor_exact, _, _) = run(
+        &env,
+        repo.path(),
+        &["gate", "--base", "main", "--exact-base", "--json"],
+        0,
+    );
+    let (ancestor_normalized, _, _) = run(
+        &env,
+        repo.path(),
+        &[
+            "feature",
+            "main",
+            "--update",
+            "--quick",
+            "--skip-security",
+            "--json",
+            "--no-fetch",
+            "--no-zip",
+        ],
+        0,
+    );
+    assert_eq!(
+        ancestor_normalized["output_dir"],
+        ancestor_exact["output_dir"]
+    );
+}
+
+#[test]
 fn mcp_automatic_base_transport_keeps_automatic_self_diff_semantics() {
     let repo = fixture();
     git(repo.path(), &["checkout", "main"]);
