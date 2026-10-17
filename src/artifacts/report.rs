@@ -86,7 +86,7 @@ pub(super) fn generate_for_range(
     review_range: &super::review_range::ReviewRange,
 ) -> Result<()> {
     let report = build_report_for_range(input, Some(review_range));
-    std::fs::write(
+    crate::owned_output::fs::write(
         input.dir.join("report.json"),
         serde_json::to_string_pretty(&report)?,
     )?;

@@ -321,6 +321,32 @@ fn update_cannot_reuse_auto_pass_for_explicit_self_diff() {
 }
 
 #[test]
+fn self_diff_report_inside_the_caller_repo_uses_owned_output() {
+    let repo = fixture();
+    let env = support::ContractEnvironment::new();
+    let output = repo.path().join("owned-review-pack");
+    let (_, gate, _) = run(
+        &env,
+        repo.path(),
+        &[
+            "HEAD",
+            "self-alias",
+            "--quick",
+            "--skip-security",
+            "--json",
+            "--no-fetch",
+            "--no-zip",
+            "--output-dir",
+            output.to_str().unwrap(),
+        ],
+        0,
+    );
+    assert_eq!(gate["decision"]["verdict"], "CONDITIONAL");
+    assert!(output.join("report.json").is_file());
+    assert!(!output.join("00_summary/INCOMPLETE.json").exists());
+}
+
+#[test]
 fn update_reuses_matching_explicit_self_and_mixed_assessments() {
     let repo = fixture();
     git(repo.path(), &["checkout", "main"]);
