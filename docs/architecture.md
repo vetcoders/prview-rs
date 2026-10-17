@@ -4627,7 +4627,7 @@ These labels do not change the merge gate or relax incomplete analysis.
 
 For the supported npm/pnpm listing commands, the reviewed tree's
 `packageManager` declaration takes precedence over its lockfile. Without a
-supported declaration, nonempty lockfiles can select the manager; empty or
+package-manager declaration, nonempty lockfiles can select the manager; empty or
 whitespace-only files are ignored. If both lockfiles are nonempty, the existing
 pnpm-first order is retained; this is not validation of lockfile syntax. An
 explicit unsupported manager bypasses lockfile inference and retains the
@@ -4635,8 +4635,7 @@ existing PATH fallback. pnpm uses `list --depth Infinity`; npm uses
 `ls --all`. The compatibility fix adapts the existing local donor `08f7a5d9`.
 The command label identifies npm or pnpm; the existing `npm-sbom.txt` filename
 remains compatible for both. Other package managers retain the existing fallback
-behavior; this is not a
-claim of Yarn/Bun support. Failed commands record their exit status in RUN.
+behavior; this is not a claim of Yarn/Bun support. Failed commands record their exit status in RUN.
 
 `PR_REVIEW.md` (also embedded in `REVIEW_SUMMARY.md`) reports Loctree twins
 and unused-symbol counts only for an available scan of at least one file.
@@ -4655,8 +4654,11 @@ Invalid UTF-8 in retained bytes is decoded lossily with an explicit marker.
 This keeps late diagnostics visible after large traces; the retained artifact is
 explicitly incomplete. Short valid UTF-8 text stays byte-identical.
 
-JSON is validated as a stream without constructing an in-memory value, then
-copied in full (including stdout larger than 500 KB). Invalid JSON is retained
+Object/array JSON is validated as a stream without constructing an in-memory value, then
+copied byte-for-byte (including surrounding whitespace and stdout larger than
+500 KB). Validation checks JSON syntax, UTF-8 and paired Unicode escapes; it
+does not convert numbers to f64 or impose that numeric range. Downstream
+consumers may have narrower numeric limits. Invalid JSON is retained
 as bounded text in an additive `<requested-name>.raw.log` sibling, for example
 `eslint.json.raw.log`, with a format warning and the final diagnostic. It is
 never written under the requested `.json` name. A normal exit with invalid JSON
