@@ -1558,6 +1558,46 @@ fn cargo_audit_policy_key(config: &Config) -> Option<String> {
     cargo_audit_policy_key_with_home(config, home.as_deref())
 }
 
+/// Identity of a regular policy in the same pinned logical tree the snapshot
+/// materializes. Gitlinks are traversed only through their pinned object stores;
+/// symlink/non-directory ancestors and case aliases cannot authorize replay.
+fn reviewed_audit_policy_blob(
+    repo: &crate::git::Repository,
+    commit: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    use crate::git::GitTreeEntryKind;
+    let entries = repo.tree_entries_with_gitlinks_at_oid(commit)?;
+    let components = path.split('/').collect::<Vec<_>>();
+    for end in 1..=components.len() {
+        let prefix = components[..end].join("/");
+        anyhow::ensure!(
+            !entries
+                .iter()
+                .any(|entry| entry.path != prefix && entry.path.eq_ignore_ascii_case(&prefix)),
+            "case variant of audit policy path {prefix}"
+        );
+        let Some(entry) = entries.iter().find(|entry| entry.path == prefix) else {
+            return Ok(None);
+        };
+        if end == components.len() {
+            anyhow::ensure!(
+                entry.kind == GitTreeEntryKind::RegularFile,
+                "audit policy is not a regular file: {path}"
+            );
+            return Ok(Some(entry.object_id.clone()));
+        }
+        anyhow::ensure!(
+            matches!(
+                entry.kind,
+                GitTreeEntryKind::Tree | GitTreeEntryKind::Gitlink
+            ),
+            "audit policy ancestor is not a directory: {prefix}"
+        );
+    }
+    Ok(None)
+}
+
 fn cargo_audit_policy_key_with_home(config: &Config, home: Option<&Path>) -> Option<String> {
     match review_substrate(config).ok()? {
         ReviewSubstrate::ExactTarget(target) => {
@@ -1575,12 +1615,7 @@ fn cargo_audit_policy_key_with_home(config: &Config, home: Option<&Path>) -> Opt
                 format!("{relative}/.cargo/audit.toml")
             };
             let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-            // Git's exact spelling is not the lookup a case-insensitive
-            // filesystem performs. A variant may even resolve an external link.
-            if repo.case_variant_at_commit(&target.commit_id, &path).ok()? {
-                return None;
-            }
-            if let Some(blob) = repo.regular_blob_at_commit(&target.commit_id, &path).ok()? {
+            if let Some(blob) = reviewed_audit_policy_blob(&repo, &target.commit_id, &path).ok()? {
                 return Some(format!("blob-{blob}"));
             }
             // Relative homes resolve inside the ephemeral snapshot. Its path
@@ -3494,6 +3529,122 @@ mod tests {
         assert_eq!(key(), missing);
         std::fs::create_dir(home.join("audit.toml")).unwrap();
         assert!(cargo_audit_policy_key_with_home(&config, Some(&home)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_policy_keys_follow_pinned_gitlinks_and_reject_unsafe_paths() {
+        use crate::git::cmd::git_cmd;
+        for layout in [
+            "regular",
+            "absent",
+            "case-variant",
+            "symlink",
+            "symlink-dir",
+        ] {
+            let (sub, _) = repo_with_two_commits_containing(&["Cargo.toml"]);
+            let policy = "[advisories]\nignore = []\n";
+            let directory = if layout == "case-variant" {
+                ".Cargo"
+            } else {
+                ".cargo"
+            };
+            let policy_dir = sub.path().join(directory);
+            if layout != "absent" {
+                #[cfg(unix)]
+                if layout == "symlink-dir" {
+                    std::os::unix::fs::symlink("missing-external-dir", &policy_dir).unwrap();
+                }
+                if layout != "symlink-dir" {
+                    std::fs::create_dir(&policy_dir).unwrap();
+                    #[cfg(unix)]
+                    if layout == "symlink" {
+                        std::os::unix::fs::symlink(
+                            "missing-external-file",
+                            policy_dir.join("audit.toml"),
+                        )
+                        .unwrap();
+                    }
+                    if layout != "symlink" {
+                        std::fs::write(policy_dir.join("audit.toml"), policy).unwrap();
+                    }
+                }
+                commit_all(sub.path(), "pinned audit policy");
+            }
+            let (super_repo, _) = repo_with_two_commits();
+            let root = super_repo.path();
+            let added = git_cmd()
+                .args(["-c", "protocol.file.allow=always", "submodule", "add", "-q"])
+                .arg(sub.path())
+                .arg("backend")
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                added.status.success(),
+                "{}",
+                String::from_utf8_lossy(&added.stderr)
+            );
+            commit_all(root, "pin backend");
+            let mut config = config_with_cargo_root(root, &root.join("backend"), true);
+            config.target = Some(head_sha(root));
+            let home = tempfile::tempdir().unwrap();
+            let key = cargo_audit_policy_key_with_home(&config, Some(home.path()));
+            if layout == "regular" {
+                let blob =
+                    git2::Oid::hash_object(git2::ObjectType::Blob, policy.as_bytes()).unwrap();
+                assert_eq!(key, Some(format!("blob-{blob}")));
+                assert!(CargoAuditCheck.cache_key(&config).is_some());
+                std::fs::write(root.join("backend/.cargo/audit.toml"), "operator dirty\n").unwrap();
+                assert_eq!(
+                    cargo_audit_policy_key_with_home(&config, Some(home.path())),
+                    key
+                );
+                let backend = root.join("backend");
+                let advanced = git_cmd()
+                    .args([
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.test",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "-qam",
+                        "operator advanced",
+                    ])
+                    .current_dir(&backend)
+                    .output()
+                    .unwrap();
+                assert!(advanced.status.success());
+                assert_eq!(
+                    cargo_audit_policy_key_with_home(&config, Some(home.path())),
+                    key
+                );
+                std::fs::rename(
+                    root.join(".git/modules/backend"),
+                    root.join(".git/modules/missing-backend"),
+                )
+                .unwrap();
+                assert!(cargo_audit_policy_key_with_home(&config, Some(home.path())).is_none());
+            } else if layout == "absent" {
+                assert!(
+                    key.is_some(),
+                    "absence inside a gitlink must permit stable fallback"
+                );
+                std::fs::write(home.path().join("audit.toml"), policy).unwrap();
+                assert_ne!(
+                    cargo_audit_policy_key_with_home(&config, Some(home.path())),
+                    key
+                );
+                assert!(
+                    cargo_audit_policy_key_with_home(&config, Some(Path::new("relative-home")))
+                        .is_none()
+                );
+            } else {
+                assert!(key.is_none(), "{layout} must disable replay");
+            }
+        }
     }
 
     #[test]

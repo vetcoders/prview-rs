@@ -4509,6 +4509,12 @@ This bounded fix does not claim a complete fingerprint of compiler/tool versions
 Cargo configuration, environment, external path dependencies, or advisory database
 updates within the existing daily audit window.
 
+Exact-target audit policy identity follows the snapshot's pinned gitlinks,
+including a missing local policy selecting the live Cargo-home fallback.
+Operator submodule HEAD and dirty policy bytes do not select that identity.
+Missing pinned objects, symlink/non-directory ancestors, and case aliases disable
+replay; identical safe lock/policy/day inputs can reuse a clean result.
+
 A hit also reports `age_secs`: how long ago the entry was published, read from
 the entry file's mtime — an entry is published by a single `rename`, so its mtime
 IS the moment the result became readable. Nothing changed on disk to carry it, so
