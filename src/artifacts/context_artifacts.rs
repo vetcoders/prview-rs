@@ -577,15 +577,27 @@ fn dependency_list_cmd(repo_root: &Path, has_pnpm: bool) -> (&'static str, Vec<S
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|json| json["packageManager"].as_str().map(str::to_owned));
+    use std::io::Read;
+    let lock_has_content = |name: &str| {
+        fs::File::open(repo_root.join(name)).is_ok_and(|file| {
+            std::io::BufReader::new(file)
+                .bytes()
+                .map_while(std::result::Result::ok)
+                .any(|byte| !byte.is_ascii_whitespace())
+        })
+    };
     let use_pnpm = match declared
         .as_deref()
         .and_then(|value| value.split('@').next())
     {
         Some("pnpm") => true,
         Some("npm") => false,
-        _ if repo_root.join("pnpm-lock.yaml").is_file() => true,
-        _ if repo_root.join("package-lock.json").is_file()
-            || repo_root.join("npm-shrinkwrap.json").is_file() =>
+        // Unsupported declarations retain the PATH fallback rather than
+        // silently substituting a manager inferred from an unrelated lock.
+        Some(_) => has_pnpm,
+        None if lock_has_content("pnpm-lock.yaml") => true,
+        None if lock_has_content("package-lock.json")
+            || lock_has_content("npm-shrinkwrap.json") =>
         {
             false
         }
@@ -900,7 +912,7 @@ fn plan_context_cmds(
         // the dependency listing lives in npm/pnpm themselves.
         let (sbom_cmd, sbom_args) = dependency_list_cmd(&scan_root, has_pnpm);
         cmds.push(ContextCmd {
-            label: "npm sbom".into(),
+            label: format!("{sbom_cmd} sbom"),
             gate: None,
             cmd: sbom_cmd.into(),
             args: sbom_args,
@@ -1363,25 +1375,29 @@ fn run_context_cmds_parallel_after_spawn(
                         break;
                     }
                     // Collect output
-                    collect_cmd_output(&r.stdout_path, &r.stderr_path, &r.out_dir, &r.out_file);
+                    let capture =
+                        collect_cmd_output(&r.stdout_path, &r.stderr_path, &r.out_dir, &r.out_file);
+                    let exit_reason =
+                        (!exit.success()).then(|| format!("{} exited with {exit}", r.label));
                     timings.push(ContextCommandTiming {
                         label: r.label.clone(),
-                        artifact: (!r.out_file.is_empty())
-                            .then(|| context_artifact_wire_path(&r.out_file)),
+                        artifact: capture.artifact,
                         // A command the cancel SIGKILLed exits non-zero. That
                         // is not the tool failing, and the pack must not read
                         // as though it were.
                         status: if governor.is_cancelled() {
                             "cancelled"
-                        } else if exit.success() {
+                        } else if exit.success() && !capture.failed {
                             "completed"
                         } else {
                             "failed"
                         },
                         started: true,
                         duration_secs: r.started_at.elapsed().as_secs_f32(),
-                        reason: (!exit.success())
-                            .then(|| format!("{} exited with {exit}", r.label)),
+                        reason: match (exit_reason, capture.reason) {
+                            (Some(exit), Some(capture)) => Some(format!("{exit}; {capture}")),
+                            (exit, capture) => exit.or(capture),
+                        },
                     });
                 }
                 Ok(None) => {
@@ -1414,17 +1430,24 @@ fn run_context_cmds_parallel_after_spawn(
                             break;
                         }
                         // Writers are gone before collecting partial diagnostics.
-                        collect_cmd_output(&r.stdout_path, &r.stderr_path, &r.out_dir, &r.out_file);
-                        let artifact = (!r.out_file.is_empty()
-                            && r.out_dir.join(&r.out_file).is_file())
-                        .then(|| context_artifact_wire_path(&r.out_file));
+                        let capture = collect_cmd_output(
+                            &r.stdout_path,
+                            &r.stderr_path,
+                            &r.out_dir,
+                            &r.out_file,
+                        );
                         timings.push(ContextCommandTiming {
                             label: r.label.clone(),
-                            artifact,
+                            artifact: capture.artifact,
                             status: "timed_out",
                             started: true,
                             duration_secs: r.started_at.elapsed().as_secs_f32(),
-                            reason: Some(format!("exceeded {timeout_secs}s context timeout")),
+                            reason: Some(match capture.reason {
+                                Some(reason) => {
+                                    format!("exceeded {timeout_secs}s context timeout; {reason}")
+                                }
+                                None => format!("exceeded {timeout_secs}s context timeout"),
+                            }),
                         });
                         if emit {
                             use colored::Colorize;
@@ -1514,58 +1537,209 @@ fn context_artifact_wire_path(out_file: &str) -> String {
     )
 }
 
-/// Collect stdout+stderr from completed command temp files and write to artifact file.
+/// The file that was actually written, plus any loss of the requested format.
+pub(super) struct ContextCapture {
+    artifact: Option<String>,
+    reason: Option<String>,
+    failed: bool,
+}
+
+/// Collect only after all writers have been reaped. Text capture reads two
+/// bounded windows from disk; valid JSON is validated and copied as a stream.
 pub(super) fn collect_cmd_output(
     stdout_path: &Path,
     stderr_path: &Path,
     out_dir: &Path,
     out_file: &str,
-) {
-    let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
-    let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+) -> ContextCapture {
+    use std::io::Read;
+
+    let collect = || -> std::io::Result<ContextCapture> {
+        if out_file.is_empty() {
+            return Ok(ContextCapture {
+                artifact: None,
+                reason: None,
+                failed: false,
+            });
+        }
+        let mut stdout = fs::File::open(stdout_path)?;
+        let mut stderr = fs::File::open(stderr_path)?;
+        let is_json = out_file.ends_with(".json");
+        if is_json {
+            // Validate without constructing a Value (large JSON strings and
+            // arrays must not turn into a second in-memory copy of the log).
+            let stdout_is_json = valid_json_capture(fs::File::open(stdout_path)?);
+            let combined_is_json = !stdout_is_json
+                && valid_json_capture(
+                    fs::File::open(stdout_path)?
+                        .chain(std::io::Cursor::new(b"\n"))
+                        .chain(fs::File::open(stderr_path)?),
+                );
+            if stdout_is_json || combined_is_json {
+                let destination = out_dir.join(out_file);
+                let result = (|| -> std::io::Result<()> {
+                    let mut output = fs::File::create(&destination)?;
+                    if stdout_is_json {
+                        std::io::copy(&mut stdout, &mut output)?;
+                    } else {
+                        std::io::copy(
+                            &mut stdout.chain(std::io::Cursor::new(b"\n")).chain(stderr),
+                            &mut output,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let _ = fs::remove_file(destination);
+                    return Err(error);
+                }
+                return Ok(ContextCapture {
+                    artifact: Some(context_artifact_wire_path(out_file)),
+                    reason: None,
+                    failed: false,
+                });
+            }
+        }
+
+        let diagnostic_name = if is_json {
+            format!("{out_file}.raw.log")
+        } else {
+            out_file.to_owned()
+        };
+        let note = if is_json {
+            "[prview] invalid JSON; raw diagnostic follows\n"
+        } else {
+            ""
+        };
+        let text = read_context_capture(&mut stdout, &mut stderr, note)?;
+        let destination = out_dir.join(&diagnostic_name);
+        if let Err(error) = fs::write(&destination, text) {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
+        Ok(ContextCapture {
+            artifact: Some(context_artifact_wire_path(&diagnostic_name)),
+            reason: is_json.then(|| "invalid JSON; retained raw diagnostic log".to_owned()),
+            failed: is_json,
+        })
+    };
+    let result = collect();
     let _ = fs::remove_file(stdout_path);
     let _ = fs::remove_file(stderr_path);
-
-    if out_file.is_empty() {
-        return;
-    }
-
-    let combined = format!("{}\n{}", stdout, stderr);
-
-    // Preserve the existing JSON extraction path; only text logs use head+tail.
-    let content = if !out_file.ends_with(".json") {
-        bounded_context_text(&combined)
-    } else if combined.len() > MAX_TSC_TRACE_BYTES {
-        let truncated = truncate_on_char_boundary(&combined, MAX_TSC_TRACE_BYTES);
-        format!(
-            "{}\n\n... (truncated, {} total bytes)",
-            truncated,
-            combined.len()
-        )
-    } else {
-        combined
-    };
-
-    // For JSON outputs, only save if valid
-    if out_file.ends_with(".json") {
-        if let Some(json) = extract_valid_json(&stdout, &content)
-            && let Err(e) = fs::write(out_dir.join(out_file), json)
-        {
-            eprintln!("  warning: failed to write artifact {out_file}: {e}");
-        }
-    } else if let Err(e) = fs::write(out_dir.join(out_file), &content) {
-        eprintln!("  warning: failed to write artifact {out_file}: {e}");
-    }
+    result.unwrap_or_else(|error| ContextCapture {
+        artifact: None,
+        reason: Some(format!(
+            "failed to retain context artifact {out_file}: {error}"
+        )),
+        failed: true,
+    })
 }
 
-/// Retain both ends of large text logs, including late stderr diagnostics.
+fn valid_json_capture(reader: impl std::io::Read) -> bool {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(reader);
+    loop {
+        let Ok(bytes) = reader.fill_buf() else {
+            return false;
+        };
+        if let Some(first) = bytes.iter().position(|byte| !byte.is_ascii_whitespace()) {
+            if !matches!(bytes[first], b'[' | b'{') {
+                return false;
+            }
+            break;
+        }
+        let len = bytes.len();
+        if len == 0 {
+            return false;
+        }
+        reader.consume(len);
+    }
+    serde_json::from_reader::<_, serde::de::IgnoredAny>(reader).is_ok()
+}
+
+/// Read the logical stdout + newline + stderr stream without ever loading its
+/// omitted middle. Byte buffers and UTF-8 replacement are bounded by the cap.
+fn read_context_capture(
+    stdout: &mut fs::File,
+    stderr: &mut fs::File,
+    note: &str,
+) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let stdout_len = stdout.metadata()?.len();
+    let stderr_len = stderr.metadata()?.len();
+    let total = stdout_len.saturating_add(1).saturating_add(stderr_len);
+    let marker = if total.saturating_add(note.len() as u64) > MAX_TSC_TRACE_BYTES as u64 {
+        format!("\n\n... (truncated, {total} total bytes; middle omitted)\n\n")
+    } else {
+        String::new()
+    };
+    let budget = MAX_TSC_TRACE_BYTES - marker.len() - note.len();
+    let mut range = |offset: u64, length: usize| -> std::io::Result<Vec<u8>> {
+        let end = offset + length as u64;
+        let mut bytes = Vec::with_capacity(length);
+        if offset < stdout_len {
+            stdout.seek(SeekFrom::Start(offset))?;
+            stdout
+                .take((end.min(stdout_len)) - offset)
+                .read_to_end(&mut bytes)?;
+        }
+        if offset <= stdout_len && end > stdout_len {
+            bytes.push(b'\n');
+        }
+        if end > stdout_len + 1 {
+            let start = offset.saturating_sub(stdout_len + 1);
+            stderr.seek(SeekFrom::Start(start))?;
+            stderr
+                .take(end - (stdout_len + 1).max(offset))
+                .read_to_end(&mut bytes)?;
+        }
+        Ok(bytes)
+    };
+    let (mut head, mut tail) = if marker.is_empty() && total <= budget as u64 {
+        (range(0, total as usize)?, Vec::new())
+    } else {
+        let head_len = budget / 2;
+        (
+            range(0, head_len)?,
+            range(total - (budget - head_len) as u64, budget - head_len)?,
+        )
+    };
+    // A valid UTF-8 code point split by a window edge is omitted with the
+    // middle, rather than falsely reported as corrupt input.
+    if !tail.is_empty() {
+        if let Err(error) = std::str::from_utf8(&head)
+            && error.error_len().is_none()
+        {
+            head.truncate(error.valid_up_to());
+        }
+        let continuation = tail
+            .iter()
+            .take(3)
+            .take_while(|byte| (**byte & 0xc0) == 0x80)
+            .count();
+        tail.drain(..continuation);
+    }
+    let head = String::from_utf8_lossy(&head);
+    let tail = String::from_utf8_lossy(&tail);
+    let invalid_utf8 =
+        matches!(head, std::borrow::Cow::Owned(_)) || matches!(tail, std::borrow::Cow::Owned(_));
+    let encoding = if invalid_utf8 {
+        "[prview] invalid UTF-8 bytes replaced with U+FFFD\n"
+    } else {
+        ""
+    };
+    Ok(bounded_context_text(&format!(
+        "{note}{encoding}{head}{marker}{tail}"
+    )))
+}
+
+/// Also cap the constant-size UTF-8 replacement expansion, retaining both ends.
 fn bounded_context_text(input: &str) -> String {
     if input.len() <= MAX_TSC_TRACE_BYTES {
         return input.to_owned();
     }
-
     let marker = format!(
-        "\n\n... (truncated, {} total bytes; middle omitted)\n\n",
+        "\n\n... (truncated, {} retained bytes; middle omitted)\n\n",
         input.len()
     );
     let available = MAX_TSC_TRACE_BYTES - marker.len();
@@ -1575,17 +1749,6 @@ fn bounded_context_text(input: &str) -> String {
         tail_start += 1;
     }
     format!("{head}{marker}{}", &input[tail_start..])
-}
-
-pub(super) fn extract_valid_json(stdout: &str, combined: &str) -> Option<String> {
-    [stdout.trim(), combined.trim()]
-        .into_iter()
-        .find(|candidate| {
-            !candidate.is_empty()
-                && (candidate.starts_with('[') || candidate.starts_with('{'))
-                && serde_json::from_str::<serde_json::Value>(candidate).is_ok()
-        })
-        .map(str::to_owned)
 }
 
 pub(super) fn build_regression_patch_text(patch_texts: &[String]) -> Option<String> {
@@ -1665,6 +1828,11 @@ mod tests {
         let content = collected_context(&stdout, stderr, "trace.txt");
         assert!(content.starts_with("START:🦀\n"));
         assert!(content.ends_with(stderr));
+        assert!(
+            !content.contains('\u{fffd}'),
+            "valid UTF-8 windows must not introduce replacement characters"
+        );
+        assert!(!content.contains("invalid UTF-8"));
         assert!(content.len() <= super::MAX_TSC_TRACE_BYTES);
         assert!(content.contains("middle omitted"));
     }
@@ -1683,6 +1851,250 @@ mod tests {
         let content = collected_context(&stdout, "stderr diagnostic", "listing.json");
         assert_eq!(content, stdout);
         assert!(serde_json::from_str::<serde_json::Value>(&content).is_ok());
+    }
+
+    #[test]
+    fn pr70_capture_invalid_json_keeps_raw_tail_without_claiming_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("stdout");
+        let err = dir.path().join("stderr");
+        fs::write(&out, format!("[{}", "broken,".repeat(150_000))).unwrap();
+        fs::write(&err, "FINAL ESLINT ERROR: malformed output\n").unwrap();
+        super::collect_cmd_output(&out, &err, dir.path(), "eslint.json");
+        assert!(!dir.path().join("eslint.json").exists());
+        let raw = fs::read_to_string(dir.path().join("eslint.json.raw.log"))
+            .expect("invalid JSON retains a diagnostic sibling");
+        assert!(raw.contains("invalid JSON"));
+        assert!(raw.contains("middle omitted"));
+        assert!(raw.ends_with("FINAL ESLINT ERROR: malformed output\n"));
+        assert!(raw.len() <= super::MAX_TSC_TRACE_BYTES);
+    }
+
+    #[test]
+    fn pr70_capture_invalid_utf8_is_explicit_and_keeps_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("stdout");
+        let err = dir.path().join("stderr");
+        fs::write(&out, b"START\n\xff\xfe\n").unwrap();
+        fs::write(&err, "FINAL ERROR\n").unwrap();
+        super::collect_cmd_output(&out, &err, dir.path(), "trace.log");
+        let text = fs::read_to_string(dir.path().join("trace.log")).unwrap();
+        assert!(text.contains("invalid UTF-8"));
+        assert!(text.contains("START\n"));
+        assert!(text.ends_with("FINAL ERROR\n"));
+    }
+
+    #[test]
+    fn pr70_capture_invalid_utf8_tail_is_not_erased_as_a_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("stdout"), "a".repeat(600_000)).unwrap();
+        fs::write(dir.path().join("stderr"), vec![0x80; 300_000]).unwrap();
+        super::collect_cmd_output(
+            &dir.path().join("stdout"),
+            &dir.path().join("stderr"),
+            dir.path(),
+            "trace.log",
+        );
+        let retained = fs::read_to_string(dir.path().join("trace.log")).unwrap();
+        assert!(retained.contains("invalid UTF-8"));
+        assert!(retained.ends_with("�"));
+        assert!(retained.len() <= super::MAX_TSC_TRACE_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr70_capture_large_file_memory_is_bounded() {
+        const CHILD: &str = "PRVIEW_TEST_BOUNDED_CAPTURE_CHILD";
+        const FORMAT: &str = "PRVIEW_TEST_BOUNDED_CAPTURE_FORMAT";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let dir = Path::new(&path);
+            let name = std::env::var(FORMAT).unwrap();
+            let original_len = fs::metadata(dir.join("stdout")).unwrap().len();
+            let peak = || {
+                let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+                // SAFETY: getrusage initializes the caller-owned result on success.
+                assert_eq!(
+                    unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                    0
+                );
+                // SAFETY: getrusage succeeded above.
+                let bytes = unsafe { usage.assume_init() }.ru_maxrss as u64;
+                if cfg!(target_os = "macos") {
+                    bytes
+                } else {
+                    bytes * 1024
+                }
+            };
+            let before = peak();
+            super::collect_cmd_output(&dir.join("stdout"), &dir.join("stderr"), dir, &name);
+            let increase = peak().saturating_sub(before);
+            println!("{name}: input={original_len} additional_peak_rss={increase}");
+            assert!(
+                increase < 16 * 1024 * 1024,
+                "capture allocated {increase} bytes of additional peak RSS"
+            );
+            if name.ends_with(".json") {
+                assert_eq!(fs::metadata(dir.join(&name)).unwrap().len(), original_len);
+                assert!(super::valid_json_capture(
+                    fs::File::open(dir.join(&name)).unwrap()
+                ));
+                // Check every byte of the large string, with bounded buffers.
+                use std::io::Read;
+                let mut file = fs::File::open(dir.join(&name)).unwrap();
+                let mut prefix = [0; 12];
+                file.read_exact(&mut prefix).unwrap();
+                assert_eq!(&prefix, b"{\"payload\":\"");
+                let mut left = original_len - 14;
+                let mut buffer = [0; 8192];
+                while left > 0 {
+                    let len = left.min(buffer.len() as u64) as usize;
+                    file.read_exact(&mut buffer[..len]).unwrap();
+                    assert!(buffer[..len].iter().all(|byte| *byte == b'a'));
+                    left -= len as u64;
+                }
+                let mut suffix = [0; 2];
+                file.read_exact(&mut suffix).unwrap();
+                assert_eq!(&suffix, b"\"}");
+            } else {
+                let retained = fs::read_to_string(dir.join(&name)).unwrap();
+                assert!(retained.starts_with("START\n"));
+                assert!(retained.ends_with("FINAL ERROR\n"));
+                assert!(retained.contains("middle omitted"));
+                assert!(retained.len() <= super::MAX_TSC_TRACE_BYTES);
+            }
+            return;
+        }
+        use std::io::{Seek, SeekFrom, Write};
+        for (size, name) in [
+            (1024 * 1024, "trace.log"),
+            (128 * 1024 * 1024, "trace.log"),
+            (128 * 1024 * 1024, "listing.json"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut out = fs::File::create(dir.path().join("stdout")).unwrap();
+            if name.ends_with(".json") {
+                out.write_all(b"{\"payload\":\"").unwrap();
+                let buffer = vec![b'a'; 1024 * 1024];
+                for _ in 0..size / buffer.len() {
+                    out.write_all(&buffer).unwrap();
+                }
+                out.write_all(b"\"}").unwrap();
+            } else {
+                out.set_len(size as u64).unwrap();
+                out.write_all(b"START\n").unwrap();
+                out.seek(SeekFrom::End(-6)).unwrap();
+                out.write_all(b"TAIL\n\n").unwrap();
+            }
+            drop(out);
+            fs::write(dir.path().join("stderr"), "FINAL ERROR\n").unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "artifacts::context_artifacts::tests::pr70_capture_large_file_memory_is_bounded", "--nocapture"])
+                .env(CHILD, dir.path()).env(FORMAT, name).output().unwrap();
+            println!("{}", String::from_utf8_lossy(&child.stdout));
+            assert!(
+                child.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn pr70_capture_raw_json_note_does_not_hide_near_limit_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("stdout"),
+            "x".repeat(super::MAX_TSC_TRACE_BYTES - 20),
+        )
+        .unwrap();
+        fs::write(dir.path().join("stderr"), "FINAL ERROR\n").unwrap();
+        super::collect_cmd_output(
+            &dir.path().join("stdout"),
+            &dir.path().join("stderr"),
+            dir.path(),
+            "eslint.json",
+        );
+        let raw = fs::read_to_string(dir.path().join("eslint.json.raw.log")).unwrap();
+        assert!(raw.contains("middle omitted"));
+        assert!(raw.ends_with("FINAL ERROR\n"));
+        assert!(raw.len() <= super::MAX_TSC_TRACE_BYTES);
+    }
+
+    #[test]
+    fn pr70_capture_empty_lock_does_not_override_npm_and_unsupported_manager_ignores_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(super::dependency_list_cmd(dir.path(), true).0, "npm");
+        fs::write(dir.path().join("pnpm-lock.yaml"), " \n\t\r\n").unwrap();
+        assert_eq!(super::dependency_list_cmd(dir.path(), true).0, "npm");
+        fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"packageManager":"yarn@4.0.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::dependency_list_cmd(dir.path(), false).0, "npm");
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"packageManager":"bun@1.0.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::dependency_list_cmd(dir.path(), false).0, "npm");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr70_capture_normal_exit_links_only_written_artifact_and_rejects_invalid_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let command = |name: &str| ContextCmd {
+            label: "eslint json".into(),
+            gate: None,
+            cmd: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '[invalid'; printf 'FINAL ESLINT ERROR' >&2".into(),
+            ],
+            cwd: tmp.path().to_path_buf(),
+            out_dir: tmp.path().to_path_buf(),
+            out_file: name.into(),
+        };
+        let governor = ResourceGovernor::new();
+        let timings =
+            super::run_context_cmds_parallel(&[command("eslint.json")], 5, false, &governor)
+                .unwrap();
+        assert_eq!(timings[0].status, "failed");
+        assert!(
+            timings[0]
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("invalid JSON")
+        );
+        assert_eq!(
+            timings[0].artifact.as_deref(),
+            Some("30_context/eslint.json.raw.log")
+        );
+        let timings = super::run_context_cmds_parallel(
+            &[command("absent-parent/trace.log")],
+            5,
+            false,
+            &governor,
+        )
+        .unwrap();
+        assert!(timings[0].artifact.is_none());
+        assert!(
+            timings[0]
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("artifact")
+        );
     }
 
     /// A JS repo whose checked-out `HEAD` is NOT the reviewed target.
@@ -2427,6 +2839,12 @@ mod tests {
         fs::write(tmp.path().join("package-lock.json"), "{}").unwrap();
         assert_eq!(super::dependency_list_cmd(tmp.path(), true).0, "npm");
         fs::write(tmp.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(super::dependency_list_cmd(tmp.path(), false).0, "npm");
+        fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
         assert_eq!(super::dependency_list_cmd(tmp.path(), false).0, "pnpm");
         fs::write(
             tmp.path().join("package.json"),
