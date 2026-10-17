@@ -1278,6 +1278,8 @@ enforcement disposition to at least `review_required`. The verdict is therefore
 at least `CONDITIONAL`; an existing `BLOCK` remains `BLOCK`. The existing exit
 mapping applies: advisory `gate` exits 0, `gate --strict` exits 2 for this signal.
 `--update` cannot reuse an earlier PASS in place of this assessment.
+It can reuse an identical modern explicit self-diff assessment whose recorded
+verdict is already `CONDITIONAL` or `BLOCK`; that reuse preserves the caveat and verdict.
 
 `MERGE_GATE.json`, `PROVENANCE.json`, and root `report.json` carry the same
 additive `review_range` object: `current_only`, `explicit_bases`, and a

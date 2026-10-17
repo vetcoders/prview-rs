@@ -227,15 +227,7 @@ impl App {
 
         // 3. Check for update mode
         self.ensure_not_cancelled()?;
-        // A previous target-tree result cannot satisfy an explicit request to
-        // compare the target with itself, even when HEAD is unchanged.
-        let explicit_self_diff = !self.config.current_only
-            && self
-                .config
-                .bases_were_explicitly_selected(self.explicit_bases)
-            && bases.iter().any(|base| base.commit_id == target.commit_id);
         if self.config.update_mode
-            && !explicit_self_diff
             && let Some(prev_run) = self.find_previous_run()?
             && let Some(report) =
                 self.reuse_unchanged_run(&target, &bases, &diff_bases, prev_run, emit_human_stdout)?
@@ -932,11 +924,20 @@ impl App {
         // New packs record comparison coverage. Reuse may not carry an
         // explicit self-diff assessment into an automatic/current-only run, or
         // an automatic PASS into a different requested comparison.
-        let previous_range =
-            crate::paths::read_to_string_within(&prev_run, std::path::Path::new("report.json"))
+        let explicit_self_diff = !self.config.current_only
+            && self
+                .config
+                .bases_were_explicitly_selected(self.explicit_bases)
+            && bases.iter().any(|base| base.commit_id == target.commit_id);
+        let read_json = |path: &str| {
+            crate::paths::read_to_string_within(&prev_run, std::path::Path::new(path))
                 .ok()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                .and_then(|report| report.get("review_range").cloned());
+        };
+        let previous_report = read_json("report.json");
+        let previous_range = previous_report
+            .as_ref()
+            .and_then(|report| report.get("review_range"));
         if let Some(range) = previous_range {
             let same_modes = range["current_only"].as_bool() == Some(self.config.current_only)
                 && range["explicit_bases"].as_bool()
@@ -960,6 +961,58 @@ impl App {
                     )
             });
             if !same_modes || !same_bases {
+                return Ok(None);
+            }
+        }
+        // An identical modern self-diff already records the required caveat.
+        // CLI verdicts come from MERGE_GATE, so report-only coverage cannot
+        // authorize a legacy PASS or an inconsistent copied pack.
+        if explicit_self_diff {
+            let (Some(range), Some(gate), Some(provenance)) = (
+                previous_range,
+                read_json("00_summary/MERGE_GATE.json"),
+                read_json("00_summary/PROVENANCE.json"),
+            ) else {
+                return Ok(None);
+            };
+            let decision = &gate["decision"];
+            let verdict = decision["verdict"].as_str();
+            let disposition = decision["enforcement_disposition"].as_str();
+            let covers_self = range["comparisons"].as_array().is_some_and(|comparisons| {
+                comparisons
+                    .iter()
+                    .zip(bases)
+                    .filter(|(_, base)| base.commit_id == target.commit_id)
+                    .all(|(comparison, base)| {
+                        comparison["status"].as_str() == Some("self_diff")
+                            && decision["review_caveats"]
+                                .as_array()
+                                .is_some_and(|caveats| {
+                                    let prefix = format!(
+                                        "No change reviewed against '{}' ({}): self_diff;",
+                                        base.name, target.commit_id
+                                    );
+                                    caveats.iter().any(|caveat| {
+                                        caveat
+                                            .as_str()
+                                            .is_some_and(|text| text.starts_with(&prefix))
+                                    })
+                                })
+                    })
+            });
+            if !matches!(
+                (verdict, disposition),
+                (Some("CONDITIONAL"), Some("review_required")) | (Some("BLOCK"), Some("block"))
+            ) || previous_report
+                .as_ref()
+                .and_then(|report| report["gate"]["status"].as_str())
+                != verdict
+                || gate.get("review_range") != Some(range)
+                || provenance.get("review_range") != Some(range)
+                || decision["allow_merge"].as_bool() != Some(false)
+                || decision["analysis_status"].as_str() != Some("incomplete")
+                || !covers_self
+            {
                 return Ok(None);
             }
         }
@@ -2015,6 +2068,99 @@ mod tests {
             0,
             "a cancelled watcher regenerates nothing",
         );
+    }
+
+    #[test]
+    fn explicit_self_reuse_requires_a_matching_modern_non_pass_assessment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(tmp.path(), out.path());
+        let head = rev_parse(tmp.path(), "HEAD");
+        let mut base = resolved(&head);
+        base.name = "feature".to_owned();
+        config.bases = vec![base.name.clone()];
+        config.required_base = Some(base);
+        let app = crate::App::from_config(config).unwrap();
+        let target = app.repo.resolve_target(&app.config).unwrap();
+        let bases = app.repo.resolve_bases(&app.config).unwrap();
+        let effective = app.repo.resolve_diff_bases(&app.config, &target, &bases);
+        let prev = tempfile::tempdir().unwrap();
+        std::fs::create_dir(prev.path().join("00_summary")).unwrap();
+        std::fs::write(
+            prev.path().join("00_summary/pr-metadata.txt"),
+            format!("HEAD: feature ({head})\n"),
+        )
+        .unwrap();
+        for (verdict, flaw, expected) in [
+            ("PASS", "legacy", false),
+            ("PASS", "none", false),
+            ("CONDITIONAL", "none", true),
+            ("BLOCK", "none", true),
+            ("CONDITIONAL", "missing-gate", false),
+            ("CONDITIONAL", "canonical-pass", false),
+            ("CONDITIONAL", "gate-range", false),
+            ("CONDITIONAL", "provenance-range", false),
+            ("CONDITIONAL", "wrong-status", false),
+            ("CONDITIONAL", "missing-caveat", false),
+            ("CONDITIONAL", "warnings-only", false),
+            ("CONDITIONAL", "allow-merge", false),
+            ("CONDITIONAL", "complete", false),
+        ] {
+            let mut report = serde_json::json!({"gate": {"status": verdict}});
+            if flaw != "legacy" {
+                report["review_range"] = serde_json::json!({
+                    "current_only": false, "explicit_bases": true,
+                    "comparisons": [{"base": "feature", "requested_base_sha": head,
+                        "effective_base_sha": head, "target_sha": head, "status": "self_diff"}]
+                });
+            }
+            if flaw == "wrong-status" {
+                report["review_range"]["comparisons"][0]["status"] = serde_json::json!("compared");
+            }
+            let mut gate = serde_json::json!({
+                "review_range": report["review_range"],
+                "decision": {"verdict": verdict, "allow_merge": false, "analysis_status": "incomplete",
+                    "enforcement_disposition": if verdict == "BLOCK" { "block" } else { "review_required" },
+                    "review_caveats": [format!("No change reviewed against 'feature' ({head}): self_diff; target-tree checks do not establish review of a change.")]}
+            });
+            let mut provenance = serde_json::json!({"review_range": report["review_range"]});
+            match flaw {
+                "canonical-pass" => gate["decision"]["verdict"] = serde_json::json!("PASS"),
+                "gate-range" => gate["review_range"]["explicit_bases"] = serde_json::json!(false),
+                "provenance-range" => {
+                    provenance["review_range"]["explicit_bases"] = serde_json::json!(false)
+                }
+                "missing-caveat" => gate["decision"]["review_caveats"] = serde_json::json!([]),
+                "warnings-only" => {
+                    gate["decision"]["enforcement_disposition"] = serde_json::json!("warnings_only")
+                }
+                "allow-merge" => gate["decision"]["allow_merge"] = serde_json::json!(true),
+                "complete" => gate["decision"]["analysis_status"] = serde_json::json!("complete"),
+                _ => {}
+            }
+            let gate_path = prev.path().join("00_summary/MERGE_GATE.json");
+            if flaw == "missing-gate" {
+                std::fs::remove_file(gate_path).unwrap();
+            } else {
+                std::fs::write(gate_path, gate.to_string()).unwrap();
+            }
+            std::fs::write(
+                prev.path().join("00_summary/PROVENANCE.json"),
+                provenance.to_string(),
+            )
+            .unwrap();
+            std::fs::write(prev.path().join("report.json"), report.to_string()).unwrap();
+            let reused = app
+                .reuse_unchanged_run(
+                    &target,
+                    &bases,
+                    &effective,
+                    prev.path().to_path_buf(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(reused.is_some(), expected, "flaw={flaw}, verdict={verdict}");
+        }
     }
 
     #[test]

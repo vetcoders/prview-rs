@@ -321,6 +321,84 @@ fn update_cannot_reuse_auto_pass_for_explicit_self_diff() {
 }
 
 #[test]
+fn update_reuses_matching_explicit_self_and_mixed_assessments() {
+    let repo = fixture();
+    git(repo.path(), &["checkout", "main"]);
+    let env = support::ContractEnvironment::new();
+    for bases in [vec!["main"], vec!["main", "feature"]] {
+        let mut args = vec!["HEAD"];
+        args.extend(bases);
+        args.extend([
+            "--update",
+            "--quick",
+            "--skip-security",
+            "--json",
+            "--no-fetch",
+            "--no-zip",
+        ]);
+        let (first, gate, _) = run(&env, repo.path(), &args, 0);
+        assert_eq!(gate["decision"]["verdict"], "CONDITIONAL");
+        let (repeated, repeated_gate, _) = run(&env, repo.path(), &args, 0);
+        assert_eq!(first["output_dir"], repeated["output_dir"]);
+        assert_eq!(gate, repeated_gate);
+    }
+}
+
+#[test]
+fn update_rejects_a_self_pack_with_a_conflicting_canonical_pass() {
+    let repo = fixture();
+    git(repo.path(), &["checkout", "main"]);
+    let env = support::ContractEnvironment::new();
+    let args = [
+        "HEAD",
+        "main",
+        "--update",
+        "--quick",
+        "--skip-security",
+        "--json",
+        "--no-fetch",
+        "--no-zip",
+    ];
+    let (first, mut gate, _) = run(&env, repo.path(), &args, 0);
+    gate["decision"]["verdict"] = Value::from("PASS");
+    gate["decision"]["allow_merge"] = Value::from(true);
+    gate["decision"]["analysis_status"] = Value::from("complete");
+    gate["decision"]["enforcement_disposition"] = Value::from("clean");
+    gate["decision"]["merge_recommendation"] = Value::from("approve");
+    gate["decision"]["review_caveats"] = serde_json::json!([]);
+    let gate_path =
+        Path::new(first["output_dir"].as_str().unwrap()).join("00_summary/MERGE_GATE.json");
+    fs::write(gate_path, serde_json::to_vec(&gate).unwrap()).unwrap();
+    let output = env
+        .command()
+        .current_dir(repo.path())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repeated: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        repeated["verdict"],
+        "CONDITIONAL",
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_ne!(first["output_dir"], repeated["output_dir"]);
+    let regenerated: Value = serde_json::from_slice(
+        &fs::read(
+            Path::new(repeated["output_dir"].as_str().unwrap()).join("00_summary/MERGE_GATE.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(regenerated["decision"]["allow_merge"], false);
+}
+
+#[test]
 fn update_compares_effective_base_without_disabling_identical_range_reuse() {
     let repo = fixture();
     git(repo.path(), &["checkout", "-b", "other", "main"]);
