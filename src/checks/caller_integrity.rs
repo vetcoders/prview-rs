@@ -205,9 +205,11 @@ impl CallerGuard {
         let repo = git2::Repository::open(&root)?;
         let tracked = tracked_paths(&repo)?;
         if let Ok(relative) = path.strip_prefix(&root)
-            && tracked
-                .iter()
-                .any(|bytes| git_path(bytes).is_ok_and(|p| p == relative))
+            && tracked.paths.iter().any(|bytes| {
+                git_path(bytes).is_ok_and(|p| {
+                    p == relative || (tracked.gitlinks.contains(bytes) && relative.starts_with(p))
+                })
+            })
         {
             return Ok(true);
         }
@@ -218,8 +220,8 @@ impl CallerGuard {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error.into()),
             };
-            for bytes in tracked {
-                match existing_leaf_identity(&root.join(git_path(&bytes)?)) {
+            for tracked_path in protected_tracked_paths(&root, 0)? {
+                match existing_leaf_identity(&tracked_path) {
                     Ok(tracked_identity) if tracked_identity == identity => return Ok(true),
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1284,7 +1286,7 @@ pub(crate) fn namespace_source_visible(root: &Path, output: &Path) -> Result<boo
         return Ok(true);
     }
     let repo = git2::Repository::open(&caller)?;
-    for bytes in tracked_paths(&repo)? {
+    for bytes in tracked_paths(&repo)?.paths {
         let tracked = git_path(&bytes)?;
         if tracked.starts_with(relative) || relative.starts_with(&tracked) {
             return Ok(true);
@@ -1346,15 +1348,19 @@ pub(crate) fn planned_path(path: &Path) -> Result<PathBuf> {
     Ok(result)
 }
 
-fn tracked_paths(repo: &git2::Repository) -> Result<BTreeSet<Vec<u8>>> {
+struct TrackedPaths {
+    paths: BTreeSet<Vec<u8>>,
+    gitlinks: BTreeSet<Vec<u8>>,
+}
+
+fn tracked_paths(repo: &git2::Repository) -> Result<TrackedPaths> {
     let index = repo.index()?;
     let mut paths = BTreeSet::new();
+    let mut gitlinks = BTreeSet::new();
     for entry in index.iter() {
-        ensure!(
-            entry.mode != 0o160000,
-            "caller observation unsupported for gitlink {:?}",
-            entry.path
-        );
+        if entry.mode == 0o160000 {
+            gitlinks.insert(entry.path.clone());
+        }
         paths.insert(entry.path);
     }
     let head = match repo.head() {
@@ -1371,28 +1377,164 @@ fn tracked_paths(repo: &git2::Repository) -> Result<BTreeSet<Vec<u8>>> {
     };
     if let Some(head) = head {
         let tree = head.peel_to_tree()?;
-        let mut unsupported = false;
         tree.walk(git2::TreeWalkMode::PreOrder, |prefix, entry| {
-            if entry.kind() == Some(git2::ObjectType::Commit) {
-                unsupported = true;
-                return git2::TreeWalkResult::Skip;
-            }
-            if entry.kind() == Some(git2::ObjectType::Blob) {
+            if matches!(
+                entry.kind(),
+                Some(git2::ObjectType::Blob | git2::ObjectType::Commit)
+            ) {
                 let mut path = prefix.as_bytes().to_vec();
                 path.extend_from_slice(entry.name_bytes());
+                if entry.kind() == Some(git2::ObjectType::Commit) {
+                    gitlinks.insert(path.clone());
+                }
                 paths.insert(path);
             }
             git2::TreeWalkResult::Ok
         })?;
+    }
+    Ok(TrackedPaths { paths, gitlinks })
+}
+
+fn capture_token(root: &Path, owned: &BTreeSet<String>) -> Result<CallerToken> {
+    capture_token_at_depth(root, owned, 0)
+}
+
+const MAX_CALLER_GITLINK_DEPTH: usize = 16;
+
+/// Never discover a parent repository or follow a gitlink/ancestor symlink.
+/// Missing, file and symlink replacements use the ordinary source observation.
+fn gitlink_directory(root: &Path, relative: &Path) -> Result<Option<PathBuf>> {
+    let mut current = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        current.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+        if !metadata.is_dir() {
+            ensure!(
+                components.peek().is_none(),
+                "gitlink ancestor is not a directory"
+            );
+            return Ok(None);
+        }
+    }
+    ensure!(
+        fs::canonicalize(&current)? == current,
+        "gitlink directory resolves through an alias"
+    );
+    Ok(Some(current))
+}
+
+fn gitlink_repository(directory: &Path) -> Result<Option<git2::Repository>> {
+    let marker = match fs::symlink_metadata(directory.join(".git")) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure!(
+                fs::read_dir(directory)?.next().is_none(),
+                "nonempty gitlink directory has no repository: {}",
+                directory.display()
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        !marker.file_type().is_symlink() && (marker.is_file() || marker.is_dir()),
+        "unsupported gitlink Git marker: {}",
+        directory.display()
+    );
+    let repo = git2::Repository::open(directory)?;
+    ensure!(
+        fs::canonicalize(directory)? == directory
+            && repo.workdir().map(fs::canonicalize).transpose()?.as_deref() == Some(directory),
+        "gitlink repository worktree does not match its caller path"
+    );
+    Ok(Some(repo))
+}
+
+fn gitlink_entry(root: &Path, relative: &Path, depth: usize) -> Result<SourceEntry> {
+    let Some(directory) = gitlink_directory(root, relative)? else {
+        return source_entry(root, relative);
+    };
+    let mode = mode(&fs::symlink_metadata(&directory)?);
+    let Some(repo) = gitlink_repository(&directory)? else {
+        return Ok(SourceEntry {
+            path: source_entry_name(relative),
+            kind: "gitlink-uninitialized",
+            mode,
+            sha256: None,
+        });
+    };
+    let git_dir = fs::canonicalize(repo.path())?;
+    let common_dir = fs::canonicalize(repo.commondir())?;
+    let marker = fs::symlink_metadata(directory.join(".git"))?;
+    let pointer = if marker.is_file() {
+        Some(source_entry(&directory, Path::new(".git"))?)
+    } else {
+        None
+    };
+    // No owned-output exemptions inside a gitlink. Its operator checkout need
+    // not equal the pin; preserve and compare its actual initial dirty state.
+    let token = capture_token_at_depth(&directory, &BTreeSet::new(), depth + 1)?;
+    ensure!(
+        token.root == directory
+            && token.git_dir == git_dir
+            && token.common_dir == common_dir
+            && gitlink_directory(root, relative)?.as_ref() == Some(&directory),
+        "gitlink repository identity changed during observation"
+    );
+    if let Some(before) = &pointer {
         ensure!(
-            !unsupported,
-            "caller observation unsupported for gitlinks in HEAD"
+            *before == source_entry(&directory, Path::new(".git"))?,
+            "gitlink Git pointer changed during observation"
         );
+    }
+    Ok(SourceEntry {
+        path: source_entry_name(relative),
+        kind: "gitlink",
+        mode,
+        sha256: Some(hex(&Sha256::digest(serde_json::to_vec(&(token, pointer))?))),
+    })
+}
+
+/// The pre-open physical-identity check includes nested tracked leaves, not
+/// only their containing gitlink directories (hardlinks and case aliases).
+fn protected_tracked_paths(root: &Path, depth: usize) -> Result<Vec<PathBuf>> {
+    ensure!(
+        depth <= MAX_CALLER_GITLINK_DEPTH,
+        "caller gitlink nesting limit exceeded"
+    );
+    let repo = git2::Repository::open(root)?;
+    let tracked = tracked_paths(&repo)?;
+    let mut paths = Vec::new();
+    for bytes in &tracked.paths {
+        let relative = git_path(bytes)?;
+        paths.push(root.join(&relative));
+        if tracked.gitlinks.contains(bytes)
+            && let Some(directory) = gitlink_directory(root, &relative)?
+            && gitlink_repository(&directory)?.is_some()
+        {
+            paths.extend(protected_tracked_paths(&directory, depth + 1)?);
+        }
     }
     Ok(paths)
 }
 
-fn capture_token(root: &Path, owned: &BTreeSet<String>) -> Result<CallerToken> {
+fn capture_token_at_depth(
+    root: &Path,
+    owned: &BTreeSet<String>,
+    depth: usize,
+) -> Result<CallerToken> {
+    ensure!(
+        depth <= MAX_CALLER_GITLINK_DEPTH,
+        "caller gitlink nesting limit exceeded"
+    );
     let root = fs::canonicalize(root).context("resolve caller root")?;
     let repo = git2::Repository::open(&root).context("open caller repository")?;
     let workdir = repo
@@ -1432,7 +1574,7 @@ fn capture_token(root: &Path, owned: &BTreeSet<String>) -> Result<CallerToken> {
         .and_then(|reference| reference.target())
         .map(|oid| oid.to_string());
     let tracked = tracked_paths(&repo)?;
-    let mut paths = tracked.clone();
+    let mut paths = tracked.paths.clone();
     let mut options = git2::StatusOptions::new();
     options
         .include_untracked(true)
@@ -1449,11 +1591,16 @@ fn capture_token(root: &Path, owned: &BTreeSet<String>) -> Result<CallerToken> {
         let key = hex(&bytes);
         // Active owned raw captures must be removed before any source read.
         // Tracked HEAD/index paths remain source even if a writer claims them.
-        if owned.contains(&key) && !tracked.contains(&bytes) {
+        if owned.contains(&key) && !tracked.paths.contains(&bytes) {
             continue;
         }
         let relative = git_path(&bytes)?;
-        sources.insert(key, source_entry(&root, &relative)?);
+        let entry = if tracked.gitlinks.contains(&bytes) {
+            gitlink_entry(&root, &relative, depth)?
+        } else {
+            source_entry(&root, &relative)?
+        };
+        sources.insert(key, entry);
     }
     let end_head = match repo.head() {
         Ok(reference) => reference.target().map(|oid| oid.to_string()),
@@ -1847,6 +1994,259 @@ fn mode(metadata: &fs::Metadata) -> u32 {
 mod tests {
     use super::*;
     use crate::checks::caller_guard_tests::fixture;
+
+    fn gitlink_fixture() -> (tempfile::TempDir, tempfile::TempDir, git2::Oid) {
+        let (root, home, _) = fixture();
+        let child = git2::Repository::init(root.path().join("backend")).unwrap();
+        fs::write(root.path().join("backend/source.rs"), "pinned source\n").unwrap();
+        let pin = commit_gitlink_child(&child);
+        let repo = git2::Repository::open(root.path()).unwrap();
+        fs::write(
+            root.path().join(".gitmodules"),
+            "[submodule \"backend\"]\n\tpath = backend\n\turl = ../fixture-source\n",
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(".gitmodules")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let mut builder = repo.treebuilder(Some(&tree)).unwrap();
+        builder.insert("backend", pin, 0o160000).unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        index.read_tree(&tree).unwrap();
+        index.write().unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "pin backend", &tree, &[&parent])
+            .unwrap();
+        (root, home, pin)
+    }
+
+    fn commit_gitlink_child(repo: &git2::Repository) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("source.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.head().ok().map(|head| head.peel_to_commit().unwrap());
+        let parents: Vec<_> = parent.iter().collect();
+        let sig = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "child source", &tree, &parents)
+            .unwrap()
+    }
+
+    #[test]
+    fn issue69_gitlink_guard_accepts_stable_pinned_checkout_and_operator_dirty_state() {
+        let (root, home, pin) = gitlink_fixture();
+        let child = git2::Repository::open(root.path().join("backend")).unwrap();
+        fs::write(root.path().join("backend/source.rs"), "operator commit\n").unwrap();
+        assert_ne!(commit_gitlink_child(&child), pin);
+        fs::write(
+            root.path().join("backend/source.rs"),
+            "operator dirty bytes\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("backend/userdata.rs"),
+            "untracked baseline\n",
+        )
+        .unwrap();
+        let guard = CallerGuard::capture_sync(root.path().into(), home.path().join("diagnostics"));
+        guard.verify_sync("before-checks", None).unwrap();
+        guard.verify_sync("after-checks", None).unwrap();
+        assert_eq!(
+            fs::read(root.path().join("backend/source.rs")).unwrap(),
+            b"operator dirty bytes\n"
+        );
+    }
+
+    #[test]
+    fn issue69_gitlink_guard_refuses_foreign_source_head_and_index_drift() {
+        for mutation in [
+            "tracked",
+            "untracked-new",
+            "untracked-edit",
+            "head",
+            "index",
+        ] {
+            let (root, home, _) = gitlink_fixture();
+            let backend = root.path().join("backend");
+            fs::write(backend.join("userdata.rs"), "before\n").unwrap();
+            let guard =
+                CallerGuard::capture_sync(root.path().into(), home.path().join("diagnostics"));
+            guard.verify_sync("before-checks", None).unwrap();
+            let child = git2::Repository::open(&backend).unwrap();
+            match mutation {
+                "tracked" => fs::write(backend.join("source.rs"), "foreign\n").unwrap(),
+                "untracked-new" => fs::write(backend.join("new.rs"), "foreign\n").unwrap(),
+                "untracked-edit" => fs::write(backend.join("userdata.rs"), "foreign\n").unwrap(),
+                "head" => child
+                    .set_head_detached(child.head().unwrap().target().unwrap())
+                    .unwrap(),
+                "index" => {
+                    let mut index = child.index().unwrap();
+                    index.remove_path(Path::new("source.rs")).unwrap();
+                    index.write().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = guard.verify_sync("after-foreign-edit", None).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<CallerDriftError>()
+                    .unwrap()
+                    .receipt
+                    .as_ref()
+                    .unwrap()
+                    .is_file(),
+                "{mutation}"
+            );
+            assert!(guard.verify_sync("later", None).is_err(), "{mutation}");
+            if mutation == "tracked" {
+                assert_eq!(fs::read(backend.join("source.rs")).unwrap(), b"foreign\n");
+            }
+        }
+    }
+
+    #[test]
+    fn issue69_gitlink_guard_accepts_missing_and_empty_but_observes_initialization() {
+        for empty in [false, true] {
+            let (root, home, _) = gitlink_fixture();
+            let backend = root.path().join("backend");
+            fs::rename(&backend, home.path().join("parked-backend")).unwrap();
+            if empty {
+                fs::create_dir(&backend).unwrap();
+            }
+            let guard =
+                CallerGuard::capture_sync(root.path().into(), home.path().join("diagnostics"));
+            guard.verify_sync("before-checks", None).unwrap();
+            if empty {
+                fs::remove_dir(&backend).unwrap();
+            }
+            fs::rename(home.path().join("parked-backend"), &backend).unwrap();
+            assert!(guard.verify_sync("after-initialization", None).is_err());
+        }
+    }
+
+    #[test]
+    fn issue69_gitlink_guard_refuses_owned_outputs_and_nested_tracked_alias() {
+        let (root, home, _) = gitlink_fixture();
+        let guard = CallerGuard::capture_sync(root.path().into(), home.path().join("diagnostics"));
+        guard.verify_sync("before-checks", None).unwrap();
+        let alias = home.path().join("source-alias");
+        fs::hard_link(root.path().join("backend/source.rs"), &alias).unwrap();
+        assert!(
+            guard
+                .seed_launcher_outputs(std::slice::from_ref(&alias))
+                .is_err()
+        );
+        assert!(!guard.owns_output(&alias));
+        for path in [
+            root.path().join("backend/source.rs"),
+            root.path().join("backend/new.rs"),
+            alias,
+        ] {
+            assert!(
+                guard
+                    .create_output(&path, true, |_, _| panic!("tracked writer must never open"))
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            fs::read(root.path().join("backend/source.rs")).unwrap(),
+            b"pinned source\n"
+        );
+    }
+
+    #[test]
+    fn issue69_gitlink_guard_head_only_gitlink_observes_regular_replacement() {
+        let (root, home, _) = gitlink_fixture();
+        fs::rename(
+            root.path().join("backend"),
+            home.path().join("parked-backend"),
+        )
+        .unwrap();
+        fs::write(root.path().join("backend"), "staged regular replacement\n").unwrap();
+        let repo = git2::Repository::open(root.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("backend")).unwrap();
+        index.add_path(Path::new("backend")).unwrap();
+        index.write().unwrap();
+        let guard = CallerGuard::capture_sync(root.path().into(), home.path().join("diagnostics"));
+        guard.verify_sync("before-checks", None).unwrap();
+        fs::write(root.path().join("backend"), "foreign replacement edit\n").unwrap();
+        assert!(guard.verify_sync("after-foreign-edit", None).is_err());
+    }
+
+    #[test]
+    fn issue69_gitlink_guard_nested_sources_and_alias_are_protected() {
+        let (root, home, _) = gitlink_fixture();
+        let backend = root.path().join("backend");
+        let nested = backend.join("nested");
+        let child = git2::Repository::init(&nested).unwrap();
+        fs::write(nested.join("source.rs"), "nested pinned source\n").unwrap();
+        let pin = commit_gitlink_child(&child);
+        fs::write(
+            backend.join(".gitmodules"),
+            "[submodule \"nested\"]\n\tpath = nested\n\turl = ../nested-source\n",
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&backend).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(".gitmodules")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let mut builder = repo.treebuilder(Some(&tree)).unwrap();
+        builder.insert("nested", pin, 0o160000).unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        index.read_tree(&tree).unwrap();
+        index.write().unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "pin nested", &tree, &[&parent])
+            .unwrap();
+        let guard = CallerGuard::capture_sync(root.path().into(), home.path().join("diagnostics"));
+        guard.verify_sync("before-checks", None).unwrap();
+        let alias = home.path().join("nested-alias");
+        fs::hard_link(nested.join("source.rs"), &alias).unwrap();
+        assert!(
+            guard
+                .seed_launcher_outputs(std::slice::from_ref(&alias))
+                .is_err()
+        );
+        assert!(!guard.owns_output(&alias));
+        assert!(
+            guard
+                .create_output(&alias, true, |_, _| panic!(
+                    "nested alias writer must never open"
+                ))
+                .is_err()
+        );
+        fs::write(nested.join("source.rs"), "foreign nested edit\n").unwrap();
+        assert!(guard.verify_sync("after-foreign-edit", None).is_err());
+        assert_eq!(
+            fs::read(nested.join("source.rs")).unwrap(),
+            b"foreign nested edit\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue69_gitlink_guard_observes_symlink_replacement_without_following_target() {
+        let (root, home, _) = gitlink_fixture();
+        let backend = root.path().join("backend");
+        fs::rename(&backend, home.path().join("parked-backend")).unwrap();
+        let outside = home.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("source.rs"), "outside source\n").unwrap();
+        std::os::unix::fs::symlink(&outside, &backend).unwrap();
+        let guard = CallerGuard::capture_sync(root.path().into(), home.path().join("diagnostics"));
+        guard.verify_sync("before-checks", None).unwrap();
+        fs::write(outside.join("source.rs"), "outside changed\n").unwrap();
+        guard
+            .verify_sync("outside-is-not-caller-source", None)
+            .unwrap();
+        fs::remove_file(&backend).unwrap();
+        std::os::unix::fs::symlink(home.path().join("different"), &backend).unwrap();
+        assert!(guard.verify_sync("after-link-retarget", None).is_err());
+    }
 
     #[tokio::test]
     async fn issue69_caller_guard_first_mismatch_survives_restoration() {

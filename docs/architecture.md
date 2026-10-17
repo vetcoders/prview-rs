@@ -1696,8 +1696,16 @@ hashes, and streaming hashes/modes of tracked and nonignored untracked source.
 Initial dirty source is a valid baseline. Symlink content is its link bytes,
 not the target. Unix regular-file reads use anchored no-follow opens and stop
 after the initial file size plus one byte; unstable or unreadable evidence is
-fatal. Owned worktree registrations are outside the source walk. Gitlinks remain
-explicitly unsupported by this token rather than certified clean.
+fatal. Owned worktree registrations are outside the source walk. Gitlink paths
+are taken from both HEAD and the index. Initialized gitlinks recursively observe
+their actual checkout's Git identity and tracked/nonignored untracked sources,
+including regular `.git` pointer bytes; their initial HEAD and dirty state need
+not match the pinned commit. Missing and empty uninitialized paths are distinct
+observed states. Nonempty directories without a repository and ambiguous Git
+markers fail closed; source symlinks retain link bytes without walking targets.
+Recursion is limited to 16 gitlink levels. Gitlink roots and descendants cannot
+be admitted as owned outputs, and pre-open alias checks include nested tracked
+leaves. This does not fetch, initialize, reset or restore operator submodules.
 
 Quality dispatchers observe before/after live checks, after budget admission and
 before cache writes. Python pre-sync, context admission/completion and publication
