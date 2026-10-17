@@ -136,3 +136,55 @@ fn unknown_code_theme_falls_back_without_panic() {
     let out = render("```rust\nfn a() {}\n```", &theme);
     assert!(out.contains("<pre style=\"background-color:#"));
 }
+
+#[test]
+fn style_url_schemes_are_filtered_case_insensitively() {
+    // Even CSS values that are invalid for a color must pass URL sanitization;
+    // the HTML allowlist must not preserve a forbidden scheme in a style value.
+    for function in ["url", "URL", "UrL"] {
+        let input = format!(
+            r#"<span style='color:{function}("javascript:alert(1)");font-weight:bold'>text</span>"#
+        );
+        let out = render(&input, &Theme::default());
+        assert!(
+            !out.contains("javascript:"),
+            "unsafe CSS URL survived: {out}"
+        );
+        assert!(out.contains("text"));
+    }
+    // Rejecting an unsafe URL may discard its whole style attribute. Ordinary
+    // highlighting in a separate, valid attribute must continue to work.
+    let out = render(
+        r##"<span style="color:#123456;font-weight:bold">safe</span>"##,
+        &Theme::default(),
+    );
+    assert!(out.contains("color:#123456"), "safe color lost: {out}");
+    assert!(out.contains("font-weight:bold"), "safe weight lost: {out}");
+}
+
+#[test]
+fn svg_animation_elements_cannot_escape_the_html_allowlist() {
+    for tag in [
+        "animateMotion",
+        "animateTransform",
+        "animateColor",
+        "set",
+        "animate",
+    ] {
+        let input = format!(
+            r#"<svg><a><{tag} attributeName="href" from="javascript:alert(1)" to="javascript:alert(2)"></{tag}></a></svg><span style="color:#123456">safe</span>"#
+        );
+        let out = render(&input, &Theme::default());
+        assert!(!out.contains("<svg"), "SVG tag survived: {out}");
+        assert!(
+            !out.to_ascii_lowercase()
+                .contains(&format!("<{}", tag.to_ascii_lowercase()))
+        );
+        assert!(
+            !out.contains("javascript:"),
+            "animation URL survived: {out}"
+        );
+        assert!(out.contains("color:#123456"), "safe color lost: {out}");
+        assert!(out.contains("safe"));
+    }
+}
