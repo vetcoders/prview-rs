@@ -1,6 +1,7 @@
 //! Pure context/publication boundary controls. No tools or scanner processes.
 use super::*;
 use crate::checks::caller_guard_tests::fixture;
+use std::sync::Arc;
 
 #[test]
 fn issue69_caller_guard_context_mock_admission_and_completion() {
@@ -30,10 +31,11 @@ fn issue69_caller_guard_publication_mock_rejects_and_clears_success_surfaces() {
         .initialize_caller_guard_sync(&config.repo_root)
         .unwrap();
     let pack = home.path().join("owned-unpublished-pack");
+    let _scope = ledger.output_scope(Some(pack.clone()));
     for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
         let path = pack.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "synthetic pinned PASS").unwrap();
+        crate::owned_output::fs::write(path, "synthetic pinned PASS").unwrap();
     }
     let index = home.path().join("index.jsonl");
     let latest = home.path().join("latest");
@@ -56,47 +58,26 @@ fn issue69_caller_guard_publication_mock_rejects_and_clears_success_surfaces() {
 }
 
 #[test]
-fn issue69_caller_guard_output_variant_a_refuses_non_source_namespace_before_write() {
-    use crate::checks::caller_integrity::validate_output_namespace;
-    let (root, home, _) = fixture();
-    let unignored = root.path().join("new-pack");
-    assert!(validate_output_namespace(root.path(), &unignored).is_err());
-    assert!(
-        !unignored.exists(),
-        "preflight must not allocate the refused namespace"
-    );
-    let external = home.path().join("external-pack");
-    validate_output_namespace(root.path(), &external).unwrap();
-    assert!(!external.exists(), "preflight is read-only");
-    validate_output_namespace(root.path(), &root.path().join(".generated/pack")).unwrap();
-    let tracked = root.path().join(".generated/source.txt");
-    std::fs::create_dir_all(tracked.parent().unwrap()).unwrap();
+fn issue69_caller_guard_internal_output_uses_exact_leaves_and_protects_tracked_data() {
+    let (root, home, config) = fixture();
+    let pack = root.path().join("new-pack");
+    std::fs::create_dir(&pack).unwrap();
+    let tracked = pack.join("user-source.txt");
     std::fs::write(&tracked, "tracked source\n").unwrap();
     let repo = git2::Repository::open(root.path()).unwrap();
     let mut index = repo.index().unwrap();
-    index.add_path(Path::new(".generated/source.txt")).unwrap();
-    index.write().unwrap();
-    assert!(validate_output_namespace(root.path(), &root.path().join(".generated")).is_err());
-    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-    let parent = repo.head().unwrap().peel_to_commit().unwrap();
-    let sig = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
-    repo.commit(
-        Some("HEAD"),
-        &sig,
-        &sig,
-        "tracked ignored source",
-        &tree,
-        &[&parent],
-    )
-    .unwrap();
     index
-        .remove_path(Path::new(".generated/source.txt"))
+        .add_path(Path::new("new-pack/user-source.txt"))
         .unwrap();
     index.write().unwrap();
-    assert!(
-        validate_output_namespace(root.path(), &root.path().join(".generated")).is_err(),
-        "HEAD tracked source must also be refused"
+    let guard = crate::checks::caller_integrity::CallerGuard::capture_sync(
+        config.repo_root,
+        home.path().join("diagnostics"),
     );
+    let _scope = crate::owned_output::enter(Arc::clone(&guard), Some(pack.clone()));
+    crate::owned_output::fs::write(pack.join("own-report.json"), "{}\n").unwrap();
+    guard.verify_sync("after-owned-report", None).unwrap();
+    assert!(crate::owned_output::fs::write(&tracked, "overwrite\n").is_err());
     assert_eq!(
         std::fs::read_to_string(tracked).unwrap(),
         "tracked source\n"
@@ -193,29 +174,132 @@ fn issue69_caller_guard_context_admission_rechecks_expired_deadline() {
 
 #[cfg(unix)]
 #[test]
-fn issue69_caller_guard_publication_parent_namespace_refuses_source_siblings() {
-    use crate::checks::caller_integrity::validate_storage_namespaces;
-    let (root, home, mut config) = fixture();
-    let _home = crate::config::override_test_prview_home(home.path());
-    config.output_dir = Some(root.path().join(".generated"));
-    assert!(
-        validate_storage_namespaces(&config).is_err(),
-        "ignored pack alone cannot authorize nonignored sibling latest writes"
-    );
-    assert!(!root.path().join(".generated").exists());
-    config.output_dir = Some(root.path().join(".generated/pack"));
-    validate_storage_namespaces(&config).unwrap();
-    let latest = root.path().join(".generated/latest");
-    std::fs::create_dir_all(latest.parent().unwrap()).unwrap();
+fn issue69_caller_guard_tracked_latest_is_protected_without_parent_refusal() {
+    let (root, home, config) = fixture();
+    let latest = root.path().join("latest");
     std::os::unix::fs::symlink(home.path(), &latest).unwrap();
     let repo = git2::Repository::open(root.path()).unwrap();
     let mut index = repo.index().unwrap();
-    index.add_path(Path::new(".generated/latest")).unwrap();
+    index.add_path(Path::new("latest")).unwrap();
     index.write().unwrap();
-    assert!(
-        validate_storage_namespaces(&config).is_err(),
-        "tracked sibling latest must be refused without following its target"
+    let guard = crate::checks::caller_integrity::CallerGuard::capture_sync(
+        config.repo_root,
+        home.path().join("diagnostics"),
     );
-    assert_eq!(std::fs::read_link(&latest).unwrap(), home.path());
-    assert!(!config.output_dir.as_ref().unwrap().exists());
+    let _scope = crate::owned_output::enter(Arc::clone(&guard), Some(root.path().to_path_buf()));
+    assert!(crate::owned_output::admit_validated_mutable(&latest).is_err());
+    assert_eq!(std::fs::read_link(latest).unwrap(), home.path());
+}
+
+#[cfg(unix)]
+fn transaction_drift_control(replace_latest_with_foreign: bool) {
+    let (root, home, config) = fixture();
+    let _home = crate::config::override_test_prview_home(home.path());
+    let previous = root.path().join("old-pack");
+    let out = root.path().join("new-pack");
+    std::fs::create_dir_all(previous.join("00_summary")).unwrap();
+    std::fs::create_dir_all(out.join("00_summary")).unwrap();
+    std::fs::write(
+        previous.join("00_summary/RUN.json"),
+        serde_json::to_vec(&serde_json::json!({"artifacts_root":previous})).unwrap(),
+    )
+    .unwrap();
+    let latest = root.path().join("latest");
+    std::os::unix::fs::symlink("old-pack", &latest).unwrap();
+    let ledger = TaskLedger::new();
+    ledger.initialize_caller_guard_config_sync(&config).unwrap();
+    let _scope = ledger.output_scope(Some(out.clone()));
+    crate::owned_output::fs::write(
+        out.join("00_summary/RUN.json"),
+        serde_json::to_vec(&serde_json::json!({"artifacts_root":out})).unwrap(),
+    )
+    .unwrap();
+    let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+    let transaction = begin_latest_publication(&publication, &out).unwrap();
+    assert_eq!(std::fs::read_link(&latest).unwrap(), Path::new("new-pack"));
+    std::fs::write(root.path().join("source.txt"), "foreign source\n").unwrap();
+    assert!(
+        ledger
+            .verify_caller_sync("before-index-commit", None)
+            .is_err()
+    );
+    if replace_latest_with_foreign {
+        std::fs::remove_file(&latest).unwrap();
+        std::os::unix::fs::symlink("foreign-pack", &latest).unwrap();
+    }
+    let rollback = rollback_latest_publication(&transaction);
+    drop(publication);
+    if replace_latest_with_foreign {
+        assert!(rollback.is_err());
+        assert_eq!(
+            std::fs::read_link(&latest).unwrap(),
+            Path::new("foreign-pack")
+        );
+        assert!(home.path().join("publication-transaction.json").is_file());
+    } else {
+        assert!(
+            rollback.is_ok(),
+            "actual transaction rollback must work after sticky source drift: {rollback:?}"
+        );
+        assert_eq!(std::fs::read_link(&latest).unwrap(), Path::new("old-pack"));
+        assert!(!home.path().join("publication-transaction.json").exists());
+    }
+    assert!(
+        !home.path().join("index.jsonl.lock").exists(),
+        "exact own legacy sentinel must be released even after drift"
+    );
+    assert!(ledger.ensure_caller_valid().is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("source.txt")).unwrap(),
+        "foreign source\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn issue69_caller_guard_transaction_drift_rolls_back_latest_and_releases_owned_lock() {
+    transaction_drift_control(false);
+}
+#[cfg(unix)]
+#[test]
+fn issue69_caller_guard_transaction_foreign_latest_is_preserved_after_drift() {
+    transaction_drift_control(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn issue69_caller_guard_external_invalid_journal_quarantine_keeps_source_valid() {
+    let (_root, home, config) = fixture();
+    let _home = crate::config::override_test_prview_home(home.path());
+    let payload = b"not a publication journal\n";
+    let journal = home.path().join("publication-transaction.json");
+    std::fs::write(&journal, payload).unwrap();
+    let ledger = TaskLedger::new();
+    ledger.initialize_caller_guard_config_sync(&config).unwrap();
+    let _scope = ledger.output_scope(None);
+    let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+    let recovery = recover_latest_publication(&publication);
+    assert!(
+        recovery.is_ok(),
+        "validated external invalid journal must remain recoverable under active accounting: {recovery:?}"
+    );
+    assert!(!journal.exists());
+    let preserved: Vec<_> = std::fs::read_dir(home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".publication-transaction.invalid.")
+        })
+        .map(|entry| std::fs::read(entry.path()).unwrap())
+        .collect();
+    assert_eq!(preserved, vec![payload.to_vec()]);
+    ledger
+        .verify_caller_sync("after-external-quarantine", None)
+        .unwrap();
+    drop(publication);
+    assert!(!home.path().join("index.jsonl.lock").exists());
+    ledger.ensure_caller_valid().unwrap();
 }

@@ -6,9 +6,9 @@ use super::common::{
 };
 use crate::checks::{CheckResult, CheckStatus};
 use crate::git::{Diff, Repository};
+use crate::owned_output::fs;
 use anyhow::Result;
 use std::fmt::Write as FmtWrite;
-use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Serialize)]

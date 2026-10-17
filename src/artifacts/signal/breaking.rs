@@ -5,9 +5,9 @@ use super::common::{
     LegacyPatchHeader, LegacyPatchSides, ReviewFileCategory, classify_review_file,
     is_js_ts_export_line, js_ts_export, js_ts_export_is_nested, js_ts_patch_sections,
 };
+use crate::owned_output::fs;
 use anyhow::Result;
 use std::fmt::Write as FmtWrite;
-use std::fs;
 use std::path::Path;
 
 /// Risk level for breaking change publicness heuristic (B3).

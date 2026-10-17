@@ -1676,73 +1676,87 @@ reason. Nonzero process outputs retain the scanner's existing classification.
 The proposed caller boundary guard below is separate from the shared snapshot
 observations: those observations continue to govern snapshot cache reuse.
 
-#### Caller boundary guard — proposed local variant A
+#### Caller boundary guard — exact owned output leaves
 
-A run retains the caller repository's first identity in the task ledger: canonical
+The task ledger retains the caller repository’s first identity: canonical
 worktree/Git/common directories, symbolic HEAD and resolved commit, raw HEAD/index
-hashes, and streaming hashes/modes of Git-tracked and nonignored untracked source.
-Initial dirty source is a valid baseline. Symlink targets are observed as link
-bytes rather than followed; Unix regular-file reads use anchored no-follow opens.
-Git administration such as owned worktree registrations is outside the source
-walk. Reads stop after the initial file size plus one byte; growth or an unstable
-read is unknown evidence and aborts rather than waiting for a writer to stop.
+hashes, and streaming hashes/modes of tracked and nonignored untracked source.
+Initial dirty source is a valid baseline. Symlink content is its link bytes,
+not the target. Unix regular-file reads use anchored no-follow opens and stop
+after the initial file size plus one byte; unstable or unreadable evidence is
+fatal. Owned worktree registrations are outside the source walk. Gitlinks remain
+explicitly unsupported by this token rather than certified clean.
 
-Both quality dispatchers observe before and after live checks, again after budget
-admission, and before cache writes. Python pre-sync, context command admission and
-completion, and publication use the same retained baseline. Context admission
-rechecks its existing deadline after observation and just before spawn; Python
-pre-sync rechecks existing run cancellation after observation/planning. Artifact generation
-initializes it for quick reviews that skipped the quality dispatcher. A mismatch
-or unreadable observation latches the first error even if source is later restored;
-queued checks are refused and dropping active futures/owned context children uses
-the existing process cleanup rails. A typed fatal error propagates through the
-existing Result path. No merge recommendation, analysis status, security policy,
-verdict enum, or cancellation reason is reclassified.
+Quality dispatchers observe before/after live checks, after budget admission and
+before cache writes. Python pre-sync, context admission/completion and publication
+use the same baseline; quick reviews initialize it without replacing an existing
+quality baseline. Observation errors and source mismatches latch permanently,
+even after restoration. Queued work stops and active futures/owned context
+children use existing cleanup rails. Context admission rechecks its existing
+deadline after observation and immediately before spawn. Errors use the existing
+fatal Result path, without changing verdicts, statuses or cancellation reasons.
 
-First-failure evidence is written exclusively under
-`PRVIEW_HOME/diagnostics/caller-drift-*/CALLER_DRIFT.json`, separate from normal
-pack allocation, latest aliases and run history. It records expected/observed
-hashes and changed paths, or an explicit observation error. Diagnostics configured
-inside the caller are refused without a caller write; retention is then honestly
-unconfirmed in the fatal reason. A late artifact-stage mismatch removes the
-existing success-shaped surfaces (including RUN/MERGE_GATE/ZIP), leaves typed
-INCOMPLETE evidence with reason `caller drift`, and rolls back an uncommitted
-latest advertisement before the index commit. After owned child cleanup, early
-caller-drift aborts retain raw `.context-cmd-*.{stdout,stderr}.tmp` captures in the
-partial pack. The fatal reason and INCOMPLETE receipt name that directory; these
-raw bytes are diagnostic evidence, never completed gates.
+Internal nonignored `PRVIEW_HOME` and `--output-dir` remain supported. Only exact
+leaves created by the run’s concrete writers are excluded; no directory prefix,
+WalkDir result or final manifest grants ownership. An exclusive new-file open and
+registration are serialized with observations. Tracked HEAD/index paths are
+always protected. An unclaimed preexisting pack leaf is refused before writing;
+a disappeared baseline leaf or newly observed foreign collision latches drift.
+Foreign siblings remain visible, including inside the allocated pack.
 
-**Variant A is a local proposal pending contract acceptance:** the whole
-`PRVIEW_HOME` storage namespace (cache, index, latest and runs), plus any explicit
-artifact output and its sibling-publication parent, must be outside the caller
-or in a Git-ignored namespace
-containing no tracked index/HEAD source. Nonignored internal storage or
-`--output-dir` is refused before cache use, artifact allocation or the first
-artifact write, including when explicit output is external. An ignored pack
-whose parent is nonignored is also refused, because latest/lock/staging entries
-are siblings of the pack rather than its children. Read-only parent traversal
-requires an already existing, resolvable directory; missing-component `..` paths
-are refused without allocating their prefixes. No output subtree is silently excluded from caller
-source, and ignored output does not authorize overwriting tracked files. Default
-external `~/.prview` storage keeps its existing success verdicts. Gitlinks are
-explicitly unsupported by this caller token instead of being certified clean;
-that compatibility limit also remains pending acceptance.
+The synchronous writer scope exists only around artifact generation and cache
+publication, never external Check::run or an await. Shared cache/index/latest and
+journal leaves require their explicit writer role and a preimage matching the
+baseline or last own state. Known-byte writes retain the observation lock through
+preimage checking, a nontruncating opened-handle check and the write, and record
+the supplied content’s hash rather than adopting a fresh pathname read. Atomic
+replacements carry the staged writer intent. Mutable expected state is checked
+before excluding its key at later boundaries. Growing raw captures are admitted
+before the child writes and skipped before hashing. esbuild’s exact metafile is
+claimed before spawn. MCP nonce/sentinel validation seeds only the reservation’s
+exact control/log leaves before the first observation, preserving its existing
+one-shot handoff and rejecting tracked collisions or foreign reservation files.
 
-Variant A validates planned namespace roots; it does not prove confinement of
-pre-existing writers through descendant symlinks. In particular, a redirected
-cache-check directory or default run subtree can still point into source. The
-subsequent caller boundary detects resulting drift and prevents successful
-publication; a partial pack and writer damage may already exist. This guard
-does not prevent damage by those existing writers. Writer
-confinement remains a separate unresolved boundary, not a claimed property of A.
+Unknown caller-visible old cache/retention payloads are retained rather than
+adopted from an old manifest. Cache remains best effort; unrecognized current
+entries are not overwritten. Retention uses the existing unpruned-index fallback
+when old predecessors or prune storage are caller-visible. Existing validated
+non-source retention cleanup remains available; tracked descendants defeat an
+ignore-based non-source decision.
 
-These are boundary observations, not a continuous watcher: mutation followed by
-restoration entirely between observations can escape detection. Raw-index
-identity is deliberately strict, so even a Git stat-cache refresh can abort a run.
-Hashing costs source bytes per observed boundary, with bounded content buffers;
-there is no claim of a fixed whole-repository observation time. New execution
-controls use synthetic mock checks only; previous Semgrep runtime evidence and
-its interrupted additional repeat remain historical, not proof of this proposal.
+Configured Cargo/uv getters and ambient target/.venv behavior stay unchanged.
+Only snapshot-managed cargo-target/uv-env scratch whose real namespace is
+caller-visible or redirects into caller source is relocated into repository-
+namespaced temporary scratch outside the caller. Its actual path remains in the
+command environment/provenance, and a diagnostic explains relocation and the
+separate warm cache. Old scratch is neither migrated nor pruned. An effective
+temporary namespace inside the caller produces a targeted planning error. This
+is not absolute child-write confinement; custom pytest/Vitest temporary paths
+and preexisting writer redirects remain separate boundaries.
+
+First-mismatch evidence is an exclusive immutable CALLER_DRIFT.json outside normal
+pack allocation, latest and history. The configured diagnostics parent is used
+when external; an internal parent uses external temporary diagnostics instead.
+If that fallback is also inside caller, retention is honestly unconfirmed in the
+fatal error. Late artifact drift removes only already-owned success surfaces,
+writes an exact INCOMPLETE marker and retains raw
+`.context-cmd-*.{stdout,stderr}.tmp` bytes after owned process cleanup. The fatal
+reason and marker name the partial directory; raw bytes are diagnostics, never
+completed gates. Existing uncommitted latest rollback remains in use. After a
+sticky failure, only that transaction’s registered alias/journal may be undone,
+and only while their current postimages still match the run’s recorded intent;
+foreign replacements are preserved. The exact own legacy lock sentinel can be
+released without clearing the fatal source observation.
+
+These are boundary observations, not a continuous watcher. Mutation/restoration
+entirely between boundaries may escape. Raw-index identity is deliberately
+strict, including Git stat-cache refreshes. Hashing costs source bytes per
+boundary with bounded content buffers, not a fixed repository-wide time bound.
+Exact output accounting is not a cryptographic claim of every later writer’s
+authorship. It does not establish confinement of all existing writer descendants;
+a partial pack or writer damage may precede a detected fatal boundary. Historical
+Semgrep runtime evidence and its interrupted additional repeat are not new
+runtime proof of this guard.
 
 `checks::snapshot_integrity::SnapshotObservation` compares the ledger-owned
 worktree with the immutable commit resolved before worktree creation. The shared

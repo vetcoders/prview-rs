@@ -55,6 +55,7 @@ use crate::git::git_cmd;
 use crate::git::{Diff, Repository, ResolvedRef};
 use crate::heuristics::HeuristicsResult;
 use crate::ledger::TaskLedger;
+use crate::owned_output::fs;
 use crate::paths::{read_dir_within, read_to_string_within, read_within};
 use crate::policy::{GateClass, PolicySeverity};
 use crate::regression;
@@ -66,7 +67,6 @@ use signal::{
 };
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
-use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -567,8 +567,8 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let ledger = input.ledger;
     // Quick reviews did not pass through the quality dispatcher. Preserve any
     // existing baseline rather than recertifying a caller after it changed.
-    ledger.initialize_caller_guard_sync(&input.config.repo_root)?;
-    crate::checks::caller_integrity::validate_storage_namespaces(input.config)?;
+    ledger.initialize_caller_guard_config_sync(input.config)?;
+    let _output_scope = ledger.output_scope(None);
     ledger.verify_caller_sync("before-artifact-allocation", None)?;
     let mut owned_out_dir = None;
     let result = generate_guarded(input, &mut owned_out_dir);
@@ -589,6 +589,7 @@ fn finish_caller_guarded_generation(
                     "caller drift; partial diagnostics retained at {}",
                     out_dir.display()
                 ));
+                let _cleanup_scope = ledger.output_scope(Some(out_dir.to_path_buf()));
                 if let Err(cleanup) = mark_generation_caller_drift(out_dir) {
                     return Err(error.context(format!(
                         "caller-drift success-surface cleanup not confirmed: {cleanup:#}"
@@ -605,7 +606,7 @@ fn finish_caller_guarded_generation(
 fn mark_generation_caller_drift(out_dir: &Path) -> Result<()> {
     let mut failures = Vec::new();
     for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
-        if let Err(error) = fs::remove_file(out_dir.join(relative))
+        if let Err(error) = crate::owned_output::remove_owned_after_abort(&out_dir.join(relative))
             && error.kind() != std::io::ErrorKind::NotFound
         {
             failures.push(format!("{relative}: {error}"));
@@ -613,13 +614,13 @@ fn mark_generation_caller_drift(out_dir: &Path) -> Result<()> {
     }
     let summary = out_dir.join("00_summary");
     fs::create_dir_all(&summary)?;
-    fs::write(
-        summary.join("INCOMPLETE.json"),
+    crate::owned_output::write_incomplete_after_abort(
+        &summary.join("INCOMPLETE.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": "1.0", "status": "incomplete", "reason": "caller drift", "stage": "caller boundary",
             "partial_output_dir": out_dir,
             "raw_context_diagnostics": "30_context/.context-cmd-*.{stdout,stderr}.tmp; partial raw bytes, not completed gates"
-        }))?,
+        }))?.as_slice(),
     )?;
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
@@ -731,6 +732,7 @@ fn generate_guarded(
     }
 
     *owned_out_dir = Some(out_dir.clone());
+    let _pack_scope = ledger.output_scope(Some(out_dir.clone()));
 
     // Open repository once for all generators
     let repo = Repository::open(&config.repo_root)?;
@@ -1548,6 +1550,51 @@ pub(crate) fn reserve_mcp_output_dir(out_dir: &Path, nonce: &str) -> Result<()> 
     file.write_all(nonce.as_bytes())?;
     file.sync_all()?;
     Ok(())
+}
+
+pub(crate) fn caller_launcher_outputs(config: &Config) -> Result<Vec<PathBuf>> {
+    let Some(nonce) = std::env::var_os(MCP_OUTPUT_RESERVATION_ENV) else {
+        return Ok(Vec::new());
+    };
+    let nonce = nonce
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("invalid MCP reservation encoding"))?;
+    let out_dir = config
+        .output_dir
+        .as_deref()
+        .context("MCP reservation requires an explicit output directory")?;
+    validate_mcp_reservation(out_dir, &nonce)
+}
+
+fn validate_mcp_reservation(out_dir: &Path, nonce: &str) -> Result<Vec<PathBuf>> {
+    let reservation = out_dir.join(MCP_OUTPUT_RESERVATION_FILE);
+    let metadata = std::fs::symlink_metadata(&reservation)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 8192,
+        "invalid MCP reservation sentinel"
+    );
+    anyhow::ensure!(
+        std::fs::read_to_string(&reservation)? == nonce,
+        "MCP reservation nonce mismatch"
+    );
+    for entry in std::fs::read_dir(out_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let allowed = name == std::ffi::OsStr::new(MCP_OUTPUT_RESERVATION_FILE)
+            || MCP_CONTROL_FILES
+                .iter()
+                .any(|value| name == std::ffi::OsStr::new(value));
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        anyhow::ensure!(
+            allowed && metadata.is_file() && !metadata.file_type().is_symlink(),
+            "MCP reservation contains an unowned entry: {:?}",
+            name
+        );
+    }
+    Ok(std::iter::once(MCP_OUTPUT_RESERVATION_FILE)
+        .chain(MCP_CONTROL_FILES.iter().copied())
+        .map(|name| out_dir.join(name))
+        .collect())
 }
 
 /// Claim one explicit pack path. Existing directories are rejected unless the

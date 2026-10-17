@@ -9,10 +9,10 @@ use super::common::{
     strip_rust_non_code,
 };
 use crate::checks::{CheckResult, CheckStatus};
+use crate::owned_output::fs;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
-use std::fs;
 use std::path::Path;
 
 /// A summarized result of public API changes between base and target.

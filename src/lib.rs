@@ -17,6 +17,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod mdrender;
 pub mod output;
+pub(crate) mod owned_output;
 pub mod paths;
 pub mod policy;
 pub mod proc;

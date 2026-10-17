@@ -28,6 +28,7 @@ pub const TEST_TIMEOUT_SECS: u64 = 900;
 pub(crate) mod caller_guard_tests;
 pub(crate) mod caller_integrity;
 mod cargo;
+mod managed_scratch;
 mod pytest_home;
 mod python;
 pub mod scope;
@@ -763,8 +764,7 @@ async fn run_all_checks(
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::io::Write;
 
-    caller_integrity::validate_storage_namespaces(config)?;
-    ledger.initialize_caller_guard(&config.repo_root).await?;
+    ledger.initialize_caller_guard_config(config).await?;
     let cache = Arc::new(cache);
     let emit = !config.json && !config.quiet;
 
@@ -1282,8 +1282,7 @@ async fn run_all_checks_with_events<F>(
 where
     F: Fn(CheckEvent) + Send + Sync,
 {
-    caller_integrity::validate_storage_namespaces(config)?;
-    ledger.initialize_caller_guard(&config.repo_root).await?;
+    ledger.initialize_caller_guard_config(config).await?;
     let mut results = Vec::new();
     let mut skipped = Vec::new();
     let mut runnable_checks: Vec<Box<dyn Check>> = Vec::new();
@@ -1753,6 +1752,9 @@ async fn execute_live_check(
                     .provenance
                     .as_ref()
                     .and_then(|prov| serde_json::to_string(prov).ok());
+                // No writer authority exists during external Check::run.
+                // The same run guard is scoped only over this synchronous API.
+                let _output_scope = ledger.and_then(|ledger| ledger.output_scope(None));
                 if let Err(e) = cache.set(
                     &name,
                     &key,

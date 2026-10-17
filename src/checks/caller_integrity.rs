@@ -4,7 +4,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -64,13 +64,20 @@ pub(crate) struct CallerGuard {
     baseline: std::result::Result<CallerToken, String>,
     first: Mutex<Option<CallerDriftError>>,
     observation_gate: Mutex<()>,
+    owned_outputs: Mutex<BTreeMap<PathBuf, OwnedLeaf>>,
+}
+
+#[derive(Clone)]
+struct OwnedLeaf {
+    mutable: bool,
+    expected: Option<SourceEntry>,
 }
 
 impl CallerGuard {
     pub(crate) async fn capture(root: PathBuf, diagnostics: PathBuf) -> Arc<Self> {
         let capture_root = root.clone();
         let baseline = tokio::task::spawn_blocking(move || {
-            capture_token(&capture_root).map_err(|error| format!("{error:#}"))
+            capture_token(&capture_root, &BTreeSet::new()).map_err(|error| format!("{error:#}"))
         })
         .await
         .unwrap_or_else(|error| Err(format!("caller observation worker failed: {error}")));
@@ -78,7 +85,7 @@ impl CallerGuard {
     }
 
     pub(crate) fn capture_sync(root: PathBuf, diagnostics: PathBuf) -> Arc<Self> {
-        let baseline = capture_token(&root).map_err(|error| format!("{error:#}"));
+        let baseline = capture_token(&root, &BTreeSet::new()).map_err(|error| format!("{error:#}"));
         Self::from_observation(root, diagnostics, baseline)
     }
 
@@ -93,7 +100,696 @@ impl CallerGuard {
             baseline,
             first: Mutex::new(None),
             observation_gate: Mutex::new(()),
+            owned_outputs: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn owned_keys(&self) -> Result<BTreeSet<String>> {
+        let root = fs::canonicalize(&self.root)?;
+        let owned = self
+            .owned_outputs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Ok(owned
+            .keys()
+            .filter_map(|path| path.strip_prefix(&root).ok())
+            .map(path_key)
+            .collect())
+    }
+
+    /// The caller already validated a typed MCP reservation. Seed only its
+    /// exact launcher leaves before a first observation can read active logs.
+    pub(crate) fn seed_launcher_outputs(&self, paths: &[PathBuf]) -> Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut owned = self
+            .owned_outputs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for path in paths {
+            let path = output_leaf_path(path)?;
+            ensure!(
+                !self.output_is_tracked(&path)?,
+                "tracked source cannot be a launcher output: {}",
+                path.display()
+            );
+            owned.insert(
+                path,
+                OwnedLeaf {
+                    mutable: false,
+                    expected: None,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capture_sync_with_launcher(
+        root: PathBuf,
+        diagnostics: PathBuf,
+        paths: &[PathBuf],
+    ) -> Result<Arc<Self>> {
+        let normalized: Vec<_> = paths
+            .iter()
+            .map(|p| output_leaf_path(p))
+            .collect::<Result<_>>()?;
+        let canonical_root = fs::canonicalize(&root)?;
+        let keys = normalized
+            .iter()
+            .filter_map(|p| p.strip_prefix(&canonical_root).ok())
+            .map(path_key)
+            .collect();
+        let baseline = capture_token(&root, &keys).map_err(|error| format!("{error:#}"));
+        let guard = Self::from_observation(root, diagnostics, baseline);
+        guard.seed_launcher_outputs(&normalized)?;
+        Ok(guard)
+    }
+
+    fn output_is_tracked(&self, path: &Path) -> Result<bool> {
+        let root = fs::canonicalize(&self.root)?;
+        let Ok(relative) = path.strip_prefix(&root) else {
+            return Ok(false);
+        };
+        let repo = git2::Repository::open(&root)?;
+        Ok(tracked_paths(&repo)?
+            .iter()
+            .any(|bytes| git_path(bytes).is_ok_and(|p| p == relative)))
+    }
+
+    pub(crate) fn owns_output(&self, path: &Path) -> bool {
+        output_leaf_path(path).is_ok_and(|p| {
+            self.owned_outputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&p)
+        })
+    }
+
+    pub(crate) fn owns_mutable_output(&self, path: &Path) -> bool {
+        output_leaf_path(path).is_ok_and(|path| {
+            self.owned_outputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&path)
+                .is_some_and(|leaf| leaf.mutable)
+        })
+    }
+
+    /// New output admission and exclusive open are serialized with capture.
+    /// The capability is supplied by a pack leaf or a typed shared writer.
+    pub(crate) fn create_output(
+        &self,
+        path: &Path,
+        allow_new: bool,
+        open: impl FnOnce(&Path, bool) -> std::io::Result<File>,
+    ) -> std::io::Result<File> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.create_output_locked(path, allow_new, open)
+    }
+
+    fn create_output_locked(
+        &self,
+        path: &Path,
+        allow_new: bool,
+        open: impl FnOnce(&Path, bool) -> std::io::Result<File>,
+    ) -> std::io::Result<File> {
+        self.ensure_valid().map_err(std::io::Error::other)?;
+        let path = output_leaf_path(path).map_err(|error| {
+            std::io::Error::other(self.latch_output_unknown("output-path-resolution", error))
+        })?;
+        if self.output_is_tracked(&path).map_err(|error| {
+            std::io::Error::other(self.latch_output_unknown("output-tracked-observation", error))
+        })? {
+            return Err(std::io::Error::other(format!(
+                "refusing tracked output collision: {}",
+                path.display()
+            )));
+        }
+        let mut owned = self
+            .owned_outputs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let known = owned.contains_key(&path);
+        if !known
+            && self.baseline_contains_output(&path).map_err(|error| {
+                std::io::Error::other(self.latch_output_unknown("new-output-baseline", error))
+            })?
+            && fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(std::io::Error::other(self.latch_output_unknown(
+                "new-output-baseline",
+                "initial caller userdata disappeared before output creation",
+            )));
+        }
+        if let Some(leaf) = owned.get(&path) {
+            self.check_mutable_preimage(&path, leaf)
+                .map_err(std::io::Error::other)?;
+        }
+        if !known && fs::symlink_metadata(&path).is_ok() {
+            drop(owned);
+            self.reject_new_foreign_collision(&path)
+                .map_err(std::io::Error::other)?;
+            return Err(std::io::Error::other(format!(
+                "unowned output collision: {}",
+                path.display()
+            )));
+        }
+        if !known && !allow_new {
+            return Err(std::io::Error::other(format!(
+                "no exact output capability for {}",
+                path.display()
+            )));
+        }
+        let mut file = open(&path, !known)?;
+        if known {
+            if let Some(leaf) = owned.get(&path)
+                && leaf.mutable
+            {
+                let expected = leaf
+                    .expected
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("mutable file preimage is absent"))?;
+                let observed = hash_file(file.try_clone()?).map_err(|error| {
+                    std::io::Error::other(self.latch_output_unknown("output-handle-read", error))
+                })?;
+                if expected.sha256.as_ref() != Some(&observed.0) || expected.mode != observed.1 {
+                    return Err(std::io::Error::other(self.latch_output_unknown(
+                        "output-handle-preimage",
+                        "opened mutable handle differs from expected preimage",
+                    )));
+                }
+            }
+            let metadata = file.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let at_path = fs::symlink_metadata(&path)?;
+                if metadata.nlink() != 1
+                    || metadata.dev() != at_path.dev()
+                    || metadata.ino() != at_path.ino()
+                {
+                    return Err(std::io::Error::other(
+                        "output handle is shared or no longer names its claimed leaf",
+                    ));
+                }
+            }
+            file.seek(SeekFrom::Start(0))?;
+            file.set_len(0)?;
+        }
+        owned.entry(path).or_insert(OwnedLeaf {
+            mutable: false,
+            expected: None,
+        });
+        Ok(file)
+    }
+
+    pub(crate) fn write_output(
+        &self,
+        path: &Path,
+        allow_new: bool,
+        bytes: &[u8],
+        open: impl FnOnce(&Path, bool) -> std::io::Result<File>,
+    ) -> std::io::Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut file = self.create_output_locked(path, allow_new, open)?;
+        let controlled_mode = mode(&file.metadata()?);
+        file.write_all(bytes)?;
+        // Trust the writer's supplied bytes, never a fresh pathname postimage.
+        let path = output_leaf_path(path).map_err(|error| {
+            std::io::Error::other(self.latch_output_unknown("output-path-resolution", error))
+        })?;
+        let expected = SourceEntry {
+            path: output_entry_name(&self.root, &path).map_err(std::io::Error::other)?,
+            kind: "file",
+            mode: controlled_mode,
+            sha256: Some(hex(&Sha256::digest(bytes))),
+        };
+        if let Some(leaf) = self
+            .owned_outputs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(&path)
+        {
+            leaf.expected = Some(expected);
+        }
+        Ok(())
+    }
+
+    /// Admit a validated shared-state leaf without rebasing its preimage.
+    /// The format/role check belongs to the actual cache/index/latest API.
+    pub(crate) fn admit_mutable_output(&self, path: &Path) -> Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.ensure_valid()?;
+        let path = output_leaf_path(path)
+            .map_err(|error| self.latch_output_unknown("shared-output-resolution", error))?;
+        ensure!(
+            !self
+                .output_is_tracked(&path)
+                .map_err(|error| self.latch_output_unknown("shared-output-tracked", error))?,
+            "tracked shared-state collision: {}",
+            path.display()
+        );
+        let actual = output_state(&self.root, &path)
+            .map_err(|error| self.latch_output_unknown("shared-output-read", error))?;
+        let root = fs::canonicalize(&self.root)
+            .map_err(|error| self.latch_output_unknown("output-root-observation", error))?;
+        let key = path.strip_prefix(&root).ok().map(path_key);
+        let mut owned = self
+            .owned_outputs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = owned.get(&path);
+        let expected = match previous {
+            Some(leaf) if leaf.mutable => leaf.expected.clone(),
+            Some(_) => actual.clone(), // already-created own output, not caller source
+            None => key
+                .as_ref()
+                .and_then(|key| self.baseline.as_ref().ok()?.sources.get(key).cloned()),
+        };
+        // Ignored/external shared state is outside the source token. Caller
+        // visible state must equal the baseline or the last own postimage.
+        let visible =
+            key.as_ref().is_some_and(|key| {
+                self.baseline
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|b| b.sources.contains_key(key))
+            }) || (key.is_some() && actual.is_some() && !git_ignored_output(&root, &path)?);
+        if (visible || previous.is_some_and(|leaf| leaf.mutable)) && expected != actual {
+            drop(owned);
+            return self.reject_observation(
+                "shared-output-preimage",
+                None,
+                Err(format!(
+                    "shared output preimage changed: {}",
+                    path.display()
+                )),
+            );
+        }
+        owned.insert(
+            path,
+            OwnedLeaf {
+                mutable: true,
+                expected: actual,
+            },
+        );
+        Ok(())
+    }
+
+    fn latch_output_unknown(&self, phase: &str, error: impl std::fmt::Display) -> anyhow::Error {
+        match self.reject_observation(phase, None, Err(error.to_string())) {
+            Err(error) => error,
+            Ok(()) => anyhow::anyhow!("unknown caller output observation: {error}"),
+        }
+    }
+
+    fn baseline_contains_output(&self, path: &Path) -> Result<bool> {
+        let root = fs::canonicalize(&self.root)
+            .map_err(|error| self.latch_output_unknown("output-root-observation", error))?;
+        Ok(path.strip_prefix(&root).ok().is_some_and(|relative| {
+            self.baseline
+                .as_ref()
+                .ok()
+                .is_some_and(|baseline| baseline.sources.contains_key(&path_key(relative)))
+        }))
+    }
+
+    fn check_mutable_preimage(&self, path: &Path, leaf: &OwnedLeaf) -> Result<()> {
+        if leaf.mutable
+            && leaf.expected
+                != output_state(&self.root, path)
+                    .map_err(|error| self.latch_output_unknown("mutable-output-read", error))?
+        {
+            return self.reject_observation(
+                "shared-output-preimage",
+                None,
+                Err(format!(
+                    "registered output preimage changed: {}",
+                    path.display()
+                )),
+            );
+        }
+        Ok(())
+    }
+
+    fn reject_new_foreign_collision(&self, path: &Path) -> Result<()> {
+        let root = fs::canonicalize(&self.root)
+            .map_err(|error| self.latch_output_unknown("output-root-observation", error))?;
+        let Ok(relative) = path.strip_prefix(&root) else {
+            return Ok(());
+        };
+        if !git_ignored_output(&root, path)?
+            && self
+                .baseline
+                .as_ref()
+                .ok()
+                .is_some_and(|baseline| !baseline.sources.contains_key(&path_key(relative)))
+        {
+            return self.reject_observation(
+                "new-output-collision",
+                None,
+                Err(format!(
+                    "foreign leaf appeared after caller baseline: {}",
+                    path.display()
+                )),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_output(&self, path: &Path) -> std::io::Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.ensure_valid().map_err(std::io::Error::other)?;
+        let path = output_leaf_path(path).map_err(|error| {
+            std::io::Error::other(self.latch_output_unknown("output-path-resolution", error))
+        })?;
+        ensure_untracked_output(self, &path).map_err(std::io::Error::other)?;
+        let mut owned = self
+            .owned_outputs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(leaf) = owned.get(&path) {
+            self.check_mutable_preimage(&path, leaf)
+                .map_err(std::io::Error::other)?;
+        }
+        if !owned.contains_key(&path) {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(error),
+                Err(error) => {
+                    return Err(std::io::Error::other(
+                        self.latch_output_unknown("output-removal-observation", error),
+                    ));
+                }
+                Ok(_) => {}
+            }
+            drop(owned);
+            self.reject_new_foreign_collision(&path)
+                .map_err(std::io::Error::other)?;
+            return Err(std::io::Error::other(format!(
+                "refusing unowned output removal: {}",
+                path.display()
+            )));
+        }
+        fs::remove_file(&path)?;
+        if let Some(leaf) = owned.get_mut(&path) {
+            leaf.expected = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rename_output(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.ensure_valid().map_err(std::io::Error::other)?;
+        let source = output_leaf_path(source).map_err(|error| {
+            std::io::Error::other(self.latch_output_unknown("output-source-resolution", error))
+        })?;
+        let destination = output_leaf_path(destination).map_err(|error| {
+            std::io::Error::other(self.latch_output_unknown("output-destination-resolution", error))
+        })?;
+        if self.output_is_tracked(&destination).map_err(|error| {
+            std::io::Error::other(self.latch_output_unknown("output-tracked-observation", error))
+        })? {
+            return Err(std::io::Error::other("tracked output rename collision"));
+        }
+        let mut owned = self
+            .owned_outputs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        ensure_untracked_output(self, &source).map_err(std::io::Error::other)?;
+        if let Some(leaf) = owned.get(&source) {
+            self.check_mutable_preimage(&source, leaf)
+                .map_err(std::io::Error::other)?;
+        }
+        if let Some(leaf) = owned.get(&destination) {
+            self.check_mutable_preimage(&destination, leaf)
+                .map_err(std::io::Error::other)?;
+        }
+        if !owned.contains_key(&source) {
+            return Err(std::io::Error::other("unowned output rename source"));
+        }
+        if !owned.contains_key(&destination) {
+            if self
+                .baseline_contains_output(&destination)
+                .map_err(|error| {
+                    std::io::Error::other(
+                        self.latch_output_unknown("rename-output-baseline", error),
+                    )
+                })?
+                && fs::symlink_metadata(&destination)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(std::io::Error::other(self.latch_output_unknown(
+                    "rename-output-baseline",
+                    "initial caller userdata disappeared before output rename",
+                )));
+            }
+            if fs::symlink_metadata(&destination).is_ok() {
+                drop(owned);
+                self.reject_new_foreign_collision(&destination)
+                    .map_err(std::io::Error::other)?;
+                return Err(std::io::Error::other("unowned output rename destination"));
+            }
+        }
+        let mut intended = owned.get(&source).and_then(|leaf| leaf.expected.clone());
+        if owned.get(&destination).is_some_and(|leaf| leaf.mutable) && intended.is_none() {
+            return Err(std::io::Error::other(
+                "shared replacement has no writer-supplied intended bytes",
+            ));
+        }
+        if let Some(entry) = intended.as_mut() {
+            entry.path =
+                output_entry_name(&self.root, &destination).map_err(std::io::Error::other)?;
+        }
+        fs::rename(&source, &destination)?;
+        let destination_leaf = owned.entry(destination.clone()).or_insert(OwnedLeaf {
+            mutable: false,
+            expected: None,
+        });
+        destination_leaf.expected = intended;
+        if let Some(leaf) = owned.get_mut(&source) {
+            leaf.expected = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn create_latest_link(
+        &self,
+        path: &Path,
+        target: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.ensure_valid().map_err(std::io::Error::other)?;
+        let path = output_leaf_path(path).map_err(std::io::Error::other)?;
+        ensure_untracked_output(self, &path).map_err(std::io::Error::other)?;
+        if self
+            .baseline_contains_output(&path)
+            .map_err(std::io::Error::other)?
+        {
+            return Err(std::io::Error::other(
+                "latest staging leaf collides with baseline data",
+            ));
+        }
+        if fs::symlink_metadata(&path).is_ok() {
+            self.reject_new_foreign_collision(&path)
+                .map_err(std::io::Error::other)?;
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        std::os::unix::fs::symlink(target, &path)?;
+        let entry = SourceEntry {
+            path: output_entry_name(&self.root, &path).map_err(std::io::Error::other)?,
+            kind: "symlink",
+            mode: mode(&fs::symlink_metadata(&path)?),
+            sha256: Some(hex(&Sha256::digest(target.as_encoded_bytes()))),
+        };
+        self.owned_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                path,
+                OwnedLeaf {
+                    mutable: false,
+                    expected: Some(entry),
+                },
+            );
+        Ok(())
+    }
+
+    /// Undo only this run's already-advertised latest transaction. Sticky
+    /// drift remains fatal; registered alias and journal postimages must still
+    /// match before any undo, so a foreign writer's state is never adopted.
+    #[cfg(unix)]
+    pub(crate) fn rollback_latest_after_drift(
+        &self,
+        out_dir: &Path,
+        previous: Option<&std::ffi::OsStr>,
+        journal: &Path,
+    ) -> Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            self.ensure_valid().is_err(),
+            "drift rollback requires an existing sticky failure"
+        );
+        let parent = out_dir
+            .parent()
+            .context("latest rollback has no publication parent")?;
+        let latest = output_leaf_path(&parent.join("latest"))?;
+        let journal = output_leaf_path(journal)?;
+        ensure_untracked_output(self, &latest)?;
+        ensure_untracked_output(self, &journal)?;
+        let mut owned = self.owned_outputs.lock().unwrap_or_else(|e| e.into_inner());
+        for path in [&latest, &journal] {
+            let leaf = owned
+                .get(path)
+                .context("rollback path has no exact transaction ownership")?;
+            ensure!(
+                leaf.mutable,
+                "rollback path is not an admitted transaction role"
+            );
+            self.check_mutable_preimage(path, leaf)?;
+        }
+        let current = fs::read_link(&latest)?;
+        ensure!(
+            Some(current.as_os_str()) == out_dir.file_name(),
+            "latest no longer advertises this transaction; foreign alias retained"
+        );
+        let expected = if let Some(previous) = previous {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let staged = output_leaf_path(
+                &parent.join(format!(".latest.rollback.{}.{nonce}", std::process::id())),
+            )?;
+            ensure_untracked_output(self, &staged)?;
+            ensure!(
+                !self.baseline_contains_output(&staged)?,
+                "rollback stage collides with baseline userdata"
+            );
+            std::os::unix::fs::symlink(previous, &staged)?;
+            owned.insert(
+                staged.clone(),
+                OwnedLeaf {
+                    mutable: false,
+                    expected: None,
+                },
+            );
+            let expected = SourceEntry {
+                path: output_entry_name(&self.root, &latest)?,
+                kind: "symlink",
+                mode: mode(&fs::symlink_metadata(&staged)?),
+                sha256: Some(hex(&Sha256::digest(previous.as_encoded_bytes()))),
+            };
+            if let Err(error) = fs::rename(&staged, &latest) {
+                let _ = fs::remove_file(&staged);
+                return Err(error.into());
+            }
+            Some(expected)
+        } else {
+            fs::remove_file(&latest)?;
+            None
+        };
+        if let Some(leaf) = owned.get_mut(&latest) {
+            leaf.expected = expected;
+        }
+        File::open(parent)?.sync_all()?;
+        fs::remove_file(&journal)?;
+        if let Some(leaf) = owned.get_mut(&journal) {
+            leaf.expected = None;
+        }
+        if let Some(parent) = journal.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_owned_after_abort(&self, path: &Path) -> std::io::Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let path = output_leaf_path(path).map_err(std::io::Error::other)?;
+        ensure_untracked_output(self, &path).map_err(std::io::Error::other)?;
+        let mut owned = self.owned_outputs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(leaf) = owned.get(&path) {
+            self.check_mutable_preimage(&path, leaf)
+                .map_err(std::io::Error::other)?;
+        }
+        if !owned.contains_key(&path) {
+            return match fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(e),
+                _ => Err(std::io::Error::other("abort cleanup refuses unowned leaf")),
+            };
+        }
+        fs::remove_file(&path)?;
+        if let Some(leaf) = owned.get_mut(&path) {
+            leaf.expected = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_incomplete_after_abort(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let _gate = self
+            .observation_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let path = output_leaf_path(path).map_err(std::io::Error::other)?;
+        ensure_untracked_output(self, &path).map_err(std::io::Error::other)?;
+        if self
+            .baseline_contains_output(&path)
+            .map_err(std::io::Error::other)?
+        {
+            return Err(std::io::Error::other(
+                "incomplete marker collides with baseline userdata",
+            ));
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        self.owned_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                path,
+                OwnedLeaf {
+                    mutable: false,
+                    expected: None,
+                },
+            );
+        file.write_all(bytes)?;
+        file.sync_all()
     }
 
     pub(crate) fn verify_sync(&self, phase: &'static str, check: Option<&str>) -> Result<()> {
@@ -160,13 +856,26 @@ impl CallerGuard {
 
     fn verify_blocking(&self, phase: &str, check: Option<&str>) -> Result<()> {
         self.ensure_valid()?;
+        let owned = self
+            .owned_keys()
+            .map_err(|error| self.latch_output_unknown("owned-output-keys", error))?;
+        let leaves = self
+            .owned_outputs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        for (path, leaf) in &leaves {
+            self.check_mutable_preimage(path, leaf)?;
+        }
         let observed = match &self.baseline {
-            Ok(_) => capture_token(&self.root).map_err(|error| format!("{error:#}")),
+            Ok(_) => capture_token(&self.root, &owned).map_err(|error| format!("{error:#}")),
             Err(error) => Err(format!("initial caller observation unavailable: {error}")),
         };
-        if self.baseline.as_ref().ok().is_some()
-            && self.baseline.as_ref().ok() == observed.as_ref().ok()
-        {
+        let mut expected = self.baseline.as_ref().ok().cloned();
+        if let Some(expected) = expected.as_mut() {
+            expected.sources.retain(|key, _| !owned.contains(key));
+        }
+        if expected.is_some() && expected.as_ref() == observed.as_ref().ok() {
             return Ok(());
         }
         self.reject_observation(phase, check, observed)
@@ -225,6 +934,19 @@ impl CallerGuard {
     }
 }
 
+pub(crate) fn diagnostic_parent(root: &Path, configured: PathBuf) -> PathBuf {
+    let Ok(caller) = fs::canonicalize(root) else {
+        return configured;
+    };
+    if planned_path(&configured).is_ok_and(|path| path.starts_with(&caller)) {
+        let fallback = std::env::temp_dir().join("prview-caller-diagnostics");
+        if planned_path(&fallback).is_ok_and(|path| !path.starts_with(&caller)) {
+            return fallback;
+        }
+    }
+    configured // persist_receipt reports honest unretained evidence if unsafe
+}
+
 fn persist_receipt(parent: &Path, receipt: &DriftReceipt<'_>) -> Result<PathBuf> {
     // A diagnostic must not itself write into the observed caller. If the
     // configured home is inside it, retain the fatal error honestly without
@@ -254,61 +976,30 @@ fn persist_receipt(parent: &Path, receipt: &DriftReceipt<'_>) -> Result<PathBuf>
     Ok(path)
 }
 
-/// The shared home owns cache/index/latest as well as packs. An external
-/// explicit output does not authorize writes through an internal source home.
-pub(crate) fn validate_storage_namespaces(config: &crate::config::Config) -> Result<()> {
-    validate_output_namespace(&config.repo_root, &crate::config::prview_home())?;
-    if let Some(output) = config.output_dir.as_deref() {
-        validate_output_namespace(&config.repo_root, output)?;
-        // Explicit packs advertise sibling latest/lock/staging entries. Check
-        // their namespace rather than following any existing latest symlink.
-        let absolute = if output.is_absolute() {
-            output.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(output)
-        };
-        validate_output_namespace(
-            &config.repo_root,
-            absolute
-                .parent()
-                .context("artifact output has no publication parent")?,
-        )?;
-    }
-    Ok(())
-}
-
-/// PROPOSED_LOCAL_VARIANT_A: output must be external or an ignored,
-/// untracked namespace. Validate before allocation or any artifact write.
-pub(crate) fn validate_output_namespace(root: &Path, output: &Path) -> Result<()> {
+/// Does a planned namespace contain Git-reviewable caller data? This is a
+/// writer/scratch planning query, never a global output-dir restriction.
+pub(crate) fn namespace_source_visible(root: &Path, output: &Path) -> Result<bool> {
     let caller = fs::canonicalize(root)?;
     let output = planned_path(output)?;
     let Ok(relative) = output.strip_prefix(&caller) else {
-        return Ok(());
+        return Ok(false);
     };
+    if relative.as_os_str().is_empty() {
+        return Ok(true);
+    }
     let repo = git2::Repository::open(&caller)?;
-    ensure!(
-        !relative.as_os_str().is_empty(),
-        "caller guard variant A refuses output at the repository root"
-    );
     for bytes in tracked_paths(&repo)? {
         let tracked = git_path(&bytes)?;
-        ensure!(
-            !tracked.starts_with(relative) && !relative.starts_with(&tracked),
-            "caller guard variant A refuses an output namespace containing tracked source: {relative:?}"
-        );
+        if tracked.starts_with(relative) || relative.starts_with(&tracked) {
+            return Ok(true);
+        }
     }
-    // The namespace is a directory even before it exists. A trailing slash
-    // lets Git apply directory-only ignore patterns without creating it.
     let mut directory = relative.as_os_str().to_os_string();
     directory.push(std::path::MAIN_SEPARATOR_STR);
-    ensure!(
-        repo.is_path_ignored(Path::new(&directory))?,
-        "caller guard variant A requires output outside the caller checkout or in a Git-ignored non-source namespace: {relative:?}"
-    );
-    Ok(())
+    Ok(!repo.is_path_ignored(Path::new(&directory))?)
 }
 
-fn planned_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn planned_path(path: &Path) -> Result<PathBuf> {
     let unresolved = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -405,7 +1096,7 @@ fn tracked_paths(repo: &git2::Repository) -> Result<BTreeSet<Vec<u8>>> {
     Ok(paths)
 }
 
-fn capture_token(root: &Path) -> Result<CallerToken> {
+fn capture_token(root: &Path, owned: &BTreeSet<String>) -> Result<CallerToken> {
     let root = fs::canonicalize(root).context("resolve caller root")?;
     let repo = git2::Repository::open(&root).context("open caller repository")?;
     let workdir = repo
@@ -444,7 +1135,8 @@ fn capture_token(root: &Path) -> Result<CallerToken> {
         .as_ref()
         .and_then(|reference| reference.target())
         .map(|oid| oid.to_string());
-    let mut paths = tracked_paths(&repo)?;
+    let tracked = tracked_paths(&repo)?;
+    let mut paths = tracked.clone();
     let mut options = git2::StatusOptions::new();
     options
         .include_untracked(true)
@@ -458,8 +1150,13 @@ fn capture_token(root: &Path) -> Result<CallerToken> {
     }
     let mut sources = BTreeMap::new();
     for bytes in paths {
-        let relative = git_path(&bytes)?;
         let key = hex(&bytes);
+        // Active owned raw captures must be removed before any source read.
+        // Tracked HEAD/index paths remain source even if a writer claims them.
+        if owned.contains(&key) && !tracked.contains(&bytes) {
+            continue;
+        }
+        let relative = git_path(&bytes)?;
         sources.insert(key, source_entry(&root, &relative)?);
     }
     let end_head = match repo.head() {
@@ -490,6 +1187,70 @@ fn capture_token(root: &Path) -> Result<CallerToken> {
         raw_index_sha256,
         sources,
     })
+}
+
+fn ensure_untracked_output(guard: &CallerGuard, path: &Path) -> Result<()> {
+    ensure!(
+        !guard
+            .output_is_tracked(path)
+            .map_err(|error| guard.latch_output_unknown("output-tracked-observation", error))?,
+        "tracked output collision: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn output_leaf_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let parent = absolute.parent().context("output leaf has no parent")?;
+    Ok(planned_path(parent)?.join(absolute.file_name().context("output has no leaf name")?))
+}
+
+fn path_key(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hex(path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        hex(path.to_string_lossy().as_bytes())
+    }
+}
+
+fn output_entry_name(root: &Path, path: &Path) -> Result<String> {
+    let root = fs::canonicalize(root)?;
+    let relative = path
+        .strip_prefix(&root)
+        .unwrap_or_else(|_| Path::new(path.file_name().unwrap_or_default()));
+    Ok(format!("{relative:?}"))
+}
+
+fn output_state(root: &Path, path: &Path) -> Result<Option<SourceEntry>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let root = fs::canonicalize(root)?;
+    if let Ok(relative) = path.strip_prefix(&root) {
+        return Ok(Some(source_entry(&root, relative)?));
+    }
+    Ok(Some(source_entry(
+        path.parent().context("output parent")?,
+        Path::new(path.file_name().context("output name")?),
+    )?))
+}
+
+fn git_ignored_output(root: &Path, path: &Path) -> Result<bool> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(true);
+    };
+    Ok(git2::Repository::open(root)?.is_path_ignored(relative)?)
 }
 
 fn git_path(bytes: &[u8]) -> Result<PathBuf> {

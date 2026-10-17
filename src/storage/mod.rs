@@ -6,10 +6,10 @@
 use crate::config::{
     branch_storage_key, current_branch_name, find_repo_root_from, prview_home, repo_name_from_root,
 };
+use crate::owned_output::fs;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::{BufRead, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
@@ -241,17 +241,24 @@ impl RunIndex {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("index path has no parent: {}", path.display()))?;
-        let (temp, mut file) = create_owned_temp_file(parent, "index-jsonl")?;
+        if crate::owned_output::active_guard().is_some() {
+            if let Ok(file) = fs::File::open(path) {
+                read_entries_strict(file, path)?;
+            }
+            crate::owned_output::admit_validated_mutable(path)?;
+        }
+        let (temp, file) = create_owned_temp_file(parent, "index-jsonl")?;
+        drop(file);
+        let mut bytes = Vec::new();
         let write_result = (|| -> Result<()> {
             for entry in &self.entries {
                 let line = serde_json::to_string(entry)?;
-                writeln!(file, "{}", line)?;
+                writeln!(bytes, "{}", line)?;
             }
-            file.flush()?;
-            file.sync_all()?;
+            fs::write(&temp, &bytes)?;
+            fs::File::open(&temp)?.sync_all()?;
             Ok(())
         })();
-        drop(file);
         if let Err(error) = write_result {
             let _ = fs::remove_file(&temp);
             return Err(error);
@@ -462,7 +469,7 @@ impl Drop for LockGuard {
         if let Ok(mut file) = open_regular_lock_file(&self.legacy_path, false, false) {
             let mut content = String::new();
             if file.read_to_string(&mut content).is_ok() && content.trim() == self.legacy_token {
-                let _ = fs::remove_file(&self.legacy_path);
+                let _ = crate::owned_output::remove_owned_after_abort(&self.legacy_path);
             }
         }
     }
@@ -577,15 +584,35 @@ pub fn acquire_lock_at(path: &Path) -> Result<LockGuard> {
     );
     let v2_path = v2_lock_path(&path);
 
-    let mut v2_file = open_regular_lock_file(&v2_path, true, false)
-        .with_context(|| format!("Failed to open lock {}", v2_path.display()))?;
+    let mut v2_file = if crate::owned_output::active_guard().is_some() && !v2_path.exists() {
+        crate::owned_output::create_shared_new_with(&v2_path, |path| {
+            open_regular_lock_file(path, false, true)
+        })
+    } else {
+        open_regular_lock_file(&v2_path, true, false)
+    }
+    .with_context(|| format!("Failed to open lock {}", v2_path.display()))?;
 
     match v2_file.try_lock() {
         Ok(()) => {
-            v2_file.set_len(0)?;
-            v2_file.rewind()?;
-            v2_file.write_all(token.as_bytes())?;
-            v2_file.flush()?;
+            if crate::owned_output::active_guard().is_some() {
+                let mut previous = String::new();
+                v2_file.read_to_string(&mut previous)?;
+                anyhow::ensure!(
+                    previous.trim().is_empty()
+                        || previous.trim().split(':').all(
+                            |part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+                        ),
+                    "unrecognized publication lock preimage"
+                );
+                crate::owned_output::admit_validated_mutable(&v2_path)?;
+                fs::write(&v2_path, token.as_bytes())?;
+            } else {
+                v2_file.set_len(0)?;
+                v2_file.rewind()?;
+                v2_file.write_all(token.as_bytes())?;
+                v2_file.flush()?;
+            }
         }
         Err(fs::TryLockError::WouldBlock) => {
             let _ = v2_file.rewind();
@@ -637,7 +664,9 @@ fn v2_lock_path(path: &Path) -> PathBuf {
 /// migration is deliberately fail-closed. An operator may remove a stale
 /// sentinel only after establishing that no pre-0.8 publisher is still alive.
 fn acquire_legacy_sentinel(path: &Path, token: &str) -> Result<()> {
-    match open_regular_lock_file(path, false, true) {
+    match crate::owned_output::create_shared_new_with(path, |path| {
+        open_regular_lock_file(path, false, true)
+    }) {
         Ok(mut file) => {
             file.write_all(token.as_bytes())?;
             file.flush()?;
@@ -1103,7 +1132,9 @@ pub(crate) fn create_owned_temp_file(parent: &Path, prefix: &str) -> Result<(Pat
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0)
         ));
-        match open_regular_lock_file(&path, false, true) {
+        match crate::owned_output::create_shared_new_with(&path, |path| {
+            open_regular_lock_file(path, false, true)
+        }) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -1672,7 +1703,11 @@ fn register_and_prune_with_policy_locked(
     // A previous process may have died after moving retained runs but before
     // committing their removal. Reconcile durable tombstone metadata against
     // the still-persisted index before starting another transaction.
-    cleanup_committed_prunes(&index, &abort)?;
+    if crate::owned_output::active_guard().is_none()
+        || !crate::owned_output::namespace_source_visible(&prview_home().join("prune-trash"))?
+    {
+        cleanup_committed_prunes(&index, &abort)?;
+    }
 
     let previous = index.clone();
     let current_entry = entry.clone();
@@ -1686,7 +1721,16 @@ fn register_and_prune_with_policy_locked(
     if abort() {
         bail!("publication aborted before the run index was committed");
     }
-    let staged = match stage_pruned_paths(&pruned, &abort) {
+    let staged = match if pruned
+        .iter()
+        .any(|path| crate::owned_output::namespace_source_visible(path).unwrap_or(true))
+    {
+        Err(anyhow!(
+            "retention predecessor has no exact own-leaf proof in caller-visible namespace"
+        ))
+    } else {
+        stage_pruned_paths(&pruned, &abort)
+    } {
         Ok(staged) => staged,
         Err(error) if !abort() => {
             // A custom --output-dir may be on another filesystem, where an
@@ -1860,6 +1904,18 @@ impl DurablePath {
 }
 
 fn stage_pruned_paths(pruned: &[PathBuf], abort: &impl Fn() -> bool) -> Result<Vec<StagedPrune>> {
+    use std::fs;
+    anyhow::ensure!(
+        !crate::owned_output::namespace_source_visible(&prune_trash_path())?,
+        "retention trash is caller-visible; old payloads kept without adoption"
+    );
+    for path in pruned {
+        anyhow::ensure!(
+            !crate::owned_output::namespace_source_visible(path)?,
+            "retention predecessor is caller-visible; old payloads kept without adoption"
+        );
+    }
+
     #[cfg(test)]
     if take_test_prune_stage_failure() {
         bail!("injected prune staging failure");
@@ -1971,6 +2027,16 @@ fn stage_pruned_paths(pruned: &[PathBuf], abort: &impl Fn() -> bool) -> Result<V
 }
 
 fn rollback_staged_prunes(staged: &[StagedPrune]) -> Result<()> {
+    use std::fs;
+    for prune in staged {
+        for path in [&prune.original, &prune.tombstone, &prune.transaction_dir] {
+            anyhow::ensure!(
+                !crate::owned_output::namespace_source_visible(path)?,
+                "retention rollback path became caller-visible; preserved for manual recovery"
+            );
+        }
+    }
+
     for prune in staged.iter().rev() {
         if prune.tombstone.exists() && prune.original.exists() {
             bail!(
@@ -2119,6 +2185,11 @@ fn read_prune_manifest(transaction_dir: &Path) -> Result<PruneTransactionManifes
 }
 
 fn cleanup_committed_prunes(index: &RunIndex, abort: &impl Fn() -> bool) -> Result<()> {
+    use std::fs;
+    if crate::owned_output::namespace_source_visible(&prune_trash_path())? {
+        return Ok(());
+    }
+
     let trash = prune_trash_path();
     let entries = match fs::read_dir(&trash) {
         Ok(entries) => entries,
@@ -2213,6 +2284,8 @@ fn reconcile_legacy_prune(
     index: &RunIndex,
     abort: &impl Fn() -> bool,
 ) -> Result<bool> {
+    use std::fs;
+
     let original = match read_prune_payload_original(tombstone) {
         Ok(original) => original,
         Err(error) => {
@@ -2244,6 +2317,11 @@ fn reconcile_legacy_prune(
         );
         return Ok(false);
     }
+    if crate::owned_output::namespace_source_visible(tombstone)?
+        || crate::owned_output::namespace_source_visible(&original)?
+    {
+        return Ok(false);
+    }
     fs::rename(tombstone, &original).with_context(|| {
         format!(
             "Failed to recover retained run {} from legacy tombstone {}",
@@ -2261,7 +2339,15 @@ fn reconcile_prune_transaction(
     index: &RunIndex,
     abort: &impl Fn() -> bool,
 ) -> Result<bool> {
+    use std::fs;
+
     let original = manifest.original.to_path_buf()?;
+    if crate::owned_output::namespace_source_visible(transaction_dir)?
+        || crate::owned_output::namespace_source_visible(&original)?
+    {
+        return Ok(false);
+    }
+
     let tombstone = transaction_dir.join(PRUNE_PAYLOAD_DIR);
     if tombstone.exists()
         && let Err(error) = validate_prune_payload_identity(&tombstone, &original)
@@ -2379,6 +2465,12 @@ fn read_prune_payload_original(payload: &Path) -> Result<PathBuf> {
 }
 
 fn remove_dir_all_cancellable(path: &Path, abort: &impl Fn() -> bool) -> Result<()> {
+    use std::fs;
+    anyhow::ensure!(
+        !crate::owned_output::namespace_source_visible(path)?,
+        "retention cleanup path is caller-visible; payload retained"
+    );
+
     let root_metadata = fs::symlink_metadata(path)
         .with_context(|| format!("Failed to inspect prune tombstone {}", path.display()))?;
     if !is_owned_regular_dir(&root_metadata) {
@@ -2437,7 +2529,7 @@ fn remove_dir_all_cancellable(path: &Path, abort: &impl Fn() -> bool) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::owned_output::fs;
     use std::path::Path;
 
     #[cfg(unix)]

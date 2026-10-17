@@ -299,21 +299,17 @@ async fn issue69_caller_guard_fatal_dispatch_drops_active_mock_future() {
 }
 
 #[tokio::test]
-async fn issue69_caller_guard_internal_storage_refused_before_mock_or_cache() {
+async fn issue69_caller_guard_internal_storage_does_not_preempt_real_drift_detection() {
     for events in [false, true] {
         let (root, home, mut config) = fixture();
         let storage = root.path().join("new-home");
         config.output_dir = Some(home.path().join("external-output"));
         let _home = crate::config::override_test_prview_home(&storage);
-        let (outcome, first, queued, cached) = run_mock_pair(&config, &storage, None, events).await;
-        assert!(outcome.unwrap_err().to_string().contains("variant A"));
-        assert_eq!((first, queued), (0, 0));
+        let (outcome, first, queued, cached) =
+            run_mock_pair(&config, &storage, Some("tracked"), events).await;
+        assert!(outcome.is_err());
+        assert_eq!((first, queued), (1, 0));
         assert!(!cached);
-        assert!(
-            !storage.exists(),
-            "refusal precedes cache/diagnostic writes"
-        );
         assert!(!config.output_dir.as_ref().unwrap().exists());
-        assert!(caller_integrity::validate_storage_namespaces(&config).is_err());
     }
 }

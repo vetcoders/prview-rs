@@ -153,7 +153,7 @@ impl SnapshotIntegrity {
         if !self.requires_review() {
             return Ok(());
         }
-        std::fs::write(
+        crate::owned_output::fs::write(
             quality_dir.join("SNAPSHOT_INTEGRITY.json"),
             serde_json::to_vec_pretty(self)?,
         )?;
@@ -164,7 +164,7 @@ impl SnapshotIntegrity {
             self.observed_head_sha.as_deref().unwrap_or("unknown"),
             serde_json::to_string_pretty(&self.changed_paths)?,
         );
-        std::fs::write(quality_dir.join("SNAPSHOT_INTEGRITY.md"), md)?;
+        crate::owned_output::fs::write(quality_dir.join("SNAPSHOT_INTEGRITY.md"), md)?;
         Ok(())
     }
 }

@@ -1,9 +1,9 @@
 //! Dependency diff — added/removed/changed deps from manifests.
 
 use crate::git::{Diff, Repository};
+use crate::owned_output::fs;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 
 /// Summary of dependency changes between base and head.

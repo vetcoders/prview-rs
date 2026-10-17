@@ -1234,7 +1234,7 @@ fn run_context_cmds_parallel_inner(
             let args: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
             let stdout_path = cmd.out_dir.join(format!(".context-cmd-{idx}.stdout.tmp"));
             let stderr_path = cmd.out_dir.join(format!(".context-cmd-{idx}.stderr.tmp"));
-            let stdout_file = match File::create(&stdout_path) {
+            let stdout_file = match crate::owned_output::create(&stdout_path) {
                 Ok(file) => file,
                 Err(error) => {
                     timings.push(ContextCommandTiming {
@@ -1252,7 +1252,7 @@ fn run_context_cmds_parallel_inner(
                     continue;
                 }
             };
-            let stderr_file = match File::create(&stderr_path) {
+            let stderr_file = match crate::owned_output::create(&stderr_path) {
                 Ok(file) => file,
                 Err(error) => {
                     let _ = fs::remove_file(&stdout_path);
@@ -1272,6 +1272,15 @@ fn run_context_cmds_parallel_inner(
                 }
             };
 
+            // esbuild writes this exact file itself; claim it before the child
+            // can write, rather than adopting a discovered file afterwards.
+            if cmd.label == "esbuild meta" {
+                for argument in &cmd.args {
+                    if let Some(path) = argument.strip_prefix("--metafile=") {
+                        crate::owned_output::reserve_external_leaf(Path::new(path))?;
+                    }
+                }
+            }
             let mut command = Command::new(&cmd.cmd);
             command.args(&args).current_dir(&cmd.cwd);
             if Path::new(&cmd.cmd)
@@ -1671,7 +1680,7 @@ pub(super) fn collect_cmd_output(
             if stdout_is_json || combined_is_json {
                 let destination = out_dir.join(out_file);
                 let result = (|| -> std::io::Result<()> {
-                    let mut output = fs::File::create(&destination)?;
+                    let mut output = crate::owned_output::create(&destination)?;
                     if stdout_is_json {
                         std::io::copy(&mut stdout, &mut output)?;
                     } else {
@@ -2060,7 +2069,7 @@ mod tests {
     use crate::git::cmd::git_cmd;
     use crate::governor::{ResourceGovernor, Weight};
     use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
-    use std::fs;
+    use crate::owned_output::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use std::time::Instant;

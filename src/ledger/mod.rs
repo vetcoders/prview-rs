@@ -186,6 +186,83 @@ impl TaskLedger {
         Self::default()
     }
 
+    pub(crate) fn output_scope(
+        &self,
+        pack_root: Option<std::path::PathBuf>,
+    ) -> Option<crate::owned_output::Scope> {
+        self.caller_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .map(|guard| crate::owned_output::enter(guard, pack_root))
+    }
+
+    /// Launcher logs can already be growing before the first quality check.
+    pub(crate) async fn initialize_caller_guard_config(
+        &self,
+        config: &crate::config::Config,
+    ) -> anyhow::Result<()> {
+        let missing = self
+            .caller_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none();
+        if missing {
+            let paths = crate::artifacts::caller_launcher_outputs(config)?;
+            if !paths.is_empty() {
+                let root = config.repo_root.clone();
+                let diagnostics = crate::checks::caller_integrity::diagnostic_parent(
+                    &root,
+                    crate::config::prview_home().join("diagnostics"),
+                );
+                let guard = tokio::task::spawn_blocking(move || {
+                    crate::checks::caller_integrity::CallerGuard::capture_sync_with_launcher(
+                        root,
+                        diagnostics,
+                        &paths,
+                    )
+                })
+                .await??;
+                self.caller_guard
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert(guard);
+            }
+        }
+        self.initialize_caller_guard(&config.repo_root).await
+    }
+
+    pub(crate) fn initialize_caller_guard_config_sync(
+        &self,
+        config: &crate::config::Config,
+    ) -> anyhow::Result<()> {
+        let missing = self
+            .caller_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none();
+        if missing {
+            let paths = crate::artifacts::caller_launcher_outputs(config)?;
+            if !paths.is_empty() {
+                let diagnostics = crate::checks::caller_integrity::diagnostic_parent(
+                    &config.repo_root,
+                    crate::config::prview_home().join("diagnostics"),
+                );
+                let guard =
+                    crate::checks::caller_integrity::CallerGuard::capture_sync_with_launcher(
+                        config.repo_root.clone(),
+                        diagnostics,
+                        &paths,
+                    )?;
+                self.caller_guard
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert(guard);
+            }
+        }
+        self.initialize_caller_guard_sync(&config.repo_root)
+    }
+
     /// Freeze the caller before cache selection or external check admission.
     /// The caller root remains distinct from any shared target snapshot.
     pub(crate) async fn initialize_caller_guard(
@@ -202,7 +279,10 @@ impl TaskLedger {
         } else {
             // Resolve on the async caller's thread: tests may scope PRVIEW_HOME
             // there, and native observation workers must not rediscover it.
-            let diagnostics = crate::config::prview_home().join("diagnostics");
+            let diagnostics = crate::checks::caller_integrity::diagnostic_parent(
+                root,
+                crate::config::prview_home().join("diagnostics"),
+            );
             let guard = crate::checks::caller_integrity::CallerGuard::capture(
                 root.to_path_buf(),
                 diagnostics,
@@ -231,7 +311,10 @@ impl TaskLedger {
             .get_or_insert_with(|| {
                 crate::checks::caller_integrity::CallerGuard::capture_sync(
                     root.to_path_buf(),
-                    crate::config::prview_home().join("diagnostics"),
+                    crate::checks::caller_integrity::diagnostic_parent(
+                        root,
+                        crate::config::prview_home().join("diagnostics"),
+                    ),
                 )
             })
             .clone();

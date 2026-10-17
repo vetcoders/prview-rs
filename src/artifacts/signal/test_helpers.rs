@@ -2,7 +2,7 @@
 
 use crate::checks::{CheckResult, CheckStatus};
 use crate::git::{Diff, DiffStats, FileChange, FileStatus, Repository};
-use std::fs;
+use crate::owned_output::fs;
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
