@@ -1328,8 +1328,9 @@ coverage retain the earlier reuse behavior, with the explicit-self guard applied
 ## Evidence scope (schema 3.2, additive)
 
 These metadata objects explain evidence; none changes policy severity, skip
-handling, the decision axes or process exit codes. All 3.1 fields keep their
-names, types and values. Readers accepting unknown fields can ignore the new
+handling, the decision axes or process exit codes. Existing metric and decision
+fields retain their names, types and semantics; schema_version advances to 3.2
+and explanatory caveat text is clarified. Readers accepting unknown fields can ignore the new
 objects. Both the Rust reader and standalone validator accept 3.2 and retain
 older schemas; older Rust readers may announce the existing forward-MINOR
 compatibility caveat.
