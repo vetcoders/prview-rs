@@ -1944,6 +1944,7 @@ macro_rules! generate_run_json_test {
             context_artifacts: $context_artifacts,
             context_command_timings: $context_command_timings,
             regression: $regression,
+            coverage_history: None,
         })
     };
 }
@@ -2569,6 +2570,7 @@ fn run_json_publishes_the_test_scope_on_the_checks_that_own_one() {
         ledger: &crate::ledger::TaskLedger::new(),
         scope: Some(&scope),
         regression: None,
+        coverage_history: None,
     })
     .expect("run json");
 
@@ -8584,6 +8586,7 @@ fn informational_notes_keep_current_and_historical_counts_comparable() {
         run_started_at: "2026-01-01T00:00:00Z",
         heuristics: None,
         regression: None,
+        coverage_history: None,
         scope: None,
         provenance: &ProvenanceConsistency::default(),
     })

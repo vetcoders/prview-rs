@@ -58,3 +58,21 @@ they are not a second Rust API analyzer. The generic `CONSISTENCY_CHECK` keeps
 its existing file/finding/verdict checks and intentionally does not reconstruct
 Rust API facts into a scalar count; equality is enforced by the lossless
 artifact contract tests instead.
+
+## Evidence metadata in report 3.2
+
+Legacy ratio and decision fields remain compatible. A sample coverage object is:
+
+```json
+{"kind":"source_test_change_match","heuristic_ratio":0.6097560975609756,
+ "measured":true,"measured_field_meaning":"heuristic_evaluated",
+ "execution_coverage_measured":false,"matched":25,"total":41,"weak_match_count":11}
+```
+
+`security_scope` lists requested mode and recorded execution separately.
+`loctree_evidence` labels whole-repository warnings and net count comparisons;
+`finding_identities_compared:false` prevents equal counts being mistaken for
+proof of pre-existing findings. The previous-run metric behind legacy
+`base_coverage_ratio` is identified by
+`regression.tests.coverage_comparison.source`; missing source revisions stay
+unknown. These metadata fields explain evidence and never override the gate.

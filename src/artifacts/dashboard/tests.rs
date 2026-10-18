@@ -637,7 +637,7 @@ fn test_merge_decision_card_review_caveats() {
     ));
     assert!(html.contains(r#"data-i18n="message.reviewSignalsPrefix""#));
     assert!(html.contains(
-            r#"data-review-signals="1 removed public symbol · 11% coverage heuristic · 1 inline finding""#
+            r#"data-review-signals="1 removed public symbol · 11% coverage heuristic (test-change matching; not execution coverage) · 1 inline finding""#
         ));
     assert!(html.contains("11% coverage heuristic"));
     assert!(html.contains("1 inline finding"));

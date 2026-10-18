@@ -2,48 +2,205 @@
 
 use super::*;
 
-/// Load coverage ratio and untested count from the previous run's report.json.
-///
-/// Uses the `latest` symlink to find the previous run. Falls back through:
-/// 1. `regression.tests.coverage_ratio` (preferred — our own output)
-/// 2. `quality.coverage.heuristic_ratio` (fallback for pre-regression runs)
-/// 3. Sorted sibling timestamp dirs if `latest` points to current run
-///
-/// Returns `(base_coverage_ratio, base_untested_critical_count)`.
-/// Completely defensive: any error returns `(None, None)`.
-pub(crate) fn load_previous_coverage(out_dir: &Path) -> (Option<f64>, Option<usize>) {
-    let parent = match out_dir.parent() {
-        Some(p) => p,
-        None => return (None, None),
+/// Previous-run source-to-test matching, not coverage at the PR base commit.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PreviousCoverage {
+    pub ratio: Option<f64>,
+    pub untested_count: Option<usize>,
+    source: Option<CoverageHistorySource>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CoverageHistorySource {
+    report_path: String,
+    run_id: Option<String>,
+    metric_path: Option<&'static str>,
+    untested_count_path: Option<&'static str>,
+    review_range: Option<serde_json::Value>,
+    run_freshness: Option<serde_json::Value>,
+}
+
+impl PreviousCoverage {
+    pub(crate) fn description(&self) -> String {
+        match self.source.as_ref() {
+            Some(source) => format!("Coverage trend compares source/test-change matching with previous run `{}` (`{}`), not with the PR base commit. Historical revision metadata is in report.json regression.tests.coverage_comparison.", source.run_id.as_deref().unwrap_or("unknown"), source.report_path),
+            None => "Coverage trend: no previous-run metric available; this is not a PR-base coverage comparison.".into(),
+        }
+    }
+}
+
+pub(crate) fn load_previous_coverage(out_dir: &Path) -> PreviousCoverage {
+    let Some(parent) = out_dir.parent() else {
+        return PreviousCoverage::default();
     };
-
-    // Try `latest` symlink first
-    let prev_report = find_previous_report(parent, out_dir);
-    let json = match prev_report {
-        Some(content) => content,
-        None => return (None, None),
+    let Some((path, json)) = find_previous_report(parent, out_dir) else {
+        return PreviousCoverage::default();
     };
+    let paths = [
+        "/regression/tests/coverage_ratio",
+        "/quality/coverage/heuristic_ratio",
+    ];
+    let metric = paths.into_iter().find_map(|path| {
+        json.pointer(path)
+            .and_then(|v| v.as_f64())
+            .map(|ratio| (path, ratio))
+    });
+    let count = [
+        "/regression/tests/untested_code_count",
+        "/regression/tests/untested_critical_count",
+    ]
+    .into_iter()
+    .find_map(|path| {
+        json.pointer(path)
+            .and_then(|v| v.as_u64())
+            .map(|count| (path, count as usize))
+    });
+    if metric.is_none() && count.is_none() {
+        return PreviousCoverage::default();
+    }
+    // Preserve the actual record, including unknown/missing revision metadata.
+    // A branch label must never be promoted into an inferred commit SHA.
+    let run = fs::read_to_string(path.parent().unwrap().join("00_summary/RUN.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    PreviousCoverage {
+        ratio: metric.map(|(_, ratio)| ratio),
+        untested_count: count.map(|(_, count)| count),
+        source: Some(CoverageHistorySource {
+            report_path: path.display().to_string(),
+            run_id: path
+                .parent()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned()),
+            metric_path: metric.map(|(path, _)| path),
+            untested_count_path: count.map(|(path, _)| path),
+            review_range: json.get("review_range").cloned(),
+            run_freshness: run.and_then(|run| run.get("freshness").cloned()),
+        }),
+    }
+}
 
-    // Extract coverage_ratio: regression.tests preferred, quality.coverage fallback
-    let coverage_ratio = json
-        .pointer("/regression/tests/coverage_ratio")
-        .and_then(|v| v.as_f64())
-        .or_else(|| {
-            json.pointer("/quality/coverage/heuristic_ratio")
-                .and_then(|v| v.as_f64())
-        });
+/// Keep the public regression structs and all legacy wire fields intact.
+/// Artifact-only provenance is additive and shared by RUN.json/report.json.
+pub(crate) fn regression_with_coverage_history(
+    report: &regression::RegressionReport,
+    history: Option<&PreviousCoverage>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!(report);
+    value["tests"]["coverage_comparison"] = serde_json::json!({
+        "kind": "previous_run",
+        "metric_kind": "source_test_change_match",
+        "pr_base_comparison": false,
+        "source_status": match history { Some(h) if h.source.is_some() => "recorded", Some(_) => "unavailable", None => "not_recorded" },
+        "source": history.and_then(|h| h.source.as_ref()),
+    });
+    value
+}
 
-    // Extract untested count — try code-only first, fallback to critical
-    let untested_count = json
-        .pointer("/regression/tests/untested_code_count")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            json.pointer("/regression/tests/untested_critical_count")
-                .and_then(|v| v.as_u64())
-        })
-        .map(|v| v as usize);
+#[cfg(test)]
+mod dogfood_tests {
+    use super::*;
+    use serde_json::json;
 
-    (coverage_ratio, untested_count)
+    #[test]
+    fn dogfood_previous_coverage_carries_actual_source_without_claiming_pr_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous = temp.path().join("20261015-225515-old");
+        let current = temp.path().join("20261018-053545-new");
+        fs::create_dir_all(previous.join("00_summary")).unwrap();
+        fs::create_dir_all(&current).unwrap();
+        let range =
+            json!({"comparisons":[{"target_sha":"old-target", "effective_base_sha":"old-base"}]});
+        fs::write(previous.join("report.json"), json!({"review_range":range,"regression":{"tests":{"coverage_ratio":0.25,"untested_code_count":null,"untested_critical_count":3}}}).to_string()).unwrap();
+        fs::write(
+            previous.join("00_summary/RUN.json"),
+            json!({"freshness":{"target_sha":"old-target","base_sha":"old-base"}}).to_string(),
+        )
+        .unwrap();
+        let history = load_previous_coverage(&current);
+        assert_eq!(history.ratio, Some(0.25));
+        assert_eq!(history.untested_count, Some(3));
+        assert!(
+            history
+                .description()
+                .contains("not with the PR base commit")
+        );
+        let report = regression::RegressionReport::default();
+        let mut emitted = regression_with_coverage_history(&report, Some(&history));
+        let metadata = emitted["tests"]
+            .as_object_mut()
+            .unwrap()
+            .remove("coverage_comparison")
+            .unwrap();
+        assert_eq!(metadata["kind"], "previous_run");
+        assert_eq!(metadata["pr_base_comparison"], false);
+        assert_eq!(metadata["source"]["run_id"], "20261015-225515-old");
+        assert_eq!(metadata["source"]["review_range"], range);
+        assert_eq!(metadata["source"]["run_freshness"]["base_sha"], "old-base");
+        assert_eq!(
+            emitted,
+            json!(report),
+            "all legacy fields remain byte-value compatible"
+        );
+    }
+
+    #[test]
+    fn dogfood_count_only_previous_coverage_retains_the_consumed_source() {
+        for field in ["untested_code_count", "untested_critical_count"] {
+            let temp = tempfile::tempdir().unwrap();
+            let previous = temp.path().join("20261017-empty");
+            let current = temp.path().join("20261018-current");
+            fs::create_dir_all(&previous).unwrap();
+            fs::create_dir_all(&current).unwrap();
+            fs::write(
+                previous.join("report.json"),
+                json!({"regression":{"tests":{"coverage_ratio":null,field:0}}}).to_string(),
+            )
+            .unwrap();
+            let history = load_previous_coverage(&current);
+            assert_eq!(history.ratio, None);
+            assert_eq!(history.untested_count, Some(0));
+            assert!(history.description().contains("20261017-empty"));
+            let value = regression_with_coverage_history(
+                &regression::RegressionReport::default(),
+                Some(&history),
+            );
+            let comparison = &value["tests"]["coverage_comparison"];
+            assert_eq!(comparison["source_status"], "recorded");
+            assert!(comparison["source"]["metric_path"].is_null());
+            assert_eq!(
+                comparison["source"]["untested_count_path"],
+                format!("/regression/tests/{field}")
+            );
+        }
+    }
+
+    #[test]
+    fn dogfood_previous_coverage_missing_source_and_legacy_revisions_stay_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("20261018-current");
+        fs::create_dir_all(&current).unwrap();
+        let empty = load_previous_coverage(&current);
+        assert_eq!(empty.ratio, None);
+        let report = regression::RegressionReport::default();
+        assert_eq!(
+            regression_with_coverage_history(&report, Some(&empty))["tests"]["coverage_comparison"]
+                ["source_status"],
+            "unavailable"
+        );
+        let previous = temp.path().join("20261017-legacy");
+        fs::create_dir_all(&previous).unwrap();
+        fs::write(previous.join("report.json"), json!({"meta":{"range":{"head":"branch-label"}},"quality":{"coverage":{"heuristic_ratio":0.5}}}).to_string()).unwrap();
+        let old = load_previous_coverage(&current);
+        let emitted = regression_with_coverage_history(&report, Some(&old));
+        assert_eq!(old.ratio, Some(0.5));
+        assert_eq!(
+            emitted["tests"]["coverage_comparison"]["source"]["metric_path"],
+            "/quality/coverage/heuristic_ratio"
+        );
+        assert!(emitted["tests"]["coverage_comparison"]["source"]["review_range"].is_null());
+        assert!(emitted["tests"]["coverage_comparison"]["source"]["run_freshness"].is_null());
+    }
 }
 
 /// Find and parse report.json from the previous run.
@@ -54,7 +211,7 @@ pub(crate) fn load_previous_coverage(out_dir: &Path) -> (Option<f64>, Option<usi
 pub(crate) fn find_previous_report(
     branch_dir: &Path,
     current_dir: &Path,
-) -> Option<serde_json::Value> {
+) -> Option<(PathBuf, serde_json::Value)> {
     let latest = branch_dir.join("latest");
 
     // Try latest symlink first (fallthrough on any error to sort-based fallback)
@@ -70,7 +227,7 @@ pub(crate) fn find_previous_report(
             && let Ok(content) = fs::read_to_string(resolved_full.join("report.json"))
             && let Ok(json) = serde_json::from_str(&content)
         {
-            return Some(json);
+            return Some((resolved_full.join("report.json"), json));
         }
     }
 
@@ -92,7 +249,9 @@ pub(crate) fn find_previous_report(
     let prev_name = dirs.iter().rev().find(|d| d.as_str() < current_name)?;
     let prev_dir = branch_dir.join(prev_name);
     let content = fs::read_to_string(prev_dir.join("report.json")).ok()?;
-    serde_json::from_str(&content).ok()
+    serde_json::from_str(&content)
+        .ok()
+        .map(|json| (prev_dir.join("report.json"), json))
 }
 
 /// Load delta from a previous run's report.json via the `latest` symlink.

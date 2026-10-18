@@ -1261,6 +1261,13 @@ pub fn print_config(config: &Config, target: &ResolvedRef, bases: &[ResolvedRef]
         plain: format!(" Checks: {}", checks),
         style: ConfigLineStyle::Label("Checks"),
     });
+    rows.push(ConfigRow::Line {
+        plain: format!(
+            " Security: {}",
+            crate::checks::security_scope::preflight(config)
+        ),
+        style: ConfigLineStyle::Label("Security"),
+    });
     let plan = config.resource_plan;
     let load = plan
         .load_per_core
@@ -1335,7 +1342,7 @@ fn describe_run_mode(config: &Config) -> String {
 fn describe_enabled_steps(config: &Config) -> String {
     let mut steps = vec!["diff".to_string()];
 
-    if which::which("semgrep").is_ok() {
+    if !config.skip_security && which::which("semgrep").is_ok() {
         steps.push("semgrep".to_string());
     }
     if config.profile.has_cargo {
@@ -1350,11 +1357,6 @@ fn describe_enabled_steps(config: &Config) -> String {
     if config.run_tests {
         steps.push("tests".to_string());
     }
-    if config.run_security {
-        steps.push("security+".to_string());
-    } else if config.profile.has_cargo {
-        steps.push("cargo-audit".to_string());
-    }
     if config.run_heuristics {
         steps.push("heuristics".to_string());
     }
@@ -1368,7 +1370,7 @@ fn describe_enabled_steps(config: &Config) -> String {
 fn describe_expensive_steps(config: &Config) -> String {
     let mut steps = Vec::new();
     let fast_lint_skipped = config.is_fast_remote_only_standard() && !config.lint_forced;
-    if which::which("semgrep").is_ok() {
+    if !config.skip_security && which::which("semgrep").is_ok() {
         steps.push("semgrep(capped)");
     }
     if config.profile.has_cargo {

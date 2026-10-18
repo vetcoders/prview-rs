@@ -103,6 +103,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let mut worst_merge = outcome.worst_merge;
     let mut blocking_issues = outcome.blocking_issues;
     let mut review_caveats = outcome.advisory_caveats;
+    explain_loctree_warnings(&mut review_caveats, heuristics);
     let mut enforcement_disposition =
         EnforcementDisposition::from_evaluations(&outcome.effective_evals);
     let mut gate_checks = Vec::new();
@@ -468,6 +469,9 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             "origin": if config.policy.source.is_some() { "file" } else { "builtin-default" }
         },
         "checks": &gate_checks,
+        "security_scope": crate::checks::security_scope::recorded(config, checks, skipped_checks),
+        "coverage_evidence": coverage_evidence(coverage),
+        "loctree_evidence": loctree_evidence(heuristics),
         "inline_findings": {
             "file": inline_findings_path,
             "file_exists": inline.findings_count > 0,
@@ -1300,6 +1304,7 @@ mod tests {
             run_started_at: "2026-09-11T00:00:00Z",
             heuristics: None,
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &provenance,
         })
