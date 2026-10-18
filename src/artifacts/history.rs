@@ -97,112 +97,6 @@ pub(crate) fn regression_with_coverage_history(
     value
 }
 
-#[cfg(test)]
-mod dogfood_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn dogfood_previous_coverage_carries_actual_source_without_claiming_pr_base() {
-        let temp = tempfile::tempdir().unwrap();
-        let previous = temp.path().join("20261015-225515-old");
-        let current = temp.path().join("20261018-053545-new");
-        fs::create_dir_all(previous.join("00_summary")).unwrap();
-        fs::create_dir_all(&current).unwrap();
-        let range =
-            json!({"comparisons":[{"target_sha":"old-target", "effective_base_sha":"old-base"}]});
-        fs::write(previous.join("report.json"), json!({"review_range":range,"regression":{"tests":{"coverage_ratio":0.25,"untested_code_count":null,"untested_critical_count":3}}}).to_string()).unwrap();
-        fs::write(
-            previous.join("00_summary/RUN.json"),
-            json!({"freshness":{"target_sha":"old-target","base_sha":"old-base"}}).to_string(),
-        )
-        .unwrap();
-        let history = load_previous_coverage(&current);
-        assert_eq!(history.ratio, Some(0.25));
-        assert_eq!(history.untested_count, Some(3));
-        assert!(
-            history
-                .description()
-                .contains("not with the PR base commit")
-        );
-        let report = regression::RegressionReport::default();
-        let mut emitted = regression_with_coverage_history(&report, Some(&history));
-        let metadata = emitted["tests"]
-            .as_object_mut()
-            .unwrap()
-            .remove("coverage_comparison")
-            .unwrap();
-        assert_eq!(metadata["kind"], "previous_run");
-        assert_eq!(metadata["pr_base_comparison"], false);
-        assert_eq!(metadata["source"]["run_id"], "20261015-225515-old");
-        assert_eq!(metadata["source"]["review_range"], range);
-        assert_eq!(metadata["source"]["run_freshness"]["base_sha"], "old-base");
-        assert_eq!(
-            emitted,
-            json!(report),
-            "all legacy fields remain byte-value compatible"
-        );
-    }
-
-    #[test]
-    fn dogfood_count_only_previous_coverage_retains_the_consumed_source() {
-        for field in ["untested_code_count", "untested_critical_count"] {
-            let temp = tempfile::tempdir().unwrap();
-            let previous = temp.path().join("20261017-empty");
-            let current = temp.path().join("20261018-current");
-            fs::create_dir_all(&previous).unwrap();
-            fs::create_dir_all(&current).unwrap();
-            fs::write(
-                previous.join("report.json"),
-                json!({"regression":{"tests":{"coverage_ratio":null,field:0}}}).to_string(),
-            )
-            .unwrap();
-            let history = load_previous_coverage(&current);
-            assert_eq!(history.ratio, None);
-            assert_eq!(history.untested_count, Some(0));
-            assert!(history.description().contains("20261017-empty"));
-            let value = regression_with_coverage_history(
-                &regression::RegressionReport::default(),
-                Some(&history),
-            );
-            let comparison = &value["tests"]["coverage_comparison"];
-            assert_eq!(comparison["source_status"], "recorded");
-            assert!(comparison["source"]["metric_path"].is_null());
-            assert_eq!(
-                comparison["source"]["untested_count_path"],
-                format!("/regression/tests/{field}")
-            );
-        }
-    }
-
-    #[test]
-    fn dogfood_previous_coverage_missing_source_and_legacy_revisions_stay_unknown() {
-        let temp = tempfile::tempdir().unwrap();
-        let current = temp.path().join("20261018-current");
-        fs::create_dir_all(&current).unwrap();
-        let empty = load_previous_coverage(&current);
-        assert_eq!(empty.ratio, None);
-        let report = regression::RegressionReport::default();
-        assert_eq!(
-            regression_with_coverage_history(&report, Some(&empty))["tests"]["coverage_comparison"]
-                ["source_status"],
-            "unavailable"
-        );
-        let previous = temp.path().join("20261017-legacy");
-        fs::create_dir_all(&previous).unwrap();
-        fs::write(previous.join("report.json"), json!({"meta":{"range":{"head":"branch-label"}},"quality":{"coverage":{"heuristic_ratio":0.5}}}).to_string()).unwrap();
-        let old = load_previous_coverage(&current);
-        let emitted = regression_with_coverage_history(&report, Some(&old));
-        assert_eq!(old.ratio, Some(0.5));
-        assert_eq!(
-            emitted["tests"]["coverage_comparison"]["source"]["metric_path"],
-            "/quality/coverage/heuristic_ratio"
-        );
-        assert!(emitted["tests"]["coverage_comparison"]["source"]["review_range"].is_null());
-        assert!(emitted["tests"]["coverage_comparison"]["source"]["run_freshness"].is_null());
-    }
-}
-
 /// Find and parse report.json from the previous run.
 ///
 /// Strategy:
@@ -563,4 +457,110 @@ pub(crate) fn compute_flaky_scores(out_dir: &Path, max_runs: usize) -> Vec<Flaky
     });
 
     scores
+}
+
+#[cfg(test)]
+mod dogfood_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn dogfood_previous_coverage_carries_actual_source_without_claiming_pr_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous = temp.path().join("20261015-225515-old");
+        let current = temp.path().join("20261018-053545-new");
+        fs::create_dir_all(previous.join("00_summary")).unwrap();
+        fs::create_dir_all(&current).unwrap();
+        let range =
+            json!({"comparisons":[{"target_sha":"old-target", "effective_base_sha":"old-base"}]});
+        fs::write(previous.join("report.json"), json!({"review_range":range,"regression":{"tests":{"coverage_ratio":0.25,"untested_code_count":null,"untested_critical_count":3}}}).to_string()).unwrap();
+        fs::write(
+            previous.join("00_summary/RUN.json"),
+            json!({"freshness":{"target_sha":"old-target","base_sha":"old-base"}}).to_string(),
+        )
+        .unwrap();
+        let history = load_previous_coverage(&current);
+        assert_eq!(history.ratio, Some(0.25));
+        assert_eq!(history.untested_count, Some(3));
+        assert!(
+            history
+                .description()
+                .contains("not with the PR base commit")
+        );
+        let report = regression::RegressionReport::default();
+        let mut emitted = regression_with_coverage_history(&report, Some(&history));
+        let metadata = emitted["tests"]
+            .as_object_mut()
+            .unwrap()
+            .remove("coverage_comparison")
+            .unwrap();
+        assert_eq!(metadata["kind"], "previous_run");
+        assert_eq!(metadata["pr_base_comparison"], false);
+        assert_eq!(metadata["source"]["run_id"], "20261015-225515-old");
+        assert_eq!(metadata["source"]["review_range"], range);
+        assert_eq!(metadata["source"]["run_freshness"]["base_sha"], "old-base");
+        assert_eq!(
+            emitted,
+            json!(report),
+            "all legacy fields remain byte-value compatible"
+        );
+    }
+
+    #[test]
+    fn dogfood_count_only_previous_coverage_retains_the_consumed_source() {
+        for field in ["untested_code_count", "untested_critical_count"] {
+            let temp = tempfile::tempdir().unwrap();
+            let previous = temp.path().join("20261017-empty");
+            let current = temp.path().join("20261018-current");
+            fs::create_dir_all(&previous).unwrap();
+            fs::create_dir_all(&current).unwrap();
+            fs::write(
+                previous.join("report.json"),
+                json!({"regression":{"tests":{"coverage_ratio":null,field:0}}}).to_string(),
+            )
+            .unwrap();
+            let history = load_previous_coverage(&current);
+            assert_eq!(history.ratio, None);
+            assert_eq!(history.untested_count, Some(0));
+            assert!(history.description().contains("20261017-empty"));
+            let value = regression_with_coverage_history(
+                &regression::RegressionReport::default(),
+                Some(&history),
+            );
+            let comparison = &value["tests"]["coverage_comparison"];
+            assert_eq!(comparison["source_status"], "recorded");
+            assert!(comparison["source"]["metric_path"].is_null());
+            assert_eq!(
+                comparison["source"]["untested_count_path"],
+                format!("/regression/tests/{field}")
+            );
+        }
+    }
+
+    #[test]
+    fn dogfood_previous_coverage_missing_source_and_legacy_revisions_stay_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("20261018-current");
+        fs::create_dir_all(&current).unwrap();
+        let empty = load_previous_coverage(&current);
+        assert_eq!(empty.ratio, None);
+        let report = regression::RegressionReport::default();
+        assert_eq!(
+            regression_with_coverage_history(&report, Some(&empty))["tests"]["coverage_comparison"]
+                ["source_status"],
+            "unavailable"
+        );
+        let previous = temp.path().join("20261017-legacy");
+        fs::create_dir_all(&previous).unwrap();
+        fs::write(previous.join("report.json"), json!({"meta":{"range":{"head":"branch-label"}},"quality":{"coverage":{"heuristic_ratio":0.5}}}).to_string()).unwrap();
+        let old = load_previous_coverage(&current);
+        let emitted = regression_with_coverage_history(&report, Some(&old));
+        assert_eq!(old.ratio, Some(0.5));
+        assert_eq!(
+            emitted["tests"]["coverage_comparison"]["source"]["metric_path"],
+            "/quality/coverage/heuristic_ratio"
+        );
+        assert!(emitted["tests"]["coverage_comparison"]["source"]["review_range"].is_null());
+        assert!(emitted["tests"]["coverage_comparison"]["source"]["run_freshness"].is_null());
+    }
 }
