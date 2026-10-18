@@ -1331,7 +1331,16 @@ These metadata objects explain evidence; none changes policy severity, skip
 handling, the decision axes or process exit codes. Existing metric and decision
 fields retain their names, types and semantics; schema_version advances to 3.2
 and explanatory caveat text is clarified. Readers accepting unknown fields can ignore the new
-objects. Both the Rust reader and standalone validator accept 3.2 and retain
+objects. A gate declaring 3.2 must include all three evidence objects and their
+documented members, including explicitly nullable members. The standalone
+validator checks their types, enum values, execution/status correspondence and
+count-delta consistency; unavailable
+Loctree comparisons must carry null deltas/revisions. Earlier schemas do not
+require these objects. These checks validate evidence descriptions, not whether a
+security child process spawned. `not_executed`/`skipped_at_runtime` require
+`status:skipped`, `error` requires `status:error`, and uncached `executed`
+requires passed/failed/warnings. `cached` preserves any canonical stored status.
+Both the Rust reader and standalone validator accept 3.2 and retain
 older schemas; older Rust readers may announce the existing forward-MINOR
 compatibility caveat.
 

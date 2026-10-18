@@ -411,6 +411,117 @@ def inline_class_counts_coherent(
     return False
 
 
+def validate_evidence_scope(data: dict[str, Any]) -> list[str]:
+    """Validate the evidence descriptions required by schema 3.2.
+
+    This certifies artifact shape and internal measurement claims, never a
+    different verdict or proof that a security child process actually spawned.
+    Earlier schemas do not promise these objects and are checked as before.
+    """
+    issues: list[str] = []
+    names = ("security_scope", "coverage_evidence", "loctree_evidence")
+    issues.extend(ensure_keys(data, names, "root"))
+    objects = {}
+    for name in names:
+        if name not in data:
+            continue
+        if not isinstance(data[name], dict):
+            issues.append(f"{name} must be an object")
+        else:
+            objects[name] = data[name]
+
+    security = objects.get("security_scope")
+    if security is not None:
+        issues.extend(ensure_keys(security, ("requested", "source", "checks"), "security_scope"))
+        if security.get("requested") not in ("standard", "extended", "disabled"):
+            issues.append("security_scope.requested must be standard|extended|disabled")
+        if security.get("source") != "recorded_check_results":
+            issues.append("security_scope.source must be recorded_check_results")
+        rows = security.get("checks")
+        if not isinstance(rows, list):
+            issues.append("security_scope.checks must be an array")
+        else:
+            for index, row in enumerate(rows):
+                ctx = f"security_scope.checks[{index}]"
+                if not isinstance(row, dict):
+                    issues.append(f"{ctx} must be an object")
+                    continue
+                issues.extend(ensure_keys(row, ("id", "name", "execution", "status", "reason"), ctx))
+                for field in ("id", "name"):
+                    require_non_empty_string(row.get(field), f"{ctx}.{field}", issues)
+                if row.get("execution") not in (
+                    "executed", "cached", "not_executed", "skipped_at_runtime", "error"
+                ):
+                    issues.append(f"{ctx}.execution must name a recorded security execution state")
+                if not isinstance(row.get("status"), str) or row["status"] not in VALID_CHECK_STATUSES:
+                    issues.append(f"{ctx}.status must be a canonical check status")
+                # Mirror recorded(): cached is resolved first and may retain
+                # any canonical status. Uncached states describe what ran.
+                execution_statuses = {
+                    "executed": ("passed", "failed", "warnings"),
+                    "not_executed": ("skipped",),
+                    "skipped_at_runtime": ("skipped",),
+                    "error": ("error",),
+                }
+                execution = row.get("execution")
+                if (isinstance(execution, str) and execution in execution_statuses
+                        and row.get("status") not in execution_statuses[execution]):
+                    issues.append(f"{ctx}.execution and status contradict recorded check semantics")
+                if row.get("reason") is not None and not isinstance(row["reason"], str):
+                    issues.append(f"{ctx}.reason must be a string or null")
+
+    coverage = objects.get("coverage_evidence")
+    if coverage is not None:
+        issues.extend(ensure_keys(coverage, (
+            "kind", "execution_coverage_measured", "measured_field_meaning", "weak_match_count"
+        ), "coverage_evidence"))
+        if coverage.get("kind") != "source_test_change_match":
+            issues.append("coverage_evidence.kind must be source_test_change_match")
+        if coverage.get("execution_coverage_measured") is not False:
+            issues.append("coverage_evidence.execution_coverage_measured must be false")
+        if coverage.get("measured_field_meaning") != "heuristic_evaluated":
+            issues.append("coverage_evidence.measured_field_meaning must be heuristic_evaluated")
+        require_non_negative_integer(coverage.get("weak_match_count"), "coverage_evidence.weak_match_count", issues)
+
+    loctree = objects.get("loctree_evidence")
+    if loctree is not None:
+        issues.extend(ensure_keys(loctree, (
+            "scope", "comparison_kind", "finding_identities_compared", "net_counts_unchanged",
+            "count_deltas", "base_sha", "target_sha"
+        ), "loctree_evidence"))
+        if loctree.get("scope") != "whole_repository":
+            issues.append("loctree_evidence.scope must be whole_repository")
+        if loctree.get("finding_identities_compared") is not False:
+            issues.append("loctree_evidence.finding_identities_compared must be false")
+        kind = loctree.get("comparison_kind")
+        if kind == "not_available":
+            for field in ("net_counts_unchanged", "count_deltas", "base_sha", "target_sha"):
+                if loctree.get(field) is not None:
+                    issues.append(f"loctree_evidence.{field} must be null when comparison is not_available")
+        elif kind == "net_count_delta":
+            for field in ("base_sha", "target_sha"):
+                require_non_empty_string(loctree.get(field), f"loctree_evidence.{field}", issues)
+            unchanged = loctree.get("net_counts_unchanged")
+            require_boolean(unchanged, "loctree_evidence.net_counts_unchanged", issues)
+            deltas = loctree.get("count_deltas")
+            if not isinstance(deltas, dict):
+                issues.append("loctree_evidence.count_deltas must be an object for net_count_delta")
+            else:
+                fields = ("dead_exports", "cycles", "unused_symbols")
+                issues.extend(ensure_keys(deltas, fields, "loctree_evidence.count_deltas"))
+                valid = True
+                for field in fields:
+                    value = deltas.get(field)
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        issues.append(f"loctree_evidence.count_deltas.{field} must be an integer")
+                        valid = False
+                if valid and isinstance(unchanged, bool) and unchanged != all(deltas[f] == 0 for f in fields):
+                    issues.append("loctree_evidence.net_counts_unchanged must agree with count_deltas")
+        else:
+            issues.append("loctree_evidence.comparison_kind must be net_count_delta|not_available")
+    return issues
+
+
 def validate(path: Path) -> list[str]:
     issues: list[str] = []
     try:
@@ -449,6 +560,8 @@ def validate(path: Path) -> list[str]:
         issues.append(
             "schema_version must be '1.0', '2.0', '2.1', '2.2', '2.3', '3.0', '3.1', or '3.2'"
         )
+    if schema_at_least(data["schema_version"], (3, 2)):
+        issues.extend(validate_evidence_scope(data))
     require_iso_datetime(data["generated_at"], "generated_at", issues)
     if (
         isinstance(data["bridge_stage"], bool)
