@@ -4485,9 +4485,9 @@ fn merge_gate_names_the_origin_of_every_quality_failure_entry() {
     );
     assert_eq!(
         crate::gate::MERGE_GATE_SCHEMA_VERSION,
-        "3.1",
+        "3.2",
         "nullable policy source changed the MAJOR while retaining typed enforcement proof; \
-         3.1 adds the additive per-check `scope` object"
+         3.2 adds evidence-scope metadata on top of the per-check `scope` object"
     );
 }
 

@@ -2994,7 +2994,7 @@ mod tests {
 
         let gate: serde_json::Value =
             serde_json::from_slice(&fs::read(summary.join("MERGE_GATE.json")).unwrap()).unwrap();
-        assert_eq!(gate["schema_version"], "3.1");
+        assert_eq!(gate["schema_version"], "3.2");
         let rows = gate["checks"].as_array().expect("gate rows");
         let cargo_test = rows
             .iter()
