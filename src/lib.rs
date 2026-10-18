@@ -103,6 +103,8 @@ pub struct App {
     /// The signal handler in `main` needs it too, and can only reach it through
     /// something that outlives the run future.
     governor: std::sync::Arc<governor::ResourceGovernor>,
+    /// Selection intent belongs to this run, outside the exhaustive Config API.
+    explicit_bases: bool,
 }
 
 impl App {
@@ -117,7 +119,8 @@ impl App {
     /// Create new App instance from CLI arguments
     pub fn new(cli: &Cli) -> Result<Self> {
         let config = Config::from_cli(cli)?;
-        Self::from_config(config)
+        Ok(Self::from_config(config)?
+            .with_explicit_bases(!cli.bases.is_empty() || cli.pr.is_some()))
     }
 
     /// Create new App instance from Config
@@ -127,11 +130,23 @@ impl App {
             std::sync::Arc::new(governor::ResourceGovernor::from_plan(config.resource_plan));
 
         Ok(Self {
+            explicit_bases: config.pr_number.is_some(),
             config,
             repo,
             start_time: Instant::now(),
             governor,
         })
+    }
+
+    /// Preserve caller selection intent without changing the public Config shape.
+    ///
+    /// `from_config` retains its historical automatic classification: a Config
+    /// alone cannot distinguish explicit bases from materialized CLI defaults.
+    /// `new` records CLI intent; other callers can supply it with this builder.
+    #[must_use]
+    pub fn with_explicit_bases(mut self, explicit_bases: bool) -> Self {
+        self.explicit_bases = explicit_bases;
+        self
     }
 
     /// This run's resource governor, for a supervisor that has to cancel it.
@@ -184,27 +199,31 @@ impl App {
         // 1-2. Refresh and resolve refs. These operations are synchronous and
         // libgit2-backed; on a one-worker runtime they must yield the worker to
         // the separately spawned Ctrl-C supervisor just like the TUI sync phase.
-        let (worktree, target, bases) = run_headless_sync_stage(&self.governor, || {
-            self.ensure_not_cancelled()?;
-            // Capture source provenance only after the run-wide Ctrl-C scope is
-            // installed. `git2::statuses` can block on a large worktree, and
-            // doing it in `from_config` starved a one-worker runtime before its
-            // interrupt supervisor had ever been polled. This remains the first
-            // tree read of the run, before ref refresh, checks, or artifacts.
-            let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
-            self.ensure_not_cancelled()?;
-            self.repo.prepare_refs(&self.config)?;
-            self.ensure_not_cancelled()?;
+        let (worktree, target, bases, diff_bases) =
+            run_headless_sync_stage(&self.governor, || {
+                self.ensure_not_cancelled()?;
+                // Capture source provenance only after the run-wide Ctrl-C scope is
+                // installed. `git2::statuses` can block on a large worktree, and
+                // doing it in `from_config` starved a one-worker runtime before its
+                // interrupt supervisor had ever been polled. This remains the first
+                // tree read of the run, before ref refresh, checks, or artifacts.
+                let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
+                self.ensure_not_cancelled()?;
+                self.repo.prepare_refs(&self.config)?;
+                self.ensure_not_cancelled()?;
 
-            let target = self.repo.resolve_target(&self.config)?;
-            let bases = if self.config.current_only {
-                Vec::new()
-            } else {
-                self.repo.resolve_bases(&self.config)?
-            };
-            self.ensure_not_cancelled()?;
-            Ok((worktree, target, bases))
-        })?;
+                let target = self.repo.resolve_target(&self.config)?;
+                let bases = if self.config.current_only {
+                    Vec::new()
+                } else {
+                    self.repo.resolve_bases(&self.config)?
+                };
+                // Capture the effective comparison before update reuse as well as
+                // diff generation: exact and merge-base modes can share both tips.
+                let diff_bases = self.repo.resolve_diff_bases(&self.config, &target, &bases);
+                self.ensure_not_cancelled()?;
+                Ok((worktree, target, bases, diff_bases))
+            })?;
         self.ensure_not_cancelled()?;
 
         // 3. Check for update mode
@@ -212,18 +231,15 @@ impl App {
         if self.config.update_mode
             && let Some(prev_run) = self.find_previous_run()?
             && let Some(report) =
-                self.reuse_unchanged_run(&target, &bases, prev_run, emit_human_stdout)?
+                self.reuse_unchanged_run(&target, &bases, &diff_bases, prev_run, emit_human_stdout)?
         {
             return Ok(report);
         }
 
         // 4. Generate diffs
-        let (diff_bases, diffs) = run_headless_sync_stage(&self.governor, || {
-            let diff_bases = self.repo.resolve_diff_bases(&self.config, &target, &bases);
-            let diffs = self
-                .repo
-                .generate_diffs(&target, &diff_bases, self.config.quiet)?;
-            Ok((diff_bases, diffs))
+        let diffs = run_headless_sync_stage(&self.governor, || {
+            self.repo
+                .generate_diffs(&target, &diff_bases, self.config.quiet)
         })?;
         self.ensure_not_cancelled()?;
 
@@ -231,7 +247,10 @@ impl App {
         // The ledger is the run's record of what work was considered and how it
         // resolved. It also OWNS the run's shared target snapshot, so it must
         // outlive artifact generation (step 7), which reads that snapshot.
-        let ledger = ledger::TaskLedger::new();
+        let ledger = ledger::TaskLedger::new().with_explicit_bases(
+            self.config
+                .bases_were_explicitly_selected(self.explicit_bases),
+        );
         let mut run_config = self.config.clone();
         run_config.pinned_target = Some(target.clone());
         // Profile detection at CLI startup sees the operator checkout. An
@@ -659,7 +678,10 @@ impl App {
         // still needs the reviewed tree. An exact target keeps its snapshot in
         // the ledger through artifact generation; an ambient watch iteration
         // reads the live working tree it is watching.
-        let ledger = ledger::TaskLedger::new();
+        let ledger = ledger::TaskLedger::new().with_explicit_bases(
+            self.config
+                .bases_were_explicitly_selected(self.explicit_bases),
+        );
         let mut run_config = self.config.clone();
         run_config.pinned_target = Some(target.clone());
         run_headless_sync_stage(&self.governor, || {
@@ -893,11 +915,108 @@ impl App {
         &self,
         target: &git::ResolvedRef,
         bases: &[git::ResolvedRef],
+        diff_bases: &[git::ResolvedRef],
         prev_run: std::path::PathBuf,
         emit_human_stdout: bool,
     ) -> Result<Option<output::Report>> {
         use colored::Colorize;
 
+        self.ensure_not_cancelled()?;
+        // New packs record comparison coverage. Reuse may not carry an
+        // explicit self-diff assessment into an automatic/current-only run, or
+        // an automatic PASS into a different requested comparison.
+        let explicit_self_diff = !self.config.current_only
+            && self
+                .config
+                .bases_were_explicitly_selected(self.explicit_bases)
+            && bases.iter().any(|base| base.commit_id == target.commit_id);
+        let read_json = |path: &str| {
+            crate::paths::read_to_string_within(&prev_run, std::path::Path::new(path))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        };
+        let previous_report = read_json("report.json");
+        let previous_range = previous_report
+            .as_ref()
+            .and_then(|report| report.get("review_range"));
+        if let Some(range) = previous_range {
+            let same_modes = range["current_only"].as_bool() == Some(self.config.current_only)
+                && range["explicit_bases"].as_bool()
+                    == Some(
+                        self.config
+                            .bases_were_explicitly_selected(self.explicit_bases),
+                    );
+            let same_bases = range["comparisons"].as_array().is_some_and(|comparisons| {
+                comparisons.len() == bases.len()
+                    && diff_bases.len() == bases.len()
+                    && comparisons.iter().zip(bases.iter().zip(diff_bases)).all(
+                        |(previous, (base, diff_base))| {
+                            previous["base"].as_str() == Some(base.name.as_str())
+                                && previous["requested_base_sha"].as_str()
+                                    == Some(base.commit_id.as_str())
+                                && previous["effective_base_sha"].as_str()
+                                    == Some(diff_base.commit_id.as_str())
+                                && previous["target_sha"].as_str()
+                                    == Some(target.commit_id.as_str())
+                        },
+                    )
+            });
+            if !same_modes || !same_bases {
+                return Ok(None);
+            }
+        }
+        // An identical modern self-diff already records the required caveat.
+        // CLI verdicts come from MERGE_GATE, so report-only coverage cannot
+        // authorize a legacy PASS or an inconsistent copied pack.
+        if explicit_self_diff {
+            let (Some(range), Some(gate), Some(provenance)) = (
+                previous_range,
+                read_json("00_summary/MERGE_GATE.json"),
+                read_json("00_summary/PROVENANCE.json"),
+            ) else {
+                return Ok(None);
+            };
+            let decision = &gate["decision"];
+            let verdict = decision["verdict"].as_str();
+            let disposition = decision["enforcement_disposition"].as_str();
+            let covers_self = range["comparisons"].as_array().is_some_and(|comparisons| {
+                comparisons
+                    .iter()
+                    .zip(bases)
+                    .filter(|(_, base)| base.commit_id == target.commit_id)
+                    .all(|(comparison, base)| {
+                        comparison["status"].as_str() == Some("self_diff")
+                            && decision["review_caveats"]
+                                .as_array()
+                                .is_some_and(|caveats| {
+                                    let prefix = format!(
+                                        "No change reviewed against '{}' ({}): self_diff;",
+                                        base.name, target.commit_id
+                                    );
+                                    caveats.iter().any(|caveat| {
+                                        caveat
+                                            .as_str()
+                                            .is_some_and(|text| text.starts_with(&prefix))
+                                    })
+                                })
+                    })
+            });
+            if !matches!(
+                (verdict, disposition),
+                (Some("CONDITIONAL"), Some("review_required")) | (Some("BLOCK"), Some("block"))
+            ) || previous_report
+                .as_ref()
+                .and_then(|report| report["gate"]["status"].as_str())
+                != verdict
+                || gate.get("review_range") != Some(range)
+                || provenance.get("review_range") != Some(range)
+                || decision["allow_merge"].as_bool() != Some(false)
+                || decision["analysis_status"].as_str() != Some("incomplete")
+                || !covers_self
+            {
+                return Ok(None);
+            }
+        }
         let prev_head = self.read_previous_head(&prev_run)?;
         let current_head = target.commit_id.clone();
 
@@ -951,6 +1070,19 @@ impl App {
     }
 
     fn read_previous_head(&self, prev_run: &std::path::Path) -> Result<String> {
+        // Older empty-diff packs omitted HEAD from the text metadata, but their
+        // provenance still captured the resolved target. Prefer that identity.
+        if let Some(target) = crate::paths::read_to_string_within(
+            prev_run,
+            std::path::Path::new("00_summary/PROVENANCE.json"),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|provenance| provenance["target_sha"].as_str().map(str::to_owned))
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Ok(target);
+        }
         // Try new layout first, fall back to legacy path
         let metadata_file = {
             let new_path = prev_run.join("00_summary/pr-metadata.txt");
@@ -1424,6 +1556,53 @@ mod tests {
         assert_eq!(gate["profile"], "Js", "{gate}");
     }
 
+    #[tokio::test]
+    async fn tui_and_watch_quick_runs_publish_the_captured_base_selection() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(repo.path(), out.path());
+        config.target = Some("main".to_owned());
+        config.run_lint = false;
+        config.run_tests = false;
+        for (index, explicit) in [false, true, true].into_iter().enumerate() {
+            config.output_dir = Some(out.path().join(format!("tui-{index}")));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::from_plan(
+                config.resource_plan,
+            ));
+            crate::tui::run_analysis_with_explicit_bases(config.clone(), tx, governor, explicit)
+                .await
+                .unwrap();
+            let read = |name: &str| -> serde_json::Value {
+                serde_json::from_slice(
+                    &std::fs::read(config.output_dir.as_ref().unwrap().join(name)).unwrap(),
+                )
+                .unwrap()
+            };
+            let gate = read("00_summary/MERGE_GATE.json");
+            assert_eq!(gate["review_range"]["explicit_bases"], explicit);
+            assert_eq!(gate["review_range"], read("report.json")["review_range"]);
+            assert_eq!(
+                gate["review_range"],
+                read("00_summary/PROVENANCE.json")["review_range"]
+            );
+        }
+        let mut app = crate::App::from_config(config)
+            .unwrap()
+            .with_explicit_bases(true);
+        // run_watch delegates every iteration to this same quick entry point.
+        for index in 0..2 {
+            // Each immutable pack needs its own explicit output directory.
+            app.config.output_dir = Some(out.path().join(format!("quick-watch-{index}")));
+            let report = app.run_quick().await.unwrap();
+            let gate: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(report.artifacts_dir.join("00_summary/MERGE_GATE.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(gate["review_range"]["explicit_bases"], true);
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn ambient_review_keeps_external_manifest_cargo_root() {
@@ -1892,6 +2071,161 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_self_reuse_requires_a_matching_modern_non_pass_assessment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(tmp.path(), out.path());
+        let head = rev_parse(tmp.path(), "HEAD");
+        let mut base = resolved(&head);
+        base.name = "feature".to_owned();
+        config.bases = vec![base.name.clone()];
+        config.required_base = Some(base);
+        let app = crate::App::from_config(config).unwrap();
+        let target = app.repo.resolve_target(&app.config).unwrap();
+        let bases = app.repo.resolve_bases(&app.config).unwrap();
+        let effective = app.repo.resolve_diff_bases(&app.config, &target, &bases);
+        let prev = tempfile::tempdir().unwrap();
+        std::fs::create_dir(prev.path().join("00_summary")).unwrap();
+        std::fs::write(
+            prev.path().join("00_summary/pr-metadata.txt"),
+            format!("HEAD: feature ({head})\n"),
+        )
+        .unwrap();
+        for (verdict, flaw, expected) in [
+            ("PASS", "legacy", false),
+            ("PASS", "none", false),
+            ("CONDITIONAL", "none", true),
+            ("BLOCK", "none", true),
+            ("CONDITIONAL", "missing-gate", false),
+            ("CONDITIONAL", "canonical-pass", false),
+            ("CONDITIONAL", "gate-range", false),
+            ("CONDITIONAL", "provenance-range", false),
+            ("CONDITIONAL", "wrong-status", false),
+            ("CONDITIONAL", "missing-caveat", false),
+            ("CONDITIONAL", "warnings-only", false),
+            ("CONDITIONAL", "allow-merge", false),
+            ("CONDITIONAL", "complete", false),
+        ] {
+            let mut report = serde_json::json!({"gate": {"status": verdict}});
+            if flaw != "legacy" {
+                report["review_range"] = serde_json::json!({
+                    "current_only": false, "explicit_bases": true,
+                    "comparisons": [{"base": "feature", "requested_base_sha": head,
+                        "effective_base_sha": head, "target_sha": head, "status": "self_diff"}]
+                });
+            }
+            if flaw == "wrong-status" {
+                report["review_range"]["comparisons"][0]["status"] = serde_json::json!("compared");
+            }
+            let mut gate = serde_json::json!({
+                "review_range": report["review_range"],
+                "decision": {"verdict": verdict, "allow_merge": false, "analysis_status": "incomplete",
+                    "enforcement_disposition": if verdict == "BLOCK" { "block" } else { "review_required" },
+                    "review_caveats": [format!("No change reviewed against 'feature' ({head}): self_diff; target-tree checks do not establish review of a change.")]}
+            });
+            let mut provenance = serde_json::json!({"review_range": report["review_range"]});
+            match flaw {
+                "canonical-pass" => gate["decision"]["verdict"] = serde_json::json!("PASS"),
+                "gate-range" => gate["review_range"]["explicit_bases"] = serde_json::json!(false),
+                "provenance-range" => {
+                    provenance["review_range"]["explicit_bases"] = serde_json::json!(false)
+                }
+                "missing-caveat" => gate["decision"]["review_caveats"] = serde_json::json!([]),
+                "warnings-only" => {
+                    gate["decision"]["enforcement_disposition"] = serde_json::json!("warnings_only")
+                }
+                "allow-merge" => gate["decision"]["allow_merge"] = serde_json::json!(true),
+                "complete" => gate["decision"]["analysis_status"] = serde_json::json!("complete"),
+                _ => {}
+            }
+            let gate_path = prev.path().join("00_summary/MERGE_GATE.json");
+            if flaw == "missing-gate" {
+                std::fs::remove_file(gate_path).unwrap();
+            } else {
+                std::fs::write(gate_path, gate.to_string()).unwrap();
+            }
+            std::fs::write(
+                prev.path().join("00_summary/PROVENANCE.json"),
+                provenance.to_string(),
+            )
+            .unwrap();
+            std::fs::write(prev.path().join("report.json"), report.to_string()).unwrap();
+            let reused = app
+                .reuse_unchanged_run(
+                    &target,
+                    &bases,
+                    &effective,
+                    prev.path().to_path_buf(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(reused.is_some(), expected, "flaw={flaw}, verdict={verdict}");
+        }
+    }
+
+    #[test]
+    fn update_reuse_checks_effective_bases_in_both_normalization_directions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(tmp.path(), out.path());
+        let ancestor = rev_parse(tmp.path(), "main");
+        git_run(tmp.path(), &["checkout", "-q", "-b", "other", "main"]);
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn keep() {}\n// edit\n").unwrap();
+        git_run(tmp.path(), &["commit", "-qam", "divergent equal tree"]);
+        let other = rev_parse(tmp.path(), "HEAD");
+        git_run(tmp.path(), &["checkout", "-q", "feature"]);
+        config.bases = vec!["other".to_owned()];
+        let mut requested = resolved(&other);
+        requested.name = "other".to_owned();
+        config.required_base = Some(requested);
+        let prev = tempfile::tempdir().unwrap();
+        std::fs::create_dir(prev.path().join("00_summary")).unwrap();
+
+        for exact in [false, true] {
+            config.required_base_exact = exact;
+            let app = crate::App::from_config(config.clone()).unwrap();
+            let target = app.repo.resolve_target(&app.config).unwrap();
+            let bases = app.repo.resolve_bases(&app.config).unwrap();
+            let effective = app.repo.resolve_diff_bases(&app.config, &target, &bases);
+            let expected = if exact { &other } else { &ancestor };
+            let different = if exact { &ancestor } else { &other };
+            assert_eq!(&effective[0].commit_id, expected);
+            std::fs::write(
+                prev.path().join("00_summary/pr-metadata.txt"),
+                format!("HEAD: feature ({})\n", target.commit_id),
+            )
+            .unwrap();
+            for previous_effective in [different, expected] {
+                std::fs::write(
+                    prev.path().join("report.json"),
+                    serde_json::json!({"review_range": {
+                        "current_only": false, "explicit_bases": true,
+                        "comparisons": [{"base": "other", "requested_base_sha": other,
+                            "effective_base_sha": previous_effective,
+                            "target_sha": target.commit_id}]
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+                let reused = app
+                    .reuse_unchanged_run(
+                        &target,
+                        &bases,
+                        &effective,
+                        prev.path().to_path_buf(),
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    reused.is_some(),
+                    previous_effective == expected,
+                    "exact={exact}"
+                );
+            }
+        }
+    }
+
     /// `--update` is the one path that returns a report without running a
     /// single stage, and so the one that reached `main` with a verdict while
     /// the operator was pressing Ctrl-C. Even after `git fetch` is registered
@@ -1925,7 +2259,7 @@ mod tests {
 
         // Uncancelled, the seam does what `--update` exists to do.
         let reused = app
-            .reuse_unchanged_run(&target, &[], prev.path().to_path_buf(), false)
+            .reuse_unchanged_run(&target, &[], &[], prev.path().to_path_buf(), false)
             .unwrap()
             .expect("HEAD has not moved, so the previous pack is reused");
         assert!(reused.unchanged, "the reused report is the unchanged one");
@@ -1933,7 +2267,7 @@ mod tests {
 
         app.governor().cancel();
         let err = app
-            .reuse_unchanged_run(&target, &[], prev.path().to_path_buf(), false)
+            .reuse_unchanged_run(&target, &[], &[], prev.path().to_path_buf(), false)
             .expect_err("a cancelled run must not hand back a pack to take a verdict from");
         assert!(
             crate::governor::is_cancellation(&err),

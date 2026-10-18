@@ -267,9 +267,10 @@ fn test_build_html_stays_self_contained_without_external_font_cdns() {
     let diffs = vec![mock_diff()];
     let checks = mock_checks();
     let ctx = mock_ctx();
-    let dir = std::env::temp_dir();
+    let pack = tempfile::tempdir().unwrap();
+    let dir = pack.path();
 
-    let html = build_html_test!(&config, &diffs, &checks, None, &ctx, "", &dir, "", None);
+    let html = build_html_test!(&config, &diffs, &checks, None, &ctx, "", dir, "", None);
 
     assert!(html.contains("system stack only, no external CDN dependency"));
     assert!(!html.contains("fonts.googleapis.com"));

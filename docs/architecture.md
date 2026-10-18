@@ -483,8 +483,15 @@ The proof reads the files as they are when the gate is written, so it describes
 only an audit executed in this run. `CargoAuditCheck` declines every cached
 status except `Passed` (`Check::replays_cached`, asked on both the write and the
 lookup, so an entry an older prview stored is not replayed either): a clean
-report has nothing to downgrade, and a failing or warning one runs live, because
-the audit's key binds the lockfile and the day but not `.cargo/audit.toml`. R3-14
+report has nothing to downgrade, and a failing or warning one runs live. The
+audit's versioned key binds the lockfile, day, and effective audit policy: the
+cargo root's `.cargo/audit.toml`, or Cargo home's `audit.toml` when the former
+is absent. Exact-target reviews use the target's policy blob and still hash an
+external fallback live. Case-variant target policy paths, unreadable or
+non-regular policies disable replay;
+relative Cargo homes without a target-local policy also disable replay because
+they resolve inside an ephemeral snapshot. This changes cache identity only,
+not advisory classification, freshness windows, or downgrade policy. R3-14
 (`--current-only`) and R4-20 (no resolvable base diff) still veto the downgrade
 upstream of the proof. A newly published advisory against an unchanged lock is
 therefore reported as pre-existing debt newly revealed, not as debt this change
@@ -684,7 +691,12 @@ evidence, and buys no exception anywhere.
 **Rust workspace resolution.** One `cargo metadata --format-version 1 --no-deps
 --frozen` per run, with its own timeout, read from the cargo root **inside the
 reviewed tree**. An exact review detects `profile.cargo_root` in the pinned
-target tree and expresses it relative to the logical repository root. Reading
+target tree and expresses it relative to the logical repository root. Profile
+markers and Cargo-root eligibility include gitlinks recursively at each pinned
+commit, using the same offline object-store resolver as snapshot materialization.
+Only regular Git blobs count as manifests; symlinks are not followed. The
+operator submodule checkout supplies objects, never marker bytes or `HEAD`.
+Reading
 metadata from the operator checkout could describe another revision's members
 and path edges. The detected root is rebased onto the reviewed tree, and a root
 that cannot be placed inside it escalates with that stated reason. This is not
@@ -1684,8 +1696,16 @@ hashes, and streaming hashes/modes of tracked and nonignored untracked source.
 Initial dirty source is a valid baseline. Symlink content is its link bytes,
 not the target. Unix regular-file reads use anchored no-follow opens and stop
 after the initial file size plus one byte; unstable or unreadable evidence is
-fatal. Owned worktree registrations are outside the source walk. Gitlinks remain
-explicitly unsupported by this token rather than certified clean.
+fatal. Owned worktree registrations are outside the source walk. Gitlink paths
+are taken from both HEAD and the index. Initialized gitlinks recursively observe
+their actual checkout's Git identity and tracked/nonignored untracked sources,
+including regular `.git` pointer bytes; their initial HEAD and dirty state need
+not match the pinned commit. Missing and empty uninitialized paths are distinct
+observed states. Nonempty directories without a repository and ambiguous Git
+markers fail closed; source symlinks retain link bytes without walking targets.
+Recursion is limited to 16 gitlink levels. Gitlink roots and descendants cannot
+be admitted as owned outputs, and pre-open alias checks include nested tracked
+leaves. This does not fetch, initialize, reset or restore operator submodules.
 
 Quality dispatchers observe before/after live checks, after budget admission and
 before cache writes. Python pre-sync, context admission/completion and publication
@@ -4606,6 +4626,20 @@ pub fn rust_hash(root: &Path) -> String {
     // Cargo.toml/Cargo.lock hash + Rust source hash, 16-byte digest segments
 }
 ```
+
+Cargo file fingerprints frame each relative filename and content length before
+hashing its bytes. Moving bytes between manifests or renaming a Rust source
+file therefore invalidates the cache even when concatenated contents match.
+The versioned framing also separates these keys from older unframed entries.
+This bounded fix does not claim a complete fingerprint of compiler/tool versions,
+Cargo configuration, environment, external path dependencies, or advisory database
+updates within the existing daily audit window.
+
+Exact-target audit policy identity follows the snapshot's pinned gitlinks,
+including a missing local policy selecting the live Cargo-home fallback.
+Operator submodule HEAD and dirty policy bytes do not select that identity.
+Missing pinned objects, symlink/non-directory ancestors, and case aliases disable
+replay; identical safe lock/policy/day inputs can reuse a clean result.
 
 A hit also reports `age_secs`: how long ago the entry was published, read from
 the entry file's mtime — an entry is published by a single `rename`, so its mtime

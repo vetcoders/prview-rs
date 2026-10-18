@@ -12,6 +12,8 @@ mod context_artifacts;
 mod findings;
 pub(crate) mod git_artifacts;
 mod merge_gate;
+mod review_range;
+use review_range::ReviewRange;
 mod sanity;
 
 use context_artifacts::*;
@@ -234,6 +236,7 @@ struct MergeGateInput<'a> {
 }
 
 pub(crate) struct DashboardContextInput<'a> {
+    review_range: &'a ReviewRange,
     config: &'a Config,
     checks: &'a [CheckResult],
     heuristics: Option<&'a HeuristicsResult>,
@@ -1065,6 +1068,13 @@ fn generate_guarded(
     ));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::MergeGate)?;
 
+    let review_range = ReviewRange::assess(
+        config,
+        ledger.explicit_bases(),
+        resolved_target,
+        resolved_bases,
+        diffs,
+    );
     // Root-level content generators
     let t = Instant::now();
     generate_checks_status_json(&out_dir, config, &all_checks, &skipped_checks)?;
@@ -1077,6 +1087,13 @@ fn generate_guarded(
         &coverage_delta,
         heuristics,
     )?;
+    let range_notices = review_range.review_caveats();
+    if !range_notices.is_empty() {
+        let path = out_dir.join("PR_REVIEW.md");
+        let narrative = fs::read_to_string(&path)?;
+        let notice = format!("# PR Review\n\n{}\n", range_notices.join("\n\n"));
+        fs::write(path, narrative.replacen("# PR Review\n", &notice, 1))?;
+    }
     stage_timings.push(finish_timing(emit_human_stdout, "PR_REVIEW", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PrReview)?;
 
@@ -1182,6 +1199,7 @@ fn generate_guarded(
     let ownership_map =
         build_ownership_map_at_revision(&repo, &resolved_target.commit_id, &file_paths);
     let dash_ctx = build_dashboard_context(DashboardContextInput {
+        review_range: &review_range,
         config,
         checks: &all_checks,
         heuristics,
@@ -1204,20 +1222,23 @@ fn generate_guarded(
 
     // Root-level report.json (generated first so dashboard can embed it)
     let t = Instant::now();
-    report::generate(&report::ReportInput {
-        dir: &out_dir,
-        config,
-        diffs,
-        checks: &all_checks,
-        resolved_target,
-        resolved_bases,
-        ctx: &dash_ctx,
-        run_started_at: &run_started_at,
-        heuristics,
-        regression: Some(&regression_report),
-        provenance: &provenance_consistency,
-        scope,
-    })?;
+    report::generate_for_range(
+        &report::ReportInput {
+            dir: &out_dir,
+            config,
+            diffs,
+            checks: &all_checks,
+            resolved_target,
+            resolved_bases,
+            ctx: &dash_ctx,
+            run_started_at: &run_started_at,
+            heuristics,
+            regression: Some(&regression_report),
+            provenance: &provenance_consistency,
+            scope,
+        },
+        &review_range,
+    )?;
     generate_consistency_check(&summary_dir, &out_dir, diffs, &provenance_consistency)?;
     stage_timings.push(finish_timing(emit_human_stdout, "report.json", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::ReportJson)?;
@@ -1241,6 +1262,7 @@ fn generate_guarded(
     // RUN.json/MANIFEST so the manifest hashes it like any other pack file.
     let t = Instant::now();
     generate_provenance_json(ProvenanceJsonInput {
+        review_range: &review_range,
         dir: &summary_dir,
         checks: &all_checks,
         skipped_checks: &skipped_checks,
@@ -1823,11 +1845,12 @@ fn generate_metadata(
         config.pr_url.as_deref().unwrap_or("n/a")
     ));
 
+    // Identity exists even when generate_diffs omitted every comparison.
+    content.push_str(&format!(
+        "HEAD: {} ({})\n",
+        resolved_target.name, resolved_target.commit_id
+    ));
     if let Some(diff) = diffs.first() {
-        content.push_str(&format!(
-            "HEAD: {} ({})\n",
-            diff.target, resolved_target.commit_id
-        ));
         content.push_str(&format!("BASE: {}\n\n", diff.base));
     }
 
@@ -2064,6 +2087,7 @@ fn generate_heuristics_gate_result(
 }
 
 struct ProvenanceJsonInput<'a> {
+    review_range: &'a ReviewRange,
     dir: &'a Path,
     checks: &'a [CheckResult],
     /// Checks that were configured but never executed. They are gates too: a
@@ -2083,37 +2107,34 @@ struct ProvenanceJsonInput<'a> {
     contradictions: &'a ProvenanceConsistency,
 }
 
-/// Every baseline the pack's diffs were actually produced from, named.
-///
-/// `resolved_bases` holds the base *tips* the operator named. When the branches
-/// have diverged the patch is generated from the merge base instead — unless
-/// the run pinned an exact base (`Repository::resolve_diff_bases`) — so
-/// recording a tip here would name a commit no diff in the pack was computed
-/// against — the contradiction of a file whose whole job is to state what was
-/// compared. Reading the values off the diffs themselves makes that impossible
-/// by construction, in both range modes.
-///
-/// One entry per diff: `--base a --base b` produces a patch per base, each with
-/// its own merge base, and collapsing them to one row left a reviewer unable to
-/// say which commit the second patch came from.
-///
-/// Falls back to the resolved bases when there is no diff at all: an empty diff
-/// set means either `--current-only` (no base, so no rows) or a base pointing at
-/// the target commit, where the tip IS the baseline.
+/// Every requested baseline, including comparisons omitted by generate_diffs.
+/// An omitted comparison has effective-base == target, even when the requested
+/// tip is a descendant of target. Preserve that fact in mixed-base runs too.
 fn provenance_bases<'a>(
     diffs: &'a [Diff],
     resolved_bases: &'a [ResolvedRef],
+    target: &'a ResolvedRef,
 ) -> Vec<(&'a str, &'a str)> {
-    if diffs.is_empty() {
-        return resolved_bases
-            .iter()
-            .map(|base| (base.name.as_str(), base.commit_id.as_str()))
-            .collect();
-    }
-    diffs
+    let mut rows: Vec<_> = resolved_bases
         .iter()
-        .map(|diff| (diff.base.as_str(), diff.base_commit_id.as_str()))
-        .collect()
+        .map(|base| {
+            let sha = diffs
+                .iter()
+                .find(|d| d.base == base.name)
+                .map(|d| d.base_commit_id.as_str())
+                .unwrap_or(&target.commit_id);
+            (base.name.as_str(), sha)
+        })
+        .collect();
+    // Preserve directly supplied diff evidence even when the caller's resolved
+    // metadata is partial (e.g. artifact API fixtures).
+    rows.extend(
+        diffs
+            .iter()
+            .filter(|diff| !resolved_bases.iter().any(|base| base.name == diff.base))
+            .map(|d| (d.base.as_str(), d.base_commit_id.as_str())),
+    );
+    rows
 }
 
 /// PROVENANCE.json — pack-level record of WHAT was analysed.
@@ -2128,6 +2149,7 @@ fn provenance_bases<'a>(
 fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
     use serde_json::json;
     let ProvenanceJsonInput {
+        review_range,
         dir,
         checks,
         skipped_checks,
@@ -2173,7 +2195,7 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
     });
     let check_rows: Vec<serde_json::Value> = executed.chain(skipped).collect();
 
-    let bases = provenance_bases(diffs, resolved_bases);
+    let bases = provenance_bases(diffs, resolved_bases, resolved_target);
     let base_rows: Vec<serde_json::Value> = bases
         .iter()
         .map(|(name, sha)| json!({ "name": name, "sha": sha }))
@@ -2181,6 +2203,7 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
 
     let provenance = json!({
         "schema_version": "2.0",
+        "review_range": review_range,
         "generated_at": chrono::Local::now().to_rfc3339(),
         // Commit whose tree the pack judges.
         "target_sha": resolved_target.commit_id,

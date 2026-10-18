@@ -111,6 +111,7 @@ pub(crate) struct DashboardContext {
 
 pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> DashboardContext {
     let DashboardContextInput {
+        review_range,
         config,
         checks,
         heuristics,
@@ -401,6 +402,8 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     if let Some(integrity) = snapshot_integrity {
         review_caveats.extend(integrity.apply_review(&mut worst_confidence, &mut worst_merge));
     }
+
+    review_caveats.extend(review_range.apply_review(&mut worst_confidence, &mut worst_merge));
 
     // B2: Compute i18n parity delta
     let i18n_delta = signal::compute_i18n_delta(diffs, &config.repo_root);

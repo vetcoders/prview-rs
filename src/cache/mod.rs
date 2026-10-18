@@ -343,8 +343,8 @@ pub fn stylelint_hash(repo_root: &Path) -> String {
 
 /// Generate a content-based cache key for Rust checks.
 pub fn rust_hash(repo_root: &Path) -> String {
-    let cargo_hash = hash_files(repo_root, &["Cargo.toml", "Cargo.lock"]);
-    let src_hash = hash_files(repo_root, &["*.rs", "**/*.rs"]);
+    let cargo_hash = hash_cargo_files(repo_root, &["Cargo.toml", "Cargo.lock"]);
+    let src_hash = hash_cargo_files(repo_root, &["*.rs", "**/*.rs"]);
     format!("{}-{}", cargo_hash, src_hash)
 }
 
@@ -352,7 +352,7 @@ pub fn rust_hash(repo_root: &Path) -> String {
 /// security audit, whose result depends on the resolved dependency set — not on
 /// unrelated source churn.
 pub fn cargo_lock_hash(repo_root: &Path) -> String {
-    hash_files(repo_root, &["Cargo.lock", "Cargo.toml"])
+    hash_cargo_files(repo_root, &["Cargo.lock", "Cargo.toml"])
 }
 
 /// Legacy Python content fingerprint.
@@ -381,7 +381,20 @@ pub fn key_token(value: &str) -> String {
 }
 
 fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
+    hash_files_impl(repo_root, patterns, false)
+}
+
+/// Cargo fingerprints distinguish file names and byte boundaries. Concatenated
+/// bytes alone collide when content moves between manifests or modules rename.
+fn hash_cargo_files(repo_root: &Path, patterns: &[&str]) -> String {
+    hash_files_impl(repo_root, patterns, true)
+}
+
+fn hash_files_impl(repo_root: &Path, patterns: &[&str], frame_files: bool) -> String {
     let mut hasher = Sha256::new();
+    if frame_files {
+        hasher.update(b"cargo-files-v2");
+    }
     // Escape glob metacharacters in the repo root so a path like `repo[old]` is
     // matched literally, not parsed as a glob pattern. `glob::Pattern::escape`
     // brackets exactly the chars glob treats as special (`? * [ ]`); braces are
@@ -395,6 +408,15 @@ fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
 
             for path in paths {
                 if let Ok(content) = fs::read(&path) {
+                    if frame_files {
+                        let name = path
+                            .strip_prefix(repo_root)
+                            .unwrap_or(&path)
+                            .to_string_lossy();
+                        hasher.update((name.len() as u64).to_le_bytes());
+                        hasher.update(name.as_bytes());
+                        hasher.update((content.len() as u64).to_le_bytes());
+                    }
                     hasher.update(&content);
                 }
             }
@@ -411,6 +433,29 @@ mod tests {
     use crate::git::git_cmd;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn cargo_fingerprints_frame_file_boundaries_and_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("Cargo.toml"), "# comment\n").unwrap();
+        fs::write(root.join("Cargo.lock"), "# comment\n# comment\n").unwrap();
+        let before = (rust_hash(root), cargo_lock_hash(root));
+        // The concatenation stays identical in either manifest order.
+        fs::write(root.join("Cargo.toml"), "# comment\n# comment\n").unwrap();
+        fs::write(root.join("Cargo.lock"), "# comment\n").unwrap();
+        assert_ne!(before.0, rust_hash(root));
+        assert_ne!(before.1, cargo_lock_hash(root));
+        fs::write(root.join("old.rs"), "pub fn demo() {}\n").unwrap();
+        let before = rust_hash(root);
+        fs::rename(root.join("old.rs"), root.join("new.rs")).unwrap();
+        assert_ne!(
+            before,
+            rust_hash(root),
+            "a Rust module rename changes compiler inputs"
+        );
+        assert_eq!(rust_hash(root), rust_hash(root));
+    }
 
     #[test]
     fn test_cached_result_creation() {

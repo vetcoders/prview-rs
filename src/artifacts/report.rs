@@ -73,10 +73,23 @@ pub struct ReportInput<'a> {
 }
 
 /// Generate `report.json` in the artifact root directory.
+#[cfg(test)]
 pub fn generate(input: &ReportInput<'_>) -> Result<()> {
     let report = build_report(input);
     let json = serde_json::to_string_pretty(&report)?;
     crate::owned_output::fs::write(input.dir.join("report.json"), json)?;
+    Ok(())
+}
+
+pub(super) fn generate_for_range(
+    input: &ReportInput<'_>,
+    review_range: &super::review_range::ReviewRange,
+) -> Result<()> {
+    let report = build_report_for_range(input, Some(review_range));
+    crate::owned_output::fs::write(
+        input.dir.join("report.json"),
+        serde_json::to_string_pretty(&report)?,
+    )?;
     Ok(())
 }
 
@@ -86,6 +99,7 @@ pub fn generate(input: &ReportInput<'_>) -> Result<()> {
 
 #[derive(Serialize)]
 struct Report {
+    review_range: super::review_range::ReviewRange,
     schema_version: &'static str,
     meta: Meta,
     gate: Gate,
@@ -674,7 +688,15 @@ struct UiHints {
 // Builder
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn build_report(input: &ReportInput<'_>) -> Report {
+    build_report_for_range(input, None)
+}
+
+fn build_report_for_range(
+    input: &ReportInput<'_>,
+    review_range: Option<&super::review_range::ReviewRange>,
+) -> Report {
     let ReportInput {
         config,
         diffs,
@@ -693,10 +715,9 @@ fn build_report(input: &ReportInput<'_>) -> Report {
     // history and the previous-run delta, which count the same list.
     let sarif_findings_count = ctx.findings.len();
 
-    let diff_merge_base = diffs
+    let diff_merge_base = super::provenance_bases(diffs, resolved_bases, resolved_target)
         .first()
-        .map(|diff| diff.base_commit_id.clone())
-        .or_else(|| resolved_bases.first().map(|base| base.commit_id.clone()));
+        .map(|(_, sha)| (*sha).to_owned());
 
     // -- meta --
     let meta = Meta {
@@ -1239,6 +1260,15 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         .collect();
 
     Report {
+        review_range: review_range.cloned().unwrap_or_else(|| {
+            super::review_range::ReviewRange::assess(
+                config,
+                false,
+                resolved_target,
+                resolved_bases,
+                diffs,
+            )
+        }),
         // 3.0: `quality.breaking_changes.md_path` is nullable and
         // `gate.status` carries the canonical
         // PASS/CONDITIONAL/BLOCK verdict. Readers must migrate from 2.0.

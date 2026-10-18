@@ -49,6 +49,12 @@ Exact target snapshots expand committed submodules from local pinned Git
 objects without fetching. If the pinned submodule commit is unavailable
 locally, the review stops with its path and object ID rather than scanning an
 empty submodule directory.
+Profile detection and Cargo-root planning expand those same pinned objects,
+including nested gitlinks. A `project.cargo_root = './backend/'` can select a
+regular `Cargo.toml` committed inside the `backend` submodule even when the
+operator has checked out another submodule revision or deleted its manifest.
+Symlink manifests and symlink components of the Cargo root never supply
+project markers, including inside submodules.
 Its header and check list refresh before checks start, including when a later
 analysis in the same TUI session selects a different target.
 An ordinary target-less local review uses the live checkout. `--profile` still
@@ -1410,3 +1416,14 @@ Make sure `tsconfig.json` exists and `pnpm`/`npm` are available.
 ### Cargo check fails
 
 Check that `cargo` is on PATH and `Cargo.toml` is valid.
+
+### Explicit self-diffs
+
+`prview HEAD HEAD` and `prview gate --base HEAD` cannot establish review of a
+change. They still run target-tree checks, but emit `CONDITIONAL` with a
+`No change reviewed` explanation in CLI output and the review pack. Use an
+actual earlier base, for example `prview gate --base HEAD^ --strict`, to review
+that change. Existing gate policy applies: `--strict` rejects the self-diff with
+exit 2; advisory gate mode reports it with exit 0. Automatic base discovery,
+`--current-only`, and different commits with identical trees remain distinct
+cases in the pack's `review_range` metadata.

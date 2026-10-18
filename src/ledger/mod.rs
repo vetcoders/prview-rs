@@ -158,6 +158,8 @@ pub struct TaskEntry {
 /// task must not turn the whole ledger into a run-ending error.
 #[derive(Default)]
 pub struct TaskLedger {
+    /// Immutable selection intent captured by the run's entry point.
+    explicit_bases: bool,
     entries: Mutex<Vec<TaskEntry>>,
     caller_guard: Mutex<Option<Arc<crate::checks::caller_integrity::CallerGuard>>>,
     /// The one target snapshot the run shares. Materialising it stays the
@@ -184,6 +186,17 @@ impl TaskLedger {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record explicit versus automatic base selection before starting the run.
+    #[must_use]
+    pub fn with_explicit_bases(mut self, explicit_bases: bool) -> Self {
+        self.explicit_bases = explicit_bases;
+        self
+    }
+
+    pub(crate) fn explicit_bases(&self) -> bool {
+        self.explicit_bases
     }
 
     pub(crate) fn output_scope(

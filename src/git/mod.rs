@@ -1029,6 +1029,53 @@ impl Repository {
         Ok(entries)
     }
 
+    /// Enumerate the logical target tree, expanding gitlinks at their pinned
+    /// OIDs from local object stores. Symlinks remain entries, never traversed
+    /// paths. Use this for project detection and Cargo planning; raw tree
+    /// consumers keep [`Self::tree_entries_at_oid`]'s superproject-only view.
+    pub(crate) fn tree_entries_with_gitlinks_at_oid(
+        &self,
+        commit_oid: &str,
+    ) -> Result<Vec<GitTreeEntry>> {
+        fn expand(repo: &Repository, oid: &str, depth: usize) -> Result<Vec<GitTreeEntry>> {
+            anyhow::ensure!(
+                depth < 16,
+                "nested submodule depth exceeds offline snapshot limit"
+            );
+            let mut entries = repo.tree_entries_at_oid(oid)?;
+            let mut children = Vec::new();
+            for link in entries
+                .iter()
+                .filter(|entry| entry.kind == GitTreeEntryKind::Gitlink)
+            {
+                let relative = crate::paths::validate_repo_relative_str(&link.path)?;
+                let operator_root = repo.inner.workdir().unwrap_or(&repo.path);
+                let pinned_oid = git2::Oid::from_str(&link.object_id)?;
+                let sub_repo = worktree::open_pinned_gitlink(
+                    &repo.inner,
+                    operator_root,
+                    relative,
+                    pinned_oid,
+                )?;
+                let sub = Repository {
+                    inner: sub_repo,
+                    path: operator_root.join(relative),
+                };
+                for mut entry in expand(&sub, &link.object_id, depth + 1)
+                    .with_context(|| format!("expanding pinned submodule {}", link.path))?
+                {
+                    entry.path = format!("{}/{}", link.path, entry.path);
+                    children.push(entry);
+                }
+            }
+            entries.extend(children);
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(entries)
+        }
+
+        expand(self, commit_oid, 0)
+    }
+
     /// Return exact bytes for a regular blob in one exact commit tree.
     ///
     /// `Ok(None)` means the path is absent. Non-regular entries are rejected;

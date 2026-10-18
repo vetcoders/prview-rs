@@ -531,6 +531,10 @@ pub async fn start(
     if full_tests {
         args.push("--full-tests".to_string());
     }
+    // Preserve whether MCP selected a default or the caller requested a base.
+    if base.is_none() {
+        args.push("--auto-selected-bases".to_string());
+    }
     args.extend(positional_args(repo, &selection));
 
     match profile {
