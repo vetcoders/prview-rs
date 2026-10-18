@@ -5038,6 +5038,7 @@ api-router/app/core/cache.py
         assert!(security.contains("requested=standard"));
         assert!(security.contains("Cargo audit:"));
         config.run_security = true;
+        config.security_full = true;
         let extended = crate::checks::security_scope::preflight(&config);
         assert!(extended.contains("requested=extended"));
         assert!(extended.contains("Cargo geiger:"));
