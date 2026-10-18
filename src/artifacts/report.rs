@@ -56,6 +56,7 @@ pub struct ReportInput<'a> {
     pub run_started_at: &'a str,
     pub heuristics: Option<&'a crate::heuristics::HeuristicsResult>,
     pub regression: Option<&'a crate::regression::RegressionReport>,
+    pub coverage_history: Option<&'a super::PreviousCoverage>,
     /// The run's substrate cross-check, resolved ONCE for the whole pack and
     /// handed to every surface that publishes it (see
     /// [`super::signal::detect_provenance_contradictions`]).
@@ -111,7 +112,9 @@ struct Report {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ownership: Vec<OwnershipMapEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    regression: Option<crate::regression::RegressionReport>,
+    regression: Option<serde_json::Value>,
+    security_scope: serde_json::Value,
+    loctree_evidence: serde_json::Value,
     artifacts: Artifacts,
     #[serde(skip_serializing_if = "Option::is_none")]
     ui_hints: Option<UiHints>,
@@ -578,6 +581,8 @@ struct BreakingSection {
 
 #[derive(Serialize)]
 struct CoverageSection {
+    #[serde(flatten)]
+    evidence: serde_json::Value,
     /// `null` when there were no changed source files to evaluate. 0/0 is an
     /// absence of measurement, not a perfect ratio.
     heuristic_ratio: Option<f64>,
@@ -1079,6 +1084,7 @@ fn build_report_for_range(
             rust_api_delta: ctx.rust_api_delta.clone(),
         },
         coverage: CoverageSection {
+            evidence: super::coverage_evidence(&ctx.coverage),
             // 0/0 must serialize as null + measured:false, never as a 1.0 that
             // downstream renders as "100% coverage".
             heuristic_ratio: (ctx.coverage.total_source > 0)
@@ -1275,7 +1281,8 @@ fn build_report_for_range(
         // 3.1: check rows may carry the additive `scope` object — how much of
         // that check's suite the run decided had to execute, and why. Additive
         // only; a 3.0 reader loses the field and nothing else.
-        schema_version: "3.1",
+        // 3.2: additive evidence kind/security scope and previous-run provenance.
+        schema_version: "3.2",
         meta,
         gate,
         checks: check_entries,
@@ -1283,7 +1290,15 @@ fn build_report_for_range(
         diff: diff_section,
         quality,
         ownership,
-        regression: input.regression.cloned(),
+        regression: input
+            .regression
+            .map(|r| super::regression_with_coverage_history(r, input.coverage_history)),
+        security_scope: crate::checks::security_scope::recorded(
+            config,
+            checks,
+            &ctx.skipped_checks,
+        ),
+        loctree_evidence: super::loctree_evidence(heuristics_input),
         artifacts,
         ui_hints,
     }
@@ -1545,6 +1560,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-09T00:00:00Z",
             heuristics: None,
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
@@ -1713,12 +1729,13 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-09-15T00:00:00Z",
             heuristics: None,
             regression: None,
+            coverage_history: None,
             scope: Some(&scope),
             provenance: &ProvenanceConsistency::default(),
         });
         let json = serde_json::to_value(&report).expect("serialize report");
 
-        assert_eq!(json["schema_version"], "3.1");
+        assert_eq!(json["schema_version"], "3.2");
         let rows = json["checks"].as_array().expect("check rows");
         let cargo_test = rows
             .iter()
@@ -1838,6 +1855,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-09T00:00:00Z",
             heuristics: None,
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
@@ -1957,6 +1975,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-09T00:00:00Z",
             heuristics: None,
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
@@ -2082,6 +2101,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-12T00:00:00Z",
             heuristics: None,
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
@@ -2223,6 +2243,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-12T00:00:00Z",
             heuristics: Some(&heuristics),
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
@@ -2324,6 +2345,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-12T00:00:00Z",
             heuristics,
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
@@ -2409,6 +2431,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-09-09T00:00:00Z",
             heuristics: None,
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &ProvenanceConsistency::default(),
         });
@@ -2513,9 +2536,9 @@ test result: FAILED. 0 passed; 1 failed
         );
         assert_eq!(
             json["schema_version"].as_str(),
-            Some("3.1"),
+            Some("3.2"),
             "a nullable field and omittable counters are not an additive change; \
-             3.1 adds the additive per-check `scope` object on top of that shape"
+             3.2 adds evidence-scope and previous-run provenance on top of that shape"
         );
         assert!(json["quality"]["breaking_changes"]["md_path"].is_null());
     }
@@ -2555,6 +2578,34 @@ test result: FAILED. 0 passed; 1 failed
         assert_eq!(cov["measured"].as_bool(), Some(true));
         assert!(cov.get("not_measured_reason").is_none());
         assert_eq!(cov["total"].as_u64(), Some(3));
+    }
+
+    #[test]
+    fn dogfood_report_names_heuristic_without_claiming_execution_coverage() {
+        use crate::artifacts::signal::{CoverageMatchTier, CoveragePair};
+        let mut ctx = skip_as_zero_ctx(coverage_delta(3, 2, Some(66)));
+        ctx.coverage.covered = vec![CoveragePair {
+            src_status: 'M',
+            src_path: "src/a.py".into(),
+            test_status: 'M',
+            test_path: "tests/test_a.py".into(),
+            tier: CoverageMatchTier::Low,
+        }];
+        let json = skip_as_zero_report(&ctx, None, false);
+        let cov = &json["quality"]["coverage"];
+        assert_eq!(cov["kind"], "source_test_change_match");
+        assert_eq!(cov["execution_coverage_measured"], false);
+        assert_eq!(cov["weak_match_count"], 1);
+        assert_eq!(cov["measured_field_meaning"], "heuristic_evaluated");
+        assert_eq!(cov["measured"], true);
+        assert_eq!(cov["heuristic_ratio"], 2.0 / 3.0);
+        let empty = skip_as_zero_report(&skip_as_zero_ctx(coverage_delta(0, 0, None)), None, false);
+        assert_eq!(empty["quality"]["coverage"]["measured"], false);
+        assert!(empty["quality"]["coverage"]["heuristic_ratio"].is_null());
+        assert_eq!(
+            empty["quality"]["coverage"]["execution_coverage_measured"],
+            false
+        );
     }
 
     #[test]
@@ -2722,6 +2773,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-12T00:00:00Z",
             heuristics: None,
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
@@ -2815,6 +2867,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-09-11T00:00:00Z",
             heuristics: None,
             regression: None,
+            coverage_history: None,
             scope: None,
             provenance: &provenance,
         };

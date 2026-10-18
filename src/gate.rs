@@ -15,18 +15,27 @@ pub const GATE_EXECUTION_ERROR_EXIT_CODE: i32 = 3;
 /// 3.1 adds the additive `scope` object on a gate check row: how much of that
 /// check's suite the run decided had to execute, and why. A 3.0 reader loses
 /// the field and nothing else.
-pub const MERGE_GATE_SCHEMA_VERSION: &str = "3.1";
+/// 3.2 adds evidence-scope metadata without changing any decision axis.
+pub const MERGE_GATE_SCHEMA_VERSION: &str = "3.2";
 
 /// `MERGE_GATE.json` schemas this build has actually seen, as `(MAJOR, MINOR)`.
 ///
 /// This is the SAME set `tools/validate_merge_gate.py` accepts verbatim
-/// (`1.0` / `2.0` / `2.1` / `2.2` / `2.3` / `3.0` / `3.1`), so "readable by the CLI/MCP" and "valid per the
+/// (`1.0` / `2.0` / `2.1` / `2.2` / `2.3` / `3.0` / `3.1` / `3.2`), so "readable by the CLI/MCP" and "valid per the
 /// contract validator" cannot drift apart for a version in the set. The reader
 /// is deliberately broader in exactly two documented directions — an absent
 /// field and a newer MINOR of a known MAJOR — and both are announced rather
 /// than silent.
-const MERGE_GATE_KNOWN_SCHEMAS: &[(u32, u32)] =
-    &[(1, 0), (2, 0), (2, 1), (2, 2), (2, 3), (3, 0), (3, 1)];
+const MERGE_GATE_KNOWN_SCHEMAS: &[(u32, u32)] = &[
+    (1, 0),
+    (2, 0),
+    (2, 1),
+    (2, 2),
+    (2, 3),
+    (3, 0),
+    (3, 1),
+    (3, 2),
+];
 
 /// Schema 2.3 is the first version that can prove a `CONDITIONAL` is only a
 /// warning. Schema 3.x and forward-compatible 2.x packs inherit that requirement; older packs

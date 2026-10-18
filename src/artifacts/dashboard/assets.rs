@@ -2063,8 +2063,8 @@ const JS_SUFFIX: &str = r##"
             var breakingCount = Number(match[1]);
             return match[1] + ' ' + polishPlural(breakingCount, 'zmiana łamiąca', 'zmiany łamiące', 'zmian łamiących');
         }
-        match = trimmed.match(/^(\d+)%\s+coverage heuristic$/);
-        if (match) return match[1] + '% plików z dopasowanymi zmianami w testach';
+        match = trimmed.match(/^(\d+)%\s+coverage heuristic(?: \(test-change matching; not execution coverage\))?$/);
+        if (match) return match[1] + '% plików z dopasowanymi zmianami w testach (heurystyka; nie pokrycie wykonania kodu)';
         match = trimmed.match(/^(\d+)\s+inline finding(?:s)?$/);
         if (match) {
             var inlineCount = Number(match[1]);

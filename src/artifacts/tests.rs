@@ -1944,6 +1944,7 @@ macro_rules! generate_run_json_test {
             context_artifacts: $context_artifacts,
             context_command_timings: $context_command_timings,
             regression: $regression,
+            coverage_history: None,
         })
     };
 }
@@ -2569,6 +2570,7 @@ fn run_json_publishes_the_test_scope_on_the_checks_that_own_one() {
         ledger: &crate::ledger::TaskLedger::new(),
         scope: Some(&scope),
         regression: None,
+        coverage_history: None,
     })
     .expect("run json");
 
@@ -4483,9 +4485,9 @@ fn merge_gate_names_the_origin_of_every_quality_failure_entry() {
     );
     assert_eq!(
         crate::gate::MERGE_GATE_SCHEMA_VERSION,
-        "3.1",
+        "3.2",
         "nullable policy source changed the MAJOR while retaining typed enforcement proof; \
-         3.1 adds the additive per-check `scope` object"
+         3.2 adds evidence-scope metadata on top of the per-check `scope` object"
     );
 }
 
@@ -5496,7 +5498,7 @@ fn ai_index_coverage_signal_says_not_measured_for_zero_of_zero() {
     let index = std::fs::read_to_string(out.join("AI_INDEX.md")).expect("AI_INDEX.md");
     assert!(
         index.contains(&format!(
-            "Coverage signal: 0/0 changed code files ({COVERAGE_NOT_MEASURED})"
+            "Test-change matching: 0/0 changed code files ({COVERAGE_NOT_MEASURED}; heuristic, not execution coverage)"
         )),
         "0/0 must be labelled not-measured, got:\n{index}"
     );
@@ -5518,7 +5520,9 @@ fn ai_index_coverage_signal_says_not_measured_for_zero_of_zero() {
     generate_ai_index(out, &config, &diffs, &[], &measured).expect("ai index");
     let index = std::fs::read_to_string(out.join("AI_INDEX.md")).expect("AI_INDEX.md");
     assert!(
-        index.contains("Coverage signal: 0/4 changed code files (0%)"),
+        index.contains(
+            "Test-change matching: 0/4 changed code files (0%; heuristic, not execution coverage)"
+        ),
         "0/N must render as 0%, got:\n{index}"
     );
     assert!(!index.contains(COVERAGE_NOT_MEASURED));
@@ -5897,7 +5901,9 @@ fn pr_review_uses_coverage_delta_for_warning_summary() {
     .expect("pr review");
     let content = std::fs::read_to_string(tmp.path().join("PR_REVIEW.md")).expect("read");
 
-    assert!(content.contains("Coverage review signal: 25% heuristic coverage (1/4)"));
+    assert!(content.contains(
+        "Test-change matching: 25% (1/4 changed code files; heuristic, not execution coverage)"
+    ));
     assert!(
             content.contains(
                 "Rust caveat: coverage heuristic may miss inline `#[cfg(test)]` modules inside changed `.rs` files."
@@ -8584,6 +8590,7 @@ fn informational_notes_keep_current_and_historical_counts_comparable() {
         run_started_at: "2026-01-01T00:00:00Z",
         heuristics: None,
         regression: None,
+        coverage_history: None,
         scope: None,
         provenance: &ProvenanceConsistency::default(),
     })

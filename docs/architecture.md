@@ -4224,6 +4224,27 @@ left the bracket depth stuck open under the old rule — dominated by
 the next line (`pub static X: [[u16; N];`) must hold its depth open so that `;`
 is not mistaken for the end of the item.
 
+#### Evidence scope and previous-run provenance
+
+Report/gate schema 3.2 adds descriptions without changing decision semantics.
+`checks::security_scope` uses the dispatcher's actual eligibility for preflight,
+then projects recorded results/skips without re-probing PATH after execution.
+Requested mode, cached evidence, fresh execution, runtime skips and errors stay
+separate. The public CLI JSON and regression Rust structs keep their shapes.
+
+`artifacts::evidence_scope` describes source/test-change matching, counts weak
+associations and explains Loctree whole-repository warnings. Loctree's comparison
+is a net count delta, not a set-identity comparison: zero never clears warnings.
+The same pure projections feed gate/report/RUN and the narrative warning.
+
+`artifacts::history` loads the previous metric and its report path/run ID once;
+its original review-range and run-freshness metadata travel to report/RUN under
+`regression.tests.coverage_comparison`. Legacy ratio/delta fields still describe
+a previous-run trend. They never become measurements of the PR base commit.
+Missing historical metadata stays unknown. The source/test matching ratio and
+its thresholds are unchanged; `measured` retains its legacy availability meaning
+and `execution_coverage_measured:false` states the narrower evidence explicitly.
+
 #### signal/coverage.rs — source-to-test matching
 
 Cross-references changed source files with test files. This is structural
