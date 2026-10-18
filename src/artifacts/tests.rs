@@ -5520,7 +5520,9 @@ fn ai_index_coverage_signal_says_not_measured_for_zero_of_zero() {
     generate_ai_index(out, &config, &diffs, &[], &measured).expect("ai index");
     let index = std::fs::read_to_string(out.join("AI_INDEX.md")).expect("AI_INDEX.md");
     assert!(
-        index.contains("Coverage signal: 0/4 changed code files (0%)"),
+        index.contains(
+            "Test-change matching: 0/4 changed code files (0%; heuristic, not execution coverage)"
+        ),
         "0/N must render as 0%, got:\n{index}"
     );
     assert!(!index.contains(COVERAGE_NOT_MEASURED));
@@ -5899,7 +5901,9 @@ fn pr_review_uses_coverage_delta_for_warning_summary() {
     .expect("pr review");
     let content = std::fs::read_to_string(tmp.path().join("PR_REVIEW.md")).expect("read");
 
-    assert!(content.contains("Test-change matching: 25% (1/4 changed code files; heuristic, not execution coverage)"));
+    assert!(content.contains(
+        "Test-change matching: 25% (1/4 changed code files; heuristic, not execution coverage)"
+    ));
     assert!(
             content.contains(
                 "Rust caveat: coverage heuristic may miss inline `#[cfg(test)]` modules inside changed `.rs` files."

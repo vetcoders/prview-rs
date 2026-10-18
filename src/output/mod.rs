@@ -5033,7 +5033,14 @@ api-router/app/core/cache.py
         assert!(steps.contains("diff"));
         assert!(steps.contains("cargo-check"));
         assert!(steps.contains("lint"));
-        assert!(steps.contains("cargo-audit"));
+        assert!(!steps.contains("cargo-audit"));
+        let security = crate::checks::security_scope::preflight(&config);
+        assert!(security.contains("requested=standard"));
+        assert!(security.contains("Cargo audit:"));
+        config.run_security = true;
+        let extended = crate::checks::security_scope::preflight(&config);
+        assert!(extended.contains("requested=extended"));
+        assert!(extended.contains("Cargo geiger:"));
     }
 
     #[test]
