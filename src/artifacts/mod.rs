@@ -881,6 +881,20 @@ fn generate_guarded(
     generate_commit_list(&summary_dir, diffs)?;
     generate_file_status(&summary_dir, diffs)?;
     generate_system_meta(&summary_dir)?;
+    if let Some((caller_root, execution_repo)) = ledger.execution_roots() {
+        fs::write(
+            summary_dir.join("EXECUTION_ROOTS.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "caller_root": caller_root,
+                "execution_repo": execution_repo,
+                "target_root": ledger.scan_dir(),
+                "output_root": out_dir,
+                "ambient_caller_dependencies_imported": false,
+                "host_write_confinement": false,
+            }))?,
+        )?;
+    }
     generate_git_meta(&summary_dir, config, resolved_target, resolved_bases)?;
     stage_timings.push(finish_timing(emit_human_stdout, "00_summary", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::SummaryMetadata)?;

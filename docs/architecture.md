@@ -4831,3 +4831,30 @@ with the truncation marker (including the legacy prefix-only marker) are not
 indexed for advisory dependency paths. Neither PR_REVIEW nor FAILURES_SUMMARY
 may infer ancestry across an omitted portion; advisories remain visible without
 those paths. Complete trees keep their existing path enrichment.
+
+### Remote review repository ownership
+
+`--pr`, `--remote` and `--remote-only` runs transport local Git objects and refs
+into an independently owned temporary repository before refreshing refs or
+planning checks. Its Git common directory, target worktrees and cleanup are
+separate from the invocation checkout. The copy imports neither its index,
+untracked source, hooks/config nor ambient `node_modules`/`.venv`. Initialized
+submodule object stores are transported separately; missing pinned objects still
+fail closed. No automatic checkout restoration is attempted.
+
+The existing caller boundary guard observes that execution repository. An
+unrelated nested repository or concurrent caller edit is not an input to its
+baseline. Concrete output collision checks still protect the original caller's
+tracked files and aliases. Remote home/output/Cargo/uv write roots must be outside
+the caller; an internal override is refused rather than silently dropping its
+protection. Snapshot-integrity and exact owned-output pre/postimage checks remain
+active. Ambient local reviews retain their existing caller baseline.
+
+`00_summary/EXECUTION_ROOTS.json` records caller, execution repository, target and
+output separately. It explicitly reports `host_write_confinement: false`.
+This is separation of Git ownership and ordinary execution paths, not OS access
+control: arbitrary tests/plugins may still address absolute host paths. Default
+host home/tool caches and target-owned external links are not made into a sandbox
+by this change. The issue #69 Semgrep baseline planner, pinned range and
+cancel/timeout process cleanup remain unchanged; its resets operate only on the
+owned detached snapshot. No new sandbox backend is required to run a review.

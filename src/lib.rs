@@ -11,6 +11,7 @@ pub mod cli;
 pub mod config;
 pub mod gate;
 pub mod git;
+mod review_workspace;
 pub mod governor;
 pub mod heuristics;
 pub mod ledger;
@@ -105,6 +106,7 @@ pub struct App {
     governor: std::sync::Arc<governor::ResourceGovernor>,
     /// Selection intent belongs to this run, outside the exhaustive Config API.
     explicit_bases: bool,
+    execution_repo: Option<std::sync::Arc<review_workspace::IndependentReview>>,
 }
 
 impl App {
@@ -135,6 +137,7 @@ impl App {
             repo,
             start_time: Instant::now(),
             governor,
+            execution_repo: None,
         })
     }
 
@@ -176,8 +179,38 @@ impl App {
         Ok(())
     }
 
+    /// Plan a remote run without making the active caller a check substrate.
+    /// Called within the run's governed blocking phase, never at CLI startup.
+    pub(crate) fn independent_review(&self) -> Result<Option<Self>> {
+        if self.execution_repo.is_some()
+            || !(self.config.remote_mode || self.config.remote_only || self.config.pr_number.is_some())
+        {
+            return Ok(None);
+        }
+        self.ensure_not_cancelled()?;
+        let workspace = std::sync::Arc::new(review_workspace::IndependentReview::create(&self.config)?);
+        let config = workspace.config(&self.config)?;
+        let repo = git::Repository::open(&config.repo_root)?;
+        Ok(Some(Self {
+            config,
+            repo,
+            start_time: self.start_time,
+            governor: std::sync::Arc::clone(&self.governor),
+            explicit_bases: self.explicit_bases,
+            execution_repo: Some(workspace),
+        }))
+    }
+
     /// Run the PR review process
     pub async fn run(&self) -> Result<output::Report> {
+        let execution = run_headless_sync_stage(&self.governor, || self.independent_review())?;
+        match execution {
+            Some(app) => app.run_inner().await,
+            None => self.run_inner().await,
+        }
+    }
+
+    async fn run_inner(&self) -> Result<output::Report> {
         use colored::Colorize;
         // The governor may already be closed before the run starts a single
         // stage — `--watch` shares one across iterations, and a cancel can land
@@ -251,6 +284,7 @@ impl App {
             self.config
                 .bases_were_explicitly_selected(self.explicit_bases),
         );
+        ledger.retain_execution_repo(self.execution_repo.clone());
         let mut run_config = self.config.clone();
         run_config.pinned_target = Some(target.clone());
         // Profile detection at CLI startup sees the operator checkout. An
@@ -646,6 +680,14 @@ impl App {
     }
 
     async fn run_quick_with_sync_probe(&self, sync_probe: impl FnOnce()) -> Result<output::Report> {
+        let execution = run_headless_sync_stage(&self.governor, || self.independent_review())?;
+        match execution {
+            Some(app) => app.run_quick_inner(sync_probe).await,
+            None => self.run_quick_inner(sync_probe).await,
+        }
+    }
+
+    async fn run_quick_inner(&self, sync_probe: impl FnOnce()) -> Result<output::Report> {
         let run_started_at = Instant::now();
         // `--watch` reuses one governor across every iteration, and closing it is
         // one-way, so a cancelled watcher must not start another pack.
@@ -682,6 +724,7 @@ impl App {
             self.config
                 .bases_were_explicitly_selected(self.explicit_bases),
         );
+        ledger.retain_execution_repo(self.execution_repo.clone());
         let mut run_config = self.config.clone();
         run_config.pinned_target = Some(target.clone());
         run_headless_sync_stage(&self.governor, || {

@@ -741,7 +741,9 @@ pub(crate) async fn run_analysis_with_explicit_bases(
         worktree_dirty_paths,
         worktree_head_sha,
     ) = crate::governor::blocking_stage(|| -> Result<_> {
-        let app = App::from_config(config)?;
+        let original = App::from_config(config)?;
+        let app = original.independent_review()?.unwrap_or(original);
+        ledger.retain_execution_repo(app.execution_repo.clone());
         // Freeze cleanliness before any check runs or artifact is written (R4-19).
         // This closure runs inside the TUI run scope and blocking_stage, so the
         // event loop can cancel even while libgit2 scans a large worktree.
