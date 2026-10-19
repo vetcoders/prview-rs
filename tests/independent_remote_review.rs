@@ -38,6 +38,13 @@ fn fixture(parent: &Path) -> (PathBuf, PathBuf) {
     git(&caller, &["checkout", "-b", "topic"]);
     fs::write(caller.join("source.txt"), "target\n").unwrap();
     git(&caller, &["commit", "-am", "target"]);
+    let base = git(&caller, &["rev-parse", "main"]);
+    let target = git(&caller, &["rev-parse", "topic"]);
+    git(&caller, &["update-ref", "refs/remotes/origin/main", &base]);
+    git(
+        &caller,
+        &["update-ref", "refs/remotes/origin/topic", &target],
+    );
     let foreign = caller.join(".claude/worktrees/agent-control");
     git(
         &caller,

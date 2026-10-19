@@ -33,6 +33,24 @@ impl IndependentReview {
                 path.display()
             );
         }
+        // Keep the old managed-scratch protection against a descendant link
+        // redirecting an otherwise external cache back into active source.
+        for root in [config.cargo_build_cache_dir(), config.uv_env_root()] {
+            if !root.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+                let entry = entry?;
+                if entry.file_type().is_symlink() {
+                    let target = std::fs::canonicalize(entry.path())?;
+                    ensure!(
+                        !target.starts_with(&caller_root),
+                        "remote review scratch {} redirects into the caller",
+                        entry.path().display()
+                    );
+                }
+            }
+        }
         let directory = tempfile::Builder::new()
             .prefix("prview-review-")
             .tempdir()?;
@@ -128,7 +146,7 @@ fn copy_objects(source: &git2::Repository, destination: &git2::Repository) -> Re
         .arg(source.path())
         .arg("+refs/*:refs/*");
     if source.head().is_ok() {
-        command.arg("HEAD:refs/prview/copied-head");
+        command.arg("+HEAD:refs/prview/copied-head");
     }
     command.current_dir(destination.path());
     let output = crate::proc::output_governed_with_timeout(
@@ -244,6 +262,76 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(&alias).unwrap(), b"original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_cache_redirect_into_caller_is_refused() {
+        let (caller, home, config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let cache = config.cargo_build_cache_dir();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::os::unix::fs::symlink(caller.path(), cache.join("redirect")).unwrap();
+        let error = IndependentReview::create(&config)
+            .err()
+            .expect("redirect refused");
+        assert!(error.to_string().contains("redirects into the caller"));
+        assert_eq!(
+            std::fs::read(caller.path().join("source.txt")).unwrap(),
+            b"original\n"
+        );
+    }
+
+    #[test]
+    fn initialized_gitlink_objects_are_available_without_sharing_the_module_store() {
+        let (caller, home, config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let (module, _module_home, _) = crate::checks::caller_guard_tests::fixture();
+        let status = git_cmd()
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "core.hooksPath=",
+                "submodule",
+                "add",
+                "--quiet",
+            ])
+            .arg(module.path())
+            .arg("backend")
+            .current_dir(caller.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let mut index = source.index().unwrap();
+        let tree = source.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = source.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let target = source
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "add module",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let workspace = IndependentReview::create(&config).unwrap();
+        let entries = crate::git::Repository::open(&workspace.repo_root)
+            .unwrap()
+            .tree_entries_with_gitlinks_at_oid(&target.to_string())
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path == "backend/source.txt")
+        );
+        assert_ne!(
+            source.commondir().join("modules/backend"),
+            workspace.repo_root.join(".git/modules/backend")
+        );
     }
 
     #[test]
