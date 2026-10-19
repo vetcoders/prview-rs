@@ -49,6 +49,7 @@ impl AnalysisTask {
         config: Config,
         tx: mpsc::UnboundedSender<TuiEvent>,
         explicit_bases: bool,
+        execution_repo: Option<Arc<crate::review_workspace::IndependentReview>>,
     ) -> Self {
         let governor = Arc::new(crate::governor::ResourceGovernor::from_plan(
             config.resource_plan,
@@ -59,7 +60,13 @@ impl AnalysisTask {
         let handle = tokio::spawn(async move {
             crate::governor::with_run_scope(
                 run_governor,
-                run_analysis_with_explicit_bases(config, tx, analysis_governor, explicit_bases),
+                run_analysis_with_workspace(
+                    config,
+                    tx,
+                    analysis_governor,
+                    explicit_bases,
+                    execution_repo,
+                ),
             )
             .await
         });
@@ -149,6 +156,7 @@ pub async fn run_tui_with_explicit_bases(config: Config, explicit_bases: bool) -
     // a governed git fetch with nobody able to observe the operator's abort.
     let mut state = TuiState::new(config);
     let pre_raw_mode = initialize_state_supervised(&mut state, crate::governor::CtrlC).await?;
+    let execution_repo = pre_raw_mode.execution_repo.clone();
 
     // Setup terminal
     pre_raw_mode.ensure_active()?;
@@ -195,6 +203,7 @@ pub async fn run_tui_with_explicit_bases(config: Config, explicit_bases: bool) -
             &mut rx,
             &mut analysis,
             explicit_bases,
+            execution_repo,
         )
         .await
     }
@@ -225,16 +234,18 @@ async fn initialize_state_supervised(
     let supervisor = crate::governor::InterruptSupervisor::start(Arc::clone(&governor), interrupts);
     let work = async { crate::governor::blocking_stage(|| initialize_state(state)) };
     let result = crate::governor::with_run_scope(Arc::clone(&governor), work).await;
-    finish_tui_preflight(result, &governor)?;
+    let execution_repo = finish_tui_preflight(result, &governor)?;
     Ok(PreRawModeGuard {
         governor,
         supervisor,
+        execution_repo,
     })
 }
 
 struct PreRawModeGuard {
     governor: Arc<crate::governor::ResourceGovernor>,
     supervisor: crate::governor::InterruptSupervisor,
+    execution_repo: Option<Arc<crate::review_workspace::IndependentReview>>,
 }
 
 impl PreRawModeGuard {
@@ -246,6 +257,7 @@ impl PreRawModeGuard {
         let Self {
             governor,
             supervisor,
+            execution_repo: _,
         } = self;
         supervisor.stop().await;
         finish_tui_preflight(Ok(()), &governor)
@@ -300,7 +312,7 @@ async fn run_event_loop<B: Backend>(
 where
     B::Error: Send + Sync + 'static,
 {
-    run_event_loop_with_explicit_bases(terminal, state, tx, rx, analysis, false).await
+    run_event_loop_with_explicit_bases(terminal, state, tx, rx, analysis, false, None).await
 }
 
 async fn run_event_loop_with_explicit_bases<B: Backend>(
@@ -310,11 +322,21 @@ async fn run_event_loop_with_explicit_bases<B: Backend>(
     rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
     analysis: &mut Option<AnalysisTask>,
     explicit_bases: bool,
+    execution_repo: Option<Arc<crate::review_workspace::IndependentReview>>,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
 {
-    let result = run_event_loop_inner(terminal, state, tx, rx, analysis, explicit_bases).await;
+    let result = run_event_loop_inner(
+        terminal,
+        state,
+        tx,
+        rx,
+        analysis,
+        explicit_bases,
+        execution_repo,
+    )
+    .await;
     join_cancelled_analysis(result, analysis).await
 }
 
@@ -325,6 +347,7 @@ async fn run_event_loop_inner<B: Backend>(
     rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
     analysis: &mut Option<AnalysisTask>,
     mut explicit_bases: bool,
+    execution_repo: Option<Arc<crate::review_workspace::IndependentReview>>,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -362,6 +385,7 @@ where
                     state.config.clone(),
                     tx.clone(),
                     explicit_bases,
+                    execution_repo.clone(),
                 ));
             } else {
                 handle_selection_key(state, key, tx, &mut explicit_bases).await?;
@@ -632,7 +656,9 @@ fn map_check_event(event: CheckEvent) -> TuiEvent {
 }
 
 /// Initialize TUI state with branch info and check list
-fn initialize_state(state: &mut TuiState) -> Result<()> {
+fn initialize_state(
+    state: &mut TuiState,
+) -> Result<Option<Arc<crate::review_workspace::IndependentReview>>> {
     // Try to resolve branches
     let original = App::from_config(state.config.clone())?;
     let app = original.independent_review()?.unwrap_or(original);
@@ -665,7 +691,7 @@ fn initialize_state(state: &mut TuiState) -> Result<()> {
     // Update message to include branch selection hint
     state.message = "[b]ranch wizard [r]un [1-6]panel [?]help [q]uit".to_string();
 
-    Ok(())
+    Ok(app.execution_repo.clone())
 }
 
 /// Run the TUI in state-only mode (`prview state --tui`)
@@ -723,6 +749,16 @@ pub(crate) async fn run_analysis_with_explicit_bases(
     governor: Arc<crate::governor::ResourceGovernor>,
     explicit_bases: bool,
 ) -> Result<()> {
+    run_analysis_with_workspace(config, tx, governor, explicit_bases, None).await
+}
+
+async fn run_analysis_with_workspace(
+    config: Config,
+    tx: mpsc::UnboundedSender<TuiEvent>,
+    governor: Arc<crate::governor::ResourceGovernor>,
+    explicit_bases: bool,
+    execution_repo: Option<Arc<crate::review_workspace::IndependentReview>>,
+) -> Result<()> {
     let t_start = std::time::Instant::now();
     let ledger = crate::ledger::TaskLedger::new()
         .with_explicit_bases(config.bases_were_explicitly_selected(explicit_bases));
@@ -744,7 +780,12 @@ pub(crate) async fn run_analysis_with_explicit_bases(
         worktree_head_sha,
     ) = crate::governor::blocking_stage(|| -> Result<_> {
         let original = App::from_config(config)?;
-        let app = original.independent_review()?.unwrap_or(original);
+        let app = match execution_repo {
+            Some(workspace) if original.remote_review_requested() => {
+                original.review_in_workspace(workspace)?
+            }
+            _ => original.independent_review()?.unwrap_or(original),
+        };
         ledger.retain_execution_repo(app.execution_repo.clone());
         // Freeze cleanliness before any check runs or artifact is written (R4-19).
         // This closure runs inside the TUI run scope and blocking_stage, so the
@@ -1246,6 +1287,7 @@ mod tests {
         let error = PreRawModeGuard {
             governor,
             supervisor,
+            execution_repo: None,
         }
         .handoff()
         .await
@@ -1341,6 +1383,160 @@ mod tests {
         assert_preflight_ref_ownership(true);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tui_preflight_retains_a_pr_oid_across_a_successful_force_push_fetch() {
+        assert_session_refresh("pinned").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tui_retained_session_still_refreshes_an_unpinned_pr_target() {
+        assert_session_refresh("fresh").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tui_retained_session_does_not_hide_a_failed_fetch() {
+        assert_session_refresh("offline").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tui_retained_session_preserves_local_wizard_selection_semantics() {
+        assert_session_refresh("local").await;
+    }
+
+    async fn assert_session_refresh(mode: &str) {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let upstream = home.path().join("upstream.git");
+        let bare = git2::Repository::init_bare(&upstream).unwrap();
+        assert!(
+            crate::git::git_cmd()
+                .args(["-c", "core.hooksPath=", "fetch", "--quiet"])
+                .arg(caller.path())
+                .arg("+HEAD:refs/heads/main")
+                .current_dir(&upstream)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let parent = bare
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+        let commit = |contents: &[u8]| {
+            let mut builder = bare.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+            builder
+                .insert("source.txt", bare.blob(contents).unwrap(), 0o100644)
+                .unwrap();
+            let tree = bare.find_tree(builder.write().unwrap()).unwrap();
+            bare.commit(
+                None,
+                &signature,
+                &signature,
+                "PR revision",
+                &tree,
+                &[&parent],
+            )
+            .unwrap()
+        };
+        let selected = commit(b"selected PR revision\n");
+        let moved = commit(b"later force-push revision\n");
+        bare.reference("refs/pull/42/head", selected, true, "fixture")
+            .unwrap();
+        let source = git2::Repository::open(caller.path()).unwrap();
+        source.remote("origin", upstream.to_str().unwrap()).unwrap();
+        assert!(source.find_commit(selected).is_err());
+        config.remote_mode = true;
+        config.pr_number = Some(42);
+        config.pr_head_oid = Some(selected.to_string());
+        config.target = Some("PR42".to_owned());
+        if mode == "local" {
+            config.pr_number = None;
+            config.pr_head_oid = None;
+            config.target = Some("main".to_owned());
+        }
+        config.bases = vec!["main".to_owned()];
+        config.do_fetch = true;
+        config.run_tests = false;
+        config.run_lint = false;
+        config.run_heuristics = false;
+        config.skip_security = true;
+        config.create_zip = false;
+        let output = home.path().join("pack");
+        config.output_dir = Some(output.clone());
+        let mut state = TuiState::new(config);
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let preflight = initialize_state_supervised(&mut state, ChannelInterrupts(interrupt_rx))
+            .await
+            .unwrap();
+        let retained = preflight.execution_repo.clone();
+        preflight.handoff().await.unwrap();
+        assert!(
+            source.find_commit(selected).is_err(),
+            "preflight must not write caller objects"
+        );
+        bare.reference("refs/pull/42/head", moved, true, "force push")
+            .unwrap();
+        if mode == "fresh" {
+            state.config.pr_head_oid = None;
+        } else if mode == "offline" {
+            std::fs::rename(&upstream, home.path().join("unavailable.git")).unwrap();
+        } else if mode == "local" {
+            std::fs::write(caller.path().join("source.txt"), "local working source\n").unwrap();
+            state.start_target_wizard();
+            state.select_branch();
+            state.finish_base_selection();
+            assert!(!state.config.remote_mode);
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut analysis =
+            AnalysisTask::spawn_with_explicit_bases(state.config, tx, false, retained.clone());
+        let result = (&mut analysis.handle).await.unwrap();
+        if let Some(deadline) = analysis.disarm_deadline() {
+            deadline.await.unwrap();
+        }
+        if mode == "offline" {
+            assert!(format!("{:#}", result.unwrap_err()).contains("fetch"));
+            assert!(!output.join("00_summary/PROVENANCE.json").exists());
+            return;
+        }
+        result.unwrap();
+        let provenance: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output.join("00_summary/PROVENANCE.json")).unwrap(),
+        )
+        .unwrap();
+        if mode == "local" {
+            assert_eq!(provenance["target_sha"], parent.id().to_string());
+            assert_eq!(provenance["operator_worktree"]["clean"], false);
+            assert!(
+                !output.join("00_summary/EXECUTION_ROOTS.json").exists(),
+                "a local selection must use the ambient caller rather than the retained remote workspace"
+            );
+            assert_eq!(
+                std::fs::read(caller.path().join("source.txt")).unwrap(),
+                b"local working source\n"
+            );
+            return;
+        }
+        assert_eq!(
+            provenance["target_sha"],
+            if mode == "pinned" { selected } else { moved }.to_string()
+        );
+        if let Some(owner) = retained {
+            let repo = git2::Repository::open(&owner.repo_root).unwrap();
+            assert_eq!(
+                repo.find_reference("refs/remotes/origin/pr/42")
+                    .unwrap()
+                    .target(),
+                Some(moved),
+                "each run still fetches fresh refs"
+            );
+        }
+        assert!(source.find_commit(selected).is_err());
+        assert!(source.find_commit(moved).is_err());
+    }
+
     #[test]
     fn ambient_tui_preflight_retains_its_existing_fetch_behavior() {
         assert_preflight_ref_ownership(false);
@@ -1381,7 +1577,7 @@ mod tests {
         config.do_fetch = true;
         let original_root = config.repo_root.clone();
         let mut state = TuiState::new(config);
-        initialize_state(&mut state).unwrap();
+        let _preflight_owner = initialize_state(&mut state).unwrap();
         assert_eq!(state.config.repo_root, original_root);
         assert!(
             state

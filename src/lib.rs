@@ -179,29 +179,41 @@ impl App {
         Ok(())
     }
 
-    /// Plan a remote run without making the active caller a check substrate.
-    /// Called within the run's governed blocking phase, never at CLI startup.
+    /// Whether this run requests an independently owned review repository.
+    pub(crate) fn remote_review_requested(&self) -> bool {
+        self.config.remote_mode || self.config.remote_only || self.config.pr_number.is_some()
+    }
+
+    /// Plan a remote run within its governed blocking phase.
     pub(crate) fn independent_review(&self) -> Result<Option<Self>> {
-        if self.execution_repo.is_some()
-            || !(self.config.remote_mode
-                || self.config.remote_only
-                || self.config.pr_number.is_some())
-        {
+        if self.execution_repo.is_some() || !self.remote_review_requested() {
             return Ok(None);
         }
         self.ensure_not_cancelled()?;
         let workspace =
             std::sync::Arc::new(review_workspace::IndependentReview::create(&self.config)?);
+        self.review_in_workspace(workspace).map(Some)
+    }
+
+    pub(crate) fn review_in_workspace(
+        &self,
+        workspace: std::sync::Arc<review_workspace::IndependentReview>,
+    ) -> Result<Self> {
+        self.ensure_not_cancelled()?;
+        anyhow::ensure!(
+            std::fs::canonicalize(&self.config.repo_root)? == workspace.caller_root,
+            "retained review workspace belongs to a different caller"
+        );
         let config = workspace.config(&self.config)?;
         let repo = git::Repository::open(&config.repo_root)?;
-        Ok(Some(Self {
+        Ok(Self {
             config,
             repo,
             start_time: self.start_time,
             governor: std::sync::Arc::clone(&self.governor),
             explicit_bases: self.explicit_bases,
             execution_repo: Some(workspace),
-        }))
+        })
     }
 
     /// Audit the invocation checkout separately from the execution guard.

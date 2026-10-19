@@ -4855,7 +4855,12 @@ baseline. The invocation checkout still has its own once-per-run provenance
 observation, including its actual dirty paths, digest and HEAD; it is not
 replaced by the clean execution checkout. TUI preflight ref refresh also uses
 an owned repository while retaining the original invocation config for later
-analysis. Relative local origin paths retain the invocation checkout as their
+analysis. The private repository stays owned through the TUI session, so a
+preflight-only PR object survives a later force-push. Each run still refreshes
+refs and propagates fetch failures; retaining objects does not freeze symbolic
+refs or waive requested network refreshes. Selecting a local target in the
+wizard restores the ambient local-review path for that run; it does not reuse
+the remote execution repository. Relative local origin paths retain the invocation checkout as their
 resolution base. The ordered origin fetch refspecs, including exclusions and an
 empty mapping, retain their meaning; unrelated caller configuration is not
 imported. Concrete output collision checks still protect the original caller's
