@@ -181,6 +181,25 @@ fn copy_modules(
         depth < 16,
         "remote review submodule object nesting limit exceeded"
     );
+    // Normalize active modules by gitlink path (their configured name may be
+    // different), including old-form checkouts with an embedded .git directory.
+    if source.workdir().is_some() {
+        for module in source.submodules()? {
+            let relative = module.path();
+            crate::paths::validate_repo_relative_str(
+                relative
+                    .to_str()
+                    .context("non-UTF-8 remote review submodule path")?,
+            )?;
+            if let Ok(store) = module.open() {
+                let copied = git2::Repository::init_bare(
+                    destination.commondir().join("modules").join(relative),
+                )?;
+                copy_module_objects(&store, &copied)?;
+                copy_modules(&store, &copied, depth + 1)?;
+            }
+        }
+    }
     let modules = source.commondir().join("modules");
     if modules.exists() {
         copy_module_namespace(&modules, &destination.commondir().join("modules"), depth)?;
@@ -206,7 +225,7 @@ fn copy_module_namespace(source: &Path, destination: &Path, depth: usize) -> Res
                 &[] as &[&std::ffi::OsStr],
             )?;
             let copied = git2::Repository::init_bare(&target)?;
-            copy_objects(&module, &copied)?;
+            copy_module_objects(&module, &copied)?;
             copy_modules(&module, &copied, depth + 1)?;
         } else {
             ensure!(
@@ -216,6 +235,50 @@ fn copy_module_namespace(source: &Path, destination: &Path, depth: usize) -> Res
             copy_module_namespace(&path, &target, depth)?;
         }
     }
+    Ok(())
+}
+
+/// Copy module ODB bytes, including available pins no longer reachable from
+/// module refs. Git upload-pack also follows stale core.worktree configuration
+/// in retained stores; opening their ODB directly avoids that dependency.
+/// Neither alternates nor repository config cross into the owned destination.
+fn copy_module_objects(source: &git2::Repository, destination: &git2::Repository) -> Result<()> {
+    let source = source.odb()?;
+    let destination = destination.odb()?;
+    let governor = crate::governor::current_run_governor();
+    let started = std::time::Instant::now();
+    let mut failure = None;
+    let enumerated = source.foreach(|oid| {
+        let result = (|| -> Result<()> {
+            if let Some(governor) = &governor
+                && governor.is_cancelled()
+            {
+                return Err(governor.cancellation_error());
+            }
+            ensure!(
+                started.elapsed() < std::time::Duration::from_secs(120),
+                "remote review module object copy timed out"
+            );
+            if !destination.exists(*oid) {
+                let object = source.read(*oid)?;
+                ensure!(
+                    destination.write(object.kind(), object.data())? == *oid,
+                    "copied module object identity mismatch"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            failure = Some(error);
+            false
+        } else {
+            true
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    enumerated?;
     Ok(())
 }
 
@@ -314,19 +377,42 @@ mod tests {
 
     #[test]
     fn initialized_gitlink_objects_are_available_without_sharing_the_module_store() {
+        assert_module_transport("standard");
+    }
+
+    #[test]
+    fn named_gitlink_store_is_normalized_to_the_gitlink_path() {
+        assert_module_transport("named");
+    }
+
+    #[test]
+    fn legacy_gitlink_with_its_own_git_directory_is_copied() {
+        assert_module_transport("legacy");
+    }
+
+    #[test]
+    fn gitlink_pin_unreachable_from_module_refs_is_copied() {
+        assert_module_transport("unreachable");
+    }
+
+    fn assert_module_transport(kind: &str) {
         let (caller, home, config) = crate::checks::caller_guard_tests::fixture();
         let _home = crate::config::override_test_prview_home(home.path());
         let (module, _module_home, _) = crate::checks::caller_guard_tests::fixture();
-        let status = git_cmd()
-            .args([
-                "-c",
-                "protocol.file.allow=always",
-                "-c",
-                "core.hooksPath=",
-                "submodule",
-                "add",
-                "--quiet",
-            ])
+        let mut command = git_cmd();
+        command.args([
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "core.hooksPath=",
+            "submodule",
+            "add",
+            "--quiet",
+        ]);
+        if kind == "named" {
+            command.args(["--name", "engine"]);
+        }
+        let status = command
             .arg(module.path())
             .arg("backend")
             .current_dir(caller.path())
@@ -348,6 +434,46 @@ mod tests {
                 &[&parent],
             )
             .unwrap();
+        if kind == "legacy" {
+            let checkout = caller.path().join("backend");
+            std::fs::remove_file(checkout.join(".git")).unwrap();
+            std::fs::rename(
+                source.commondir().join("modules/backend"),
+                checkout.join(".git"),
+            )
+            .unwrap();
+            git2::Config::open(&checkout.join(".git/config"))
+                .unwrap()
+                .remove("core.worktree")
+                .unwrap();
+        }
+        if kind == "unreachable" {
+            let module_repo = git2::Repository::open(caller.path().join("backend")).unwrap();
+            let pin = module_repo.head().unwrap().peel_to_commit().unwrap().id();
+            let empty_tree = module_repo
+                .find_tree(module_repo.treebuilder(None).unwrap().write().unwrap())
+                .unwrap();
+            let orphan = module_repo
+                .commit(
+                    None,
+                    &signature,
+                    &signature,
+                    "unrelated module history",
+                    &empty_tree,
+                    &[],
+                )
+                .unwrap();
+            module_repo.set_head_detached(orphan).unwrap();
+            let names: Vec<_> = module_repo
+                .references()
+                .unwrap()
+                .map(|r| r.unwrap().name().unwrap().to_owned())
+                .collect();
+            for name in names {
+                module_repo.find_reference(&name).unwrap().delete().unwrap();
+            }
+            assert!(module_repo.find_commit(pin).is_ok());
+        }
         let workspace = IndependentReview::create(&config).unwrap();
         let entries = crate::git::Repository::open(&workspace.repo_root)
             .unwrap()
@@ -534,6 +660,35 @@ mod tests {
         assert_eq!(copied_blob.content(), b"alternate-only bytes\n");
         assert!(private.find_commit(commit).is_ok());
         assert!(info.join("alternates").is_file());
+    }
+
+    #[test]
+    fn module_alternate_objects_are_copied_without_retaining_the_alternate() {
+        let (module, _home, _) = crate::checks::caller_guard_tests::fixture();
+        let (alternate, _alternate_home, _) = crate::checks::caller_guard_tests::fixture();
+        let alternate_repo = git2::Repository::open(alternate.path()).unwrap();
+        let blob = alternate_repo
+            .blob(b"module alternate-only bytes\n")
+            .unwrap();
+        let source = git2::Repository::open(module.path()).unwrap();
+        let info = source.path().join("objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(
+            info.join("alternates"),
+            format!("{}\n", alternate_repo.path().join("objects").display()),
+        )
+        .unwrap();
+        // Reopen after introducing the alternate, as the production bare opener does.
+        let source = git2::Repository::open(module.path()).unwrap();
+        assert!(source.find_blob(blob).is_ok());
+        let private = tempfile::tempdir().unwrap();
+        let destination = git2::Repository::init_bare(private.path()).unwrap();
+        copy_module_objects(&source, &destination).unwrap();
+        assert_eq!(
+            destination.find_blob(blob).unwrap().content(),
+            b"module alternate-only bytes\n"
+        );
+        assert!(!destination.path().join("objects/info/alternates").exists());
     }
 
     #[test]

@@ -4838,9 +4838,11 @@ those paths. Complete trees keep their existing path enrichment.
 into an independently owned temporary repository before refreshing refs or
 planning checks. Its Git common directory, target worktrees and cleanup are
 separate from the invocation checkout. The copy imports neither its index,
-untracked source, hooks/config nor ambient `node_modules`/`.venv`. Initialized
-submodule object stores are transported separately; missing pinned objects still
-fail closed. No automatic checkout restoration is attempted.
+untracked source, hooks/config nor ambient `node_modules`/`.venv`. Available submodule object stores are transported separately, including retained
+historical stores and old-form checkouts. Active module names are mapped to
+their gitlink paths. Module ODB bytes include pins no longer reachable from
+module refs and alternate-backed objects; destination ODBs retain no alternates.
+Missing pinned objects still fail closed. No automatic checkout restoration is attempted.
 
 The existing caller boundary guard observes that execution repository. An
 unrelated nested repository or concurrent caller edit is not an input to its
