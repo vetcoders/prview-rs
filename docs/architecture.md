@@ -4868,7 +4868,9 @@ headless and TUI dispatchers, including pre-sync. It rechecks configured and
 effective roots and descendant links for late redirects before tool commands.
 
 `00_summary/EXECUTION_ROOTS.json` records caller, execution repository, target and
-output separately. It explicitly reports `host_write_confinement: false`.
+output separately. Its `path_encoding: utf8_lossy_display` marks these strings
+as display paths, including on Unix paths containing non-UTF-8 bytes. It
+explicitly reports `host_write_confinement: false`.
 This is separation of Git ownership and ordinary execution paths, not OS access
 control: arbitrary tests/plugins may still address absolute host paths. Default
 host home/tool caches and target-owned external links are not made into a sandbox

@@ -93,6 +93,39 @@ fn command_mode(caller: &Path, parent: &Path, quick: bool) -> Command {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn non_utf8_caller_path_produces_execution_metadata_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+    let parent = tempfile::tempdir().unwrap();
+    let (caller, foreign) = fixture(parent.path());
+    git(
+        &caller,
+        &["worktree", "remove", "--force", foreign.to_str().unwrap()],
+    );
+    let non_utf8 = parent
+        .path()
+        .join(std::ffi::OsString::from_vec(b"caller-\xff".to_vec()));
+    fs::create_dir(&non_utf8).unwrap();
+    let moved = non_utf8.join("caller");
+    fs::rename(caller, &moved).unwrap();
+    let before = fs::read(moved.join(".git/index")).unwrap();
+    command(&moved, parent.path()).assert().success();
+    let roots: serde_json::Value = serde_json::from_slice(
+        &fs::read(parent.path().join("pack/00_summary/EXECUTION_ROOTS.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        roots["caller_root"],
+        fs::canonicalize(&moved)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    );
+    assert_eq!(roots["path_encoding"], "utf8_lossy_display");
+    assert_eq!(fs::read(moved.join(".git/index")).unwrap(), before);
+}
+
+#[test]
 fn remote_review_accepts_existing_nested_worktree_without_touching_caller_git() {
     assert_caller_provenance(true);
 }

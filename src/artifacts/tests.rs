@@ -9753,3 +9753,38 @@ fn review_summary_sbom_identifies_pnpm_even_without_output() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn execution_roots_metadata_handles_non_utf8_paths_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+    let invalid = PathBuf::from(std::ffi::OsString::from_vec(
+        b"/valid/invalid-\xff".to_vec(),
+    ));
+    let metadata = execution_roots_metadata(&invalid, &invalid, Some(&invalid), &invalid);
+    for key in [
+        "caller_root",
+        "execution_repo",
+        "target_root",
+        "output_root",
+    ] {
+        assert_eq!(metadata[key], invalid.to_string_lossy().into_owned());
+    }
+    assert_eq!(metadata["path_encoding"], "utf8_lossy_display");
+    serde_json::to_vec(&metadata).unwrap();
+}
+
+#[test]
+fn execution_roots_metadata_retains_utf8_paths_and_absent_target() {
+    let metadata = execution_roots_metadata(
+        Path::new("/caller"),
+        Path::new("/execution"),
+        None,
+        Path::new("/output"),
+    );
+    assert_eq!(metadata["caller_root"], "/caller");
+    assert_eq!(metadata["execution_repo"], "/execution");
+    assert_eq!(metadata["output_root"], "/output");
+    assert!(metadata["target_root"].is_null());
+    assert_eq!(metadata["host_write_confinement"], false);
+}
