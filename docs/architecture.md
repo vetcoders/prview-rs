@@ -4838,7 +4838,8 @@ those paths. Complete trees keep their existing path enrichment.
 into an independently owned temporary repository before refreshing refs or
 planning checks. Its Git common directory, target worktrees and cleanup are
 separate from the invocation checkout. The copy imports neither its index,
-untracked source, hooks/config nor ambient `node_modules`/`.venv`. Available submodule object stores are transported separately, including retained
+untracked source, hooks or unrelated configuration, nor ambient
+`node_modules`/`.venv`. Available submodule object stores are transported separately, including retained
 historical stores and old-form checkouts. Active module names are mapped to
 their gitlink paths. Module ODB bytes include pins no longer reachable from
 module refs and alternate-backed objects; destination ODBs retain no alternates.
@@ -4855,7 +4856,9 @@ observation, including its actual dirty paths, digest and HEAD; it is not
 replaced by the clean execution checkout. TUI preflight ref refresh also uses
 an owned repository while retaining the original invocation config for later
 analysis. Relative local origin paths retain the invocation checkout as their
-resolution base. Concrete output collision checks still protect the original caller's
+resolution base. The ordered origin fetch refspecs, including exclusions and an
+empty mapping, retain their meaning; unrelated caller configuration is not
+imported. Concrete output collision checks still protect the original caller's
 tracked files and aliases. Remote home/output/Cargo/uv write roots must be outside
 the caller; an internal override is refused rather than silently dropping its
 protection. Snapshot-integrity and exact owned-output pre/postimage checks remain

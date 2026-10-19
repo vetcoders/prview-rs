@@ -1,7 +1,8 @@
 //! An owned Git repository for remote reviews, not a host filesystem sandbox.
 //!
 //! Only Git objects/refs cross this boundary. Caller source, dependencies,
-//! config and worktree registrations are never copied or borrowed for writes.
+//! worktree registrations are never copied or borrowed for writes. Only the
+//! origin URL/fetch mapping is recreated, not arbitrary caller configuration.
 use crate::{Config, git::git_cmd};
 use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
@@ -101,6 +102,20 @@ impl IndependentReview {
             && let Some(url) = origin.url()
         {
             destination.remote("origin", &anchored_origin_url(url, &caller_root)?)?;
+            // URL alone does not define fetch semantics: a Gerrit/custom
+            // mapping can select a different commit from the same-named head.
+            // Replace the generated default with the exact ordered data list,
+            // including exclusions and an intentionally empty list. These are
+            // Git-parsed refspec values, never hooks, commands or config keys.
+            let mut remote_config = destination.config()?;
+            remote_config.remove_multivar("remote.origin.fetch", ".*")?;
+            for refspec in origin.fetch_refspecs()?.iter() {
+                remote_config.set_multivar(
+                    "remote.origin.fetch",
+                    "^$",
+                    refspec.context("origin fetch refspec is not UTF-8")?,
+                )?;
+            }
         }
         if let Ok(head) = source.head() {
             let oid = head.peel_to_commit()?.id();
@@ -870,6 +885,136 @@ mod tests {
         assert_eq!(
             std::fs::read(shallow.join(".git/shallow")).unwrap(),
             original_boundary
+        );
+    }
+
+    #[test]
+    fn custom_origin_fetch_mapping_keeps_the_requested_remote_commit() {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let expected = source.head().unwrap().target().unwrap();
+        let upstream_path = home.path().join("upstream.git");
+        let upstream = git2::Repository::init_bare(&upstream_path).unwrap();
+        assert!(
+            git_cmd()
+                .args(["-c", "core.hooksPath=", "fetch", "--quiet"])
+                .arg(caller.path())
+                .arg("+HEAD:refs/changes/review")
+                .current_dir(&upstream_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let parent = upstream.find_commit(expected).unwrap();
+        let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+        let wrong = upstream
+            .commit(
+                Some("refs/heads/review"),
+                &signature,
+                &signature,
+                "different heads mapping",
+                &parent.tree().unwrap(),
+                &[&parent],
+            )
+            .unwrap();
+        assert_ne!(expected, wrong);
+        upstream
+            .reference("refs/changes/excluded/private", wrong, true, "fixture")
+            .unwrap();
+        source
+            .remote("origin", upstream_path.to_str().unwrap())
+            .unwrap();
+        let mappings = [
+            "+refs/changes/*:refs/remotes/origin/*",
+            "+refs/heads/*:refs/remotes/heads/*",
+            "^refs/changes/excluded/*",
+        ];
+        let mut source_config = source.config().unwrap();
+        source_config
+            .remove_multivar("remote.origin.fetch", ".*")
+            .unwrap();
+        for mapping in mappings {
+            source_config
+                .set_multivar("remote.origin.fetch", "^$", mapping)
+                .unwrap();
+        }
+        source
+            .reference("refs/remotes/origin/review", expected, true, "fixture")
+            .unwrap();
+        let before_config = std::fs::read(source.path().join("config")).unwrap();
+        let workspace = IndependentReview::create(&config).unwrap();
+        config.do_fetch = true;
+        crate::git::Repository::open(&workspace.repo_root)
+            .unwrap()
+            .prepare_refs(&workspace.config(&config).unwrap())
+            .unwrap();
+        let copied = git2::Repository::open(&workspace.repo_root).unwrap();
+        assert_eq!(
+            copied
+                .find_reference("refs/remotes/origin/review")
+                .unwrap()
+                .target(),
+            Some(expected),
+            "custom mapping must not silently select the same-named heads ref"
+        );
+        assert_eq!(
+            copied
+                .find_reference("refs/remotes/heads/review")
+                .unwrap()
+                .target(),
+            Some(wrong)
+        );
+        assert!(
+            copied
+                .find_reference("refs/remotes/origin/excluded/private")
+                .is_err()
+        );
+        assert_eq!(
+            copied
+                .find_remote("origin")
+                .unwrap()
+                .fetch_refspecs()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            mappings.map(Some)
+        );
+        assert_eq!(
+            std::fs::read(source.path().join("config")).unwrap(),
+            before_config
+        );
+        assert_eq!(
+            source
+                .find_reference("refs/remotes/origin/review")
+                .unwrap()
+                .target(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn absent_origin_fetch_mapping_does_not_gain_a_default_mapping() {
+        let (caller, home, config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        source
+            .remote("origin", "https://example.invalid/repo")
+            .unwrap();
+        source
+            .config()
+            .unwrap()
+            .remove_multivar("remote.origin.fetch", ".*")
+            .unwrap();
+        let workspace = IndependentReview::create(&config).unwrap();
+        assert!(
+            git2::Repository::open(&workspace.repo_root)
+                .unwrap()
+                .find_remote("origin")
+                .unwrap()
+                .fetch_refspecs()
+                .unwrap()
+                .is_empty()
         );
     }
 
