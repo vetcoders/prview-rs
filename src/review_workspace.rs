@@ -6,6 +6,30 @@ use crate::{Config, git::git_cmd};
 use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
 
+tokio::task_local! {
+    static SCRATCH_CALLER: PathBuf;
+}
+
+/// Carry the owned workspace's original source identity through async check
+/// planning, without granting checks an owned-output write capability.
+pub(crate) async fn with_caller_scratch_protection<F: std::future::Future>(
+    caller: Option<PathBuf>,
+    work: F,
+) -> F::Output {
+    match caller {
+        Some(caller) => SCRATCH_CALLER.scope(caller, work).await,
+        None => work.await,
+    }
+}
+
+pub(crate) fn scratch_overlaps_caller(path: &Path) -> Result<bool> {
+    let Ok(caller) = SCRATCH_CALLER.try_with(Clone::clone) else {
+        return Ok(false);
+    };
+    let path = crate::checks::caller_integrity::planned_path(path)?;
+    Ok(path.starts_with(&caller) || caller.starts_with(path))
+}
+
 pub(crate) struct IndependentReview {
     pub(crate) caller_root: PathBuf,
     pub(crate) repo_root: PathBuf,
@@ -76,7 +100,7 @@ impl IndependentReview {
         if let Ok(origin) = source.find_remote("origin")
             && let Some(url) = origin.url()
         {
-            destination.remote("origin", url)?;
+            destination.remote("origin", &anchored_origin_url(url, &caller_root)?)?;
         }
         if let Ok(head) = source.head() {
             let oid = head.peel_to_commit()?.id();
@@ -138,6 +162,23 @@ impl IndependentReview {
     }
 }
 
+fn anchored_origin_url(url: &str, caller: &Path) -> Result<String> {
+    // A colon before the first slash denotes a URL/helper or scp-style
+    // transport. Absolute native paths retain their meaning too. Ordinary
+    // relative filesystem remotes must keep the invocation checkout as base.
+    let transport = url
+        .find(':')
+        .is_some_and(|colon| url.find('/').is_none_or(|slash| colon < slash));
+    if Path::new(url).is_absolute() || transport {
+        return Ok(url.to_owned());
+    }
+    caller
+        .join(url)
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("relative origin resolves to a non-UTF-8 path"))
+}
+
 fn copy_objects(source: &git2::Repository, destination: &git2::Repository) -> Result<()> {
     // A normal fetch transports object bytes, unlike a local clone/shared ODB.
     // It reads the source but never creates a registration/ref/lock there.
@@ -151,6 +192,7 @@ fn copy_objects(source: &git2::Repository, destination: &git2::Repository) -> Re
             "--quiet",
             "--no-tags",
             "--no-write-fetch-head",
+            "--update-shallow",
             "--update-head-ok",
         ])
         .arg(source.path())
@@ -181,23 +223,27 @@ fn copy_modules(
         depth < 16,
         "remote review submodule object nesting limit exceeded"
     );
-    // Normalize active modules by gitlink path (their configured name may be
-    // different), including old-form checkouts with an embedded .git directory.
-    if source.workdir().is_some() {
-        for module in source.submodules()? {
-            let relative = module.path();
-            crate::paths::validate_repo_relative_str(
-                relative
-                    .to_str()
-                    .context("non-UTF-8 remote review submodule path")?,
+    // Use committed metadata, never a dirty/half-written caller .gitmodules.
+    // Names and paths differ legitimately; old-form modules keep their ODB in
+    // the checkout while absorbed/historical modules keep it administratively.
+    for (name, relative) in committed_module_paths(source, destination)? {
+        let active = source
+            .workdir()
+            .and_then(|root| git2::Repository::open(root.join(&relative)).ok());
+        let store = active.or_else(|| {
+            git2::Repository::open_ext(
+                source.commondir().join("modules").join(&name),
+                git2::RepositoryOpenFlags::NO_SEARCH | git2::RepositoryOpenFlags::BARE,
+                &[] as &[&std::ffi::OsStr],
+            )
+            .ok()
+        });
+        if let Some(store) = store {
+            let copied = git2::Repository::init_bare(
+                destination.commondir().join("modules").join(relative),
             )?;
-            if let Ok(store) = module.open() {
-                let copied = git2::Repository::init_bare(
-                    destination.commondir().join("modules").join(relative),
-                )?;
-                copy_module_objects(&store, &copied)?;
-                copy_modules(&store, &copied, depth + 1)?;
-            }
+            copy_module_objects(&store, &copied)?;
+            copy_modules(&store, &copied, depth + 1)?;
         }
     }
     let modules = source.commondir().join("modules");
@@ -205,6 +251,58 @@ fn copy_modules(
         copy_module_namespace(&modules, &destination.commondir().join("modules"), depth)?;
     }
     Ok(())
+}
+
+fn committed_module_paths(
+    source: &git2::Repository,
+    destination: &git2::Repository,
+) -> Result<Vec<(String, String)>> {
+    use std::io::Write;
+    let Ok(tree) = source.head().and_then(|head| head.peel_to_tree()) else {
+        return Ok(Vec::new());
+    };
+    let entry = match tree.get_path(Path::new(".gitmodules")) {
+        Ok(entry) => entry,
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        entry.filemode() == 0o100644 || entry.filemode() == 0o100755,
+        "committed .gitmodules is not a regular file"
+    );
+    let blob = source.find_blob(entry.id())?;
+    let mut file = tempfile::NamedTempFile::new_in(destination.path())?;
+    file.write_all(blob.content())?;
+    let mut command = git_cmd();
+    command
+        .args(["-c", "core.hooksPath=", "config", "--no-includes", "--file"])
+        .arg(file.path())
+        .args(["--null", "--get-regexp", r"^submodule\..*\.path$"])
+        .current_dir(destination.path());
+    let output = crate::proc::output_governed_with_timeout(
+        command,
+        "read committed module mappings",
+        std::time::Duration::from_secs(120),
+    )?;
+    ensure!(
+        output.status.success() || output.status.code() == Some(1),
+        "cannot read committed module mappings: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut paths = Vec::new();
+    for record in std::str::from_utf8(&output.stdout)?.split_terminator('\0') {
+        let (key, path) = record
+            .split_once('\n')
+            .context("invalid committed module mapping")?;
+        let name = key
+            .strip_prefix("submodule.")
+            .and_then(|key| key.strip_suffix(".path"))
+            .context("invalid committed module name")?;
+        crate::paths::validate_repo_relative_str(name)?;
+        crate::paths::validate_repo_relative_str(path)?;
+        paths.push((name.to_owned(), path.to_owned()));
+    }
+    Ok(paths)
 }
 
 fn copy_module_namespace(source: &Path, destination: &Path, depth: usize) -> Result<()> {
@@ -391,6 +489,11 @@ mod tests {
     }
 
     #[test]
+    fn malformed_ambient_gitmodules_does_not_override_committed_module_mapping() {
+        assert_module_transport("malformed");
+    }
+
+    #[test]
     fn gitlink_pin_unreachable_from_module_refs_is_copied() {
         assert_module_transport("unreachable");
     }
@@ -409,7 +512,7 @@ mod tests {
             "add",
             "--quiet",
         ]);
-        if kind == "named" {
+        if kind == "named" || kind == "malformed" {
             command.args(["--name", "engine"]);
         }
         let status = command
@@ -434,6 +537,9 @@ mod tests {
                 &[&parent],
             )
             .unwrap();
+        if kind == "malformed" {
+            std::fs::write(caller.path().join(".gitmodules"), "[submodule \"unfinished").unwrap();
+        }
         if kind == "legacy" {
             let checkout = caller.path().join("backend");
             std::fs::remove_file(checkout.join(".git")).unwrap();
@@ -689,6 +795,123 @@ mod tests {
             b"module alternate-only bytes\n"
         );
         assert!(!destination.path().join("objects/info/alternates").exists());
+    }
+
+    #[test]
+    fn origin_transport_addresses_and_absolute_paths_keep_their_meaning() {
+        let caller = std::env::temp_dir().join("caller");
+        for url in [
+            "https://example.invalid/repo.git",
+            "ssh://example.invalid/repo.git",
+            "git@example.invalid:repo.git",
+            "file:///tmp/repo.git",
+            "ext::git custom-helper",
+        ] {
+            assert_eq!(anchored_origin_url(url, &caller).unwrap(), url);
+        }
+        let absolute = caller.join("upstream.git");
+        assert_eq!(
+            anchored_origin_url(absolute.to_str().unwrap(), &caller).unwrap(),
+            absolute.to_str().unwrap()
+        );
+        assert_eq!(
+            anchored_origin_url("./path:with-colon", &caller).unwrap(),
+            caller.join("./path:with-colon").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn shallow_caller_retains_head_and_its_shallow_boundary() {
+        let (source, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let repo = git2::Repository::open(source.path()).unwrap();
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let tip = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "shallow tip",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let shallow = home.path().join("shallow");
+        let url = format!("file://{}", source.path().display());
+        assert!(
+            git_cmd()
+                .args([
+                    "-c",
+                    "core.hooksPath=",
+                    "clone",
+                    "--quiet",
+                    "--depth=1",
+                    &url
+                ])
+                .arg(&shallow)
+                .status()
+                .unwrap()
+                .success()
+        );
+        config.repo_root = shallow.clone();
+        let original_boundary = std::fs::read(shallow.join(".git/shallow")).unwrap();
+        let workspace = IndependentReview::create(&config).unwrap();
+        let copied = git2::Repository::open(&workspace.repo_root).unwrap();
+        assert_eq!(copied.head().unwrap().target(), Some(tip));
+        assert!(copied.is_shallow());
+        assert_eq!(
+            std::fs::read(shallow.join(".git/shallow")).unwrap(),
+            original_boundary
+        );
+    }
+
+    #[test]
+    fn relative_origin_fetch_still_uses_the_invocation_repository_location() {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let upstream = home.path().join("upstream.git");
+        git2::Repository::init_bare(&upstream).unwrap();
+        let status = git_cmd()
+            .args(["-c", "core.hooksPath=", "fetch", "--quiet"])
+            .arg(caller.path())
+            .arg("+HEAD:refs/heads/main")
+            .current_dir(&upstream)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let relative = format!(
+            "../{}/upstream.git",
+            home.path().file_name().unwrap().to_str().unwrap()
+        );
+        git2::Repository::open(caller.path())
+            .unwrap()
+            .remote("origin", &relative)
+            .unwrap();
+        let workspace = IndependentReview::create(&config).unwrap();
+        config.do_fetch = true;
+        let copied_config = workspace.config(&config).unwrap();
+        crate::git::Repository::open(&workspace.repo_root)
+            .unwrap()
+            .prepare_refs(&copied_config)
+            .unwrap();
+        let copied = git2::Repository::open(&workspace.repo_root).unwrap();
+        assert!(copied.find_reference("refs/remotes/origin/main").is_ok());
+        assert_eq!(
+            git2::Repository::open(caller.path())
+                .unwrap()
+                .find_remote("origin")
+                .unwrap()
+                .url(),
+            Some(relative.as_str())
+        );
     }
 
     #[test]
