@@ -40,52 +40,7 @@ pub(crate) struct IndependentReview {
 impl IndependentReview {
     pub(crate) fn create(config: &Config) -> Result<Self> {
         let caller_root = std::fs::canonicalize(&config.repo_root)?;
-        // The old guard covered internal outputs too. Do not silently move those
-        // writers outside its observation while decoupling unrelated source.
-        let home = crate::config::prview_home();
-        let namespaces = [
-            config.cache_dir(),
-            home.join("runs").join(config.repo_name()),
-            home.join("prune-trash"),
-            home.join("diagnostics"),
-            config.cargo_build_cache_dir(),
-            config.uv_env_root(),
-        ];
-        for path in std::iter::once(home)
-            .chain(config.output_dir.clone())
-            .chain(namespaces.iter().cloned())
-        {
-            let physical = crate::checks::caller_integrity::planned_path(&path)?;
-            ensure!(
-                !physical.starts_with(&caller_root),
-                "remote review write path {} is inside the caller; choose an external home/output/cache",
-                path.display()
-            );
-        }
-        // Inspect actual writer namespaces, not all of PRVIEW_HOME. A nested
-        // redirect is as important as the configured root itself. Concrete
-        // writer/maintenance admission rechecks the source roots for late swaps.
-        for root in namespaces.into_iter().chain(config.output_dir.clone()) {
-            if !root.exists() {
-                continue;
-            }
-            for entry in walkdir::WalkDir::new(&root).follow_links(false) {
-                let entry = entry?;
-                if entry.file_type().is_symlink() {
-                    let target = std::fs::canonicalize(entry.path())?;
-                    ensure!(
-                        !target.starts_with(&caller_root),
-                        "remote review namespace {} redirects into the caller",
-                        entry.path().display()
-                    );
-                }
-            }
-        }
-        ensure!(
-            !crate::checks::caller_integrity::planned_path(&std::env::temp_dir())?
-                .starts_with(&caller_root),
-            "remote review temporary namespace must be outside the caller"
-        );
+        validate_write_namespaces(config, &caller_root)?;
         let directory = tempfile::Builder::new()
             .prefix("prview-review-")
             .tempdir()?;
@@ -142,6 +97,7 @@ impl IndependentReview {
     }
 
     pub(crate) fn config(&self, original: &Config) -> Result<Config> {
+        validate_write_namespaces(original, &self.caller_root)?;
         let mut config = original.clone();
         config.repo_root = self.repo_root.clone();
         config.repo_path = Some(self.repo_root.clone());
@@ -175,6 +131,58 @@ impl IndependentReview {
         }
         Ok(config)
     }
+}
+
+/// Admit the current public write namespaces before rebasing execution config.
+/// Retained sessions must observe late redirects just like a fresh remote run.
+fn validate_write_namespaces(config: &Config, caller_root: &Path) -> Result<()> {
+    // The old guard covered internal outputs too. Do not silently move those
+    // writers outside its observation while decoupling unrelated source.
+    let home = crate::config::prview_home();
+    let namespaces = [
+        config.cache_dir(),
+        home.join("runs").join(config.repo_name()),
+        home.join("prune-trash"),
+        home.join("diagnostics"),
+        config.cargo_build_cache_dir(),
+        config.uv_env_root(),
+    ];
+    for path in std::iter::once(home)
+        .chain(config.output_dir.clone())
+        .chain(namespaces.iter().cloned())
+    {
+        let physical = crate::checks::caller_integrity::planned_path(&path)?;
+        ensure!(
+            !physical.starts_with(caller_root),
+            "remote review write path {} is inside the caller; choose an external home/output/cache",
+            path.display()
+        );
+    }
+    // Inspect actual writer namespaces, not all of PRVIEW_HOME. A nested
+    // redirect is as important as the configured root itself. Concrete
+    // writer/maintenance admission rechecks the source roots for late swaps.
+    for root in namespaces.into_iter().chain(config.output_dir.clone()) {
+        if !root.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+            let entry = entry?;
+            if entry.file_type().is_symlink() {
+                let target = std::fs::canonicalize(entry.path())?;
+                ensure!(
+                    !target.starts_with(caller_root),
+                    "remote review namespace {} redirects into the caller",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+    ensure!(
+        !crate::checks::caller_integrity::planned_path(&std::env::temp_dir())?
+            .starts_with(caller_root),
+        "remote review temporary namespace must be outside the caller"
+    );
+    Ok(())
 }
 
 fn anchored_origin_url(url: &str, caller: &Path) -> Result<String> {

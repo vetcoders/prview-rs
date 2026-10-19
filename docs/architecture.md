@@ -4860,13 +4860,19 @@ preflight-only PR object survives a later force-push. Each run still refreshes
 refs and propagates fetch failures; retaining objects does not freeze symbolic
 refs or waive requested network refreshes. Selecting a local target in the
 wizard restores the ambient local-review path for that run; it does not reuse
-the remote execution repository. Relative local origin paths retain the invocation checkout as their
+the remote execution repository. Every GUI analysis session, including a local
+startup followed by a remote wizard selection, retains the original profile and
+CLI-detection authority separately from prepared UI detections; each run uses
+that authority with the current selection before rebasing and refreshing its
+profile. Private display paths from a prior run do not become caller inputs.
+Relative local origin paths retain the invocation checkout as their
 resolution base. The ordered origin fetch refspecs, including exclusions and an
 empty mapping, retain their meaning; unrelated caller configuration is not
 imported. Concrete output collision checks still protect the original caller's
 tracked files and aliases. Remote home/output/Cargo/uv write roots must be outside
 the caller; an internal override is refused rather than silently dropping its
-protection. Snapshot-integrity and exact owned-output pre/postimage checks remain
+protection. The same namespace admission runs before each retained-session
+analysis, so a late output/cache redirect is refused before directory allocation. Snapshot-integrity and exact owned-output pre/postimage checks remain
 active. Ambient local reviews retain their existing caller baseline.
 Cargo/uv scratch planning carries the original caller identity through both
 headless and TUI dispatchers, including pre-sync. It rechecks configured and
