@@ -547,12 +547,18 @@ impl TaskLedger {
         &self,
         repo: Option<Arc<crate::review_workspace::IndependentReview>>,
     ) {
-        *self.execution_repo.lock().unwrap_or_else(|error| error.into_inner()) = repo;
+        *self
+            .execution_repo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = repo;
     }
 
     pub(crate) fn execution_roots(&self) -> Option<(PathBuf, PathBuf)> {
-        self.execution_repo.lock().unwrap_or_else(|error| error.into_inner())
-            .as_ref().map(|repo| (repo.caller_root.clone(), repo.repo_root.clone()))
+        self.execution_repo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|repo| (repo.caller_root.clone(), repo.repo_root.clone()))
     }
 
     pub fn set_shared_snapshot(&self, snapshot: Option<WorktreeSnapshot>) {

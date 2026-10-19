@@ -11,7 +11,6 @@ pub mod cli;
 pub mod config;
 pub mod gate;
 pub mod git;
-mod review_workspace;
 pub mod governor;
 pub mod heuristics;
 pub mod ledger;
@@ -23,6 +22,7 @@ pub mod paths;
 pub mod policy;
 pub mod proc;
 pub mod regression;
+mod review_workspace;
 pub(crate) mod rust_source;
 pub mod scope;
 pub mod state;
@@ -183,12 +183,15 @@ impl App {
     /// Called within the run's governed blocking phase, never at CLI startup.
     pub(crate) fn independent_review(&self) -> Result<Option<Self>> {
         if self.execution_repo.is_some()
-            || !(self.config.remote_mode || self.config.remote_only || self.config.pr_number.is_some())
+            || !(self.config.remote_mode
+                || self.config.remote_only
+                || self.config.pr_number.is_some())
         {
             return Ok(None);
         }
         self.ensure_not_cancelled()?;
-        let workspace = std::sync::Arc::new(review_workspace::IndependentReview::create(&self.config)?);
+        let workspace =
+            std::sync::Arc::new(review_workspace::IndependentReview::create(&self.config)?);
         let config = workspace.config(&self.config)?;
         let repo = git::Repository::open(&config.repo_root)?;
         Ok(Some(Self {

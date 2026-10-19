@@ -205,14 +205,20 @@ impl CallerGuard {
     /// Additional read-only identity roots for concrete output collision checks.
     /// Their unrelated source is not a preservation baseline for this run.
     pub(crate) fn protect_output_source(&self, root: PathBuf) {
-        self.output_source_roots.lock().unwrap_or_else(|error| error.into_inner()).insert(root);
+        self.output_source_roots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(root);
     }
 
     fn output_is_tracked(&self, path: &Path) -> Result<bool> {
         if tracked_output_at(&self.root, path)? {
             return Ok(true);
         }
-        let roots = self.output_source_roots.lock().unwrap_or_else(|error| error.into_inner());
+        let roots = self
+            .output_source_roots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for root in roots.iter() {
             if tracked_output_at(root, path)? {
                 return Ok(true);
