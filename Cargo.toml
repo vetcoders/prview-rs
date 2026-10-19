@@ -91,7 +91,7 @@ hex = "0.4"
 anyhow = "1"
 
 # Code analysis (loctree-suite)
-loctree = "0.14.4"
+loctree = "0.15.1"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
