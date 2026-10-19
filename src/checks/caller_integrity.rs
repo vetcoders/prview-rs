@@ -141,6 +141,7 @@ impl CallerGuard {
         })
     }
 
+    #[cfg(unix)]
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
