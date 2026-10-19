@@ -39,6 +39,10 @@ fn create_fixture_repo() -> TempDir {
 }
 
 fn run_json_quiet(repo: &Path, extra_args: &[&str]) -> serde_json::Value {
+    run_json_quiet_in_home(repo, extra_args, &repo.join(".prview-test-home"))
+}
+
+fn run_json_quiet_in_home(repo: &Path, extra_args: &[&str], home: &Path) -> serde_json::Value {
     let environment = support::ContractEnvironment::new();
     let mut args = vec!["--json", "--quiet", "--no-zip", "--no-heuristics"];
     args.extend_from_slice(extra_args);
@@ -46,7 +50,7 @@ fn run_json_quiet(repo: &Path, extra_args: &[&str]) -> serde_json::Value {
     let assert = environment
         .command()
         .current_dir(repo)
-        .env("PRVIEW_HOME", repo.join(".prview-test-home"))
+        .env("PRVIEW_HOME", home)
         .args(args)
         .assert()
         .success();
@@ -2188,7 +2192,9 @@ fn generated_pack_carries_pack_level_provenance() {
 
     run_git(repo, &["update-ref", "refs/remotes/origin/main", "main"]);
     run_git(repo, &["checkout", "main"]);
-    let payload = run_json_quiet(
+    // Independent remote execution must not write its home into the caller.
+    let home = tempfile::tempdir().expect("external remote review home");
+    let payload = run_json_quiet_in_home(
         repo,
         &[
             "feature/json-contract",
@@ -2196,6 +2202,7 @@ fn generated_pack_carries_pack_level_provenance() {
             "--remote-only",
             "--no-fetch",
         ],
+        home.path(),
     );
     let output_dir = Path::new(
         payload["output_dir"]

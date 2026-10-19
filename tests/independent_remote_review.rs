@@ -70,6 +70,7 @@ fn command(caller: &Path, parent: &Path) -> Command {
             "--quick",
             "--no-fetch",
             "--no-cache",
+            "--skip-security",
             "--no-zip",
             "--no-dashboard",
             "--profile",

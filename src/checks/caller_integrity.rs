@@ -220,11 +220,27 @@ impl CallerGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for root in roots.iter() {
-            if tracked_output_at(root, path)? {
+            // This run does not own any write in its original caller, including
+            // an untracked destination reached through an external alias.
+            if output_leaf_path(path)?.starts_with(root) || tracked_output_at(root, path)? {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    pub(crate) fn namespace_source_visible(&self, path: &Path) -> Result<bool> {
+        if namespace_source_visible(&self.root, path)? {
+            return Ok(true);
+        }
+        let physical = planned_path(path)?;
+        let roots = self
+            .output_source_roots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Ok(roots
+            .iter()
+            .any(|root| physical.starts_with(root) || root.starts_with(&physical)))
     }
 
     pub(crate) fn owns_output(&self, path: &Path) -> bool {
@@ -1215,7 +1231,16 @@ impl CallerGuard {
                 },
                 receipt: None,
             };
-            match persist_receipt(&self.diagnostics, &receipt) {
+            let retained = self
+                .namespace_source_visible(&self.diagnostics)
+                .and_then(|visible| {
+                    ensure!(
+                        !visible,
+                        "caller diagnostic namespace redirects into protected source"
+                    );
+                    persist_receipt(&self.diagnostics, &receipt)
+                });
+            match retained {
                 Ok(path) => error.receipt = Some(path),
                 Err(failure) => error.detail.push_str(&format!(
                     "; diagnostic retention not confirmed: {failure:#}"

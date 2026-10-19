@@ -149,9 +149,7 @@ pub(crate) fn reserve_external_leaf(path: &Path) -> io::Result<std::fs::File> {
 
 pub(crate) fn namespace_source_visible(path: &Path) -> anyhow::Result<bool> {
     match current() {
-        Some(context) => {
-            crate::checks::caller_integrity::namespace_source_visible(context.guard.root(), path)
-        }
+        Some(context) => context.guard.namespace_source_visible(path),
         None => Ok(false),
     }
 }

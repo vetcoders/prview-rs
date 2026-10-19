@@ -17,14 +17,18 @@ impl IndependentReview {
         let caller_root = std::fs::canonicalize(&config.repo_root)?;
         // The old guard covered internal outputs too. Do not silently move those
         // writers outside its observation while decoupling unrelated source.
-        for path in [
-            Some(crate::config::prview_home()),
-            config.output_dir.clone(),
-            Some(config.cargo_build_cache_dir()),
-            Some(config.uv_env_root()),
-        ]
-        .into_iter()
-        .flatten()
+        let home = crate::config::prview_home();
+        let namespaces = [
+            config.cache_dir(),
+            home.join("runs").join(config.repo_name()),
+            home.join("prune-trash"),
+            home.join("diagnostics"),
+            config.cargo_build_cache_dir(),
+            config.uv_env_root(),
+        ];
+        for path in std::iter::once(home)
+            .chain(config.output_dir.clone())
+            .chain(namespaces.iter().cloned())
         {
             let physical = crate::checks::caller_integrity::planned_path(&path)?;
             ensure!(
@@ -33,9 +37,10 @@ impl IndependentReview {
                 path.display()
             );
         }
-        // Keep the old managed-scratch protection against a descendant link
-        // redirecting an otherwise external cache back into active source.
-        for root in [config.cargo_build_cache_dir(), config.uv_env_root()] {
+        // Inspect actual writer namespaces, not all of PRVIEW_HOME. A nested
+        // redirect is as important as the configured root itself. Concrete
+        // writer/maintenance admission rechecks the source roots for late swaps.
+        for root in namespaces.into_iter().chain(config.output_dir.clone()) {
             if !root.exists() {
                 continue;
             }
@@ -45,12 +50,17 @@ impl IndependentReview {
                     let target = std::fs::canonicalize(entry.path())?;
                     ensure!(
                         !target.starts_with(&caller_root),
-                        "remote review scratch {} redirects into the caller",
+                        "remote review namespace {} redirects into the caller",
                         entry.path().display()
                     );
                 }
             }
         }
+        ensure!(
+            !crate::checks::caller_integrity::planned_path(&std::env::temp_dir())?
+                .starts_with(&caller_root),
+            "remote review temporary namespace must be outside the caller"
+        );
         let directory = tempfile::Builder::new()
             .prefix("prview-review-")
             .tempdir()?;
@@ -171,20 +181,40 @@ fn copy_modules(
         depth < 16,
         "remote review submodule object nesting limit exceeded"
     );
-    for module in source.submodules()? {
-        let Some(relative) = module.path().to_str() else {
-            anyhow::bail!("non-UTF-8 remote review submodule path");
-        };
-        crate::paths::validate_repo_relative_str(relative)?;
-        // An uninitialized/unavailable module remains unavailable. The exact
-        // snapshot planner already fails closed if a required pin is missing.
-        let Ok(source_module) = module.open() else {
+    let modules = source.commondir().join("modules");
+    if modules.exists() {
+        copy_module_namespace(&modules, &destination.commondir().join("modules"), depth)?;
+    }
+    Ok(())
+}
+
+fn copy_module_namespace(source: &Path, destination: &Path, depth: usize) -> Result<()> {
+    // A historical pin may outlive .gitmodules, its index entry and checkout.
+    // The Git administrative stores, rather than the current module list, are
+    // the object source. Multi-component module names form directory groups.
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
             continue;
-        };
-        let module_root = destination.commondir().join("modules").join(relative);
-        let destination_module = git2::Repository::init_bare(module_root)?;
-        copy_objects(&source_module, &destination_module)?;
-        copy_modules(&source_module, &destination_module, depth + 1)?;
+        }
+        let target = destination.join(entry.file_name());
+        if path.join("HEAD").is_file() && path.join("objects").is_dir() {
+            let module = git2::Repository::open_ext(
+                &path,
+                git2::RepositoryOpenFlags::NO_SEARCH | git2::RepositoryOpenFlags::BARE,
+                &[] as &[&std::ffi::OsStr],
+            )?;
+            let copied = git2::Repository::init_bare(&target)?;
+            copy_objects(&module, &copied)?;
+            copy_modules(&module, &copied, depth + 1)?;
+        } else {
+            ensure!(
+                !entry.file_type()?.is_symlink(),
+                "unresolved submodule namespace link"
+            );
+            copy_module_namespace(&path, &target, depth)?;
+        }
     }
     Ok(())
 }
@@ -332,6 +362,178 @@ mod tests {
             source.commondir().join("modules/backend"),
             workspace.repo_root.join(".git/modules/backend")
         );
+    }
+
+    #[test]
+    fn historical_gitlink_store_is_copied_without_an_active_module() {
+        let (caller, home, config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let (module, _module_home, _) = crate::checks::caller_guard_tests::fixture();
+        let status = git_cmd()
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "core.hooksPath=",
+                "submodule",
+                "add",
+                "--quiet",
+            ])
+            .arg(module.path())
+            .arg("backend")
+            .current_dir(caller.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let mut index = source.index().unwrap();
+        let tree = source.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = source.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let target = source
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "add module",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        index.remove_path(Path::new("backend")).unwrap();
+        index.remove_path(Path::new(".gitmodules")).unwrap();
+        index.write().unwrap();
+        let removed_tree = source.find_tree(index.write_tree().unwrap()).unwrap();
+        let previous = source.find_commit(target).unwrap();
+        source
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "remove module",
+                &removed_tree,
+                &[&previous],
+            )
+            .unwrap();
+        std::fs::remove_dir_all(caller.path().join("backend")).unwrap();
+        std::fs::remove_file(caller.path().join(".gitmodules")).unwrap();
+        let mut local_config = source.config().unwrap();
+        let _ = local_config.remove("submodule.backend.url");
+        let _ = local_config.remove("submodule.backend.active");
+        assert!(source.submodules().unwrap().is_empty());
+        assert!(source.commondir().join("modules/backend").is_dir());
+        let workspace = IndependentReview::create(&config).unwrap();
+        let entries = crate::git::Repository::open(&workspace.repo_root)
+            .unwrap()
+            .tree_entries_with_gitlinks_at_oid(&target.to_string())
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path == "backend/source.txt")
+        );
+        assert_ne!(
+            source.commondir().join("modules/backend"),
+            workspace.repo_root.join(".git/modules/backend")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn result_cache_namespace_redirect_into_caller_is_refused() {
+        let (caller, home, config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let cache = config.cache_dir();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::os::unix::fs::symlink(caller.path(), cache.join("Mock")).unwrap();
+        assert!(IndependentReview::create(&config).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_cleanup_does_not_delete_caller_source_after_a_late_redirect() {
+        let (caller, home, config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let victims = caller.path().join("victims");
+        std::fs::create_dir(&victims).unwrap();
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let mut index = source.index().unwrap();
+        for number in 0..6 {
+            let name = format!("victims/key{number}");
+            std::fs::write(caller.path().join(&name), "passed").unwrap();
+            index.add_path(Path::new(&name)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = source.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = source.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        source
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "tracked cache-shaped data",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let workspace = IndependentReview::create(&config).unwrap();
+        let guard =
+            CallerGuard::capture_sync(workspace.repo_root.clone(), home.path().join("diagnostics"));
+        guard.protect_output_source(workspace.caller_root.clone());
+        let cache_root = home.path().join("late-cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        std::os::unix::fs::symlink(&victims, cache_root.join("Mock")).unwrap();
+        let cache = crate::cache::Cache::with_dir(cache_root, true);
+        let _scope = crate::owned_output::enter(guard, None);
+        let result = cache.set("Mock", "new-result", "passed", None, None);
+        for number in 0..6 {
+            assert_eq!(
+                std::fs::read(victims.join(format!("key{number}"))).unwrap(),
+                b"passed"
+            );
+        }
+        assert!(result.is_err(), "redirected cache write must be refused");
+        assert!(!victims.join("new-result").exists());
+    }
+
+    #[test]
+    fn alternate_objects_are_transported_without_retaining_the_alternate() {
+        let (caller, home, config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let (alternate, _alternate_home, _) = crate::checks::caller_guard_tests::fixture();
+        let alternate_repo = git2::Repository::open(alternate.path()).unwrap();
+        let blob = alternate_repo.blob(b"alternate-only bytes\n").unwrap();
+        let mut builder = alternate_repo.treebuilder(None).unwrap();
+        builder.insert("alternate.txt", blob, 0o100644).unwrap();
+        let tree = alternate_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let commit = alternate_repo
+            .commit(None, &signature, &signature, "alternate-only", &tree, &[])
+            .unwrap();
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let info = source.path().join("objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(
+            info.join("alternates"),
+            format!("{}\n", alternate_repo.path().join("objects").display()),
+        )
+        .unwrap();
+        source
+            .reference(
+                "refs/remotes/origin/alternate",
+                commit,
+                true,
+                "fixture alternate",
+            )
+            .unwrap();
+        let workspace = IndependentReview::create(&config).unwrap();
+        let private = git2::Repository::open(&workspace.repo_root).unwrap();
+        assert!(!private.path().join("objects/info/alternates").exists());
+        let copied_blob = private.find_blob(blob).unwrap();
+        assert_eq!(copied_blob.content(), b"alternate-only bytes\n");
+        assert!(private.find_commit(commit).is_ok());
+        assert!(info.join("alternates").is_file());
     }
 
     #[test]
