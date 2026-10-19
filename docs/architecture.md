@@ -4844,13 +4844,25 @@ their gitlink paths. Module ODB bytes include pins no longer reachable from
 module refs and alternate-backed objects; destination ODBs retain no alternates.
 Missing pinned objects still fail closed. No automatic checkout restoration is attempted.
 
+Shallow callers retain their Git shallow boundary during transport. Module
+name/path mappings come from committed `.gitmodules` metadata with includes
+disabled; a half-written invocation-checkout file does not control setup.
+
 The existing caller boundary guard observes that execution repository. An
 unrelated nested repository or concurrent caller edit is not an input to its
-baseline. Concrete output collision checks still protect the original caller's
+baseline. The invocation checkout still has its own once-per-run provenance
+observation, including its actual dirty paths, digest and HEAD; it is not
+replaced by the clean execution checkout. TUI preflight ref refresh also uses
+an owned repository while retaining the original invocation config for later
+analysis. Relative local origin paths retain the invocation checkout as their
+resolution base. Concrete output collision checks still protect the original caller's
 tracked files and aliases. Remote home/output/Cargo/uv write roots must be outside
 the caller; an internal override is refused rather than silently dropping its
 protection. Snapshot-integrity and exact owned-output pre/postimage checks remain
 active. Ambient local reviews retain their existing caller baseline.
+Cargo/uv scratch planning carries the original caller identity through both
+headless and TUI dispatchers, including pre-sync. It rechecks configured and
+effective roots and descendant links for late redirects before tool commands.
 
 `00_summary/EXECUTION_ROOTS.json` records caller, execution repository, target and
 output separately. It explicitly reports `host_write_confinement: false`.
