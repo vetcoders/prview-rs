@@ -1130,9 +1130,9 @@ mod tests {
         let output = home.path().join("pack");
         config.output_dir = Some(output.clone());
         let result = crate::App::from_config(config).unwrap().run().await;
-        let error = result
-            .err()
-            .expect("a byte-valued origin must not disappear and certify a stale copied target");
+        let error = result.expect_err(
+            "a byte-valued origin must not disappear and certify a stale copied target",
+        );
         assert!(
             format!("{error:#}").contains("origin URL is not valid UTF-8"),
             "explicit origin capability error: {error:#}"
