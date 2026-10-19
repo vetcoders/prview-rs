@@ -2243,9 +2243,9 @@ dependencies = [
 
 [[package]]
 name = "loctree"
-version = "0.14.5"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70a0112972b4f386cce5a55963747d55ded464b7123535eb886148aba5fbc65f"
+checksum = "e14d5e69f3ab84d3c1b2f775ad00f754a08b7cca3e7a171748be206a9108b800"
 dependencies = [
  "aicx",
  "anyhow",
@@ -2299,9 +2299,9 @@ dependencies = [
 
 [[package]]
 name = "loctree-ast"
-version = "0.14.5"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c27a2d89447dc6407c2913db82ae1b0f5ae46a7be2ccb17fd34583c339aa25"
+checksum = "635a39411c4bd6a02fdb90fbb236ca127c8ad09879a2335b1dd086e56fd17ddb"
 dependencies = [
  "thiserror 2.0.18",
  "tree-sitter",
@@ -3611,9 +3611,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "report-leptos"
-version = "0.14.5"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a378564f39518dbbd0b8e9822a21b7c9e4fffd1928caf84f071c81e99bea0aee"
+checksum = "66d410e0cf52c8ffb577de828e329b45b2e202b5c9a0f324edcf2e778b5b3fef"
 dependencies = [
  "leptos",
  "serde",
