@@ -634,10 +634,12 @@ fn map_check_event(event: CheckEvent) -> TuiEvent {
 /// Initialize TUI state with branch info and check list
 fn initialize_state(state: &mut TuiState) -> Result<()> {
     // Try to resolve branches
-    let repo = crate::git::Repository::open(&state.config.repo_root)?;
+    let original = App::from_config(state.config.clone())?;
+    let app = original.independent_review()?.unwrap_or(original);
+    let repo = &app.repo;
 
     // Refresh refs (honours --no-fetch / local-only / remote-only)
-    repo.prepare_refs(&state.config)?;
+    repo.prepare_refs(&app.config)?;
 
     // Populate branch list for wizard
     if let Ok(branch_list) = repo.list_branches() {
@@ -648,11 +650,11 @@ fn initialize_state(state: &mut TuiState) -> Result<()> {
         state.branch_selector.current_branch = branch_list.current.clone();
     }
 
-    if let Ok(target) = repo.resolve_target(&state.config) {
+    if let Ok(target) = repo.resolve_target(&app.config) {
         state.target_branch = target.name;
     }
 
-    if let Ok(bases) = repo.resolve_bases(&state.config) {
+    if let Ok(bases) = repo.resolve_bases(&app.config) {
         state.base_branches = bases.iter().map(|b| b.name.clone()).collect();
     }
 
@@ -747,7 +749,7 @@ pub(crate) async fn run_analysis_with_explicit_bases(
         // Freeze cleanliness before any check runs or artifact is written (R4-19).
         // This closure runs inside the TUI run scope and blocking_stage, so the
         // event loop can cancel even while libgit2 scans a large worktree.
-        let worktree = crate::artifacts::capture_worktree_provenance(&app.config.repo_root);
+        let worktree = app.operator_worktree_provenance();
         let worktree_clean = worktree.clean;
         let worktree_status_digest = worktree.status_digest;
         let worktree_dirty_paths = worktree.dirty_paths;
@@ -1284,6 +1286,129 @@ mod tests {
             self.delivered = true;
             crate::governor::Interrupt::Operator
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn remote_tui_records_invocation_provenance_separately_from_execution() {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let head = source.head().unwrap().target().unwrap();
+        source
+            .reference("refs/remotes/origin/main", head, true, "fixture")
+            .unwrap();
+        std::fs::write(
+            caller.path().join("source.txt"),
+            "dirty invocation source\n",
+        )
+        .unwrap();
+        let before = crate::artifacts::capture_worktree_provenance(caller.path());
+        config.remote_mode = true;
+        config.target = Some("main".to_owned());
+        config.bases = vec!["main".to_owned()];
+        config.do_fetch = false;
+        config.run_tests = false;
+        config.run_lint = false;
+        config.run_heuristics = false;
+        config.skip_security = true;
+        config.create_zip = false;
+        let output = home.path().join("pack");
+        config.output_dir = Some(output.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        run_analysis(config, tx, governor).await.unwrap();
+        let provenance: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output.join("00_summary/PROVENANCE.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(provenance["operator_worktree"]["clean"], false);
+        assert_eq!(
+            provenance["operator_worktree"]["status_digest"].as_str(),
+            before.status_digest.as_deref()
+        );
+        assert_eq!(
+            provenance["worktree_head_sha"].as_str(),
+            before.head_sha.as_deref()
+        );
+        assert_eq!(
+            std::fs::read(caller.path().join("source.txt")).unwrap(),
+            b"dirty invocation source\n"
+        );
+    }
+
+    #[test]
+    fn remote_tui_preflight_refreshes_owned_refs_without_touching_caller_refs() {
+        assert_preflight_ref_ownership(true);
+    }
+
+    #[test]
+    fn ambient_tui_preflight_retains_its_existing_fetch_behavior() {
+        assert_preflight_ref_ownership(false);
+    }
+
+    fn assert_preflight_ref_ownership(remote: bool) {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let upstream = home.path().join("upstream.git");
+        let bare = git2::Repository::init_bare(&upstream).unwrap();
+        let status = crate::git::git_cmd()
+            .args(["-c", "core.hooksPath=", "fetch", "--quiet"])
+            .arg(caller.path())
+            .arg("+HEAD:refs/heads/fresh-branch")
+            .current_dir(&upstream)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        source.remote("origin", upstream.to_str().unwrap()).unwrap();
+        let head = source.head().unwrap().target().unwrap();
+        source
+            .reference("refs/remotes/origin/stale-branch", head, true, "fixture")
+            .unwrap();
+        let references = || {
+            source
+                .references()
+                .unwrap()
+                .map(|r| {
+                    let r = r.unwrap();
+                    (r.name().unwrap().to_owned(), r.target())
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = references();
+        let fetch_head = std::fs::read(source.path().join("FETCH_HEAD")).ok();
+        config.remote_mode = remote;
+        config.do_fetch = true;
+        let original_root = config.repo_root.clone();
+        let mut state = TuiState::new(config);
+        initialize_state(&mut state).unwrap();
+        assert_eq!(state.config.repo_root, original_root);
+        assert!(
+            state
+                .branch_selector
+                .remote_branches
+                .iter()
+                .any(|name| name.ends_with("fresh-branch"))
+        );
+        if remote {
+            assert_eq!(references(), before);
+            assert_eq!(
+                std::fs::read(source.path().join("FETCH_HEAD")).ok(),
+                fetch_head
+            );
+            assert!(
+                source
+                    .find_reference("refs/remotes/origin/fresh-branch")
+                    .is_err()
+            );
+        } else {
+            assert!(
+                source
+                    .find_reference("refs/remotes/origin/fresh-branch")
+                    .is_ok()
+            );
+        }
+        assert!(bare.find_reference("refs/heads/fresh-branch").is_ok());
     }
 
     /// Before raw mode owns Ctrl-C as a key, TUI preflight has to own it as a

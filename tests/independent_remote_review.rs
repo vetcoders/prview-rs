@@ -60,6 +60,10 @@ fn fixture(parent: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn command(caller: &Path, parent: &Path) -> Command {
+    command_mode(caller, parent, true)
+}
+
+fn command_mode(caller: &Path, parent: &Path, quick: bool) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("prview"));
     cmd.current_dir(caller)
         .env("PRVIEW_HOME", parent.join("home"))
@@ -67,7 +71,6 @@ fn command(caller: &Path, parent: &Path) -> Command {
             "topic",
             "main",
             "--remote",
-            "--quick",
             "--no-fetch",
             "--no-cache",
             "--skip-security",
@@ -81,17 +84,34 @@ fn command(caller: &Path, parent: &Path) -> Command {
             "--output-dir",
         ])
         .arg(parent.join("pack"));
+    if quick {
+        cmd.arg("--quick");
+    } else {
+        cmd.args(["--deep", "--skip-tests", "--skip-lint", "--no-heuristics"]);
+    }
     cmd
 }
 
 #[test]
 fn remote_review_accepts_existing_nested_worktree_without_touching_caller_git() {
+    assert_caller_provenance(true);
+}
+
+#[test]
+fn remote_headless_review_records_dirty_caller_provenance() {
+    assert_caller_provenance(false);
+}
+
+fn assert_caller_provenance(quick: bool) {
     let parent = tempfile::tempdir().unwrap();
     let (caller, foreign) = fixture(parent.path());
     let head = fs::read(caller.join(".git/HEAD")).unwrap();
     let index = fs::read(caller.join(".git/index")).unwrap();
     let inventory = git(&caller, &["worktree", "list", "--porcelain"]);
-    command(&caller, parent.path()).assert().success();
+    fs::write(caller.join("source.txt"), "uncommitted caller bytes\n").unwrap();
+    command_mode(&caller, parent.path(), quick)
+        .assert()
+        .success();
     assert_eq!(fs::read(caller.join(".git/HEAD")).unwrap(), head);
     assert_eq!(fs::read(caller.join(".git/index")).unwrap(), index);
     assert_eq!(
@@ -112,6 +132,26 @@ fn remote_review_accepts_existing_nested_worktree_without_touching_caller_git() 
     let report: serde_json::Value =
         serde_json::from_slice(&fs::read(parent.path().join("pack/report.json")).unwrap()).unwrap();
     assert_eq!(report["diff"]["stats"]["files_changed"], 1);
+    let provenance: serde_json::Value = serde_json::from_slice(
+        &fs::read(parent.path().join("pack/00_summary/PROVENANCE.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(provenance["operator_worktree"]["clean"], false);
+    let digest = provenance["operator_worktree"]["status_digest"]
+        .as_str()
+        .unwrap();
+    assert!(digest.starts_with("sha256:"));
+    assert_ne!(
+        digest,
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        provenance["worktree_head_sha"],
+        git(&caller, &["rev-parse", "HEAD"])
+    );
+    let patch = fs::read_to_string(parent.path().join("pack/10_diff/full.patch")).unwrap();
+    assert!(patch.contains("+target"));
+    assert!(!patch.contains("uncommitted caller bytes"));
 }
 
 #[test]

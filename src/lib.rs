@@ -204,6 +204,19 @@ impl App {
         }))
     }
 
+    /// Audit the invocation checkout separately from the execution guard.
+    /// Each run/watch iteration takes this observation before checks; it is
+    /// metadata, never a baseline against which foreign edits can fail the run.
+    pub(crate) fn operator_worktree_provenance(&self) -> artifacts::WorktreeProvenance {
+        let caller = self
+            .execution_repo
+            .as_ref()
+            .map_or(self.config.repo_root.as_path(), |workspace| {
+                workspace.caller_root.as_path()
+            });
+        artifacts::capture_worktree_provenance(caller)
+    }
+
     /// Run the PR review process
     pub async fn run(&self) -> Result<output::Report> {
         let execution = run_headless_sync_stage(&self.governor, || self.independent_review())?;
@@ -243,7 +256,7 @@ impl App {
                 // doing it in `from_config` starved a one-worker runtime before its
                 // interrupt supervisor had ever been polled. This remains the first
                 // tree read of the run, before ref refresh, checks, or artifacts.
-                let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
+                let worktree = self.operator_worktree_provenance();
                 self.ensure_not_cancelled()?;
                 self.repo.prepare_refs(&self.config)?;
                 self.ensure_not_cancelled()?;
@@ -703,7 +716,7 @@ impl App {
         let (worktree, target, bases, diffs) = run_headless_sync_stage(&self.governor, || {
             sync_probe();
             self.ensure_not_cancelled()?;
-            let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
+            let worktree = self.operator_worktree_provenance();
             let target = self.repo.resolve_target(&self.config)?;
             let bases = if self.config.current_only {
                 Vec::new()
