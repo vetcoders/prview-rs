@@ -53,24 +53,29 @@ impl IndependentReview {
         let destination = git2::Repository::init(&repo_root)?;
         copy_objects(&source, &destination)?;
         copy_modules(&source, &destination, 0)?;
-        if let Ok(origin) = source.find_remote("origin")
-            && let Some(url) = origin.url()
-        {
-            destination.remote("origin", &anchored_origin_url(url, &caller_root)?)?;
-            // URL alone does not define fetch semantics: a Gerrit/custom
-            // mapping can select a different commit from the same-named head.
-            // Replace the generated default with the exact ordered data list,
-            // including exclusions and an intentionally empty list. These are
-            // Git-parsed refspec values, never hooks, commands or config keys.
-            let mut remote_config = destination.config()?;
-            remote_config.remove_multivar("remote.origin.fetch", ".*")?;
-            for refspec in origin.fetch_refspecs()?.iter() {
-                remote_config.set_multivar(
-                    "remote.origin.fetch",
-                    "^$",
-                    refspec.context("origin fetch refspec is not UTF-8")?,
+        match source.find_remote("origin") {
+            Ok(origin) => {
+                let url = origin.url().context(
+                    "remote review origin URL is not valid UTF-8; cannot preserve origin refresh",
                 )?;
+                destination.remote("origin", &anchored_origin_url(url, &caller_root)?)?;
+                // URL alone does not define fetch semantics: a Gerrit/custom
+                // mapping can select a different commit from the same-named head.
+                // Replace the generated default with the exact ordered data list,
+                // including exclusions and an intentionally empty list. These are
+                // Git-parsed refspec values, never hooks, commands or config keys.
+                let mut remote_config = destination.config()?;
+                remote_config.remove_multivar("remote.origin.fetch", ".*")?;
+                for refspec in origin.fetch_refspecs()?.iter() {
+                    remote_config.set_multivar(
+                        "remote.origin.fetch",
+                        "^$",
+                        refspec.context("origin fetch refspec is not UTF-8")?,
+                    )?;
+                }
             }
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(error).context("cannot inspect remote review origin"),
         }
         if let Ok(head) = source.head() {
             let oid = head.peel_to_commit()?.id();
@@ -1064,6 +1069,81 @@ mod tests {
                 .unwrap()
                 .url(),
             Some(relative.as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_utf8_origin_cannot_silently_skip_a_requested_fetch() {
+        assert_non_utf8_origin_is_rejected(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_utf8_origin_has_an_explicit_setup_error_without_fetch_too() {
+        assert_non_utf8_origin_is_rejected(false).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_non_utf8_origin_is_rejected(fetch: bool) {
+        use std::os::unix::ffi::OsStrExt;
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        source.remote("origin", "placeholder").unwrap();
+        let url = b"/definitely-unavailable/prview-origin-\xff.git";
+        assert!(
+            git_cmd()
+                .args(["config", "--local", "remote.origin.url"])
+                .arg(std::ffi::OsStr::from_bytes(url))
+                .current_dir(caller.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let origin = source.find_remote("origin").unwrap();
+        assert!(origin.url().is_none());
+        assert_eq!(origin.url_bytes(), url);
+        let head = source.head().unwrap().target().unwrap();
+        source
+            .reference("refs/remotes/origin/main", head, false, "stale fixture ref")
+            .unwrap();
+        // This control does not require an invalid-byte filename on APFS. The
+        // native fetch must fail for this unavailable byte-valued URL; setup
+        // must not turn it into a successful review of the stale copied ref.
+        let native = git_cmd()
+            .args(["fetch", "--quiet", "origin"])
+            .current_dir(caller.path())
+            .output()
+            .unwrap();
+        assert!(!native.status.success());
+        let original_config = std::fs::read(source.path().join("config")).unwrap();
+        config.remote_mode = true;
+        config.target = Some("main".to_owned());
+        config.bases = vec!["main".to_owned()];
+        config.do_fetch = fetch;
+        config.run_tests = false;
+        config.run_lint = false;
+        config.run_heuristics = false;
+        config.skip_security = true;
+        config.create_zip = false;
+        let output = home.path().join("pack");
+        config.output_dir = Some(output.clone());
+        let result = crate::App::from_config(config).unwrap().run().await;
+        let error = result
+            .err()
+            .expect("a byte-valued origin must not disappear and certify a stale copied target");
+        assert!(
+            format!("{error:#}").contains("origin URL is not valid UTF-8"),
+            "explicit origin capability error: {error:#}"
+        );
+        assert!(
+            !output.exists(),
+            "unsupported origin must fail before publishing a pack"
+        );
+        assert_eq!(
+            std::fs::read(source.path().join("config")).unwrap(),
+            original_config
         );
     }
 

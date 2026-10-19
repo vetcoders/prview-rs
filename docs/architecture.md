@@ -4868,7 +4868,10 @@ profile. Private display paths from a prior run do not become caller inputs.
 Relative local origin paths retain the invocation checkout as their
 resolution base. The ordered origin fetch refspecs, including exclusions and an
 empty mapping, retain their meaning; unrelated caller configuration is not
-imported. Concrete output collision checks still protect the original caller's
+imported. Remote setup explicitly rejects an origin URL that is not valid UTF-8,
+including with `--no-fetch`, because this transport path cannot preserve it
+losslessly. It also surfaces origin inspection errors; an unreadable origin is
+never treated as an absent remote and cannot silently suppress requested fetches. Concrete output collision checks still protect the original caller's
 tracked files and aliases. Remote home/output/Cargo/uv write roots must be outside
 the caller; an internal override is refused rather than silently dropping its
 protection. The same namespace admission runs before each retained-session
