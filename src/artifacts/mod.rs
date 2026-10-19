@@ -284,6 +284,24 @@ pub(crate) struct DashboardContextInput<'a> {
 ///   the substrate stays unknown;
 /// - no analysis root — the scan ran in `repo_root`, classified like any other
 ///   in-place scan.
+fn execution_roots_metadata(
+    caller_root: &Path,
+    execution_repo: &Path,
+    target_root: Option<&Path>,
+    output_root: &Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "path_encoding": "utf8_lossy_display",
+        "caller_root": caller_root.to_string_lossy(),
+        "execution_repo": execution_repo.to_string_lossy(),
+        "target_root": target_root.map(|path| path.to_string_lossy()),
+        "output_root": output_root.to_string_lossy(),
+        "ambient_caller_dependencies_imported": false,
+        "host_write_confinement": false,
+    })
+}
+
 fn heuristics_provenance(
     heuristics: &HeuristicsResult,
     config: &Config,
@@ -881,6 +899,17 @@ fn generate_guarded(
     generate_commit_list(&summary_dir, diffs)?;
     generate_file_status(&summary_dir, diffs)?;
     generate_system_meta(&summary_dir)?;
+    if let Some((caller_root, execution_repo)) = ledger.execution_roots() {
+        fs::write(
+            summary_dir.join("EXECUTION_ROOTS.json"),
+            serde_json::to_vec_pretty(&execution_roots_metadata(
+                &caller_root,
+                &execution_repo,
+                ledger.scan_dir().as_deref(),
+                &out_dir,
+            ))?,
+        )?;
+    }
     generate_git_meta(&summary_dir, config, resolved_target, resolved_bases)?;
     stage_timings.push(finish_timing(emit_human_stdout, "00_summary", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::SummaryMetadata)?;

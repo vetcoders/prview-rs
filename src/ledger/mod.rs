@@ -168,6 +168,7 @@ pub struct TaskLedger {
     /// stage asks for [`TaskLedger::scan_dir`], instead of having been dropped
     /// with the frame that created it.
     shared_snapshot: Mutex<Option<WorktreeSnapshot>>,
+    execution_repo: Mutex<Option<Arc<crate::review_workspace::IndependentReview>>>,
     resolved_substrate: Mutex<Option<SubstrateKey>>,
     /// How much of each test suite this run decided had to execute.
     ///
@@ -307,6 +308,9 @@ impl TaskLedger {
                 .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&guard));
             guard
         };
+        if let Some((caller, _)) = self.execution_roots() {
+            guard.protect_output_source(caller);
+        }
         guard.verify("before-checks", None).await
     }
 
@@ -332,6 +336,9 @@ impl TaskLedger {
             })
             .clone();
         drop(slot);
+        if let Some((caller, _)) = self.execution_roots() {
+            guard.protect_output_source(caller);
+        }
         guard.verify_sync("before-artifacts", None)
     }
 
@@ -536,6 +543,24 @@ impl TaskLedger {
 
     /// Hand the run's shared target snapshot to the ledger, which keeps it
     /// alive for as long as the ledger lives.
+    pub(crate) fn retain_execution_repo(
+        &self,
+        repo: Option<Arc<crate::review_workspace::IndependentReview>>,
+    ) {
+        *self
+            .execution_repo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = repo;
+    }
+
+    pub(crate) fn execution_roots(&self) -> Option<(PathBuf, PathBuf)> {
+        self.execution_repo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|repo| (repo.caller_root.clone(), repo.repo_root.clone()))
+    }
+
     pub fn set_shared_snapshot(&self, snapshot: Option<WorktreeSnapshot>) {
         *self
             .shared_snapshot

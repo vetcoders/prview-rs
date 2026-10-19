@@ -22,6 +22,7 @@ pub mod paths;
 pub mod policy;
 pub mod proc;
 pub mod regression;
+mod review_workspace;
 pub(crate) mod rust_source;
 pub mod scope;
 pub mod state;
@@ -105,6 +106,7 @@ pub struct App {
     governor: std::sync::Arc<governor::ResourceGovernor>,
     /// Selection intent belongs to this run, outside the exhaustive Config API.
     explicit_bases: bool,
+    execution_repo: Option<std::sync::Arc<review_workspace::IndependentReview>>,
 }
 
 impl App {
@@ -135,6 +137,7 @@ impl App {
             repo,
             start_time: Instant::now(),
             governor,
+            execution_repo: None,
         })
     }
 
@@ -176,8 +179,66 @@ impl App {
         Ok(())
     }
 
+    /// Whether this run requests an independently owned review repository.
+    pub(crate) fn remote_review_requested(&self) -> bool {
+        self.config.remote_mode || self.config.remote_only || self.config.pr_number.is_some()
+    }
+
+    /// Plan a remote run within its governed blocking phase.
+    pub(crate) fn independent_review(&self) -> Result<Option<Self>> {
+        if self.execution_repo.is_some() || !self.remote_review_requested() {
+            return Ok(None);
+        }
+        self.ensure_not_cancelled()?;
+        let workspace =
+            std::sync::Arc::new(review_workspace::IndependentReview::create(&self.config)?);
+        self.review_in_workspace(workspace).map(Some)
+    }
+
+    pub(crate) fn review_in_workspace(
+        &self,
+        workspace: std::sync::Arc<review_workspace::IndependentReview>,
+    ) -> Result<Self> {
+        self.ensure_not_cancelled()?;
+        anyhow::ensure!(
+            std::fs::canonicalize(&self.config.repo_root)? == workspace.caller_root,
+            "retained review workspace belongs to a different caller"
+        );
+        let config = workspace.config(&self.config)?;
+        let repo = git::Repository::open(&config.repo_root)?;
+        Ok(Self {
+            config,
+            repo,
+            start_time: self.start_time,
+            governor: std::sync::Arc::clone(&self.governor),
+            explicit_bases: self.explicit_bases,
+            execution_repo: Some(workspace),
+        })
+    }
+
+    /// Audit the invocation checkout separately from the execution guard.
+    /// Each run/watch iteration takes this observation before checks; it is
+    /// metadata, never a baseline against which foreign edits can fail the run.
+    pub(crate) fn operator_worktree_provenance(&self) -> artifacts::WorktreeProvenance {
+        let caller = self
+            .execution_repo
+            .as_ref()
+            .map_or(self.config.repo_root.as_path(), |workspace| {
+                workspace.caller_root.as_path()
+            });
+        artifacts::capture_worktree_provenance(caller)
+    }
+
     /// Run the PR review process
     pub async fn run(&self) -> Result<output::Report> {
+        let execution = run_headless_sync_stage(&self.governor, || self.independent_review())?;
+        match execution {
+            Some(app) => app.run_inner().await,
+            None => self.run_inner().await,
+        }
+    }
+
+    async fn run_inner(&self) -> Result<output::Report> {
         use colored::Colorize;
         // The governor may already be closed before the run starts a single
         // stage — `--watch` shares one across iterations, and a cancel can land
@@ -207,7 +268,7 @@ impl App {
                 // doing it in `from_config` starved a one-worker runtime before its
                 // interrupt supervisor had ever been polled. This remains the first
                 // tree read of the run, before ref refresh, checks, or artifacts.
-                let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
+                let worktree = self.operator_worktree_provenance();
                 self.ensure_not_cancelled()?;
                 self.repo.prepare_refs(&self.config)?;
                 self.ensure_not_cancelled()?;
@@ -251,6 +312,7 @@ impl App {
             self.config
                 .bases_were_explicitly_selected(self.explicit_bases),
         );
+        ledger.retain_execution_repo(self.execution_repo.clone());
         let mut run_config = self.config.clone();
         run_config.pinned_target = Some(target.clone());
         // Profile detection at CLI startup sees the operator checkout. An
@@ -646,6 +708,14 @@ impl App {
     }
 
     async fn run_quick_with_sync_probe(&self, sync_probe: impl FnOnce()) -> Result<output::Report> {
+        let execution = run_headless_sync_stage(&self.governor, || self.independent_review())?;
+        match execution {
+            Some(app) => app.run_quick_inner(sync_probe).await,
+            None => self.run_quick_inner(sync_probe).await,
+        }
+    }
+
+    async fn run_quick_inner(&self, sync_probe: impl FnOnce()) -> Result<output::Report> {
         let run_started_at = Instant::now();
         // `--watch` reuses one governor across every iteration, and closing it is
         // one-way, so a cancelled watcher must not start another pack.
@@ -658,7 +728,7 @@ impl App {
         let (worktree, target, bases, diffs) = run_headless_sync_stage(&self.governor, || {
             sync_probe();
             self.ensure_not_cancelled()?;
-            let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
+            let worktree = self.operator_worktree_provenance();
             let target = self.repo.resolve_target(&self.config)?;
             let bases = if self.config.current_only {
                 Vec::new()
@@ -682,6 +752,7 @@ impl App {
             self.config
                 .bases_were_explicitly_selected(self.explicit_bases),
         );
+        ledger.retain_execution_repo(self.execution_repo.clone());
         let mut run_config = self.config.clone();
         run_config.pinned_target = Some(target.clone());
         run_headless_sync_stage(&self.governor, || {

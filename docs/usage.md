@@ -1427,3 +1427,14 @@ that change. Existing gate policy applies: `--strict` rejects the self-diff with
 exit 2; advisory gate mode reports it with exit 0. Automatic base discovery,
 `--current-only`, and different commits with identical trees remain distinct
 cases in the pack's `review_range` metadata.
+
+Remote reviews (`--pr`, `--remote`, `--remote-only`) use a private Git repository
+and target snapshot. Existing local agent worktrees and concurrent source edits
+are not review inputs. Ambient installed dependencies are not borrowed from your
+checkout; a check whose toolchain is unavailable records its existing explicit
+skip/error rather than scanning the live checkout. Put `PRVIEW_HOME`, explicit
+`--output-dir`, Cargo build cache and uv environment roots outside the caller.
+Internal write overrides are refused in remote mode; local ambient mode keeps
+its previous behavior. `00_summary/EXECUTION_ROOTS.json` shows the actual roots.
+This separation is not a host filesystem sandbox or a guarantee against arbitrary
+absolute writes by project tests/plugins.

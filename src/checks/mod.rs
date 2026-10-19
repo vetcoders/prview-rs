@@ -760,6 +760,20 @@ async fn run_all_checks(
     ledger: &TaskLedger,
     governor: &Arc<ResourceGovernor>,
 ) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
+    crate::review_workspace::with_caller_scratch_protection(
+        ledger.execution_roots().map(|(caller, _)| caller),
+        run_all_checks_inner(checks, cache, config, ledger, governor),
+    )
+    .await
+}
+
+async fn run_all_checks_inner(
+    checks: Vec<Box<dyn Check>>,
+    cache: Cache,
+    config: &Config,
+    ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
+) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
     use colored::Colorize;
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::io::Write;
@@ -1272,6 +1286,24 @@ where
 /// reason: a test drives the loop with staged mocks instead of a profile
 /// detection and a `PRVIEW_HOME`-rooted cache.
 async fn run_all_checks_with_events<F>(
+    checks: Vec<Box<dyn Check>>,
+    cache: Cache,
+    config: &Config,
+    ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
+    on_event: F,
+) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)>
+where
+    F: Fn(CheckEvent) + Send + Sync,
+{
+    crate::review_workspace::with_caller_scratch_protection(
+        ledger.execution_roots().map(|(caller, _)| caller),
+        run_all_checks_with_events_inner(checks, cache, config, ledger, governor, on_event),
+    )
+    .await
+}
+
+async fn run_all_checks_with_events_inner<F>(
     checks: Vec<Box<dyn Check>>,
     cache: Cache,
     config: &Config,

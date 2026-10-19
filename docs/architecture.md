@@ -4831,3 +4831,63 @@ with the truncation marker (including the legacy prefix-only marker) are not
 indexed for advisory dependency paths. Neither PR_REVIEW nor FAILURES_SUMMARY
 may infer ancestry across an omitted portion; advisories remain visible without
 those paths. Complete trees keep their existing path enrichment.
+
+### Remote review repository ownership
+
+`--pr`, `--remote` and `--remote-only` runs transport local Git objects and refs
+into an independently owned temporary repository before refreshing refs or
+planning checks. Its Git common directory, target worktrees and cleanup are
+separate from the invocation checkout. The copy imports neither its index,
+untracked source, hooks or unrelated configuration, nor ambient
+`node_modules`/`.venv`. Available submodule object stores are transported separately, including retained
+historical stores and old-form checkouts. Active module names are mapped to
+their gitlink paths. Module ODB bytes include pins no longer reachable from
+module refs and alternate-backed objects; destination ODBs retain no alternates.
+Missing pinned objects still fail closed. No automatic checkout restoration is attempted.
+
+Shallow callers retain their Git shallow boundary during transport. Module
+name/path mappings come from committed `.gitmodules` metadata with includes
+disabled; a half-written invocation-checkout file does not control setup.
+
+The existing caller boundary guard observes that execution repository. An
+unrelated nested repository or concurrent caller edit is not an input to its
+baseline. The invocation checkout still has its own once-per-run provenance
+observation, including its actual dirty paths, digest and HEAD; it is not
+replaced by the clean execution checkout. TUI preflight ref refresh also uses
+an owned repository while retaining the original invocation config for later
+analysis. The private repository stays owned through the TUI session, so a
+preflight-only PR object survives a later force-push. Each run still refreshes
+refs and propagates fetch failures; retaining objects does not freeze symbolic
+refs or waive requested network refreshes. Selecting a local target in the
+wizard restores the ambient local-review path for that run; it does not reuse
+the remote execution repository. Every GUI analysis session, including a local
+startup followed by a remote wizard selection, retains the original profile and
+CLI-detection authority separately from prepared UI detections; each run uses
+that authority with the current selection before rebasing and refreshing its
+profile. Private display paths from a prior run do not become caller inputs.
+Relative local origin paths retain the invocation checkout as their
+resolution base. The ordered origin fetch refspecs, including exclusions and an
+empty mapping, retain their meaning; unrelated caller configuration is not
+imported. Remote setup explicitly rejects an origin URL that is not valid UTF-8,
+including with `--no-fetch`, because this transport path cannot preserve it
+losslessly. It also surfaces origin inspection errors; an unreadable origin is
+never treated as an absent remote and cannot silently suppress requested fetches. Concrete output collision checks still protect the original caller's
+tracked files and aliases. Remote home/output/Cargo/uv write roots must be outside
+the caller; an internal override is refused rather than silently dropping its
+protection. The same namespace admission runs before each retained-session
+analysis, so a late output/cache redirect is refused before directory allocation. Snapshot-integrity and exact owned-output pre/postimage checks remain
+active. Ambient local reviews retain their existing caller baseline.
+Cargo/uv scratch planning carries the original caller identity through both
+headless and TUI dispatchers, including pre-sync. It rechecks configured and
+effective roots and descendant links for late redirects before tool commands.
+
+`00_summary/EXECUTION_ROOTS.json` records caller, execution repository, target and
+output separately. Its `path_encoding: utf8_lossy_display` marks these strings
+as display paths, including on Unix paths containing non-UTF-8 bytes. It
+explicitly reports `host_write_confinement: false`.
+This is separation of Git ownership and ordinary execution paths, not OS access
+control: arbitrary tests/plugins may still address absolute host paths. Default
+host home/tool caches and target-owned external links are not made into a sandbox
+by this change. The issue #69 Semgrep baseline planner, pinned range and
+cancel/timeout process cleanup remain unchanged; its resets operate only on the
+owned detached snapshot. No new sandbox backend is required to run a review.

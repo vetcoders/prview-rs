@@ -26,6 +26,14 @@ use crate::checks::{CheckEvent, CheckResult, CheckStatus as CrateCheckStatus};
 use crate::{App, Config};
 use types::{TuiEvent, TuiState, WizardMode};
 
+/// Session-owned Git inputs and the caller's original profile authority.
+/// Detected profiles may update the UI without becoming the next run's inputs.
+struct ReviewSession {
+    workspace: Option<Arc<crate::review_workspace::IndependentReview>>,
+    original_profile: crate::config::DetectedProfile,
+    original_cli_detection: Option<crate::config::DetectedProfile>,
+}
+
 struct AnalysisTask {
     governor: Arc<crate::governor::ResourceGovernor>,
     handle: tokio::task::JoinHandle<Result<()>>,
@@ -49,6 +57,7 @@ impl AnalysisTask {
         config: Config,
         tx: mpsc::UnboundedSender<TuiEvent>,
         explicit_bases: bool,
+        execution_repo: Option<Arc<ReviewSession>>,
     ) -> Self {
         let governor = Arc::new(crate::governor::ResourceGovernor::from_plan(
             config.resource_plan,
@@ -59,7 +68,13 @@ impl AnalysisTask {
         let handle = tokio::spawn(async move {
             crate::governor::with_run_scope(
                 run_governor,
-                run_analysis_with_explicit_bases(config, tx, analysis_governor, explicit_bases),
+                run_analysis_with_workspace(
+                    config,
+                    tx,
+                    analysis_governor,
+                    explicit_bases,
+                    execution_repo,
+                ),
             )
             .await
         });
@@ -149,6 +164,7 @@ pub async fn run_tui_with_explicit_bases(config: Config, explicit_bases: bool) -
     // a governed git fetch with nobody able to observe the operator's abort.
     let mut state = TuiState::new(config);
     let pre_raw_mode = initialize_state_supervised(&mut state, crate::governor::CtrlC).await?;
+    let execution_repo = pre_raw_mode.execution_repo.clone();
 
     // Setup terminal
     pre_raw_mode.ensure_active()?;
@@ -195,6 +211,7 @@ pub async fn run_tui_with_explicit_bases(config: Config, explicit_bases: bool) -
             &mut rx,
             &mut analysis,
             explicit_bases,
+            execution_repo,
         )
         .await
     }
@@ -225,16 +242,18 @@ async fn initialize_state_supervised(
     let supervisor = crate::governor::InterruptSupervisor::start(Arc::clone(&governor), interrupts);
     let work = async { crate::governor::blocking_stage(|| initialize_state(state)) };
     let result = crate::governor::with_run_scope(Arc::clone(&governor), work).await;
-    finish_tui_preflight(result, &governor)?;
+    let execution_repo = finish_tui_preflight(result, &governor)?;
     Ok(PreRawModeGuard {
         governor,
         supervisor,
+        execution_repo,
     })
 }
 
 struct PreRawModeGuard {
     governor: Arc<crate::governor::ResourceGovernor>,
     supervisor: crate::governor::InterruptSupervisor,
+    execution_repo: Option<Arc<ReviewSession>>,
 }
 
 impl PreRawModeGuard {
@@ -246,6 +265,7 @@ impl PreRawModeGuard {
         let Self {
             governor,
             supervisor,
+            execution_repo: _,
         } = self;
         supervisor.stop().await;
         finish_tui_preflight(Ok(()), &governor)
@@ -300,7 +320,7 @@ async fn run_event_loop<B: Backend>(
 where
     B::Error: Send + Sync + 'static,
 {
-    run_event_loop_with_explicit_bases(terminal, state, tx, rx, analysis, false).await
+    run_event_loop_with_explicit_bases(terminal, state, tx, rx, analysis, false, None).await
 }
 
 async fn run_event_loop_with_explicit_bases<B: Backend>(
@@ -310,11 +330,21 @@ async fn run_event_loop_with_explicit_bases<B: Backend>(
     rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
     analysis: &mut Option<AnalysisTask>,
     explicit_bases: bool,
+    execution_repo: Option<Arc<ReviewSession>>,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
 {
-    let result = run_event_loop_inner(terminal, state, tx, rx, analysis, explicit_bases).await;
+    let result = run_event_loop_inner(
+        terminal,
+        state,
+        tx,
+        rx,
+        analysis,
+        explicit_bases,
+        execution_repo,
+    )
+    .await;
     join_cancelled_analysis(result, analysis).await
 }
 
@@ -325,6 +355,7 @@ async fn run_event_loop_inner<B: Backend>(
     rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
     analysis: &mut Option<AnalysisTask>,
     mut explicit_bases: bool,
+    execution_repo: Option<Arc<ReviewSession>>,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -362,6 +393,7 @@ where
                     state.config.clone(),
                     tx.clone(),
                     explicit_bases,
+                    execution_repo.clone(),
                 ));
             } else {
                 handle_selection_key(state, key, tx, &mut explicit_bases).await?;
@@ -632,12 +664,14 @@ fn map_check_event(event: CheckEvent) -> TuiEvent {
 }
 
 /// Initialize TUI state with branch info and check list
-fn initialize_state(state: &mut TuiState) -> Result<()> {
+fn initialize_state(state: &mut TuiState) -> Result<Option<Arc<ReviewSession>>> {
     // Try to resolve branches
-    let repo = crate::git::Repository::open(&state.config.repo_root)?;
+    let original = App::from_config(state.config.clone())?;
+    let app = original.independent_review()?.unwrap_or(original);
+    let repo = &app.repo;
 
     // Refresh refs (honours --no-fetch / local-only / remote-only)
-    repo.prepare_refs(&state.config)?;
+    repo.prepare_refs(&app.config)?;
 
     // Populate branch list for wizard
     if let Ok(branch_list) = repo.list_branches() {
@@ -648,11 +682,11 @@ fn initialize_state(state: &mut TuiState) -> Result<()> {
         state.branch_selector.current_branch = branch_list.current.clone();
     }
 
-    if let Ok(target) = repo.resolve_target(&state.config) {
+    if let Ok(target) = repo.resolve_target(&app.config) {
         state.target_branch = target.name;
     }
 
-    if let Ok(bases) = repo.resolve_bases(&state.config) {
+    if let Ok(bases) = repo.resolve_bases(&app.config) {
         state.base_branches = bases.iter().map(|b| b.name.clone()).collect();
     }
 
@@ -663,7 +697,11 @@ fn initialize_state(state: &mut TuiState) -> Result<()> {
     // Update message to include branch selection hint
     state.message = "[b]ranch wizard [r]un [1-6]panel [?]help [q]uit".to_string();
 
-    Ok(())
+    Ok(Some(Arc::new(ReviewSession {
+        workspace: app.execution_repo.clone(),
+        original_profile: state.config.profile.clone(),
+        original_cli_detection: state.config.profile_at_cli_detection.clone(),
+    })))
 }
 
 /// Run the TUI in state-only mode (`prview state --tui`)
@@ -721,6 +759,16 @@ pub(crate) async fn run_analysis_with_explicit_bases(
     governor: Arc<crate::governor::ResourceGovernor>,
     explicit_bases: bool,
 ) -> Result<()> {
+    run_analysis_with_workspace(config, tx, governor, explicit_bases, None).await
+}
+
+async fn run_analysis_with_workspace(
+    config: Config,
+    tx: mpsc::UnboundedSender<TuiEvent>,
+    governor: Arc<crate::governor::ResourceGovernor>,
+    explicit_bases: bool,
+    execution_repo: Option<Arc<ReviewSession>>,
+) -> Result<()> {
     let t_start = std::time::Instant::now();
     let ledger = crate::ledger::TaskLedger::new()
         .with_explicit_bases(config.bases_were_explicitly_selected(explicit_bases));
@@ -741,11 +789,24 @@ pub(crate) async fn run_analysis_with_explicit_bases(
         worktree_dirty_paths,
         worktree_head_sha,
     ) = crate::governor::blocking_stage(|| -> Result<_> {
-        let app = App::from_config(config)?;
+        let mut config = config;
+        if let Some(session) = &execution_repo {
+            config.profile = session.original_profile.clone();
+            config.profile_at_cli_detection = session.original_cli_detection.clone();
+        }
+        let original = App::from_config(config)?;
+        let retained_workspace = execution_repo.and_then(|session| session.workspace.clone());
+        let app = match retained_workspace {
+            Some(workspace) if original.remote_review_requested() => {
+                original.review_in_workspace(workspace)?
+            }
+            _ => original.independent_review()?.unwrap_or(original),
+        };
+        ledger.retain_execution_repo(app.execution_repo.clone());
         // Freeze cleanliness before any check runs or artifact is written (R4-19).
         // This closure runs inside the TUI run scope and blocking_stage, so the
         // event loop can cancel even while libgit2 scans a large worktree.
-        let worktree = crate::artifacts::capture_worktree_provenance(&app.config.repo_root);
+        let worktree = app.operator_worktree_provenance();
         let worktree_clean = worktree.clean;
         let worktree_status_digest = worktree.status_digest;
         let worktree_dirty_paths = worktree.dirty_paths;
@@ -1242,6 +1303,7 @@ mod tests {
         let error = PreRawModeGuard {
             governor,
             supervisor,
+            execution_repo: None,
         }
         .handoff()
         .await
@@ -1282,6 +1344,678 @@ mod tests {
             self.delivered = true;
             crate::governor::Interrupt::Operator
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn remote_tui_records_invocation_provenance_separately_from_execution() {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let head = source.head().unwrap().target().unwrap();
+        source
+            .reference("refs/remotes/origin/main", head, true, "fixture")
+            .unwrap();
+        std::fs::write(
+            caller.path().join("source.txt"),
+            "dirty invocation source\n",
+        )
+        .unwrap();
+        let before = crate::artifacts::capture_worktree_provenance(caller.path());
+        config.remote_mode = true;
+        config.target = Some("main".to_owned());
+        config.bases = vec!["main".to_owned()];
+        config.do_fetch = false;
+        config.run_tests = false;
+        config.run_lint = false;
+        config.run_heuristics = false;
+        config.skip_security = true;
+        config.create_zip = false;
+        let output = home.path().join("pack");
+        config.output_dir = Some(output.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        run_analysis(config, tx, governor).await.unwrap();
+        let provenance: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output.join("00_summary/PROVENANCE.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(provenance["operator_worktree"]["clean"], false);
+        assert_eq!(
+            provenance["operator_worktree"]["status_digest"].as_str(),
+            before.status_digest.as_deref()
+        );
+        assert_eq!(
+            provenance["worktree_head_sha"].as_str(),
+            before.head_sha.as_deref()
+        );
+        assert_eq!(
+            std::fs::read(caller.path().join("source.txt")).unwrap(),
+            b"dirty invocation source\n"
+        );
+    }
+
+    #[test]
+    fn remote_tui_preflight_refreshes_owned_refs_without_touching_caller_refs() {
+        assert_preflight_ref_ownership(true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tui_preflight_retains_a_pr_oid_across_a_successful_force_push_fetch() {
+        assert_session_refresh("pinned").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tui_retained_session_still_refreshes_an_unpinned_pr_target() {
+        assert_session_refresh("fresh").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tui_retained_session_does_not_hide_a_failed_fetch() {
+        assert_session_refresh("offline").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tui_retained_session_preserves_local_wizard_selection_semantics() {
+        assert_session_refresh("local").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tui_session_rebases_auto_profile_again_after_a_target_switch() {
+        assert_repeated_profile_runs(false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tui_session_preserves_a_manual_profile_override_across_detection_events() {
+        assert_repeated_profile_runs(true, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tui_local_start_retains_profile_authority_after_remote_wizard_runs() {
+        assert_repeated_profile_runs(false, true).await;
+    }
+
+    fn select_session_target(state: &mut TuiState, remote: bool, target: &str, base: &str) {
+        state.start_target_wizard();
+        state.branch_selector.show_local = !remote;
+        state.branch_selector.selected = state
+            .get_filtered_branches()
+            .iter()
+            .position(|name| name.as_str() == target)
+            .expect("fixture target in actual wizard");
+        state.select_branch();
+        state.branch_selector.show_local = !remote;
+        state.branch_selector.selected = state
+            .get_filtered_branches()
+            .iter()
+            .position(|name| name.as_str() == base)
+            .expect("fixture base in actual wizard");
+        state.select_branch();
+        state.finish_base_selection();
+        assert_eq!(state.config.remote_mode, remote);
+        assert_eq!(state.config.target.as_deref(), Some(target));
+        assert_eq!(state.config.bases, vec![base]);
+    }
+
+    // Current-thread runtimes retain the fixture's thread-local home through
+    // real spawned tasks; no process-global environment mutation is needed.
+    async fn assert_repeated_profile_runs(manual: bool, local_start: bool) {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let baseline = source.head().unwrap().peel_to_commit().unwrap();
+        source.branch("baseline", &baseline, false).unwrap();
+        std::fs::write(caller.path().join("Cargo.toml"), "[package]\nname = \"tui_profile_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+        std::fs::write(
+            caller.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"tui_profile_fixture\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(caller.path().join("lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        let mut index = source.index().unwrap();
+        for path in ["Cargo.toml", "Cargo.lock", "lib.rs"] {
+            index.add_path(std::path::Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = source.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+        let rust = source
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Rust profile",
+                &tree,
+                &[&baseline],
+            )
+            .unwrap();
+        let upstream = home.path().join("upstream.git");
+        let bare = git2::Repository::init_bare(&upstream).unwrap();
+        assert!(
+            crate::git::git_cmd()
+                .args(["-c", "core.hooksPath=", "fetch", "--quiet"])
+                .arg(caller.path())
+                .arg("+refs/heads/*:refs/heads/*")
+                .current_dir(&upstream)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let old = bare.find_commit(rust).unwrap();
+        let mut builder = bare.treebuilder(Some(&old.tree().unwrap())).unwrap();
+        for path in ["Cargo.toml", "Cargo.lock", "lib.rs"] {
+            builder.remove(path).unwrap();
+        }
+        builder
+            .insert(
+                "package.json",
+                bare.blob(b"{\"name\":\"fixture\",\"version\":\"0.0.0\"}\n")
+                    .unwrap(),
+                0o100644,
+            )
+            .unwrap();
+        builder
+            .insert(
+                "index.js",
+                bare.blob(b"export const value = 1;\n").unwrap(),
+                0o100644,
+            )
+            .unwrap();
+        let js = bare
+            .commit(
+                Some("refs/heads/next"),
+                &sig,
+                &sig,
+                "JS target",
+                &bare.find_tree(builder.write().unwrap()).unwrap(),
+                &[&old],
+            )
+            .unwrap();
+        source.remote("origin", upstream.to_str().unwrap()).unwrap();
+        config.requested_profile = Some(crate::cli::Profile::Auto);
+        config.refresh_profile_from_tree(caller.path()).unwrap();
+        assert_eq!(config.profile.kind, crate::config::ProfileKind::Rust);
+        config.profile_at_cli_detection = Some(if manual {
+            crate::config::test_generic_profile()
+        } else {
+            config.profile.clone()
+        });
+        let original_profile = config.profile.clone();
+        let original_detection = config.profile_at_cli_detection.clone();
+        let caches = [
+            config.cache_dir(),
+            config.cargo_build_cache_dir(),
+            config.uv_env_root(),
+        ];
+        for path in &caches {
+            assert!(path.starts_with(home.path()));
+            assert!(!path.starts_with(caller.path()));
+        }
+        config.remote_mode = !local_start;
+        config.target = Some("main".to_owned());
+        config.bases = vec!["baseline".to_owned()];
+        config.do_fetch = true;
+        config.run_tests = false;
+        config.run_lint = false;
+        config.run_heuristics = false;
+        config.skip_security = true;
+        config.create_zip = false;
+        let mut state = TuiState::new(config);
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let preflight = initialize_state_supervised(&mut state, ChannelInterrupts(interrupt_rx))
+            .await
+            .unwrap();
+        let retained = preflight.execution_repo.clone();
+        preflight.handoff().await.unwrap();
+        // Ambient preflight intentionally fetches; establish the caller baseline
+        // only after that existing behavior has completed.
+        let head = std::fs::read(source.path().join("HEAD")).unwrap();
+        let caller_index = std::fs::read(source.path().join("index")).unwrap();
+        let mut remote_main = source
+            .find_reference("refs/remotes/origin/main")
+            .ok()
+            .and_then(|r| r.target());
+        let stages = [
+            (true, "main", "baseline"),
+            (true, "main", "baseline"),
+            (true, "next", "main"),
+            (false, "main", "baseline"),
+            (true, "next", "main"),
+        ];
+        for (run, (remote, target, base)) in stages.into_iter().enumerate() {
+            select_session_target(&mut state, remote, target, base);
+            let output = home.path().join(format!("pack-{run}"));
+            state.config.output_dir = Some(output.clone());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut task = AnalysisTask::spawn_with_explicit_bases(
+                state.config.clone(),
+                tx,
+                true,
+                retained.clone(),
+            );
+            let result = (&mut task.handle).await.unwrap();
+            if let Some(deadline) = task.disarm_deadline() {
+                deadline.await.unwrap();
+            }
+            result.unwrap_or_else(|err| {
+                panic!("matrix stage {run} remote={remote} target={target} base={base}: {err:#}")
+            });
+            let mut profiles = 0;
+            while let Ok(event) = rx.try_recv() {
+                if matches!(event, TuiEvent::ProfileReady { .. }) {
+                    profiles += 1;
+                }
+                handle_tui_event(&mut state, event);
+            }
+            assert_eq!(profiles, 1, "actual prepared profile event at stage {run}");
+            assert_eq!(
+                state.config.profile.kind,
+                if target == "main" || manual {
+                    crate::config::ProfileKind::Rust
+                } else {
+                    crate::config::ProfileKind::Js
+                }
+            );
+            let provenance: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(output.join("00_summary/PROVENANCE.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                provenance["target_sha"],
+                if target == "main" { rust } else { js }.to_string()
+            );
+            assert_eq!(
+                provenance["base_sha"],
+                if base == "main" { rust } else { baseline.id() }.to_string()
+            );
+            if run == 0 {
+                let contents = || -> std::collections::BTreeMap<_, _> {
+                    walkdir::WalkDir::new(&output)
+                        .into_iter()
+                        .map(Result::unwrap)
+                        .filter(|entry| entry.file_type().is_file())
+                        .map(|entry| {
+                            (
+                                entry.path().strip_prefix(&output).unwrap().to_path_buf(),
+                                std::fs::read(entry.path()).unwrap(),
+                            )
+                        })
+                        .collect()
+                };
+                let before = contents();
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let mut repeated = AnalysisTask::spawn_with_explicit_bases(
+                    state.config.clone(),
+                    tx,
+                    true,
+                    retained.clone(),
+                );
+                let error = (&mut repeated.handle).await.unwrap().unwrap_err();
+                if let Some(deadline) = repeated.disarm_deadline() {
+                    deadline.await.unwrap();
+                }
+                assert!(
+                    format!("{error:#}").contains("immutable pack"),
+                    "same explicit output must be refused after profile preparation: {error:#}"
+                );
+                while let Ok(event) = rx.try_recv() {
+                    handle_tui_event(&mut state, event);
+                }
+                assert_eq!(
+                    contents(),
+                    before,
+                    "failed reuse must preserve every byte of the first pack"
+                );
+            }
+            let roots = output.join("00_summary/EXECUTION_ROOTS.json");
+            assert_eq!(
+                roots.exists(),
+                remote,
+                "execution boundary follows wizard selection"
+            );
+            if remote {
+                let roots: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(roots).unwrap()).unwrap();
+                assert_eq!(
+                    roots["caller_root"],
+                    std::fs::canonicalize(caller.path())
+                        .unwrap()
+                        .to_string_lossy()
+                        .as_ref()
+                );
+                assert_eq!(
+                    roots["output_root"],
+                    std::fs::canonicalize(&output)
+                        .unwrap()
+                        .to_string_lossy()
+                        .as_ref()
+                );
+                assert_ne!(roots["execution_repo"], roots["caller_root"]);
+            }
+            assert_eq!(state.config.repo_root, caller.path());
+            for (actual, expected) in [
+                state.config.cache_dir(),
+                state.config.cargo_build_cache_dir(),
+                state.config.uv_env_root(),
+            ]
+            .iter()
+            .zip(&caches)
+            {
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(std::fs::read(source.path().join("HEAD")).unwrap(), head);
+            assert_eq!(
+                std::fs::read(source.path().join("index")).unwrap(),
+                caller_index
+            );
+            let current_remote = source
+                .find_reference("refs/remotes/origin/main")
+                .ok()
+                .and_then(|r| r.target());
+            if remote {
+                assert_eq!(current_remote, remote_main);
+            } else {
+                remote_main = current_remote;
+            }
+        }
+        // The session's authority is the caller's input pair, not the final UI
+        // profile rooted in an ephemeral execution checkout.
+        if let Some(session) = retained {
+            assert_eq!(session.original_profile, original_profile);
+            assert_eq!(session.original_cli_detection, original_detection);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn tui_session_rechecks_an_output_parent_redirect_before_allocation() {
+        assert_late_session_namespace_redirect(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn tui_session_rechecks_a_cache_redirect_before_analysis() {
+        assert_late_session_namespace_redirect(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_late_session_namespace_redirect(cache: bool) {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        source
+            .reference(
+                "refs/remotes/origin/main",
+                source.head().unwrap().target().unwrap(),
+                false,
+                "fixture remote target",
+            )
+            .unwrap();
+        config.remote_mode = true;
+        config.target = Some("main".to_owned());
+        config.bases = vec!["main".to_owned()];
+        config.do_fetch = false;
+        config.run_tests = false;
+        config.run_lint = false;
+        config.run_heuristics = false;
+        config.skip_security = true;
+        config.create_zip = false;
+        let parent = home.path().join("external-output");
+        std::fs::create_dir(&parent).unwrap();
+        config.output_dir = Some(parent.join("pack"));
+        let cache_root = config.cache_dir();
+        let mut state = TuiState::new(config);
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let preflight = initialize_state_supervised(&mut state, ChannelInterrupts(interrupt_rx))
+            .await
+            .unwrap();
+        let retained = preflight.execution_repo.clone();
+        preflight.handoff().await.unwrap();
+        if cache {
+            std::fs::create_dir_all(cache_root.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(caller.path(), &cache_root).unwrap();
+        } else {
+            std::fs::remove_dir(&parent).unwrap();
+            std::os::unix::fs::symlink(caller.path(), &parent).unwrap();
+        }
+        let before: std::collections::BTreeSet<_> = walkdir::WalkDir::new(caller.path())
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|entry| entry.path().to_path_buf())
+            .collect();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut task = AnalysisTask::spawn_with_explicit_bases(state.config, tx, true, retained);
+        let result = (&mut task.handle).await.unwrap();
+        if let Some(deadline) = task.disarm_deadline() {
+            deadline.await.unwrap();
+        }
+        let after: std::collections::BTreeSet<_> = walkdir::WalkDir::new(caller.path())
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|entry| entry.path().to_path_buf())
+            .collect();
+        assert_eq!(
+            after, before,
+            "a late namespace redirect must be refused before any caller directory is allocated"
+        );
+        let error = result.expect_err("late redirected remote namespace must be refused");
+        assert!(
+            format!("{error:#}").contains("inside the caller"),
+            "external namespace admission: {error:#}"
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, TuiEvent::ProfileReady { .. }),
+                "namespace admission must happen before profile preparation and checks"
+            );
+        }
+        assert_eq!(
+            std::fs::read(caller.path().join("source.txt")).unwrap(),
+            b"original\n"
+        );
+    }
+
+    async fn assert_session_refresh(mode: &str) {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let upstream = home.path().join("upstream.git");
+        let bare = git2::Repository::init_bare(&upstream).unwrap();
+        assert!(
+            crate::git::git_cmd()
+                .args(["-c", "core.hooksPath=", "fetch", "--quiet"])
+                .arg(caller.path())
+                .arg("+HEAD:refs/heads/main")
+                .current_dir(&upstream)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let parent = bare
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+        let commit = |contents: &[u8]| {
+            let mut builder = bare.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+            builder
+                .insert("source.txt", bare.blob(contents).unwrap(), 0o100644)
+                .unwrap();
+            let tree = bare.find_tree(builder.write().unwrap()).unwrap();
+            bare.commit(
+                None,
+                &signature,
+                &signature,
+                "PR revision",
+                &tree,
+                &[&parent],
+            )
+            .unwrap()
+        };
+        let selected = commit(b"selected PR revision\n");
+        let moved = commit(b"later force-push revision\n");
+        bare.reference("refs/pull/42/head", selected, true, "fixture")
+            .unwrap();
+        let source = git2::Repository::open(caller.path()).unwrap();
+        source.remote("origin", upstream.to_str().unwrap()).unwrap();
+        assert!(source.find_commit(selected).is_err());
+        config.remote_mode = true;
+        config.pr_number = Some(42);
+        config.pr_head_oid = Some(selected.to_string());
+        config.target = Some("PR42".to_owned());
+        if mode == "local" {
+            config.pr_number = None;
+            config.pr_head_oid = None;
+            config.target = Some("main".to_owned());
+        }
+        config.bases = vec!["main".to_owned()];
+        config.do_fetch = true;
+        config.run_tests = false;
+        config.run_lint = false;
+        config.run_heuristics = false;
+        config.skip_security = true;
+        config.create_zip = false;
+        let output = home.path().join("pack");
+        config.output_dir = Some(output.clone());
+        let mut state = TuiState::new(config);
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let preflight = initialize_state_supervised(&mut state, ChannelInterrupts(interrupt_rx))
+            .await
+            .unwrap();
+        let retained = preflight.execution_repo.clone();
+        preflight.handoff().await.unwrap();
+        assert!(
+            source.find_commit(selected).is_err(),
+            "preflight must not write caller objects"
+        );
+        bare.reference("refs/pull/42/head", moved, true, "force push")
+            .unwrap();
+        if mode == "fresh" {
+            state.config.pr_head_oid = None;
+        } else if mode == "offline" {
+            std::fs::rename(&upstream, home.path().join("unavailable.git")).unwrap();
+        } else if mode == "local" {
+            std::fs::write(caller.path().join("source.txt"), "local working source\n").unwrap();
+            state.start_target_wizard();
+            state.select_branch();
+            state.finish_base_selection();
+            assert!(!state.config.remote_mode);
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut analysis =
+            AnalysisTask::spawn_with_explicit_bases(state.config, tx, false, retained.clone());
+        let result = (&mut analysis.handle).await.unwrap();
+        if let Some(deadline) = analysis.disarm_deadline() {
+            deadline.await.unwrap();
+        }
+        if mode == "offline" {
+            assert!(format!("{:#}", result.unwrap_err()).contains("fetch"));
+            assert!(!output.join("00_summary/PROVENANCE.json").exists());
+            return;
+        }
+        result.unwrap();
+        let provenance: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output.join("00_summary/PROVENANCE.json")).unwrap(),
+        )
+        .unwrap();
+        if mode == "local" {
+            assert_eq!(provenance["target_sha"], parent.id().to_string());
+            assert_eq!(provenance["operator_worktree"]["clean"], false);
+            assert!(
+                !output.join("00_summary/EXECUTION_ROOTS.json").exists(),
+                "a local selection must use the ambient caller rather than the retained remote workspace"
+            );
+            assert_eq!(
+                std::fs::read(caller.path().join("source.txt")).unwrap(),
+                b"local working source\n"
+            );
+            return;
+        }
+        assert_eq!(
+            provenance["target_sha"],
+            if mode == "pinned" { selected } else { moved }.to_string()
+        );
+        if let Some(owner) = retained.and_then(|session| session.workspace.clone()) {
+            let repo = git2::Repository::open(&owner.repo_root).unwrap();
+            assert_eq!(
+                repo.find_reference("refs/remotes/origin/pr/42")
+                    .unwrap()
+                    .target(),
+                Some(moved),
+                "each run still fetches fresh refs"
+            );
+        }
+        assert!(source.find_commit(selected).is_err());
+        assert!(source.find_commit(moved).is_err());
+    }
+
+    #[test]
+    fn ambient_tui_preflight_retains_its_existing_fetch_behavior() {
+        assert_preflight_ref_ownership(false);
+    }
+
+    fn assert_preflight_ref_ownership(remote: bool) {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let upstream = home.path().join("upstream.git");
+        let bare = git2::Repository::init_bare(&upstream).unwrap();
+        let status = crate::git::git_cmd()
+            .args(["-c", "core.hooksPath=", "fetch", "--quiet"])
+            .arg(caller.path())
+            .arg("+HEAD:refs/heads/fresh-branch")
+            .current_dir(&upstream)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let source = git2::Repository::open(caller.path()).unwrap();
+        source.remote("origin", upstream.to_str().unwrap()).unwrap();
+        let head = source.head().unwrap().target().unwrap();
+        source
+            .reference("refs/remotes/origin/stale-branch", head, true, "fixture")
+            .unwrap();
+        let references = || {
+            source
+                .references()
+                .unwrap()
+                .map(|r| {
+                    let r = r.unwrap();
+                    (r.name().unwrap().to_owned(), r.target())
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = references();
+        let fetch_head = std::fs::read(source.path().join("FETCH_HEAD")).ok();
+        config.remote_mode = remote;
+        config.do_fetch = true;
+        let original_root = config.repo_root.clone();
+        let mut state = TuiState::new(config);
+        let _preflight_owner = initialize_state(&mut state).unwrap();
+        assert_eq!(state.config.repo_root, original_root);
+        assert!(
+            state
+                .branch_selector
+                .remote_branches
+                .iter()
+                .any(|name| name.ends_with("fresh-branch"))
+        );
+        if remote {
+            assert_eq!(references(), before);
+            assert_eq!(
+                std::fs::read(source.path().join("FETCH_HEAD")).ok(),
+                fetch_head
+            );
+            assert!(
+                source
+                    .find_reference("refs/remotes/origin/fresh-branch")
+                    .is_err()
+            );
+        } else {
+            assert!(
+                source
+                    .find_reference("refs/remotes/origin/fresh-branch")
+                    .is_ok()
+            );
+        }
+        assert!(bare.find_reference("refs/heads/fresh-branch").is_ok());
     }
 
     /// Before raw mode owns Ctrl-C as a key, TUI preflight has to own it as a
