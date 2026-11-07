@@ -20,7 +20,7 @@ pub(super) struct TransportRun<'a> {
     marker_tag: String,
 }
 
-fn remove_tracing(command: &mut Command) {
+pub(crate) fn remove_tracing(command: &mut Command) {
     for (key, _) in std::env::vars_os() {
         let upper = key.to_string_lossy().to_ascii_uppercase();
         if upper.starts_with("GIT_TRACE") || upper == "GIT_CURL_VERBOSE" || upper == "CURL_VERBOSE"

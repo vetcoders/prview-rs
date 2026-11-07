@@ -4870,8 +4870,9 @@ Shallow callers retain their Git shallow boundary during transport. For a
 partial clone, the owned repository copies only objects currently available in
 the caller and copies refs separately, without asking the caller's promisor to
 fill its object store. With fetch enabled it then performs an origin
-`--refetch` in the owned repository before checkout, using the captured
-transport settings; this requires Git 2.36 or newer. Origin cannot supply
+`--refetch` and, when requested, a PR ref `--refetch` in the owned repository
+before checkout, using the captured transport settings; this requires Git 2.36
+or newer. Origin cannot supply
 objects that are no longer reachable or otherwise unavailable there. With
 fetch disabled no network hydration occurs: the review can use locally
 available objects and reports an error when a required object is absent.

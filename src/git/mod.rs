@@ -305,7 +305,11 @@ impl Repository {
             let pr_ref = format!("pull/{pr_number}/head:refs/remotes/origin/pr/{pr_number}");
             let mut fetch_pr = git_cmd();
             configure(&mut fetch_pr);
-            fetch_pr.args(["fetch", "--quiet", "origin", &pr_ref]);
+            fetch_pr.args(["fetch", "--quiet"]);
+            if refetch {
+                fetch_pr.arg("--refetch");
+            }
+            fetch_pr.args(["origin", &pr_ref]);
             let label = format!("git fetch PR #{pr_number}");
             let fetch_pr = if let Some(transport) = &transport {
                 transport.run(fetch_pr, &label)?

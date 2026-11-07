@@ -310,6 +310,7 @@ fn copy_partial_objects_and_refs(
     }
     if !updates.is_empty() {
         let mut command = git_cmd();
+        crate::git::transport::remove_tracing(&mut command);
         command
             .args(["-c", "core.hooksPath=", "update-ref", "--stdin", "-z"])
             .current_dir(destination.path());
@@ -339,6 +340,7 @@ fn copy_objects(source: &git2::Repository, destination: &git2::Repository) -> Re
     // It reads the source but never creates a registration/ref/lock there.
     // No repository config, hooks, index or working-tree bytes are imported.
     let mut command = git_cmd();
+    crate::git::transport::remove_tracing(&mut command);
     command
         .args([
             "-c",
@@ -432,6 +434,7 @@ fn committed_module_paths(
     let mut file = tempfile::NamedTempFile::new_in(destination.path())?;
     file.write_all(blob.content())?;
     let mut command = git_cmd();
+    crate::git::transport::remove_tracing(&mut command);
     command
         .args(["-c", "core.hooksPath=", "config", "--no-includes", "--file"])
         .arg(file.path())
@@ -545,6 +548,96 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn partial_ref_copy_does_not_write_global_trace2_into_caller() {
+        if let Some(caller) = std::env::var_os("PRVIEW_PARTIAL_TRACE_CALLER") {
+            let caller = std::path::PathBuf::from(caller);
+            let home =
+                std::path::PathBuf::from(std::env::var_os("PRVIEW_PARTIAL_TRACE_HOME").unwrap());
+            let _home = crate::config::override_test_prview_home(&home);
+            let mut config = crate::config::test_config();
+            config.repo_root = caller.clone();
+            config.repo_path = Some(caller);
+            config.do_fetch = false;
+            IndependentReview::create(&config).unwrap();
+            return;
+        }
+        let (caller, home, _) = crate::checks::caller_guard_tests::fixture();
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let parent = source.head().unwrap().peel_to_commit().unwrap();
+        std::fs::write(
+            caller.path().join(".gitmodules"),
+            "[submodule \"fixture\"]\n path = fixture-module\n url = ../fixture.git\n",
+        )
+        .unwrap();
+        let mut index = source.index().unwrap();
+        index.add_path(Path::new(".gitmodules")).unwrap();
+        index.write().unwrap();
+        let tree = source.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        source
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "module metadata",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let trace = caller.path().join("trace2-output");
+        let global = home.path().join("trace-global");
+        std::fs::write(
+            &global,
+            format!("[trace2]\n eventTarget = {}\n", trace.display()),
+        )
+        .unwrap();
+        let control = git_cmd()
+            .args(["rev-parse", "--git-dir"])
+            .current_dir(caller.path())
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env_remove("GIT_TRACE2_EVENT")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(control.success());
+        assert!(trace.exists(), "control Git must create the trace file");
+        std::fs::rename(&trace, home.path().join("trace-control")).unwrap();
+        for partial in [false, true] {
+            source
+                .config()
+                .unwrap()
+                .set_bool("remote.origin.promisor", partial)
+                .unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "review_workspace::tests::partial_ref_copy_does_not_write_global_trace2_into_caller"])
+                .env("PRVIEW_PARTIAL_TRACE_CALLER", caller.path())
+                .env("PRVIEW_PARTIAL_TRACE_HOME", home.path())
+                .env("GIT_CONFIG_GLOBAL", &global)
+                .env_remove("GIT_TRACE2_EVENT")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "isolated setup failed, partial={partial}"
+            );
+            let traced_commands: Vec<_> = std::fs::read_to_string(&trace)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|value| {
+                    value.get("event").and_then(|event| event.as_str()) == Some("start")
+                })
+                .filter_map(|value| value.get("argv").cloned())
+                .collect();
+            assert!(
+                !trace.exists(),
+                "setup must not create caller trace file, partial={partial}; commands: {traced_commands:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn partial_clone_copies_available_objects_and_refetches_only_into_owned_repo() {
         let (source_dir, home, mut config) = crate::checks::caller_guard_tests::fixture();
         let _home = crate::config::override_test_prview_home(home.path());
@@ -558,6 +651,13 @@ mod tests {
             .unwrap()
             .id();
         let sig = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let pr_blob = source.blob(b"fork-only promised blob\n").unwrap();
+        let mut pr_tree = source.treebuilder(None).unwrap();
+        pr_tree.insert("fork.txt", pr_blob, 0o100644).unwrap();
+        let pr_tree = source.find_tree(pr_tree.write().unwrap()).unwrap();
+        let pr_oid = source
+            .commit(None, &sig, &sig, "fork PR", &pr_tree, &[])
+            .unwrap();
         let obsolete_blob = source.blob(b"unique obsolete blob\n").unwrap();
         let mut obsolete_tree = source.treebuilder(None).unwrap();
         obsolete_tree
@@ -610,6 +710,10 @@ mod tests {
             .unwrap()
             .set_bool("uploadpack.allowFilter", true)
             .unwrap();
+        git2::Repository::open_bare(&upstream)
+            .unwrap()
+            .reference("refs/pull/7/head", pr_oid, true, "fixture PR")
+            .unwrap();
         let caller = home.path().join("partial-caller");
         let url = format!("file://{}", upstream.display());
         assert!(
@@ -617,6 +721,22 @@ mod tests {
                 .args(["clone", "--quiet", "--filter=blob:none"])
                 .arg(&url)
                 .arg(&caller)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            git_cmd()
+                .args([
+                    "-c",
+                    "core.hooksPath=",
+                    "fetch",
+                    "--quiet",
+                    "--filter=blob:none",
+                    "origin",
+                    "+refs/pull/7/head:refs/prview/fixture-pr"
+                ])
+                .current_dir(&caller)
                 .status()
                 .unwrap()
                 .success()
@@ -668,6 +788,14 @@ mod tests {
         assert!(
             !partial.odb().unwrap().exists(old_blob),
             "fixture must omit historical blob"
+        );
+        assert!(
+            !partial.odb().unwrap().exists(pr_blob),
+            "fixture must omit fork-only PR blob"
+        );
+        assert!(
+            partial.find_commit(pr_oid).is_ok(),
+            "fixture must already contain the PR tip"
         );
         assert!(
             partial
@@ -742,6 +870,7 @@ mod tests {
             "missing stale blob must remain explicitly unavailable"
         );
         config.do_fetch = true;
+        config.pr_number = Some(7);
         let online = IndependentReview::create(&config).unwrap();
         assert!(
             transport_marker.exists(),
@@ -752,6 +881,11 @@ mod tests {
             copy.odb().unwrap().exists(old_blob),
             "owned origin refetch must fill requested history"
         );
+        assert!(
+            copy.odb().unwrap().exists(pr_blob),
+            "owned PR refetch must fill fork-only blob"
+        );
+        assert!(copy.find_reference("refs/remotes/origin/pr/7").is_ok());
         assert!(
             copy.find_reference("refs/remotes/origin/custom-main")
                 .is_ok()
@@ -802,6 +936,7 @@ mod tests {
         assert!(!detached_repo.head().unwrap().is_branch());
         assert_eq!(detached_repo.head().unwrap().target(), Some(detached_oid));
 
+        config.pr_number = None;
         let sparse = home.path().join("sparse-caller");
         assert!(
             git_cmd()
