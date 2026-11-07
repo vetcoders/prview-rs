@@ -67,7 +67,7 @@ pub(crate) fn generate_ai_index(
     )?;
     writeln!(
         md,
-        "- Coverage signal: {}/{} changed code files ({})",
+        "- Test-change matching: {}/{} changed code files ({}; heuristic, not execution coverage)",
         coverage.covered_count,
         coverage.total_source,
         crate::artifacts::signal::format_coverage_pct(coverage.pct)

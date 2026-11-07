@@ -2897,6 +2897,7 @@ pub(super) fn build_regression_details_section(
     html.push_str(structural_scope_note());
 
     // --- Tab 1: Score ---
+    html.push_str(r#"<p class="evidence-note">Coverage trends compare source/test-change matching with a previous run, not the PR base commit or executed-line coverage. The source run and its recorded revisions are in report.json: regression.tests.coverage_comparison.</p>"#);
     if has_score {
         let reg = regression.unwrap();
         let severity = reg.score.severity.as_str();

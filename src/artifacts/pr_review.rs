@@ -770,7 +770,7 @@ pub(crate) fn generate_pr_review(
         && pct < 80
     {
         warnings.push(format!(
-            "Coverage review signal: {}% heuristic coverage ({}/{})",
+            "Test-change matching: {}% ({}/{} changed code files; heuristic, not execution coverage)",
             pct, coverage.covered_count, coverage.total_source
         ));
     } else if code_files > 0 && test_files == 0 {
@@ -803,6 +803,12 @@ pub(crate) fn generate_pr_review(
             warnings.push(format!(
                 "Cargo geiger: {} — see `20_quality/cargo_geiger.log`",
                 unsafe_summary
+            ));
+        } else if wc.name == "heuristics_loctree" {
+            warnings.push(format!(
+                "{} produced warnings ({})",
+                wc.name,
+                loctree_warning_context(heuristics)
             ));
         } else {
             warnings.push(format!("{} produced warnings", wc.name));
