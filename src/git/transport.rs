@@ -460,6 +460,32 @@ mod tests {
     }
 
     #[test]
+    fn inline_origin_credentials_never_enter_cookie_probe_arguments() {
+        let caller = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(caller.path()).unwrap();
+        let private = tempfile::tempdir().unwrap();
+        git2::Repository::init(private.path()).unwrap();
+        let url = "https://fake-inline-credential@example.invalid/repo";
+        let transport = Transport::capture(caller.path(), url).unwrap();
+        let mut command = git_cmd();
+        transport.configure(&mut command, private.path());
+        assert!(
+            !command
+                .get_args()
+                .any(|arg| arg.to_string_lossy().contains("fake-inline-credential"))
+        );
+        repo.config()
+            .unwrap()
+            .set_bool("http.saveCookies", false)
+            .unwrap();
+        let error = match Transport::capture(caller.path(), url) {
+            Ok(_) => panic!("credential-bearing URL with cookie config must be refused"),
+            Err(error) => error,
+        };
+        assert!(!format!("{error:#}").contains("fake-inline-credential"));
+    }
+
+    #[test]
     fn cookie_policy_matches_origin_not_unrelated_url() {
         let caller = tempfile::tempdir().unwrap();
         git2::Repository::init(caller.path()).unwrap();
