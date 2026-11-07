@@ -299,7 +299,17 @@ fn copy_partial_objects_and_refs(
         if reference.name_bytes() == b"refs/prview/copied-head" {
             continue;
         }
-        let resolved = reference.resolve()?;
+        let resolved = match reference.resolve() {
+            Ok(resolved) => resolved,
+            Err(error)
+                if reference.kind() == Some(git2::ReferenceType::Symbolic)
+                    && error.code() == git2::ErrorCode::NotFound =>
+            {
+                // Native fetch does not advertise a dangling symbolic ref.
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let oid = resolved
             .target()
             .context("partial clone reference has no target")?;
@@ -757,6 +767,14 @@ mod tests {
             );
         }
         let partial = git2::Repository::open(&caller).unwrap();
+        partial
+            .reference_symbolic(
+                "refs/remotes/origin/missing-head",
+                "refs/remotes/origin/nonexistent",
+                true,
+                "fixture",
+            )
+            .unwrap();
         use std::os::unix::fs::PermissionsExt;
         let transport_marker = home.path().join("origin-transport-used");
         let wrapper = caller.join("fixture-upload-pack");
@@ -835,7 +853,10 @@ mod tests {
             .unwrap()
             .map(|r| {
                 let r = r.unwrap();
-                (r.name_bytes().to_vec(), r.resolve().unwrap().target())
+                (
+                    r.name_bytes().to_vec(),
+                    r.resolve().ok().and_then(|resolved| resolved.target()),
+                )
             })
             .collect();
         config.repo_root = caller.clone();
@@ -859,6 +880,11 @@ mod tests {
             "offline must not fetch missing blob"
         );
         assert!(copy.find_reference("refs/remotes/origin/obsolete").is_ok());
+        assert!(
+            copy.find_reference("refs/remotes/origin/missing-head")
+                .is_err(),
+            "dangling symbolic refs are not advertised by native fetch"
+        );
         #[cfg(target_os = "linux")]
         assert!(
             copy.references()
@@ -916,7 +942,10 @@ mod tests {
             .unwrap()
             .map(|r| {
                 let r = r.unwrap();
-                (r.name_bytes().to_vec(), r.resolve().unwrap().target())
+                (
+                    r.name_bytes().to_vec(),
+                    r.resolve().ok().and_then(|resolved| resolved.target()),
+                )
             })
             .collect();
         assert_eq!(refs_before, refs_after);
@@ -1009,6 +1038,30 @@ mod tests {
         assert_eq!(
             std::fs::read(copied.commondir().join("shallow")).unwrap(),
             boundary
+        );
+        let cycle_source = tempfile::tempdir().unwrap();
+        let cycle_destination = tempfile::tempdir().unwrap();
+        let source_repo = git2::Repository::init(cycle_source.path()).unwrap();
+        let destination_repo = git2::Repository::init(cycle_destination.path()).unwrap();
+        source_repo
+            .reference_symbolic(
+                "refs/heads/cycle-one",
+                "refs/heads/cycle-two",
+                true,
+                "fixture",
+            )
+            .unwrap();
+        source_repo
+            .reference_symbolic(
+                "refs/heads/cycle-two",
+                "refs/heads/cycle-one",
+                true,
+                "fixture",
+            )
+            .unwrap();
+        assert!(
+            copy_partial_objects_and_refs(&source_repo, &destination_repo).is_err(),
+            "non-NotFound resolution failures must not be skipped"
         );
     }
 
