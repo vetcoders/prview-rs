@@ -4,11 +4,20 @@ use anyhow::{Context, Result, ensure};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
+const DENY_STORE_HELPER: &str = "!f() { printf '%s\\n' \"$PRVIEW_DENIED_STORE_TAG\" >&2; printf x >> \"$PRVIEW_DENIED_STORE_MARKER\"; return 1; }; f";
+
 pub(crate) struct Transport {
     entries: Vec<(String, String)>,
     caller: std::path::PathBuf,
     origin: String,
     empty_config: tempfile::NamedTempFile,
+}
+
+pub(super) struct TransportRun<'a> {
+    transport: &'a Transport,
+    marker: tempfile::NamedTempFile,
+    marker_for_shell: std::ffi::OsString,
+    marker_tag: String,
 }
 
 fn remove_tracing(command: &mut Command) {
@@ -23,6 +32,26 @@ fn remove_tracing(command: &mut Command) {
         .env("GIT_TRACE2", "0")
         .env("GIT_TRACE2_EVENT", "0")
         .env("GIT_TRACE2_PERF", "0");
+}
+
+#[cfg(not(windows))]
+fn marker_path_for_shell(path: &Path) -> Result<std::ffi::OsString> {
+    Ok(path.as_os_str().to_owned())
+}
+
+#[cfg(windows)]
+fn marker_path_for_shell(path: &Path) -> Result<std::ffi::OsString> {
+    let path = path
+        .to_str()
+        .context("credential-store marker path is not Unicode")?;
+    let path = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!("//{unc}")
+    } else if let Some(drive) = path.strip_prefix(r"\\?\") {
+        drive.to_owned()
+    } else {
+        path.to_owned()
+    };
+    Ok(path.replace('\\', "/").into())
 }
 
 fn admitted(key: &str) -> bool {
@@ -198,7 +227,15 @@ impl Transport {
                 std::str::from_utf8(value).context("transport configuration value is not UTF-8")?;
             entries.push((key.to_owned(), value.to_owned()));
         }
-        validate_store_paths(caller, &entries)?;
+        for entry in &mut entries {
+            let lower = entry.0.to_ascii_lowercase();
+            if lower.starts_with("credential.")
+                && lower.ends_with(".helper")
+                && validate_store_paths(caller, std::slice::from_ref(entry)).is_err()
+            {
+                entry.1 = DENY_STORE_HELPER.to_owned();
+            }
+        }
         let transport = Self {
             entries,
             caller: caller.to_path_buf(),
@@ -277,14 +314,25 @@ impl Transport {
         }
     }
 
-    pub(super) fn configure(&self, command: &mut Command, repo: &Path) {
-        self.configure_environment(command);
-        command
-            .current_dir(&self.caller)
-            .arg("--git-dir")
-            .arg(repo.join(".git"))
-            .arg("--work-tree")
-            .arg(repo);
+    pub(super) fn begin(&self) -> Result<TransportRun<'_>> {
+        let marker = tempfile::NamedTempFile::new()?;
+        ensure!(
+            marker.path().is_absolute(),
+            "credential-store marker path is not absolute"
+        );
+        let marker_for_shell = marker_path_for_shell(marker.path())?;
+        let name = marker
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("credential-store marker name is not Unicode")?;
+        let marker_tag = format!("prview-denied-store-{name}");
+        Ok(TransportRun {
+            transport: self,
+            marker,
+            marker_for_shell,
+            marker_tag,
+        })
     }
 
     fn redact(&self, message: &str) -> String {
@@ -305,6 +353,9 @@ impl Transport {
         }
         secrets.extend(url_credentials(&self.origin));
         for (key, value) in &self.entries {
+            if value == DENY_STORE_HELPER {
+                continue;
+            }
             let lower = key.to_ascii_lowercase();
             if lower.starts_with("http.") {
                 secrets.extend(url_credentials(key));
@@ -336,11 +387,39 @@ impl Transport {
         }
         message
     }
+}
+
+impl TransportRun<'_> {
+    pub(super) fn configure(&self, command: &mut Command, repo: &Path) {
+        self.transport.configure_environment(command);
+        command
+            .env("PRVIEW_DENIED_STORE_MARKER", &self.marker_for_shell)
+            .env("PRVIEW_DENIED_STORE_TAG", &self.marker_tag)
+            .current_dir(&self.transport.caller)
+            .arg("--git-dir")
+            .arg(repo.join(".git"))
+            .arg("--work-tree")
+            .arg(repo);
+    }
 
     pub(super) fn run(&self, command: Command, label: &str) -> Result<ExitStatus> {
         let output = crate::proc::output_governed(command, label)?;
+        self.evaluate(output)
+    }
+
+    fn evaluate(&self, output: std::process::Output) -> Result<ExitStatus> {
+        let was_selected = output
+            .stderr
+            .windows(self.marker_tag.len())
+            .any(|window| window == self.marker_tag.as_bytes());
+        ensure!(
+            self.marker.as_file().metadata()?.len() == 0 && !was_selected,
+            "credential-store was selected but its destination could write into the invocation checkout"
+        );
         if !output.status.success() {
-            let message = self.redact(&String::from_utf8_lossy(&output.stderr));
+            let message = self
+                .transport
+                .redact(&String::from_utf8_lossy(&output.stderr));
             if !message.trim().is_empty() {
                 eprintln!("{}", message.trim());
             }
@@ -388,7 +467,8 @@ mod tests {
         );
         assert!(!transport.entries.iter().any(|(k, _)| k == "core.hookspath"));
         let mut command = git_cmd();
-        transport.configure(&mut command, private.path());
+        let run = transport.begin().unwrap();
+        run.configure(&mut command, private.path());
         assert!(
             !command
                 .get_args()
@@ -444,7 +524,8 @@ mod tests {
                     .any(|(key, _)| key == "core.hookspath")
             );
             let mut command = git_cmd();
-            transport.configure(&mut command, &private);
+            let run = transport.begin().unwrap();
+            run.configure(&mut command, &private);
             assert!(
                 !command
                     .get_args()
@@ -466,9 +547,9 @@ mod tests {
         let misleading = root.path().join("misleading");
         std::fs::write(&global, format!(
             "[credential]\n helper = global-helper\n[trace2]\n normalTarget = {}\n eventTarget = {}\n perfTarget = {}\n",
-            root.path().join("trace-normal").display(),
-            root.path().join("trace-event").display(),
-            root.path().join("trace-perf").display()
+            marker_path_for_shell(&root.path().join("trace-normal")).unwrap().to_string_lossy(),
+            marker_path_for_shell(&root.path().join("trace-event")).unwrap().to_string_lossy(),
+            marker_path_for_shell(&root.path().join("trace-perf")).unwrap().to_string_lossy()
         )).unwrap();
         std::fs::write(&misleading, "[credential]\n helper = wrong-helper\n").unwrap();
         let control = root.path().join("control-global");
@@ -528,10 +609,36 @@ mod tests {
         assert!(!root.path().join("trace-perf").exists());
     }
 
+    fn credential_output(
+        run: &TransportRun<'_>,
+        repo: &Path,
+        operation: &str,
+    ) -> Result<std::process::Output> {
+        let payload: &[u8] = if operation == "fill" {
+            b"url=https://example.invalid/repo\n\n"
+        } else {
+            b"url=https://example.invalid/repo\nusername=fixture\npassword=fixture\n\n"
+        };
+        let mut command = git_cmd();
+        run.configure(&mut command, repo);
+        command.args(["credential", operation]);
+        crate::proc::output_governed_with_input(command, "fixture credential operation", payload)
+    }
+
+    fn credential_command(
+        run: &TransportRun<'_>,
+        repo: &Path,
+        operation: &str,
+    ) -> Result<ExitStatus> {
+        run.evaluate(credential_output(run, repo, operation)?)
+    }
+
     #[test]
-    fn credential_store_inside_caller_is_refused_before_any_fetch() {
+    fn selected_caller_store_is_blocked_on_get_and_erase() {
         let caller = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(caller.path()).unwrap();
+        let private = tempfile::tempdir().unwrap();
+        git2::Repository::init(private.path()).unwrap();
         let credentials = caller.path().join(".git/credentials");
         std::fs::write(&credentials, "original-fixture\n").unwrap();
         let before = std::fs::read(&credentials).unwrap();
@@ -546,10 +653,150 @@ mod tests {
                 .unwrap()
                 .set_str("credential.helper", helper)
                 .unwrap();
-            assert!(Transport::capture(caller.path(), "https://example.invalid/repo").is_err());
+            let mut transport =
+                Transport::capture(caller.path(), "https://example.invalid/repo").unwrap();
+            assert!(
+                transport
+                    .entries
+                    .iter()
+                    .any(|(key, value)| key == "credential.helper" && value == DENY_STORE_HELPER)
+            );
+            transport
+                .entries
+                .retain(|(key, _)| !key.starts_with("credential."));
+            transport
+                .entries
+                .push(("credential.helper".into(), DENY_STORE_HELPER.into()));
+            transport.entries.push((
+                "credential.helper".into(),
+                "!f() { test \"$1\" = get && printf 'username=fixture\\npassword=fixture\\n'; }; f"
+                    .into(),
+            ));
+            for operation in ["fill", "reject"] {
+                let run = transport.begin().unwrap();
+                assert!(run.marker.path().is_absolute());
+                assert!(!run.marker.path().starts_with(caller.path()));
+                assert!(credential_command(&run, private.path(), operation).is_err());
+                assert!(run.marker.as_file().metadata().unwrap().len() > 0);
+            }
+            assert_eq!(std::fs::read(&credentials).unwrap(), before);
         }
-        assert_eq!(std::fs::read(credentials).unwrap(), before);
         assert!(!caller.path().join(".git/FETCH_HEAD").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn marker_paths_are_native_git_shell_absolute_paths() {
+        for (input, expected) in [
+            (r"C:\Temp\marker", "C:/Temp/marker"),
+            (r"\\?\C:\Temp\marker", "C:/Temp/marker"),
+            (r"\\server\share\marker", "//server/share/marker"),
+            (r"\\?\UNC\server\share\marker", "//server/share/marker"),
+        ] {
+            assert_eq!(marker_path_for_shell(Path::new(input)).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn store_outside_caller_remains_unchanged() {
+        let caller = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(caller.path()).unwrap();
+        let file = marker_path_for_shell(&external.path().join("credentials")).unwrap();
+        let helper = format!("store --file='{}'", file.to_string_lossy());
+        repo.config()
+            .unwrap()
+            .set_str("credential.helper", &helper)
+            .unwrap();
+        let transport = Transport::capture(caller.path(), "https://example.invalid/repo").unwrap();
+        assert!(
+            transport
+                .entries
+                .iter()
+                .any(|(key, value)| key == "credential.helper" && value == &helper)
+        );
+    }
+
+    #[test]
+    fn denied_store_is_detected_when_marker_write_fails_and_git_succeeds() {
+        let caller = tempfile::tempdir().unwrap();
+        git2::Repository::init(caller.path()).unwrap();
+        let private = tempfile::tempdir().unwrap();
+        git2::Repository::init(private.path()).unwrap();
+        let transport = Transport {
+            entries: vec![
+                ("credential.helper".into(), DENY_STORE_HELPER.into()),
+                ("credential.helper".into(), "!f() { test \"$1\" = get && printf 'username=fixture\\npassword=fixture\\n'; }; f".into()),
+            ],
+            caller: caller.path().to_path_buf(),
+            origin: "https://example.invalid/repo".into(),
+            empty_config: tempfile::NamedTempFile::new().unwrap(),
+        };
+        let mut run = transport.begin().unwrap();
+        run.marker_for_shell = marker_path_for_shell(caller.path()).unwrap();
+        let output = credential_output(&run, private.path(), "fill").unwrap();
+        assert!(
+            output.status.success(),
+            "the secondary fixture helper must make Git succeed"
+        );
+        assert_eq!(run.marker.as_file().metadata().unwrap().len(), 0);
+        assert!(
+            run.evaluate(output).is_err(),
+            "stderr tag must signal denial after marker write fails"
+        );
+        assert!(!caller.path().join(".git/credentials").exists());
+    }
+
+    #[test]
+    fn reset_and_unmatched_url_do_not_activate_denied_store() {
+        let caller = tempfile::tempdir().unwrap();
+        git2::Repository::init(caller.path()).unwrap();
+        let private = tempfile::tempdir().unwrap();
+        git2::Repository::init(private.path()).unwrap();
+        let fake_helper =
+            "!f() { test \"$1\" = get && printf 'username=fixture\\npassword=fixture\\n'; }; f";
+        for entries in [
+            vec![
+                ("credential.helper", DENY_STORE_HELPER),
+                ("credential.helper", ""),
+                ("credential.helper", fake_helper),
+            ],
+            vec![
+                ("credential.https://other.invalid.helper", DENY_STORE_HELPER),
+                ("credential.helper", fake_helper),
+            ],
+        ] {
+            let transport = Transport {
+                entries: entries
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect(),
+                caller: caller.path().to_path_buf(),
+                origin: "https://example.invalid/repo".into(),
+                empty_config: tempfile::NamedTempFile::new().unwrap(),
+            };
+            let run = transport.begin().unwrap();
+            assert!(
+                credential_command(&run, private.path(), "fill")
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(run.marker.as_file().metadata().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn denied_marker_does_not_garble_fetch_diagnostics() {
+        let transport = Transport {
+            entries: vec![("credential.helper".into(), DENY_STORE_HELPER.into())],
+            caller: std::path::PathBuf::new(),
+            origin: "https://example.invalid/repo".into(),
+            empty_config: tempfile::NamedTempFile::new().unwrap(),
+        };
+        assert_eq!(
+            transport.redact("fatal: connection refused"),
+            "fatal: connection refused"
+        );
     }
 
     #[test]
@@ -593,7 +840,8 @@ mod tests {
         let url = "https://fake-inline-credential@example.invalid/repo";
         let transport = Transport::capture(caller.path(), url).unwrap();
         let mut command = git_cmd();
-        transport.configure(&mut command, private.path());
+        let run = transport.begin().unwrap();
+        run.configure(&mut command, private.path());
         assert!(
             !command
                 .get_args()
@@ -652,12 +900,12 @@ mod tests {
         let included = caller.path().join("headers.inc");
         std::fs::write(&included, "[http]\n extraHeader = X-Old: rejected\n extraHeader =\n extraHeader = X-Fixture: fake-token-value\n").unwrap();
         let mut config = caller_repo.config().unwrap();
-        let gitdir = caller_repo.path();
+        let gitdir = marker_path_for_shell(caller_repo.path()).unwrap();
         config
             .set_str(
                 &format!(
                     "includeIf.gitdir:{}.path",
-                    gitdir.display().to_string().trim_end_matches('/')
+                    gitdir.to_string_lossy().trim_end_matches('/')
                 ),
                 included.to_str().unwrap(),
             )
@@ -701,14 +949,10 @@ mod tests {
         assert!(!caller_status.success());
         let transport = Transport::capture(caller.path(), &url).unwrap();
         let mut command = git_cmd();
-        transport.configure(&mut command, private.path());
+        let run = transport.begin().unwrap();
+        run.configure(&mut command, private.path());
         command.args(["fetch", "--quiet", "origin"]);
-        assert!(
-            !transport
-                .run(command, "fixture HTTP fetch")
-                .unwrap()
-                .success()
-        );
+        assert!(!run.run(command, "fixture HTTP fetch").unwrap().success());
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
         for request in requests {
@@ -721,6 +965,68 @@ mod tests {
                 "reset header survived"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_fetch_does_not_invoke_http_credential_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let caller = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let upstream = tempfile::tempdir().unwrap();
+        let source = git2::Repository::init(caller.path()).unwrap();
+        let destination = git2::Repository::init(private.path()).unwrap();
+        git2::Repository::init_bare(upstream.path()).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let tree_id = source.treebuilder(None).unwrap().write().unwrap();
+        let tree = source.find_tree(tree_id).unwrap();
+        source
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        assert!(
+            git_cmd()
+                .args(["-c", "core.hooksPath=", "push", "--quiet"])
+                .arg(upstream.path())
+                .arg("HEAD:refs/heads/main")
+                .current_dir(caller.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let ssh = caller.path().join("fixture-ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nexec git-upload-pack \"{}\"\n",
+                upstream.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let url = "ssh://fixture.invalid/repo";
+        source.remote("origin", url).unwrap();
+        destination.remote("origin", url).unwrap();
+        let mut config = source.config().unwrap();
+        config.set_str("core.sshCommand", "./fixture-ssh").unwrap();
+        config.set_str("ssh.variant", "simple").unwrap();
+        config
+            .set_str("credential.helper", "store --file=.git/credentials")
+            .unwrap();
+        let transport = Transport::capture(caller.path(), url).unwrap();
+        let run = transport.begin().unwrap();
+        let mut command = git_cmd();
+        run.configure(&mut command, private.path());
+        command
+            .env_remove("GIT_SSH_COMMAND")
+            .args(["fetch", "--quiet", "origin"]);
+        assert!(run.run(command, "fixture SSH fetch").unwrap().success());
+        assert_eq!(run.marker.as_file().metadata().unwrap().len(), 0);
+        assert!(!caller.path().join(".git/credentials").exists());
+        assert!(
+            destination
+                .find_reference("refs/remotes/origin/main")
+                .is_ok()
+        );
     }
 
     #[cfg(unix)]
@@ -767,6 +1073,11 @@ mod tests {
             .unwrap()
             .set_str("remote.origin.uploadpack", "./upload-wrapper")
             .unwrap();
+        caller_repo
+            .config()
+            .unwrap()
+            .set_str("credential.helper", "store --file=.git/credentials")
+            .unwrap();
         let status = git_cmd()
             .args(["fetch", "--quiet", "origin"])
             .current_dir(caller.path())
@@ -793,9 +1104,10 @@ mod tests {
         );
         let transport = Transport::capture(caller.path(), virtual_path.to_str().unwrap()).unwrap();
         let mut command = git_cmd();
-        transport.configure(&mut command, private.path());
+        let run = transport.begin().unwrap();
+        run.configure(&mut command, private.path());
         command.args(["fetch", "--quiet", "origin"]);
-        assert!(transport.run(command, "fixture fetch").unwrap().success());
+        assert!(run.run(command, "fixture fetch").unwrap().success());
         assert_eq!(
             private_repo
                 .find_reference("refs/remotes/origin/main")
@@ -814,5 +1126,6 @@ mod tests {
             std::fs::read(caller.path().join(".git/FETCH_HEAD")).unwrap(),
             caller_fetch_head
         );
+        assert!(!caller.path().join(".git/credentials").exists());
     }
 }

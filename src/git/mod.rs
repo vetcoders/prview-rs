@@ -256,8 +256,9 @@ impl Repository {
         if !config.do_fetch || self.inner.find_remote("origin").is_err() {
             return Ok(());
         }
+        let transport = transport.map(transport::Transport::begin).transpose()?;
         let configure = |command: &mut std::process::Command| {
-            if let Some(transport) = transport {
+            if let Some(transport) = &transport {
                 transport.configure(command, &self.path);
             } else {
                 command.current_dir(&self.path);
@@ -267,7 +268,7 @@ impl Repository {
         let mut fetch_origin = git_cmd();
         configure(&mut fetch_origin);
         fetch_origin.args(["fetch", "--quiet", "--prune", "origin"]);
-        let fetch_origin = if let Some(transport) = transport {
+        let fetch_origin = if let Some(transport) = &transport {
             transport.run(fetch_origin, "git fetch origin")?
         } else {
             crate::proc::spawn_wait_governed(fetch_origin, "git fetch origin")
@@ -284,7 +285,7 @@ impl Repository {
             configure(&mut fetch_pr);
             fetch_pr.args(["fetch", "--quiet", "origin", &pr_ref]);
             let label = format!("git fetch PR #{pr_number}");
-            let fetch_pr = if let Some(transport) = transport {
+            let fetch_pr = if let Some(transport) = &transport {
                 transport.run(fetch_pr, &label)?
             } else {
                 crate::proc::spawn_wait_governed(fetch_pr, &label)

@@ -4905,10 +4905,13 @@ without fetch.
 The owned fetch runs from the caller directory for relative transport commands
 but explicitly targets the owned Git directory and worktree. Trusted helpers
 and commands can have external effects; this is not a host filesystem sandbox.
-The built-in credential-store helper is refused if its configured or default
-files resolve inside the caller worktree, Git directory or common directory;
-uninterpretable store options are refused. Cookie saving for the origin is
-refused because it can write to the caller. For a credential-bearing or
+The built-in credential-store helper is replaced by an inert marker when its
+configured or default files resolve inside the caller worktree, Git directory
+or common directory, or when its options cannot be interpreted safely. Git
+still selects helpers by URL and applies ordered resets; only invocation of
+the marker fails the review, even if the fetch itself succeeded. Objects and
+refs fetched before that failure remain confined to the owned repository. Cookie
+saving for the origin is refused because it can write to the caller. For a credential-bearing or
 query-bearing HTTP origin, a configured cookie-saving policy cannot be safely
 inspected and is refused. Non-UTF-8 admitted settings are refused. Replayed
 transport configuration values are not placed in arguments, repository config,
