@@ -7,6 +7,7 @@ use std::process::{Command, ExitStatus};
 pub(crate) struct Transport {
     entries: Vec<(String, String)>,
     caller: std::path::PathBuf,
+    origin: String,
     empty_config: tempfile::NamedTempFile,
 }
 
@@ -181,6 +182,7 @@ impl Transport {
         let transport = Self {
             entries,
             caller: caller.to_path_buf(),
+            origin: origin.to_owned(),
             empty_config: tempfile::NamedTempFile::new()?,
         };
         transport.validate_cookie_policy(origin)?;
@@ -268,11 +270,35 @@ impl Transport {
     fn redact(&self, message: &str) -> String {
         let mut message = message.to_owned();
         let mut secrets = Vec::new();
+        fn url_credentials(url: &str) -> Vec<&str> {
+            let Some((_, rest)) = url.split_once("://") else {
+                return Vec::new();
+            };
+            let authority = rest.split('/').next().unwrap_or("");
+            let Some((userinfo, _)) = authority.rsplit_once('@') else {
+                return Vec::new();
+            };
+            userinfo
+                .split(':')
+                .filter(|part| !part.is_empty())
+                .collect()
+        }
+        secrets.extend(url_credentials(&self.origin));
         for (key, value) in &self.entries {
             let lower = key.to_ascii_lowercase();
+            if lower.starts_with("http.") {
+                secrets.extend(url_credentials(key));
+            }
             if lower.ends_with(".extraheader")
                 || lower.contains("proxy")
                 || lower.starts_with("credential.")
+                || matches!(
+                    lower.as_str(),
+                    "core.sshcommand"
+                        | "core.askpass"
+                        | "remote.origin.uploadpack"
+                        | "remote.origin.vcs"
+                )
             {
                 if !value.is_empty() {
                     secrets.push(value.as_str());
@@ -457,6 +483,38 @@ mod tests {
         assert!(Transport::capture(caller.path(), "https://example.invalid/repo").is_err());
         assert_eq!(std::fs::read(credentials).unwrap(), before);
         assert!(!caller.path().join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn failure_diagnostics_redact_url_and_ssh_credentials() {
+        let transport = Transport {
+            entries: vec![
+                (
+                    "http.https://fakeuser:fakekey@example.invalid/.extraheader".into(),
+                    "X-Token: fakeheader".into(),
+                ),
+                (
+                    "core.sshcommand".into(),
+                    "ssh --password=fakesshpass".into(),
+                ),
+            ],
+            caller: std::path::PathBuf::new(),
+            origin: "https://originuser:originpass@example.invalid/repo".into(),
+            empty_config: tempfile::NamedTempFile::new().unwrap(),
+        };
+        let error = transport
+            .redact("fakeuser fakekey fakeheader fakesshpass originuser originpass network failed");
+        for secret in [
+            "fakeuser",
+            "fakekey",
+            "fakeheader",
+            "fakesshpass",
+            "originuser",
+            "originpass",
+        ] {
+            assert!(!error.contains(secret));
+        }
+        assert!(error.contains("network failed"));
     }
 
     #[test]
