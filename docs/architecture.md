@@ -4910,11 +4910,13 @@ files resolve inside the caller worktree, Git directory or common directory;
 uninterpretable store options are refused. Cookie saving for the origin is
 refused because it can write to the caller. For a credential-bearing or
 query-bearing HTTP origin, a configured cookie-saving policy cannot be safely
-inspected and is refused. Non-UTF-8 admitted settings are refused. Transport
-values are not placed in arguments, repository config, review artifacts or
-diagnostic command labels; they exist in the fetch child environment and are
-not protected from other processes of the same user. Git tracing is disabled
-for discovery and owned fetch; failure diagnostics redact known transport
+inspected and is refused. Non-UTF-8 admitted settings are refused. Replayed
+transport configuration values are not placed in arguments, repository config,
+review artifacts or diagnostic command labels; they exist in the fetch child
+environment and are not protected from other processes of the same user. The
+origin URL is still stored in the owned repository and may appear in artifact
+metadata; inline credentials in that URL have not been removed by this change.
+Git tracing is disabled for discovery and owned fetch; failure diagnostics redact known transport
 values. Arbitrary output from trusted helpers is not a confidentiality boundary.
 Remote setup explicitly rejects an origin URL that is not valid UTF-8,
 including with `--no-fetch`, because this transport path cannot preserve it

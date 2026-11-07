@@ -19,6 +19,10 @@ fn remove_tracing(command: &mut Command) {
             command.env_remove(key);
         }
     }
+    command
+        .env("GIT_TRACE2", "0")
+        .env("GIT_TRACE2_EVENT", "0")
+        .env("GIT_TRACE2_PERF", "0");
 }
 
 fn admitted(key: &str) -> bool {
@@ -53,10 +57,26 @@ fn validate_store_paths(caller: &Path, entries: &[(String, String)]) -> Result<(
             continue;
         }
         let trimmed = helper.trim();
-        if trimmed != "store" && !trimmed.starts_with("store ") && !trimmed.starts_with("store\t") {
+        if trimmed.starts_with('!') {
             continue;
         }
-        let parts = shlex::split(trimmed).context("cannot interpret credential-store options")?;
+        let Some(parts) = shlex::split(trimmed) else {
+            ensure!(
+                !trimmed.contains("store"),
+                "cannot interpret credential-store options"
+            );
+            continue;
+        };
+        let Some(program) = parts.first() else {
+            continue;
+        };
+        let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+        if !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "store" | "git-credential-store" | "git-credential-store.exe"
+        ) {
+            continue;
+        }
         let mut paths = Vec::new();
         match parts.as_slice() {
             [_] => {
@@ -200,7 +220,7 @@ impl Transport {
         let (scheme, rest) = origin.split_once("://").expect("known scheme");
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         ensure!(
-            !authority.contains('@') && !path.contains(['?', '#']),
+            !authority.contains('@') && !origin.contains(['?', '#']),
             "cannot safely inspect cookie policy for a credential-bearing origin URL"
         );
         let url = format!("{scheme}://{authority}/{path}");
@@ -430,6 +450,8 @@ mod tests {
                     .get_args()
                     .any(|v| v.to_string_lossy().contains("fake-sentinel"))
             );
+            command.args(["config", "--get", "core.bare"]);
+            assert!(command.output().unwrap().status.success());
             assert!(!root.join("trace").exists());
             assert!(!root.join("trace2").exists());
             return;
@@ -442,8 +464,42 @@ mod tests {
         git2::Repository::init(root.path().join("private")).unwrap();
         let global = root.path().join("global");
         let misleading = root.path().join("misleading");
-        std::fs::write(&global, "[credential]\n helper = global-helper\n").unwrap();
+        std::fs::write(&global, format!(
+            "[credential]\n helper = global-helper\n[trace2]\n normalTarget = {}\n eventTarget = {}\n perfTarget = {}\n",
+            root.path().join("trace-normal").display(),
+            root.path().join("trace-event").display(),
+            root.path().join("trace-perf").display()
+        )).unwrap();
         std::fs::write(&misleading, "[credential]\n helper = wrong-helper\n").unwrap();
+        let control = root.path().join("control-global");
+        std::fs::write(
+            &control,
+            format!(
+                "[trace2]\n normalTarget = {}\n eventTarget = {}\n perfTarget = {}\n",
+                root.path().join("control-normal").display(),
+                root.path().join("control-event").display(),
+                root.path().join("control-perf").display()
+            ),
+        )
+        .unwrap();
+        let control_status = git_cmd()
+            .current_dir(root.path().join("caller"))
+            .env("GIT_CONFIG_GLOBAL", control)
+            .env_remove("GIT_TRACE2")
+            .env_remove("GIT_TRACE2_EVENT")
+            .env_remove("GIT_TRACE2_PERF")
+            .args(["config", "--list"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(control_status.success());
+        for name in ["control-normal", "control-event", "control-perf"] {
+            assert!(
+                root.path().join(name).exists(),
+                "trace control did not create {name}"
+            );
+        }
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "git::transport::tests::discovery_respects_command_auth_but_not_git_config_or_traces"])
             .env("PRVIEW_TRANSPORT_CHILD", root.path())
@@ -467,6 +523,9 @@ mod tests {
         assert!(!String::from_utf8_lossy(&result.stderr).contains("fake-sentinel"));
         assert!(!root.path().join("trace").exists());
         assert!(!root.path().join("trace2").exists());
+        assert!(!root.path().join("trace-normal").exists());
+        assert!(!root.path().join("trace-event").exists());
+        assert!(!root.path().join("trace-perf").exists());
     }
 
     #[test]
@@ -476,11 +535,19 @@ mod tests {
         let credentials = caller.path().join(".git/credentials");
         std::fs::write(&credentials, "original-fixture\n").unwrap();
         let before = std::fs::read(&credentials).unwrap();
-        repo.config()
-            .unwrap()
-            .set_str("credential.helper", "store --file=.git/credentials")
-            .unwrap();
-        assert!(Transport::capture(caller.path(), "https://example.invalid/repo").is_err());
+        for helper in [
+            "store --file=.git/credentials",
+            "\"store\" --file=.git/credentials",
+            "st\\ore --file=.git/credentials",
+            "/usr/bin/git-credential-store --file=.git/credentials",
+            "C:/Git/bin/git-credential-store.exe --file=.git/credentials",
+        ] {
+            repo.config()
+                .unwrap()
+                .set_str("credential.helper", helper)
+                .unwrap();
+            assert!(Transport::capture(caller.path(), "https://example.invalid/repo").is_err());
+        }
         assert_eq!(std::fs::read(credentials).unwrap(), before);
         assert!(!caller.path().join(".git/FETCH_HEAD").exists());
     }
@@ -541,6 +608,17 @@ mod tests {
             Err(error) => error,
         };
         assert!(!format!("{error:#}").contains("fake-inline-credential"));
+        for url in [
+            "https://example.invalid?token=fake-query",
+            "https://example.invalid#fake-fragment",
+        ] {
+            let error = match Transport::capture(caller.path(), url) {
+                Ok(_) => panic!("query or fragment URL with cookie config must be refused"),
+                Err(error) => error,
+            };
+            assert!(!format!("{error:#}").contains("fake-query"));
+            assert!(!format!("{error:#}").contains("fake-fragment"));
+        }
     }
 
     #[test]
