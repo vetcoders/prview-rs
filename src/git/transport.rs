@@ -126,7 +126,8 @@ fn validate_store_paths(caller: &Path, entries: &[(String, String)]) -> Result<(
             let raw = path.to_string_lossy();
             ensure!(
                 !raw.is_empty()
-                    && !raw.contains(['$', '`', '*', '?', '~', ';', '|', '&', '<', '>']),
+                    && !raw.starts_with('~')
+                    && !raw.contains(['$', '`', '*', '?', ';', '|', '&', '<', '>']),
                 "cannot safely interpret credential-store path"
             );
             let path = if path.is_absolute() {
@@ -557,9 +558,15 @@ mod tests {
             &control,
             format!(
                 "[trace2]\n normalTarget = {}\n eventTarget = {}\n perfTarget = {}\n",
-                root.path().join("control-normal").display(),
-                root.path().join("control-event").display(),
-                root.path().join("control-perf").display()
+                marker_path_for_shell(&root.path().join("control-normal"))
+                    .unwrap()
+                    .to_string_lossy(),
+                marker_path_for_shell(&root.path().join("control-event"))
+                    .unwrap()
+                    .to_string_lossy(),
+                marker_path_for_shell(&root.path().join("control-perf"))
+                    .unwrap()
+                    .to_string_lossy()
             ),
         )
         .unwrap();
@@ -698,6 +705,39 @@ mod tests {
     }
 
     #[test]
+    fn store_path_allows_literal_short_name_but_preserves_caller_guard() {
+        let caller = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        git2::Repository::init(caller.path()).unwrap();
+        let inside = caller.path().join("RUNNER~1");
+        let outside = external.path().join("RUNNER~1");
+        std::fs::create_dir(&inside).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        for (directory, allowed) in [(inside, false), (outside, true)] {
+            let path = marker_path_for_shell(&directory.join("credentials")).unwrap();
+            let helper = format!("store --file='{}'", path.to_string_lossy());
+            let result =
+                validate_store_paths(caller.path(), &[("credential.helper".into(), helper)]);
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "literal short-name path classification: {result:?}"
+            );
+        }
+        let result = validate_store_paths(
+            caller.path(),
+            &[(
+                "credential.helper".into(),
+                "store --file=~/credentials".into(),
+            )],
+        );
+        assert!(
+            result.is_err(),
+            "unresolved home expansion must remain denied"
+        );
+    }
+
+    #[test]
     fn store_outside_caller_remains_unchanged() {
         let caller = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
@@ -708,12 +748,35 @@ mod tests {
             .unwrap()
             .set_str("credential.helper", &helper)
             .unwrap();
+        let validation = validate_store_paths(
+            caller.path(),
+            &[("credential.helper".into(), helper.clone())],
+        );
+        assert!(
+            validation.is_ok(),
+            "external fixture store unexpectedly rejected: {validation:?}"
+        );
+        let output = git_cmd()
+            .current_dir(caller.path())
+            .env_remove("GIT_CONFIG")
+            .args(["config", "--local", "--get", "credential.helper"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim_end_matches(['\r', '\n']),
+            helper,
+            "fixture helper changed during native Git config round-trip"
+        );
         let transport = Transport::capture(caller.path(), "https://example.invalid/repo").unwrap();
         assert!(
             transport
                 .entries
                 .iter()
-                .any(|(key, value)| key == "credential.helper" && value == &helper)
+                .any(|(key, value)| key == "credential.helper" && value == &helper),
+            "external fixture store was changed during snapshot"
         );
     }
 
@@ -917,6 +980,7 @@ mod tests {
             while requests.len() < 2 && std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                             .unwrap();
@@ -928,7 +992,14 @@ mod tests {
                                 break;
                             }
                             request.extend_from_slice(&buf[..n]);
+                            assert!(
+                                request.len() <= 65_536,
+                                "HTTP fixture request exceeds limit"
+                            );
                         }
+                        stream
+                            .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+                            .unwrap();
                         stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                         requests.push(String::from_utf8_lossy(&request).to_ascii_lowercase());
                     }
