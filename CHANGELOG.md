@@ -316,6 +316,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Update transitive `ctutils` to 0.4.4 and `libz-sys` to 1.1.31 to address
+  RUSTSEC-2026-0385 and RUSTSEC-2026-0418 without adding advisory exceptions.
+
 - Exact reviews now derive their check set and reported project profile from
   the pinned target tree. A dirty operator checkout can no longer hide JS,
   Python, or Rust checks by removing local project markers; ordinary local
