@@ -316,6 +316,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Remote reviews use an independently owned Git repository before ref refresh,
+  check planning and TUI preflight. Existing agent worktrees and concurrent
+  caller edits stay outside execution, while caller provenance and concrete
+  output protections are retained. This is not a host filesystem sandbox.
+- Report and merge-gate schema 3.2 distinguish requested security from recorded
+  execution, test-change matching from runtime coverage, and repository-wide
+  Loctree count deltas from finding identity. Coverage trends identify the
+  previous run supplying their metric without changing legacy policy semantics.
+
 - Exact reviews now derive their check set and reported project profile from
   the pinned target tree. A dirty operator checkout can no longer hide JS,
   Python, or Rust checks by removing local project markers; ordinary local
