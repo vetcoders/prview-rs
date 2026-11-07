@@ -67,6 +67,7 @@ fn admitted(key: &str) -> bool {
                 | "ssh.variant"
                 | "remote.origin.proxy"
                 | "remote.origin.proxyauthmethod"
+                | "remote.origin.tagopt"
                 | "remote.origin.uploadpack"
                 | "remote.origin.vcs"
         )

@@ -1727,6 +1727,82 @@ mod tests {
     }
 
     #[test]
+    fn origin_tag_option_controls_orphan_and_reachable_tags_in_owned_fetch() {
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let upstream_path = home.path().join("tag-upstream.git");
+        let upstream = git2::Repository::init_bare(&upstream_path).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let blob = upstream.blob(b"orphan release content").unwrap();
+        let mut builder = upstream.treebuilder(None).unwrap();
+        builder.insert("orphan.txt", blob, 0o100644).unwrap();
+        let tree = upstream.find_tree(builder.write().unwrap()).unwrap();
+        let orphan = upstream
+            .commit(None, &signature, &signature, "orphan", &tree, &[])
+            .unwrap();
+        upstream
+            .reference("refs/tags/orphan-release", orphan, true, "fixture")
+            .unwrap();
+        assert!(
+            git_cmd()
+                .args(["-c", "core.hooksPath=", "push", "--quiet"])
+                .arg(&upstream_path)
+                .arg("HEAD:refs/heads/main")
+                .current_dir(caller.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let caller_repo = git2::Repository::open(caller.path()).unwrap();
+        let head = caller_repo.head().unwrap().peel_to_commit().unwrap().id();
+        upstream
+            .reference("refs/tags/reachable-release", head, true, "fixture")
+            .unwrap();
+        caller_repo
+            .remote("origin", upstream_path.to_str().unwrap())
+            .unwrap();
+        config.do_fetch = true;
+        for (option, tags_present) in [("--tags", true), ("--no-tags", false)] {
+            caller_repo
+                .config()
+                .unwrap()
+                .set_str("remote.origin.tagOpt", option)
+                .unwrap();
+            let caller_config = std::fs::read(caller_repo.path().join("config")).unwrap();
+            let workspace = IndependentReview::create(&config).unwrap();
+            let owned = crate::git::Repository::open(&workspace.repo_root).unwrap();
+            owned
+                .prepare_refs_with_transport(
+                    &workspace.config(&config).unwrap(),
+                    workspace.transport.as_ref(),
+                )
+                .unwrap();
+            let copied = git2::Repository::open(&workspace.repo_root).unwrap();
+            for tag in ["refs/tags/orphan-release", "refs/tags/reachable-release"] {
+                assert_eq!(
+                    copied.find_reference(tag).is_ok(),
+                    tags_present,
+                    "origin tagOpt {option} must govern {tag}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(caller_repo.path().join("config")).unwrap(),
+                caller_config
+            );
+            assert!(
+                caller_repo
+                    .find_reference("refs/tags/orphan-release")
+                    .is_err()
+            );
+            assert!(
+                caller_repo
+                    .find_reference("refs/tags/reachable-release")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn absent_origin_fetch_mapping_does_not_gain_a_default_mapping() {
         let (caller, home, config) = crate::checks::caller_guard_tests::fixture();
         let _home = crate::config::override_test_prview_home(home.path());

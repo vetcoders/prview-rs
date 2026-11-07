@@ -4903,7 +4903,8 @@ empty mapping, retain their meaning. When fetch is enabled, the same workspace
 captures the caller's effective Git transport configuration at origin setup,
 including includes, conditional includes, worktree and command-scope entries.
 Only HTTP, credential and protocol settings, core SSH/proxy/askpass, SSH variant,
-and the origin proxy, proxy-auth, upload-pack and VCS settings are admitted.
+and the origin proxy, proxy-auth, tag policy, upload-pack and VCS settings are
+admitted.
 Each fetch receives this snapshot through its child environment, with ambient
 system/global Git config replaced by empty config. Other caller config, hooks,
 includes and URL rewrites are not imported. Git still interprets URL-specific
