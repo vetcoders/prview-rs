@@ -4904,7 +4904,14 @@ captures the caller's effective Git transport configuration at origin setup,
 including includes, conditional includes, worktree and command-scope entries.
 Only HTTP, credential and protocol settings, core SSH/proxy/askpass, SSH variant,
 and the origin proxy, proxy-auth, tag policy, upload-pack and VCS settings are
-admitted.
+admitted. Tag policy includes `remote.origin.tagOpt`,
+`remote.origin.pruneTags` and `fetch.pruneTags`. Both pruning settings are
+replayed so Git retains its native precedence: an explicit origin value
+overrides `fetch.pruneTags`, including `false`. The owned origin fetch uses
+`--prune`; when tag pruning is enabled it deletes copied tags absent upstream.
+Changed tags retain Git's normal refspec rules (Git 2.20+ rejects replacement
+without a forced tag refspec); PrView does not add `--force`. With `--no-fetch`,
+copied tags are left unchanged.
 Each fetch receives this snapshot through its child environment, with ambient
 system/global Git config replaced by empty config. Other caller config, hooks,
 includes and URL rewrites are not imported. Git still interprets URL-specific

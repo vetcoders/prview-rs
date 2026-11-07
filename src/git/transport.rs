@@ -68,6 +68,8 @@ fn admitted(key: &str) -> bool {
                 | "remote.origin.proxy"
                 | "remote.origin.proxyauthmethod"
                 | "remote.origin.tagopt"
+                | "remote.origin.prunetags"
+                | "fetch.prunetags"
                 | "remote.origin.uploadpack"
                 | "remote.origin.vcs"
         )
@@ -434,6 +436,173 @@ impl TransportRun<'_> {
 mod tests {
     use super::*;
     use crate::git::git_cmd;
+    use crate::review_workspace::IndependentReview;
+    use std::path::PathBuf;
+
+    #[test]
+    fn origin_prune_tags_policy_matches_native_fetch() {
+        if std::env::var_os("PRVIEW_PRUNE_TAGS_CHILD").is_none() {
+            let empty = tempfile::NamedTempFile::new().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            for (key, _) in std::env::vars_os() {
+                let upper = key.to_string_lossy().to_ascii_uppercase();
+                if upper == "GIT_CONFIG" || upper.starts_with("GIT_CONFIG_") {
+                    child.env_remove(key);
+                }
+            }
+            assert!(
+                child
+                    .args([
+                        "--exact",
+                        "git::transport::tests::origin_prune_tags_policy_matches_native_fetch",
+                        "--nocapture",
+                    ])
+                    .env("PRVIEW_PRUNE_TAGS_CHILD", "1")
+                    .env("GIT_CONFIG_GLOBAL", empty.path())
+                    .env("GIT_CONFIG_SYSTEM", empty.path())
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+        for (changed, do_fetch) in [(false, true), (true, true), (true, false)] {
+            assert_prune_tags_policy(changed, do_fetch);
+        }
+    }
+
+    fn assert_prune_tags_policy(changed: bool, do_fetch: bool) {
+        // Snapshot every caller file, including objects, refs, config and index.
+        fn files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            let mut result = std::collections::BTreeMap::new();
+            for entry in walkdir::WalkDir::new(root) {
+                let entry = entry.unwrap();
+                if entry.file_type().is_file() {
+                    result.insert(
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+            result
+        }
+
+        for (fetch_policy, origin_policy, prune) in [
+            (None, None, false),
+            (Some(false), None, false),
+            (None, Some(false), false),
+            (Some(true), None, true),
+            (None, Some(true), true),
+            (Some(true), Some(false), false),
+            (Some(false), Some(true), true),
+            (Some(false), Some(false), false),
+        ] {
+            let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+            let _home = crate::config::override_test_prview_home(home.path());
+            let source = git2::Repository::open(caller.path()).unwrap();
+            let old = source.head().unwrap().target().unwrap();
+            let upstream_path = home.path().join("upstream.git");
+            let upstream = git2::Repository::init_bare(&upstream_path).unwrap();
+            assert!(
+                git_cmd()
+                    .args(["-c", "core.hooksPath=", "push", "--quiet"])
+                    .arg(&upstream_path)
+                    .arg("HEAD:refs/heads/main")
+                    .current_dir(caller.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let parent = upstream.find_commit(old).unwrap();
+            let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+            let new = upstream
+                .commit(
+                    Some("refs/heads/main"),
+                    &signature,
+                    &signature,
+                    "upstream advances",
+                    &parent.tree().unwrap(),
+                    &[&parent],
+                )
+                .unwrap();
+            source
+                .remote("origin", upstream_path.to_str().unwrap())
+                .unwrap();
+            source
+                .reference("refs/tags/stale", old, true, "fixture")
+                .unwrap();
+            if changed {
+                source
+                    .reference("refs/tags/moved", old, true, "fixture")
+                    .unwrap();
+                upstream
+                    .reference("refs/tags/moved", new, true, "fixture")
+                    .unwrap();
+            }
+
+            // A separate native Git checkout is the oracle; never fetch in caller.
+            let native_path = home.path().join("native");
+            let native =
+                git2::Repository::clone(caller.path().to_str().unwrap(), &native_path).unwrap();
+            native
+                .remote_set_url("origin", upstream_path.to_str().unwrap())
+                .unwrap();
+            for repo in [&source, &native] {
+                let mut settings = repo.config().unwrap();
+                for (key, value) in [
+                    ("fetch.pruneTags", fetch_policy),
+                    ("remote.origin.pruneTags", origin_policy),
+                ] {
+                    if let Some(value) = value {
+                        settings.set_bool(key, value).unwrap();
+                    }
+                }
+            }
+            let before = files(caller.path());
+            config.do_fetch = do_fetch;
+            let workspace = IndependentReview::create(&config).unwrap();
+            let native_ok = if do_fetch {
+                git_cmd()
+                    .current_dir(&native_path)
+                    .args(["fetch", "--quiet", "--prune", "origin"])
+                    .status()
+                    .unwrap()
+                    .success()
+            } else {
+                true
+            };
+            let owned_ok = crate::git::Repository::open(&workspace.repo_root)
+                .unwrap()
+                .prepare_refs_with_transport(
+                    &workspace.config(&config).unwrap(),
+                    workspace.transport.as_ref(),
+                )
+                .is_ok();
+            let label = format!(
+                "fetch={fetch_policy:?}, origin={origin_policy:?}, changed={changed}, do_fetch={do_fetch}"
+            );
+            assert_eq!(native_ok, !(do_fetch && prune && changed), "native {label}");
+            assert_eq!(files(caller.path()), before, "caller unchanged: {label}");
+            assert_eq!(owned_ok, native_ok, "fetch status: {label}");
+            let owned = git2::Repository::open(&workspace.repo_root).unwrap();
+            for repo in [&native, &owned] {
+                assert_eq!(
+                    repo.find_reference("refs/tags/stale").is_err(),
+                    do_fetch && prune,
+                    "stale tag: {label}"
+                );
+                if changed {
+                    // Git >=2.20 rejects a moved tag without a forced tag refspec.
+                    assert_eq!(
+                        repo.find_reference("refs/tags/moved").unwrap().target(),
+                        Some(old),
+                        "moved tag: {label}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn captures_included_multivars_and_never_imports_unrelated_config() {

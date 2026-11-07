@@ -1459,7 +1459,12 @@ its previous behavior. `00_summary/EXECUTION_ROOTS.json` shows the actual roots.
 When remote fetching is enabled, the workspace captures the origin and an
 allowlisted snapshot of the caller's Git transport settings together; retained
 sessions keep that snapshot, and enabling fetch after creating a workspace
-without it requires a new review. If Git selects a credential-store helper
+without it requires a new review. This includes origin tag selection and tag
+pruning: `remote.origin.pruneTags` overrides `fetch.pruneTags`, including an
+explicit `false`. Enabled pruning removes stale tags in the private repository;
+changed tags follow Git's normal refspec rules and can fail the fetch rather
+than being overwritten. `--no-fetch` leaves copied tags unchanged.
+If Git selects a credential-store helper
 whose destination is inside the caller or cannot be determined safely, the
 review fails; it also refuses cookie saving for the origin. Default credential
 store locations depend on HOME and XDG settings, and Windows HOME fallback
