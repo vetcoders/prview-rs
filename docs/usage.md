@@ -1456,5 +1456,16 @@ skip/error rather than scanning the live checkout. Put `PRVIEW_HOME`, explicit
 `--output-dir`, Cargo build cache and uv environment roots outside the caller.
 Internal write overrides are refused in remote mode; local ambient mode keeps
 its previous behavior. `00_summary/EXECUTION_ROOTS.json` shows the actual roots.
-This separation is not a host filesystem sandbox or a guarantee against arbitrary
-absolute writes by project tests/plugins.
+When remote fetching is enabled, the workspace captures the origin and an
+allowlisted snapshot of the caller's Git transport settings together; retained
+sessions keep that snapshot, and enabling fetch after creating a workspace
+without it requires a new review. If Git selects a credential-store helper
+whose destination is inside the caller or cannot be determined safely, the
+review fails; it also refuses cookie saving for the origin. Default credential
+store locations depend on HOME and XDG settings, and Windows HOME fallback
+compatibility is not guaranteed. See
+[remote review repository ownership](architecture.md#remote-review-repository-ownership)
+for the supported settings and details.
+
+This separation is not a host filesystem sandbox: trusted custom transport
+helpers, project tests and plugins can perform arbitrary external writes.

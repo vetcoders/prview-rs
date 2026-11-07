@@ -4907,8 +4907,10 @@ but explicitly targets the owned Git directory and worktree. Trusted helpers
 and commands can have external effects; this is not a host filesystem sandbox.
 The built-in credential-store helper is replaced by an inert marker when its
 configured or default files resolve inside the caller worktree, Git directory
-or common directory, or when its options cannot be interpreted safely. Git
-still selects helpers by URL and applies ordered resets; only invocation of
+or common directory, or when its options or default locations cannot be
+interpreted safely. In particular, an unset HOME does not use Git's complete
+platform-specific fallback behavior; Windows compatibility for that case is
+not guaranteed. Git still selects helpers by URL and applies ordered resets; only invocation of
 the marker fails the review, even if the fetch itself succeeded. Objects and
 refs fetched before that failure remain confined to the owned repository. Cookie
 saving for the origin is refused because it can write to the caller. For a credential-bearing or
