@@ -671,7 +671,7 @@ fn initialize_state(state: &mut TuiState) -> Result<Option<Arc<ReviewSession>>> 
     let repo = &app.repo;
 
     // Refresh refs (honours --no-fetch / local-only / remote-only)
-    repo.prepare_refs(&app.config)?;
+    app.prepare_refs()?;
 
     // Populate branch list for wizard
     if let Ok(branch_list) = repo.list_branches() {
@@ -811,7 +811,7 @@ async fn run_analysis_with_workspace(
         let worktree_status_digest = worktree.status_digest;
         let worktree_dirty_paths = worktree.dirty_paths;
         let worktree_head_sha = worktree.head_sha;
-        app.repo.prepare_refs(&app.config)?;
+        app.prepare_refs()?;
         let target = app.repo.resolve_target(&app.config)?;
         let bases = app.repo.resolve_bases(&app.config)?;
         let diff_bases = app.repo.resolve_diff_bases(&app.config, &target, &bases);

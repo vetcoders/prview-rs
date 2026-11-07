@@ -195,6 +195,21 @@ impl App {
         self.review_in_workspace(workspace).map(Some)
     }
 
+    pub(crate) fn prepare_refs(&self) -> Result<()> {
+        if let Some(workspace) = &self.execution_repo {
+            anyhow::ensure!(
+                !self.config.do_fetch || !workspace.origin_present || workspace.transport.is_some(),
+                "retained remote review was created without fetch; start a new review to enable fetch"
+            );
+        }
+        self.repo.prepare_refs_with_transport(
+            &self.config,
+            self.execution_repo
+                .as_ref()
+                .and_then(|workspace| workspace.transport.as_ref()),
+        )
+    }
+
     pub(crate) fn review_in_workspace(
         &self,
         workspace: std::sync::Arc<review_workspace::IndependentReview>,
@@ -270,7 +285,7 @@ impl App {
                 // tree read of the run, before ref refresh, checks, or artifacts.
                 let worktree = self.operator_worktree_provenance();
                 self.ensure_not_cancelled()?;
-                self.repo.prepare_refs(&self.config)?;
+                self.prepare_refs()?;
                 self.ensure_not_cancelled()?;
 
                 let target = self.repo.resolve_target(&self.config)?;

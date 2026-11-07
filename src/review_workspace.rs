@@ -2,7 +2,8 @@
 //!
 //! Only Git objects/refs cross this boundary. Caller source, dependencies,
 //! worktree registrations are never copied or borrowed for writes. Only the
-//! origin URL/fetch mapping is recreated, not arbitrary caller configuration.
+//! origin URL/fetch mapping and an allowlisted fetch-only transport snapshot are
+//! admitted; arbitrary caller configuration is not copied.
 use crate::{Config, git::git_cmd};
 use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,8 @@ pub(crate) fn scratch_overlaps_caller(path: &Path) -> Result<bool> {
 pub(crate) struct IndependentReview {
     pub(crate) caller_root: PathBuf,
     pub(crate) repo_root: PathBuf,
+    pub(crate) transport: Option<crate::git::transport::Transport>,
+    pub(crate) origin_present: bool,
     _directory: tempfile::TempDir,
 }
 
@@ -53,12 +56,50 @@ impl IndependentReview {
         let destination = git2::Repository::init(&repo_root)?;
         copy_objects(&source, &destination)?;
         copy_modules(&source, &destination, 0)?;
+        let mut transport = None;
+        let mut origin_present = false;
         match source.find_remote("origin") {
             Ok(origin) => {
+                origin_present = true;
                 let url = origin.url().context(
                     "remote review origin URL is not valid UTF-8; cannot preserve origin refresh",
                 )?;
-                destination.remote("origin", &anchored_origin_url(url, &caller_root)?)?;
+                let anchored = anchored_origin_url(url, &caller_root)?;
+                let initial_url = url.to_owned();
+                let initial_specs = origin
+                    .fetch_refspecs()?
+                    .iter()
+                    .map(|v| v.map(str::to_owned))
+                    .collect::<Vec<_>>();
+                if config.do_fetch {
+                    crate::git::transport::Transport::verify_origin(
+                        &caller_root,
+                        &initial_url,
+                        &initial_specs,
+                    )?;
+                    transport = Some(crate::git::transport::Transport::capture(
+                        &caller_root,
+                        &initial_url,
+                    )?);
+                    crate::git::transport::Transport::verify_origin(
+                        &caller_root,
+                        &initial_url,
+                        &initial_specs,
+                    )?;
+                    let current = git2::Repository::open(&caller_root)?;
+                    let after = current.find_remote("origin")?;
+                    ensure!(
+                        after.url() == Some(initial_url.as_str())
+                            && after
+                                .fetch_refspecs()?
+                                .iter()
+                                .map(|v| v.map(str::to_owned))
+                                .collect::<Vec<_>>()
+                                == initial_specs,
+                        "origin changed while capturing transport settings; retry the review"
+                    );
+                }
+                destination.remote("origin", &anchored)?;
                 // URL alone does not define fetch semantics: a Gerrit/custom
                 // mapping can select a different commit from the same-named head.
                 // Replace the generated default with the exact ordered data list,
@@ -66,7 +107,7 @@ impl IndependentReview {
                 // Git-parsed refspec values, never hooks, commands or config keys.
                 let mut remote_config = destination.config()?;
                 remote_config.remove_multivar("remote.origin.fetch", ".*")?;
-                for refspec in origin.fetch_refspecs()?.iter() {
+                for refspec in initial_specs.iter().map(Option::as_deref) {
                     remote_config.set_multivar(
                         "remote.origin.fetch",
                         "^$",
@@ -97,6 +138,8 @@ impl IndependentReview {
         Ok(Self {
             caller_root,
             repo_root,
+            transport,
+            origin_present,
             _directory: directory,
         })
     }
@@ -1004,6 +1047,74 @@ mod tests {
                 .target(),
             Some(expected)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_transport_epoch_drives_both_owned_fetches() {
+        use std::os::unix::fs::PermissionsExt;
+        let (caller, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let upstream = home.path().join("transport-upstream.git");
+        git2::Repository::init_bare(&upstream).unwrap();
+        let status = git_cmd()
+            .args(["-c", "core.hooksPath=", "push", "--quiet"])
+            .arg(&upstream)
+            .args(["HEAD:refs/heads/main", "HEAD:refs/pull/7/head"])
+            .current_dir(caller.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let script = caller.path().join("upload-wrapper");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nexec git-upload-pack \"{}\"\n",
+                upstream.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let virtual_path = caller.path().join("virtual-origin");
+        source
+            .remote("origin", virtual_path.to_str().unwrap())
+            .unwrap();
+        source
+            .config()
+            .unwrap()
+            .set_str("remote.origin.uploadpack", "./upload-wrapper")
+            .unwrap();
+        config.do_fetch = true;
+        config.pr_number = Some(7);
+        let workspace = IndependentReview::create(&config).unwrap();
+        source
+            .config()
+            .unwrap()
+            .set_str("remote.origin.uploadpack", "false")
+            .unwrap();
+        let before_config = std::fs::read(source.path().join("config")).unwrap();
+        let before_index = std::fs::read(source.path().join("index")).unwrap();
+        let owned = crate::git::Repository::open(&workspace.repo_root).unwrap();
+        owned
+            .prepare_refs_with_transport(
+                &workspace.config(&config).unwrap(),
+                workspace.transport.as_ref(),
+            )
+            .unwrap();
+        let private = git2::Repository::open(&workspace.repo_root).unwrap();
+        assert!(private.find_reference("refs/remotes/origin/main").is_ok());
+        assert!(private.find_reference("refs/remotes/origin/pr/7").is_ok());
+        assert_eq!(
+            std::fs::read(source.path().join("config")).unwrap(),
+            before_config
+        );
+        assert_eq!(
+            std::fs::read(source.path().join("index")).unwrap(),
+            before_index
+        );
+        assert!(!source.path().join("FETCH_HEAD").exists());
+        assert!(source.find_reference("refs/remotes/origin/main").is_err());
     }
 
     #[test]

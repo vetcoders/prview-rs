@@ -1,0 +1,656 @@
+//! Fetch-only snapshot of the invocation repository's transport authority.
+//! Values are never written into the owned repository or included in argv.
+use anyhow::{Context, Result, ensure};
+use std::path::Path;
+use std::process::{Command, ExitStatus};
+
+pub(crate) struct Transport {
+    entries: Vec<(String, String)>,
+    caller: std::path::PathBuf,
+    empty_config: tempfile::NamedTempFile,
+}
+
+fn remove_tracing(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if upper.starts_with("GIT_TRACE") || upper == "GIT_CURL_VERBOSE" || upper == "CURL_VERBOSE"
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
+fn admitted(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.starts_with("http.")
+        || lower.starts_with("credential.")
+        || lower.starts_with("protocol.")
+        || matches!(
+            lower.as_str(),
+            "core.sshcommand"
+                | "core.gitproxy"
+                | "core.askpass"
+                | "ssh.variant"
+                | "remote.origin.proxy"
+                | "remote.origin.proxyauthmethod"
+                | "remote.origin.uploadpack"
+                | "remote.origin.vcs"
+        )
+}
+
+fn validate_store_paths(caller: &Path, entries: &[(String, String)]) -> Result<()> {
+    let repo = git2::Repository::open(caller)?;
+    let roots = [
+        caller.to_path_buf(),
+        repo.path().to_path_buf(),
+        repo.commondir().to_path_buf(),
+    ];
+    for (key, helper) in entries {
+        if !key.to_ascii_lowercase().starts_with("credential.")
+            || !key.to_ascii_lowercase().ends_with(".helper")
+        {
+            continue;
+        }
+        let trimmed = helper.trim();
+        if trimmed != "store" && !trimmed.starts_with("store ") && !trimmed.starts_with("store\t") {
+            continue;
+        }
+        let parts = shlex::split(trimmed).context("cannot interpret credential-store options")?;
+        let mut paths = Vec::new();
+        match parts.as_slice() {
+            [_] => {
+                let home =
+                    std::env::var_os("HOME").context("cannot resolve credential-store home")?;
+                let home = std::path::PathBuf::from(home);
+                paths.push(home.join(".git-credentials"));
+                let xdg = std::env::var_os("XDG_CONFIG_HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| home.join(".config"));
+                paths.push(xdg.join("git/credentials"));
+            }
+            [_, flag] if flag.starts_with("--file=") => paths.push(flag["--file=".len()..].into()),
+            [_, flag, path] if flag == "--file" => paths.push(path.into()),
+            _ => anyhow::bail!("cannot safely interpret credential-store options"),
+        }
+        for path in paths {
+            let raw = path.to_string_lossy();
+            ensure!(
+                !raw.is_empty()
+                    && !raw.contains(['$', '`', '*', '?', '~', ';', '|', '&', '<', '>']),
+                "cannot safely interpret credential-store path"
+            );
+            let path = if path.is_absolute() {
+                path
+            } else {
+                caller.join(path)
+            };
+            let path = crate::checks::caller_integrity::planned_path(&path)?;
+            for root in &roots {
+                let root = crate::checks::caller_integrity::planned_path(root)?;
+                ensure!(
+                    !path.starts_with(&root),
+                    "credential-store path would write into the invocation checkout"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Transport {
+    pub(crate) fn verify_origin(
+        caller: &Path,
+        expected_url: &str,
+        expected_specs: &[Option<String>],
+    ) -> Result<()> {
+        let mut url = super::git_cmd();
+        remove_tracing(&mut url);
+        url.env_remove("GIT_CONFIG")
+            .current_dir(caller)
+            .args(["remote", "get-url", "origin"]);
+        let actual = crate::proc::output_governed(url, "inspect invocation origin")?;
+        ensure!(actual.status.success(), "cannot inspect invocation origin");
+        let actual_url = std::str::from_utf8(&actual.stdout)
+            .context("origin URL is not UTF-8")?
+            .trim_end_matches(['\r', '\n']);
+        ensure!(
+            actual_url == expected_url,
+            "origin URL has inconsistent Git configuration authority; retry the review"
+        );
+        let mut specs = super::git_cmd();
+        remove_tracing(&mut specs);
+        specs.env_remove("GIT_CONFIG").current_dir(caller).args([
+            "config",
+            "--null",
+            "--get-all",
+            "remote.origin.fetch",
+        ]);
+        let actual =
+            crate::proc::output_governed(specs, "inspect invocation origin fetch mappings")?;
+        ensure!(
+            matches!(actual.status.code(), Some(0 | 1)),
+            "cannot inspect invocation origin fetch mappings"
+        );
+        let values = actual
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|v| !v.is_empty())
+            .map(|v| std::str::from_utf8(v).map(|s| Some(s.to_owned())))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("origin fetch mapping is not UTF-8")?;
+        ensure!(
+            values == expected_specs,
+            "origin fetch mapping has inconsistent Git configuration authority; retry the review"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn capture(caller: &Path, origin: &str) -> Result<Self> {
+        let mut command = super::git_cmd();
+        remove_tracing(&mut command);
+        command.env_remove("GIT_CONFIG");
+        command
+            .current_dir(caller)
+            .args(["config", "--null", "--list", "--includes"]);
+        let output =
+            crate::proc::output_governed(command, "read invocation transport configuration")?;
+        ensure!(
+            output.status.success(),
+            "cannot read invocation transport configuration"
+        );
+        let mut entries = Vec::new();
+        for entry in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (key, value) = match entry.iter().position(|byte| *byte == b'\n') {
+                Some(pos) => (&entry[..pos], &entry[pos + 1..]),
+                None => (entry, &b"true"[..]),
+            };
+            let key =
+                std::str::from_utf8(key).context("transport configuration key is not UTF-8")?;
+            if !admitted(key) {
+                continue;
+            }
+            let value =
+                std::str::from_utf8(value).context("transport configuration value is not UTF-8")?;
+            entries.push((key.to_owned(), value.to_owned()));
+        }
+        validate_store_paths(caller, &entries)?;
+        let transport = Self {
+            entries,
+            caller: caller.to_path_buf(),
+            empty_config: tempfile::NamedTempFile::new()?,
+        };
+        transport.validate_cookie_policy(origin)?;
+        Ok(transport)
+    }
+
+    fn validate_cookie_policy(&self, origin: &str) -> Result<()> {
+        if !self.entries.iter().any(|(key, _)| {
+            key.to_ascii_lowercase().starts_with("http.")
+                && key.to_ascii_lowercase().ends_with(".savecookies")
+        }) || !(origin.starts_with("https://") || origin.starts_with("http://"))
+        {
+            return Ok(());
+        }
+        let (scheme, rest) = origin.split_once("://").expect("known scheme");
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        ensure!(
+            !authority.contains('@') && !path.contains(['?', '#']),
+            "cannot safely inspect cookie policy for a credential-bearing origin URL"
+        );
+        let url = format!("{scheme}://{authority}/{path}");
+        let temporary = tempfile::tempdir()?;
+        let probe = temporary.path().join("probe.git");
+        git2::Repository::init_bare(&probe)?;
+        let mut check = super::git_cmd();
+        self.configure_environment(&mut check);
+        check
+            .current_dir(temporary.path())
+            .arg("--git-dir")
+            .arg(&probe)
+            .args([
+                "config",
+                "--bool",
+                "--get-urlmatch",
+                "http.saveCookies",
+                &url,
+            ]);
+        let result = crate::proc::output_governed(check, "check invocation cookie policy")?;
+        match result.status.code() {
+            Some(0) => ensure!(
+                result.stdout == b"false\n",
+                "remote review cannot use http.saveCookies; it can write into the invocation checkout"
+            ),
+            Some(1) => {}
+            _ => anyhow::bail!("cannot determine invocation cookie policy"),
+        }
+        Ok(())
+    }
+
+    fn configure_environment(&self, command: &mut Command) {
+        for (key, _) in std::env::vars_os() {
+            let upper = key.to_string_lossy().to_ascii_uppercase();
+            if upper == "GIT_CONFIG"
+                || upper == "GIT_CONFIG_COUNT"
+                || upper == "GIT_CONFIG_PARAMETERS"
+                || upper.starts_with("GIT_CONFIG_KEY_")
+                || upper.starts_with("GIT_CONFIG_VALUE_")
+            {
+                command.env_remove(key);
+            }
+        }
+        remove_tracing(command);
+        command
+            .env("GIT_CONFIG_GLOBAL", self.empty_config.path())
+            .env("GIT_CONFIG_SYSTEM", self.empty_config.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", self.entries.len().to_string());
+        for (index, (key, value)) in self.entries.iter().enumerate() {
+            command
+                .env(format!("GIT_CONFIG_KEY_{index}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+        }
+    }
+
+    pub(super) fn configure(&self, command: &mut Command, repo: &Path) {
+        self.configure_environment(command);
+        command
+            .current_dir(&self.caller)
+            .arg("--git-dir")
+            .arg(repo.join(".git"))
+            .arg("--work-tree")
+            .arg(repo);
+    }
+
+    fn redact(&self, message: &str) -> String {
+        let mut message = message.to_owned();
+        let mut secrets = Vec::new();
+        for (key, value) in &self.entries {
+            let lower = key.to_ascii_lowercase();
+            if lower.ends_with(".extraheader")
+                || lower.contains("proxy")
+                || lower.starts_with("credential.")
+            {
+                if !value.is_empty() {
+                    secrets.push(value.as_str());
+                }
+                secrets.extend(
+                    value
+                        .split(|c: char| c.is_whitespace() || matches!(c, ':' | '@' | '/' | '='))
+                        .filter(|part| !part.is_empty()),
+                );
+            }
+        }
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        for secret in secrets {
+            message = message.replace(secret, "[redacted]");
+        }
+        message
+    }
+
+    pub(super) fn run(&self, command: Command, label: &str) -> Result<ExitStatus> {
+        let output = crate::proc::output_governed(command, label)?;
+        if !output.status.success() {
+            let message = self.redact(&String::from_utf8_lossy(&output.stderr));
+            if !message.trim().is_empty() {
+                eprintln!("{}", message.trim());
+            }
+        }
+        Ok(output.status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::git_cmd;
+
+    #[test]
+    fn captures_included_multivars_and_never_imports_unrelated_config() {
+        let caller = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        git2::Repository::init(caller.path()).unwrap();
+        git2::Repository::init(private.path()).unwrap();
+        let included = caller.path().join("transport.inc");
+        std::fs::write(&included, "[http \"https://example.invalid/\"]\n extraHeader = Alpha: fake-token-one\n extraHeader =\n extraHeader = Beta: fake-token-two\n[credential]\n helper = example-helper\n[core]\n hooksPath = /forbidden\n").unwrap();
+        let mut config = git2::Repository::open(caller.path())
+            .unwrap()
+            .config()
+            .unwrap();
+        config
+            .set_str("include.path", included.to_str().unwrap())
+            .unwrap();
+        let transport = Transport::capture(caller.path(), "https://example.invalid/repo").unwrap();
+        let selected: Vec<_> = transport
+            .entries
+            .iter()
+            .filter(|(key, _)| key.ends_with("extraheader"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            ["Alpha: fake-token-one", "", "Beta: fake-token-two"]
+        );
+        assert!(
+            transport
+                .entries
+                .iter()
+                .any(|(k, v)| k == "credential.helper" && v == "example-helper")
+        );
+        assert!(!transport.entries.iter().any(|(k, _)| k == "core.hookspath"));
+        let mut command = git_cmd();
+        transport.configure(&mut command, private.path());
+        assert!(
+            !command
+                .get_args()
+                .any(|a| a.to_string_lossy().contains("fake-token"))
+        );
+        assert!(
+            !transport
+                .redact("server echoed fake-token-two")
+                .contains("fake-token-two")
+        );
+        let config = std::fs::read(private.path().join(".git/config")).unwrap();
+        assert!(!String::from_utf8_lossy(&config).contains("fake-token"));
+    }
+
+    #[test]
+    fn discovery_respects_command_auth_but_not_git_config_or_traces() {
+        if let Some(root) = std::env::var_os("PRVIEW_TRANSPORT_CHILD") {
+            let root = std::path::PathBuf::from(root);
+            let caller = root.join("caller");
+            let private = root.join("private");
+            let transport = Transport::capture(&caller, "https://example.invalid/repo").unwrap();
+            assert!(
+                Transport::verify_origin(
+                    &caller,
+                    "https://example.invalid/repo",
+                    &[Some("+refs/heads/*:refs/remotes/origin/*".to_owned())]
+                )
+                .is_err()
+            );
+            assert!(
+                transport
+                    .entries
+                    .iter()
+                    .any(|(key, value)| key == "credential.helper" && value == "global-helper")
+            );
+            assert!(
+                !transport
+                    .entries
+                    .iter()
+                    .any(|(_, value)| value == "wrong-helper")
+            );
+            assert!(
+                transport
+                    .entries
+                    .iter()
+                    .any(|(key, value)| key == "http.extraheader"
+                        && value == "X-Auth: fake-sentinel")
+            );
+            assert!(
+                !transport
+                    .entries
+                    .iter()
+                    .any(|(key, _)| key == "core.hookspath")
+            );
+            let mut command = git_cmd();
+            transport.configure(&mut command, &private);
+            assert!(
+                !command
+                    .get_args()
+                    .any(|v| v.to_string_lossy().contains("fake-sentinel"))
+            );
+            assert!(!root.join("trace").exists());
+            assert!(!root.join("trace2").exists());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let caller_repo = git2::Repository::init(root.path().join("caller")).unwrap();
+        caller_repo
+            .remote("origin", "https://example.invalid/repo")
+            .unwrap();
+        git2::Repository::init(root.path().join("private")).unwrap();
+        let global = root.path().join("global");
+        let misleading = root.path().join("misleading");
+        std::fs::write(&global, "[credential]\n helper = global-helper\n").unwrap();
+        std::fs::write(&misleading, "[credential]\n helper = wrong-helper\n").unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "git::transport::tests::discovery_respects_command_auth_but_not_git_config_or_traces"])
+            .env("PRVIEW_TRANSPORT_CHILD", root.path())
+            .env("GIT_CONFIG_GLOBAL", global)
+            .env("GIT_CONFIG", misleading)
+            .env("GIT_TRACE", root.path().join("trace"))
+            .env("GIT_TRACE2_EVENT", root.path().join("trace2"))
+            .env("GIT_CURL_VERBOSE", "1")
+            .env("GIT_CONFIG_COUNT", "3")
+            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+            .env("GIT_CONFIG_VALUE_0", "X-Auth: fake-sentinel")
+            .env("GIT_CONFIG_KEY_1", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_1", "/forbidden")
+            .env("GIT_CONFIG_KEY_2", "url.https://other.invalid/.insteadOf")
+            .env("GIT_CONFIG_VALUE_2", "https://example.invalid/")
+            .output().unwrap();
+        assert!(
+            result.status.success(),
+            "isolated discovery subprocess failed"
+        );
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("fake-sentinel"));
+        assert!(!root.path().join("trace").exists());
+        assert!(!root.path().join("trace2").exists());
+    }
+
+    #[test]
+    fn credential_store_inside_caller_is_refused_before_any_fetch() {
+        let caller = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(caller.path()).unwrap();
+        let credentials = caller.path().join(".git/credentials");
+        std::fs::write(&credentials, "original-fixture\n").unwrap();
+        let before = std::fs::read(&credentials).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("credential.helper", "store --file=.git/credentials")
+            .unwrap();
+        assert!(Transport::capture(caller.path(), "https://example.invalid/repo").is_err());
+        assert_eq!(std::fs::read(credentials).unwrap(), before);
+        assert!(!caller.path().join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn cookie_policy_matches_origin_not_unrelated_url() {
+        let caller = tempfile::tempdir().unwrap();
+        git2::Repository::init(caller.path()).unwrap();
+        let repo = git2::Repository::open(caller.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config
+            .set_bool("http.https://other.invalid/.saveCookies", true)
+            .unwrap();
+        assert!(Transport::capture(caller.path(), "https://example.invalid/repo").is_ok());
+        config
+            .set_bool("http.https://example.invalid/.saveCookies", true)
+            .unwrap();
+        assert!(Transport::capture(caller.path(), "https://example.invalid/repo").is_err());
+    }
+
+    #[test]
+    fn http_fetch_matches_caller_includeif_multivar_and_reset() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let caller = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let caller_repo = git2::Repository::init(caller.path()).unwrap();
+        let private_repo = git2::Repository::init(private.path()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/repo", listener.local_addr().unwrap());
+        caller_repo.remote("origin", &url).unwrap();
+        private_repo.remote("origin", &url).unwrap();
+        let included = caller.path().join("headers.inc");
+        std::fs::write(&included, "[http]\n extraHeader = X-Old: rejected\n extraHeader =\n extraHeader = X-Fixture: fake-token-value\n").unwrap();
+        let mut config = caller_repo.config().unwrap();
+        let gitdir = caller_repo.path();
+        config
+            .set_str(
+                &format!(
+                    "includeIf.gitdir:{}.path",
+                    gitdir.display().to_string().trim_end_matches('/')
+                ),
+                included.to_str().unwrap(),
+            )
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut requests = Vec::new();
+            while requests.len() < 2 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                            .unwrap();
+                        let mut request = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let n = stream.read(&mut buf).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&buf[..n]);
+                        }
+                        stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        requests.push(String::from_utf8_lossy(&request).to_ascii_lowercase());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("server accept: {error}"),
+                }
+            }
+            requests
+        });
+        let caller_status = git_cmd()
+            .args(["fetch", "--quiet", "origin"])
+            .current_dir(caller.path())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!caller_status.success());
+        let transport = Transport::capture(caller.path(), &url).unwrap();
+        let mut command = git_cmd();
+        transport.configure(&mut command, private.path());
+        command.args(["fetch", "--quiet", "origin"]);
+        assert!(
+            !transport
+                .run(command, "fixture HTTP fetch")
+                .unwrap()
+                .success()
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(
+                request.contains("x-fixture: fake-token-value"),
+                "fixture header absent"
+            );
+            assert!(
+                !request.contains("x-old: rejected"),
+                "reset header survived"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_uploadpack_uses_caller_cwd_but_updates_only_owned_repo() {
+        use std::os::unix::fs::PermissionsExt;
+        let caller = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let upstream = tempfile::tempdir().unwrap();
+        let caller_repo = git2::Repository::init(caller.path()).unwrap();
+        git2::Repository::init(private.path()).unwrap();
+        git2::Repository::init_bare(upstream.path()).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let tree_id = caller_repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = caller_repo.find_tree(tree_id).unwrap();
+        let oid = caller_repo
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        let status = git_cmd()
+            .args(["-c", "core.hooksPath=", "push", "--quiet"])
+            .arg(upstream.path())
+            .arg("HEAD:refs/heads/main")
+            .current_dir(caller.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let script = caller.path().join("upload-wrapper");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$PWD\" = \"{}\" ] || exit 71\nexec git-upload-pack \"{}\"\n",
+                std::fs::canonicalize(caller.path()).unwrap().display(),
+                upstream.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let virtual_path = caller.path().join("not-a-repository");
+        caller_repo
+            .remote("origin", virtual_path.to_str().unwrap())
+            .unwrap();
+        caller_repo
+            .config()
+            .unwrap()
+            .set_str("remote.origin.uploadpack", "./upload-wrapper")
+            .unwrap();
+        let status = git_cmd()
+            .args(["fetch", "--quiet", "origin"])
+            .current_dir(caller.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "native caller fetch must work");
+        let caller_ref = caller_repo
+            .find_reference("refs/remotes/origin/main")
+            .unwrap()
+            .target();
+        let caller_fetch_head = std::fs::read(caller.path().join(".git/FETCH_HEAD")).unwrap();
+        let private_repo = git2::Repository::open(private.path()).unwrap();
+        private_repo
+            .remote("origin", virtual_path.to_str().unwrap())
+            .unwrap();
+        let status = git_cmd()
+            .args(["fetch", "--quiet", "origin"])
+            .current_dir(private.path())
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "private fetch must reproduce the original failure"
+        );
+        let transport = Transport::capture(caller.path(), virtual_path.to_str().unwrap()).unwrap();
+        let mut command = git_cmd();
+        transport.configure(&mut command, private.path());
+        command.args(["fetch", "--quiet", "origin"]);
+        assert!(transport.run(command, "fixture fetch").unwrap().success());
+        assert_eq!(
+            private_repo
+                .find_reference("refs/remotes/origin/main")
+                .unwrap()
+                .target(),
+            Some(oid)
+        );
+        assert_eq!(
+            caller_repo
+                .find_reference("refs/remotes/origin/main")
+                .unwrap()
+                .target(),
+            caller_ref
+        );
+        assert_eq!(
+            std::fs::read(caller.path().join(".git/FETCH_HEAD")).unwrap(),
+            caller_fetch_head
+        );
+    }
+}

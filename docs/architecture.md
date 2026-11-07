@@ -4888,8 +4888,35 @@ that authority with the current selection before rebasing and refreshing its
 profile. Private display paths from a prior run do not become caller inputs.
 Relative local origin paths retain the invocation checkout as their
 resolution base. The ordered origin fetch refspecs, including exclusions and an
-empty mapping, retain their meaning; unrelated caller configuration is not
-imported. Remote setup explicitly rejects an origin URL that is not valid UTF-8,
+empty mapping, retain their meaning. When fetch is enabled, the same workspace
+captures the caller's effective Git transport configuration at origin setup,
+including includes, conditional includes, worktree and command-scope entries.
+Only HTTP, credential and protocol settings, core SSH/proxy/askpass, SSH variant,
+and the origin proxy, proxy-auth, upload-pack and VCS settings are admitted.
+Each fetch receives this snapshot through its child environment, with ambient
+system/global Git config replaced by empty config. Other caller config, hooks,
+includes and URL rewrites are not imported. Git still interprets URL-specific
+settings and ordered multivalues. URL and fetch mappings are checked against
+native Git before and after capture; this detects observed changes but is not a
+filesystem transaction. A retained TUI session retains that same origin and
+transport epoch; a new workspace is needed to enable fetch if it was created
+without fetch.
+
+The owned fetch runs from the caller directory for relative transport commands
+but explicitly targets the owned Git directory and worktree. Trusted helpers
+and commands can have external effects; this is not a host filesystem sandbox.
+The built-in credential-store helper is refused if its configured or default
+files resolve inside the caller worktree, Git directory or common directory;
+uninterpretable store options are refused. Cookie saving for the origin is
+refused because it can write to the caller. For a credential-bearing or
+query-bearing HTTP origin, a configured cookie-saving policy cannot be safely
+inspected and is refused. Non-UTF-8 admitted settings are refused. Transport
+values are not placed in arguments, repository config, review artifacts or
+diagnostic command labels; they exist in the fetch child environment and are
+not protected from other processes of the same user. Git tracing is disabled
+for discovery and owned fetch; failure diagnostics redact known transport
+values. Arbitrary output from trusted helpers is not a confidentiality boundary.
+Remote setup explicitly rejects an origin URL that is not valid UTF-8,
 including with `--no-fetch`, because this transport path cannot preserve it
 losslessly. It also surfaces origin inspection errors; an unreadable origin is
 never treated as an absent remote and cannot silently suppress requested fetches. Concrete output collision checks still protect the original caller's
