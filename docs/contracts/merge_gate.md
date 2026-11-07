@@ -1,4 +1,4 @@
-# MERGE_GATE Contract (schema 3.1)
+# MERGE_GATE Contract (schema 3.2)
 
 `MERGE_GATE.json` is the policy-aware merge decision emitted at
 `00_summary/MERGE_GATE.json`. It is the single machine-readable verdict surface
@@ -11,7 +11,7 @@ document disagree, the code is the contract and this document is the bug.
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema_version` | string | `"3.1"` |
+| `schema_version` | string | `"3.2"` |
 | `generated_at` | string | RFC 3339 local datetime |
 | `bridge_stage` | integer | `0..4` |
 | `target` | string | Resolved target branch name (not raw CLI input) |
@@ -19,6 +19,9 @@ document disagree, the code is the contract and this document is the bug.
 | `profile` | string | Resolved profile kind |
 | `policy` | object | `{ version, mode, default_severity, source, origin }` |
 | `checks` | object[] | Per-check evaluation records (see below) |
+| `security_scope` | object | Additive (3.2): requested mode and recorded security-check execution, independently of the verdict |
+| `coverage_evidence` | object | Additive (3.2): source/test-change matching method; never executed-line coverage |
+| `loctree_evidence` | object | Additive (3.2): whole-repository scope, net count comparison and identity-comparison limits |
 | `inline_findings` | object | Inline SARIF summary (see below) |
 | `stale_cache_caveats` | object[] | Advisory, additive: gate rows replayed from an old or age-unverifiable cache (see below) |
 | `provenance_contradictions` | object[] | Advisory, additive: substrate statements the run and a check make that cannot both be true (see below) |
@@ -1321,3 +1324,61 @@ reusing a modern pack; a prior self-diff assessment cannot become an automatic o
 assessment merely because HEAD stayed unchanged. Legacy empty packs can recover
 their target SHA from `PROVENANCE.json`; legacy packs without readable comparison
 coverage retain the earlier reuse behavior, with the explicit-self guard applied.
+
+## Evidence scope (schema 3.2, additive)
+
+These metadata objects explain evidence; none changes policy severity, skip
+handling, the decision axes or process exit codes. Existing metric and decision
+fields retain their names, types and semantics; schema_version advances to 3.2
+and explanatory caveat text is clarified. Readers accepting unknown fields can ignore the new
+objects. A gate declaring 3.2 must include all three evidence objects and their
+documented members, including explicitly nullable members. The standalone
+validator checks their types, enum values, execution/status correspondence and
+count-delta consistency; unavailable
+Loctree comparisons must carry null deltas/revisions. Earlier schemas do not
+require these objects. These checks validate evidence descriptions, not whether a
+security child process spawned. `not_executed`/`skipped_at_runtime` require
+`status:skipped`, `error` requires `status:error`, and uncached `executed`
+requires passed/failed/warnings. `cached` preserves any canonical stored status.
+Both the Rust reader and standalone validator accept 3.2 and retain
+older schemas; older Rust readers may announce the existing forward-MINOR
+compatibility caveat.
+
+- `security_scope.requested` is `standard`, `extended` or `disabled` as requested
+  in configuration. It does not mean that a security scan ran. `source` is
+  `recorded_check_results`; each `checks[]` row carries the canonical check ID,
+  name, status, reason and `execution`: `executed`, `cached`, `not_executed`,
+  `skipped_at_runtime` or `error`. An error alone does not prove a child spawned.
+  Empty rows mean no security execution record, not a clean scan. Preflight
+  prints the requested mode and each provider's actual eligibility separately.
+- `coverage_evidence.kind` is `source_test_change_match`.
+  `execution_coverage_measured` is false; `measured_field_meaning` is
+  `heuristic_evaluated`. `weak_match_count` counts keyword-only associations
+  already included in the legacy matched total; it does not reweight the ratio.
+- `loctree_evidence.scope` is `whole_repository`. `comparison_kind` is
+  `net_count_delta` or `not_available`; `net_counts_unchanged` is nullable.
+  `finding_identities_compared` is false. The same-count result must never be
+  interpreted as proof that every finding pre-existed. The raw warning and
+  gate impact are retained even when all net count deltas are zero.
+
+`report.json` 3.2 publishes the same `security_scope`/`loctree_evidence` and
+flattens coverage metadata into `quality.coverage`. Legacy `measured`,
+`heuristic_ratio`, `matched` and `total` retain their meanings and nullability:
+`measured:true` says the heuristic evaluated changed source files, not that tests
+measured runtime line or branch coverage.
+
+`report.json` and `RUN.json` add
+`regression.tests.coverage_comparison`: `kind:previous_run`,
+`metric_kind:source_test_change_match`, `pr_base_comparison:false`, plus
+`source_status` (`recorded`, `unavailable` or `not_recorded`). A recorded source
+contains the report path, run ID, nullable ratio and count JSON pointers
+(`metric_path`, `untested_count_path`) and the original
+`review_range`/adjacent `RUN.json.freshness`, when available. Missing historical
+revision metadata stays null; a branch label is not promoted to a SHA. A prior
+0/0 run still supplies provenance when its untested-file count is consumed, even
+though its ratio is null. Existing
+`base_coverage_ratio`, delta and regression flags are unchanged: this comparison
+is a previous-run trend, not a coverage scan of the current PR's base commit.
+Public Rust regression structs are unchanged. The CLI JSON summary keeps its
+existing schema and public Rust shape; it carries the clarified review caveats
+and links to these canonical artifacts.

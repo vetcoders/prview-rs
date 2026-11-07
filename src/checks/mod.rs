@@ -32,6 +32,7 @@ mod managed_scratch;
 mod pytest_home;
 mod python;
 pub mod scope;
+pub(crate) mod security_scope;
 mod semgrep;
 pub(crate) mod snapshot_integrity;
 mod typescript;
@@ -1010,14 +1011,8 @@ async fn run_all_checks(
                         && running_secs >= SLOW_NOTICE_THRESHOLDS_SECS[next_slow_notice]
                     {
                         next_slow_notice += 1;
-                        println!(
-                            "\r\x1b[2K  {} Still running after {}s: {}. Cargo checks compile \
-                             the whole workspace and can take several minutes (each has its \
-                             own timeout). Press Ctrl-C to abort.",
-                            "ℹ".cyan(),
-                            running_secs,
-                            board.names_where(true).join(", "),
-                        );
+                        println!("\r\x1b[2K  {} {}", "ℹ".cyan(),
+                            slow_check_notice(running_secs, &board.names_where(true)));
                     }
                     // Refresh each running check's own elapsed time.
                     if let Some(line) = board.progress_line(now) {
@@ -2170,8 +2165,15 @@ const NOTHING_CONSUMABLE: &[&str] = &[];
 /// (PV-01), so a broken or half-installed security tool can't silently vanish
 /// from the gate. They pass which::which() at eligibility, but a runtime spawn
 /// failure (broken/partial binary, PATH change, TOCTOU) must still surface.
-fn is_security_check(name: &str) -> bool {
+pub(crate) fn is_security_check(name: &str) -> bool {
     matches!(name, "Semgrep scan" | "Cargo audit" | "Cargo geiger")
+}
+
+fn slow_check_notice(running_secs: u64, active_names: &[&str]) -> String {
+    format!(
+        "Still running after {running_secs}s: {}. Each check has its own timeout. Press Ctrl-C to abort.",
+        active_names.join(", ")
+    )
 }
 
 /// Find all matching hard failure signatures in output
@@ -2566,6 +2568,22 @@ mod tests {
     use crate::cli::ExecutionMode;
     use crate::config::{Config, test_config, test_rust_profile};
     use std::time::Duration;
+
+    #[test]
+    fn dogfood_slow_notice_is_neutral_for_python_cargo_and_mixed_checks() {
+        for names in [
+            vec!["Pytest"],
+            vec!["Cargo test"],
+            vec!["Pytest", "Cargo check"],
+        ] {
+            let notice = slow_check_notice(60, &names);
+            assert!(notice.contains("Still running after 60s"));
+            assert!(notice.contains(&names.join(", ")));
+            assert!(notice.contains("own timeout"));
+            assert!(!notice.contains("compile"));
+            assert!(!notice.contains("whole workspace"));
+        }
+    }
 
     #[test]
     fn every_emitted_status_is_in_the_vocabulary() {

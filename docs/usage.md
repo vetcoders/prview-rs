@@ -1427,3 +1427,23 @@ that change. Existing gate policy applies: `--strict` rejects the self-diff with
 exit 2; advisory gate mode reports it with exit 0. Automatic base discovery,
 `--current-only`, and different commits with identical trees remain distinct
 cases in the pack's `review_range` metadata.
+
+## Reading evidence scope
+
+The configuration box shows security **requested mode** separately from each
+provider's **eligibility**. The completed pack records execution independently:
+a requested scan may be unavailable, skipped, cached, or fail to start. Missing
+Semgrep remains an explicit skip with its existing policy impact; `--deep`
+does not install a scanner or certify that all security checks executed.
+
+“Coverage heuristic” describes matching changed source files to changed tests.
+For example, 25/41 (60%, truncated) includes any declared weak matches. It is
+not measured line/branch coverage or proof of tested behavior. The report names
+the method and weak count while keeping legacy JSON fields compatible.
+
+Loctree warnings describe the whole analyzed repository. Zero net count deltas
+do not establish identical finding sets and do not automatically produce PASS.
+Coverage trends use a previous run, which can have a different pair of revisions;
+`regression.tests.coverage_comparison` identifies that source explicitly and
+never labels it as a measurement of the current PR base. Slow-check messages
+name active checks without assuming that their delay is Cargo compilation.

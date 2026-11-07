@@ -9,6 +9,7 @@ pub(crate) mod signal;
 pub use signal::{api_delta, api_surface, revision_source};
 
 mod context_artifacts;
+mod evidence_scope;
 mod findings;
 pub(crate) mod git_artifacts;
 mod merge_gate;
@@ -19,6 +20,7 @@ mod sanity;
 use context_artifacts::*;
 #[cfg(test)]
 mod caller_guard_tests;
+use evidence_scope::*;
 use findings::*;
 use git_artifacts::*;
 use merge_gate::*;
@@ -204,6 +206,7 @@ struct RunJsonInput<'a> {
     ledger: &'a TaskLedger,
     scope: Option<&'a crate::checks::scope::ScopeDecisions>,
     regression: Option<&'a regression::RegressionReport>,
+    coverage_history: Option<&'a PreviousCoverage>,
 }
 
 struct MergeGateInput<'a> {
@@ -1078,6 +1081,7 @@ fn generate_guarded(
     // Root-level content generators
     let t = Instant::now();
     generate_checks_status_json(&out_dir, config, &all_checks, &skipped_checks)?;
+    let prev_coverage = load_previous_coverage(&out_dir);
     generate_pr_review(
         &out_dir,
         config,
@@ -1087,7 +1091,8 @@ fn generate_guarded(
         &coverage_delta,
         heuristics,
     )?;
-    let range_notices = review_range.review_caveats();
+    let mut range_notices = review_range.review_caveats();
+    range_notices.push(prev_coverage.description());
     if !range_notices.is_empty() {
         let path = out_dir.join("PR_REVIEW.md");
         let narrative = fs::read_to_string(&path)?;
@@ -1096,9 +1101,6 @@ fn generate_guarded(
     }
     stage_timings.push(finish_timing(emit_human_stdout, "PR_REVIEW", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PrReview)?;
-
-    // Load base coverage from previous run (if available)
-    let prev_coverage = load_previous_coverage(&out_dir);
 
     // Build regression context and compute regression report
     let regression_report = {
@@ -1171,13 +1173,13 @@ fn generate_guarded(
             } else {
                 None
             },
-            base_coverage_ratio: prev_coverage.0,
+            base_coverage_ratio: prev_coverage.ratio,
             untested_critical_files: coverage_delta
                 .uncovered
                 .iter()
                 .map(|f| f.path.clone())
                 .collect(),
-            base_untested_critical_count: prev_coverage.1,
+            base_untested_critical_count: prev_coverage.untested_count,
             cycles,
             dead_exports,
             unused_symbols,
@@ -1234,6 +1236,7 @@ fn generate_guarded(
             run_started_at: &run_started_at,
             heuristics,
             regression: Some(&regression_report),
+            coverage_history: Some(&prev_coverage),
             provenance: &provenance_consistency,
             scope,
         },
@@ -1296,6 +1299,7 @@ fn generate_guarded(
         ledger,
         scope,
         regression: Some(&regression_report),
+        coverage_history: Some(&prev_coverage),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "RUN.json", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::RunJson)?;
@@ -2039,6 +2043,7 @@ fn generate_heuristics_gate_result(
         "circular_imports": cycles,
         "unused_symbols": unused_symbols,
         "cached": false,
+        "evidence_scope": loctree_evidence(heuristics),
     });
 
     if let Some(h) = heuristics {
@@ -2343,6 +2348,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
         ledger,
         scope,
         regression,
+        coverage_history,
     } = input;
 
     let policy_summary =
@@ -2476,7 +2482,9 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             "checks_failed": checks.iter().filter(|c| c.is_failure()).count(),
             "checks_warned": checks.iter().filter(|c| matches!(c.status, crate::checks::CheckStatus::Warnings)).count(),
         },
-        "regression": regression.map(|r| json!(r)),
+        "regression": regression.map(|r| regression_with_coverage_history(r, coverage_history)),
+        "security_scope": crate::checks::security_scope::recorded(config, checks, skipped_checks),
+        "loctree_evidence": loctree_evidence(heuristics),
         "timings": stage_timings.iter().map(|stage| json!({
             "label": stage.label,
             "duration_secs": stage.duration_secs,

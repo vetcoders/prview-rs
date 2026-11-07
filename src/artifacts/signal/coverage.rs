@@ -123,13 +123,7 @@ pub struct CoveragePair {
     /// A repository path, or [`INLINE_TEST_MARKER`] when the source file is
     /// self-tested rather than paired with a test file.
     pub test_path: String,
-    // Never read after pairing: the match tier is computed in pair_sources_with_tests
-    // but no runtime consumer weighs it yet. Kept because tier-weighted coverage
-    // scoring in the PolicyEngine verdict (policy/engine.rs) is the planned
-    // consumer; remove if that lands without tier weighting. Re-confirmed
-    // still-dead after the wave-7 verdict wiring landed. Tracked in the vc-prune
-    // forgotten-gems report 2026-07-02.
-    #[allow(dead_code)]
+    /// Retained as evidence of weak matches; never weights the gate outcome.
     pub tier: CoverageMatchTier,
 }
 

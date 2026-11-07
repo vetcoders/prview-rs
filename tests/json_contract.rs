@@ -375,7 +375,7 @@ fn operator_policy_rank_invariants_validator_contract() {
 
     let raw = fs::read_to_string(&merge_gate).expect("read generated merge gate");
     let original: serde_json::Value = serde_json::from_str(&raw).expect("parse merge gate");
-    assert_eq!(original["schema_version"], "3.1");
+    assert_eq!(original["schema_version"], "3.2");
     assert!(
         original["decision"]["enforcement_disposition"]
             .as_str()
@@ -963,7 +963,7 @@ fn validator_rejects_schema_two_two_without_a_usable_origin() {
     let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert_eq!(
         original["schema_version"].as_str(),
-        Some("3.1"),
+        Some("3.2"),
         "the current writer retains the 2.2 `origin` requirement"
     );
     original["schema_version"] = serde_json::json!("2.2");
@@ -1155,7 +1155,7 @@ fn validator_requires_a_boolean_quality_pass_from_schema_two_two() {
     let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert_eq!(
         original["schema_version"].as_str(),
-        Some("3.1"),
+        Some("3.2"),
         "the current writer retains the 2.2 quality_pass requirement"
     );
     assert!(
@@ -1424,7 +1424,7 @@ fn validator_requires_the_decision_axes_schema_two_two_emits() {
     let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert_eq!(
         original["schema_version"].as_str(),
-        Some("3.1"),
+        Some("3.2"),
         "the current writer retains the decision axes introduced in 2.2"
     );
     original["schema_version"] = serde_json::json!("2.2");
@@ -2729,7 +2729,7 @@ fn provenance_contradiction_validator_contract() {
     let original: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&merge_gate).expect("read generated merge gate"))
             .expect("parse merge gate");
-    assert_eq!(original["schema_version"], "3.1");
+    assert_eq!(original["schema_version"], "3.2");
     assert!(
         original["provenance_contradictions"]
             .as_array()
@@ -2855,7 +2855,7 @@ fn scope_object_validator_contract() {
     let original: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&merge_gate).expect("read generated merge gate"))
             .expect("parse merge gate");
-    assert_eq!(original["schema_version"], "3.1");
+    assert_eq!(original["schema_version"], "3.2");
 
     let validate = |gate: &serde_json::Value, must_validate: bool| {
         fs::write(

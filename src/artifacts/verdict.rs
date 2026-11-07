@@ -477,7 +477,10 @@ pub(crate) fn build_review_caveats(
     if let Some(pct) = coverage.pct
         && pct < 80
     {
-        let mut coverage_caveat = format!("{}% coverage heuristic", pct);
+        let mut coverage_caveat = format!(
+            "{}% coverage heuristic (test-change matching; not execution coverage)",
+            pct
+        );
         if coverage_has_rust_inline_test_blind_spot(coverage) {
             coverage_caveat.push_str(" (Rust inline #[cfg(test)] modules may be missed)");
         }

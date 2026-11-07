@@ -156,6 +156,7 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     let mut check_gates = Vec::new();
     let mut blocking_issues = outcome.blocking_issues.clone();
     let mut review_caveats = outcome.advisory_caveats.clone();
+    explain_loctree_warnings(&mut review_caveats, heuristics);
     let mut worst_confidence = outcome.worst_confidence;
     let mut worst_merge = outcome.worst_merge;
 
