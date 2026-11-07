@@ -4866,9 +4866,19 @@ their gitlink paths. Module ODB bytes include pins no longer reachable from
 module refs and alternate-backed objects; destination ODBs retain no alternates.
 Missing pinned objects still fail closed. No automatic checkout restoration is attempted.
 
-Shallow callers retain their Git shallow boundary during transport. Module
-name/path mappings come from committed `.gitmodules` metadata with includes
-disabled; a half-written invocation-checkout file does not control setup.
+Shallow callers retain their Git shallow boundary during transport. For a
+partial clone, the owned repository copies only objects currently available in
+the caller and copies refs separately, without asking the caller's promisor to
+fill its object store. With fetch enabled it then performs an origin
+`--refetch` in the owned repository before checkout, using the captured
+transport settings; this requires Git 2.36 or newer. Origin cannot supply
+objects that are no longer reachable or otherwise unavailable there. With
+fetch disabled no network hydration occurs: the review can use locally
+available objects and reports an error when a required object is absent.
+Sparse partial checkouts can therefore require fetch even when their visible
+files are present. Module name/path mappings come from committed
+`.gitmodules` metadata read from the owned object store with includes disabled;
+a half-written invocation-checkout file does not control setup.
 
 The existing caller boundary guard observes that execution repository. An
 unrelated nested repository or concurrent caller edit is not an input to its

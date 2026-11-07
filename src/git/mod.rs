@@ -253,6 +253,24 @@ impl Repository {
         config: &Config,
         transport: Option<&transport::Transport>,
     ) -> Result<()> {
+        self.prepare_refs_inner(config, transport, false)
+    }
+
+    pub(crate) fn refetch_partial_origin(
+        &self,
+        config: &Config,
+        transport: Option<&transport::Transport>,
+    ) -> Result<()> {
+        self.prepare_refs_inner(config, transport, true)
+            .context("partial review origin refetch failed; Git 2.36 or newer with --refetch and an accessible origin are required")
+    }
+
+    fn prepare_refs_inner(
+        &self,
+        config: &Config,
+        transport: Option<&transport::Transport>,
+        refetch: bool,
+    ) -> Result<()> {
         if !config.do_fetch || self.inner.find_remote("origin").is_err() {
             return Ok(());
         }
@@ -267,7 +285,11 @@ impl Repository {
 
         let mut fetch_origin = git_cmd();
         configure(&mut fetch_origin);
-        fetch_origin.args(["fetch", "--quiet", "--prune", "origin"]);
+        fetch_origin.args(["fetch", "--quiet", "--prune"]);
+        if refetch {
+            fetch_origin.arg("--refetch");
+        }
+        fetch_origin.arg("origin");
         let fetch_origin = if let Some(transport) = &transport {
             transport.run(fetch_origin, "git fetch origin")?
         } else {

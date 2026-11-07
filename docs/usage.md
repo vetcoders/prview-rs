@@ -1463,7 +1463,11 @@ without it requires a new review. If Git selects a credential-store helper
 whose destination is inside the caller or cannot be determined safely, the
 review fails; it also refuses cookie saving for the origin. Default credential
 store locations depend on HOME and XDG settings, and Windows HOME fallback
-compatibility is not guaranteed. See
+compatibility is not guaranteed. Partial clones copy only locally available
+objects; with fetch enabled, the owned workspace refetches from origin before
+checkout and requires Git 2.36 or newer. With fetch disabled, missing objects
+required by the review are reported as errors; unneeded missing objects do not
+by themselves block setup. See
 [remote review repository ownership](architecture.md#remote-review-repository-ownership)
 for the supported settings and details.
 

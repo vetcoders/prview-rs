@@ -54,8 +54,7 @@ impl IndependentReview {
         let repo_root = directory.path().join(config.repo_name());
         let source = git2::Repository::open(&caller_root)?;
         let destination = git2::Repository::init(&repo_root)?;
-        copy_objects(&source, &destination)?;
-        copy_modules(&source, &destination, 0)?;
+        let partial = is_partial_clone(&source)?;
         let mut transport = None;
         let mut origin_present = false;
         match source.find_remote("origin") {
@@ -118,6 +117,18 @@ impl IndependentReview {
             Err(error) if error.code() == git2::ErrorCode::NotFound => {}
             Err(error) => return Err(error).context("cannot inspect remote review origin"),
         }
+        if partial {
+            copy_partial_objects_and_refs(&source, &destination)?;
+            if config.do_fetch && origin_present {
+                crate::git::Repository::open(&repo_root)?
+                    .refetch_partial_origin(config, transport.as_ref())?;
+            }
+        } else {
+            copy_objects(&source, &destination)?;
+        }
+        copy_modules(&source, &destination, 0).context(
+            "remote review module metadata copy failed; a partial clone may lack required objects, especially with fetch disabled",
+        )?;
         if let Ok(head) = source.head() {
             let oid = head.peel_to_commit()?.id();
             ensure!(
@@ -133,7 +144,8 @@ impl IndependentReview {
             } else {
                 destination.set_head_detached(oid)?;
             }
-            destination.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
+            destination.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+                .context("remote review checkout failed; a partial clone may lack required objects, especially with fetch disabled")?;
         }
         Ok(Self {
             caller_root,
@@ -250,6 +262,78 @@ fn anchored_origin_url(url: &str, caller: &Path) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("relative origin resolves to a non-UTF-8 path"))
 }
 
+fn is_partial_clone(source: &git2::Repository) -> Result<bool> {
+    let config = source.config()?;
+    if config.get_string("extensions.partialclone").is_ok() {
+        return Ok(true);
+    }
+    let mut entries = config.entries(Some(r"^remote\..*\.promisor$"))?;
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        let key = entry.name().context("promisor config name is not UTF-8")?;
+        if config.get_bool(key)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn copy_partial_objects_and_refs(
+    source: &git2::Repository,
+    destination: &git2::Repository,
+) -> Result<()> {
+    // Existing ODB enumeration reads only present bytes, without invoking
+    // upload-pack or asking the caller's promisor to fill missing objects.
+    copy_module_objects(source, destination)
+        .context("cannot copy available partial-clone objects")?;
+    let mut updates = Vec::new();
+    let mut add = |name: &[u8], oid: git2::Oid| {
+        updates.extend_from_slice(b"update ");
+        updates.extend_from_slice(name);
+        updates.push(0);
+        updates.extend_from_slice(oid.to_string().as_bytes());
+        updates.extend_from_slice(b"\0\0");
+    };
+    for reference in source.references()? {
+        let reference = reference?;
+        if reference.name_bytes() == b"refs/prview/copied-head" {
+            continue;
+        }
+        let resolved = reference.resolve()?;
+        let oid = resolved
+            .target()
+            .context("partial clone reference has no target")?;
+        add(reference.name_bytes(), oid);
+    }
+    if let Ok(head) = source.head() {
+        add(b"refs/prview/copied-head", head.peel_to_commit()?.id());
+    }
+    if !updates.is_empty() {
+        let mut command = git_cmd();
+        command
+            .args(["-c", "core.hooksPath=", "update-ref", "--stdin", "-z"])
+            .current_dir(destination.path());
+        let output = crate::proc::output_governed_with_input_timeout(
+            command,
+            "copy partial clone refs",
+            &updates,
+            std::time::Duration::from_secs(120),
+        )?;
+        ensure!(
+            output.status.success(),
+            "cannot copy partial clone refs: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if source.is_shallow() {
+        let boundary = std::fs::read(source.commondir().join("shallow"))
+            .context("cannot read partial clone shallow boundary")?;
+        std::fs::write(destination.path().join("shallow"), boundary)
+            .context("cannot copy partial clone shallow boundary")?;
+    }
+    Ok(())
+}
+
 fn copy_objects(source: &git2::Repository, destination: &git2::Repository) -> Result<()> {
     // A normal fetch transports object bytes, unlike a local clone/shared ODB.
     // It reads the source but never creates a registration/ref/lock there.
@@ -329,9 +413,12 @@ fn committed_module_paths(
     destination: &git2::Repository,
 ) -> Result<Vec<(String, String)>> {
     use std::io::Write;
-    let Ok(tree) = source.head().and_then(|head| head.peel_to_tree()) else {
+    let Ok(head) = source.head().and_then(|head| head.peel_to_commit()) else {
         return Ok(Vec::new());
     };
+    // Committed metadata belongs to the owned object store: a sparse partial
+    // caller may lack this tree or blob even after private origin refetch.
+    let tree = destination.find_commit(head.id())?.tree()?;
     let entry = match tree.get_path(Path::new(".gitmodules")) {
         Ok(entry) => entry,
         Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(Vec::new()),
@@ -341,7 +428,7 @@ fn committed_module_paths(
         entry.filemode() == 0o100644 || entry.filemode() == 0o100755,
         "committed .gitmodules is not a regular file"
     );
-    let blob = source.find_blob(entry.id())?;
+    let blob = destination.find_blob(entry.id())?;
     let mut file = tempfile::NamedTempFile::new_in(destination.path())?;
     file.write_all(blob.content())?;
     let mut command = git_cmd();
@@ -455,6 +542,340 @@ fn copy_module_objects(source: &git2::Repository, destination: &git2::Repository
 mod tests {
     use super::*;
     use crate::checks::caller_integrity::CallerGuard;
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_clone_copies_available_objects_and_refetches_only_into_owned_repo() {
+        let (source_dir, home, mut config) = crate::checks::caller_guard_tests::fixture();
+        let _home = crate::config::override_test_prview_home(home.path());
+        let source = git2::Repository::open(source_dir.path()).unwrap();
+        let first = source.head().unwrap().target().unwrap();
+        let first_commit = source.find_commit(first).unwrap();
+        let old_blob = first_commit
+            .tree()
+            .unwrap()
+            .get_name("source.txt")
+            .unwrap()
+            .id();
+        let sig = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let obsolete_blob = source.blob(b"unique obsolete blob\n").unwrap();
+        let mut obsolete_tree = source.treebuilder(None).unwrap();
+        obsolete_tree
+            .insert("obsolete.txt", obsolete_blob, 0o100644)
+            .unwrap();
+        let obsolete_tree = source.find_tree(obsolete_tree.write().unwrap()).unwrap();
+        source
+            .commit(
+                Some("refs/heads/obsolete"),
+                &sig,
+                &sig,
+                "orphan",
+                &obsolete_tree,
+                &[],
+            )
+            .unwrap();
+        std::fs::write(source_dir.path().join("source.txt"), "current\n").unwrap();
+        std::fs::write(
+            source_dir.path().join("hidden.txt"),
+            "outside sparse checkout\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_dir.path().join(".gitmodules"),
+            "[submodule \"fixture\"]\n path = fixture-module\n url = ../fixture.git\n",
+        )
+        .unwrap();
+        let mut index = source.index().unwrap();
+        index.add_path(Path::new("source.txt")).unwrap();
+        index.add_path(Path::new("hidden.txt")).unwrap();
+        index.add_path(Path::new(".gitmodules")).unwrap();
+        index.write().unwrap();
+        let tree = source.find_tree(index.write_tree().unwrap()).unwrap();
+        source
+            .commit(Some("HEAD"), &sig, &sig, "current", &tree, &[&first_commit])
+            .unwrap();
+        let upstream = home.path().join("upstream.git");
+        assert!(
+            git_cmd()
+                .args(["clone", "--bare", "--quiet"])
+                .arg(source_dir.path())
+                .arg(&upstream)
+                .status()
+                .unwrap()
+                .success()
+        );
+        git2::Repository::open_bare(&upstream)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("uploadpack.allowFilter", true)
+            .unwrap();
+        let caller = home.path().join("partial-caller");
+        let url = format!("file://{}", upstream.display());
+        assert!(
+            git_cmd()
+                .args(["clone", "--quiet", "--filter=blob:none"])
+                .arg(&url)
+                .arg(&caller)
+                .status()
+                .unwrap()
+                .success()
+        );
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw_ref = std::ffi::OsStr::from_bytes(b"refs/heads/nonutf-\xff");
+            assert!(
+                git_cmd()
+                    .args(["update-ref"])
+                    .arg(raw_ref)
+                    .arg("HEAD")
+                    .current_dir(&caller)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let partial = git2::Repository::open(&caller).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let transport_marker = home.path().join("origin-transport-used");
+        let wrapper = caller.join("fixture-upload-pack");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nexec git-upload-pack \"$@\"\n",
+                transport_marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        partial
+            .config()
+            .unwrap()
+            .set_str("remote.origin.uploadpack", "./fixture-upload-pack")
+            .unwrap();
+        let mut remote_config = partial.config().unwrap();
+        remote_config
+            .remove_multivar("remote.origin.fetch", ".*")
+            .unwrap();
+        remote_config
+            .set_multivar(
+                "remote.origin.fetch",
+                "^$",
+                "+refs/heads/main:refs/remotes/origin/custom-main",
+            )
+            .unwrap();
+        assert!(
+            !partial.odb().unwrap().exists(old_blob),
+            "fixture must omit historical blob"
+        );
+        assert!(
+            partial
+                .find_reference("refs/remotes/origin/obsolete")
+                .is_ok()
+        );
+        git2::Repository::open_bare(&upstream)
+            .unwrap()
+            .find_reference("refs/heads/obsolete")
+            .unwrap()
+            .delete()
+            .unwrap();
+        assert!(
+            !partial.odb().unwrap().exists(obsolete_blob),
+            "obsolete-only blob must be absent"
+        );
+        fn object_bytes(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+            let mut files: Vec<_> = walkdir::WalkDir::new(root)
+                .into_iter()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| {
+                    (
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect();
+            files.sort_by(|left, right| left.0.cmp(&right.0));
+            files
+        }
+        let before_objects = object_bytes(&partial.path().join("objects"));
+        let before_config = std::fs::read(partial.path().join("config")).unwrap();
+        let before_index = std::fs::read(partial.path().join("index")).unwrap();
+        let refs_before: Vec<_> = partial
+            .references()
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.name_bytes().to_vec(), r.resolve().unwrap().target())
+            })
+            .collect();
+        config.repo_root = caller.clone();
+        config.repo_path = Some(caller.clone());
+        config.do_fetch = false;
+        let hidden_upstream = home.path().join("unavailable-upstream.git");
+        std::fs::rename(&upstream, &hidden_upstream).unwrap();
+        let offline = IndependentReview::create(&config).unwrap();
+        std::fs::rename(&hidden_upstream, &upstream).unwrap();
+        assert!(
+            !transport_marker.exists(),
+            "offline setup must not invoke origin transport"
+        );
+        let copy = git2::Repository::open(&offline.repo_root).unwrap();
+        assert_eq!(
+            std::fs::read(offline.repo_root.join("source.txt")).unwrap(),
+            b"current\n"
+        );
+        assert!(
+            !copy.odb().unwrap().exists(old_blob),
+            "offline must not fetch missing blob"
+        );
+        assert!(copy.find_reference("refs/remotes/origin/obsolete").is_ok());
+        #[cfg(target_os = "linux")]
+        assert!(
+            copy.references()
+                .unwrap()
+                .any(|reference| reference.unwrap().name_bytes() == b"refs/heads/nonutf-\xff")
+        );
+        assert!(
+            copy.find_blob(obsolete_blob).is_err(),
+            "missing stale blob must remain explicitly unavailable"
+        );
+        config.do_fetch = true;
+        let online = IndependentReview::create(&config).unwrap();
+        assert!(
+            transport_marker.exists(),
+            "owned refetch must use captured caller transport"
+        );
+        let copy = git2::Repository::open(&online.repo_root).unwrap();
+        assert!(
+            copy.odb().unwrap().exists(old_blob),
+            "owned origin refetch must fill requested history"
+        );
+        assert!(
+            copy.find_reference("refs/remotes/origin/custom-main")
+                .is_ok()
+        );
+        assert_eq!(
+            copy.find_remote("origin")
+                .unwrap()
+                .fetch_refspecs()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("+refs/heads/main:refs/remotes/origin/custom-main")]
+        );
+        assert_eq!(
+            std::fs::read(partial.path().join("config")).unwrap(),
+            before_config
+        );
+        assert_eq!(
+            std::fs::read(partial.path().join("index")).unwrap(),
+            before_index
+        );
+        assert!(
+            !partial.odb().unwrap().exists(old_blob),
+            "caller must not lazily fetch"
+        );
+        let refs_after: Vec<_> = partial
+            .references()
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.name_bytes().to_vec(), r.resolve().unwrap().target())
+            })
+            .collect();
+        assert_eq!(refs_before, refs_after);
+        assert_eq!(
+            object_bytes(&partial.path().join("objects")),
+            before_objects
+        );
+        assert!(
+            !copy.odb().unwrap().exists(obsolete_blob),
+            "unadvertised stale blob must not be fabricated"
+        );
+        let detached_oid = partial.head().unwrap().peel_to_commit().unwrap().id();
+        partial.set_head_detached(detached_oid).unwrap();
+        config.do_fetch = false;
+        let detached = IndependentReview::create(&config).unwrap();
+        let detached_repo = git2::Repository::open(&detached.repo_root).unwrap();
+        assert!(!detached_repo.head().unwrap().is_branch());
+        assert_eq!(detached_repo.head().unwrap().target(), Some(detached_oid));
+
+        let sparse = home.path().join("sparse-caller");
+        assert!(
+            git_cmd()
+                .args(["clone", "--quiet", "--no-checkout", "--filter=blob:none"])
+                .arg(&url)
+                .arg(&sparse)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            git_cmd()
+                .args(["sparse-checkout", "init", "--no-cone"])
+                .current_dir(&sparse)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            git_cmd()
+                .args(["sparse-checkout", "set", "source.txt"])
+                .current_dir(&sparse)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            git_cmd()
+                .args(["checkout", "--quiet", "main"])
+                .current_dir(&sparse)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(!sparse.join("hidden.txt").exists());
+        config.repo_root = sparse.clone();
+        config.repo_path = Some(sparse);
+        config.do_fetch = false;
+        let error = match IndependentReview::create(&config) {
+            Ok(_) => panic!("offline sparse partial checkout should lack required objects"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("partial clone may lack required objects"));
+        config.do_fetch = true;
+        let hydrated = IndependentReview::create(&config).unwrap();
+        assert_eq!(
+            std::fs::read(hydrated.repo_root.join("hidden.txt")).unwrap(),
+            b"outside sparse checkout\n"
+        );
+
+        let shallow = home.path().join("shallow-caller");
+        assert!(
+            git_cmd()
+                .args(["clone", "--quiet", "--depth=1", "--filter=blob:none"])
+                .arg(&url)
+                .arg(&shallow)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let source_shallow = git2::Repository::open(&shallow).unwrap();
+        assert!(source_shallow.is_shallow());
+        let boundary = std::fs::read(source_shallow.commondir().join("shallow")).unwrap();
+        config.repo_root = shallow.clone();
+        config.repo_path = Some(shallow);
+        config.do_fetch = false;
+        let owned = IndependentReview::create(&config).unwrap();
+        let copied = git2::Repository::open(&owned.repo_root).unwrap();
+        assert!(copied.is_shallow());
+        assert_eq!(
+            std::fs::read(copied.commondir().join("shallow")).unwrap(),
+            boundary
+        );
+    }
 
     #[test]
     fn independent_repo_copies_objects_without_ambient_source_or_dependencies() {
