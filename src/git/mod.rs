@@ -8,6 +8,7 @@ pub use cmd::git_cmd;
 pub(crate) use cmd::override_test_git_program;
 
 mod snapshot;
+pub(crate) mod transport;
 pub use snapshot::AnalysisSnapshot;
 #[cfg(all(test, unix))]
 pub(crate) use snapshot::override_test_tar_program;
@@ -244,16 +245,57 @@ impl Repository {
 
     /// Refresh refs needed for the current run when fetch is enabled.
     pub fn prepare_refs(&self, config: &Config) -> Result<()> {
+        self.prepare_refs_with_transport(config, None)
+    }
+
+    pub(crate) fn prepare_refs_with_transport(
+        &self,
+        config: &Config,
+        transport: Option<&transport::Transport>,
+    ) -> Result<()> {
+        self.prepare_refs_inner(config, transport, false)
+    }
+
+    pub(crate) fn refetch_partial_origin(
+        &self,
+        config: &Config,
+        transport: Option<&transport::Transport>,
+    ) -> Result<()> {
+        self.prepare_refs_inner(config, transport, true)
+            .context("partial review origin refetch failed; Git 2.36 or newer with --refetch and an accessible origin are required")
+    }
+
+    fn prepare_refs_inner(
+        &self,
+        config: &Config,
+        transport: Option<&transport::Transport>,
+        refetch: bool,
+    ) -> Result<()> {
         if !config.do_fetch || self.inner.find_remote("origin").is_err() {
             return Ok(());
         }
+        let transport = transport.map(transport::Transport::begin).transpose()?;
+        let configure = |command: &mut std::process::Command| {
+            if let Some(transport) = &transport {
+                transport.configure(command, &self.path);
+            } else {
+                command.current_dir(&self.path);
+            }
+        };
 
         let mut fetch_origin = git_cmd();
-        fetch_origin
-            .args(["fetch", "--quiet", "--prune", "origin"])
-            .current_dir(&self.path);
-        let fetch_origin = crate::proc::spawn_wait_governed(fetch_origin, "git fetch origin")
-            .context("Failed to run git fetch origin")?;
+        configure(&mut fetch_origin);
+        fetch_origin.args(["fetch", "--quiet", "--prune"]);
+        if refetch {
+            fetch_origin.arg("--refetch");
+        }
+        fetch_origin.arg("origin");
+        let fetch_origin = if let Some(transport) = &transport {
+            transport.run(fetch_origin, "git fetch origin")?
+        } else {
+            crate::proc::spawn_wait_governed(fetch_origin, "git fetch origin")
+                .context("Failed to run git fetch origin")?
+        };
 
         if !fetch_origin.success() {
             anyhow::bail!("git fetch origin failed with status {}", fetch_origin);
@@ -262,12 +304,19 @@ impl Repository {
         if let Some(pr_number) = config.pr_number {
             let pr_ref = format!("pull/{pr_number}/head:refs/remotes/origin/pr/{pr_number}");
             let mut fetch_pr = git_cmd();
-            fetch_pr
-                .args(["fetch", "--quiet", "origin", &pr_ref])
-                .current_dir(&self.path);
-            let fetch_pr =
-                crate::proc::spawn_wait_governed(fetch_pr, &format!("git fetch PR #{pr_number}"))
-                    .with_context(|| format!("Failed to fetch PR ref for #{pr_number}"))?;
+            configure(&mut fetch_pr);
+            fetch_pr.args(["fetch", "--quiet"]);
+            if refetch {
+                fetch_pr.arg("--refetch");
+            }
+            fetch_pr.args(["origin", &pr_ref]);
+            let label = format!("git fetch PR #{pr_number}");
+            let fetch_pr = if let Some(transport) = &transport {
+                transport.run(fetch_pr, &label)?
+            } else {
+                crate::proc::spawn_wait_governed(fetch_pr, &label)
+                    .with_context(|| format!("Failed to fetch PR ref for #{pr_number}"))?
+            };
 
             if !fetch_pr.success() {
                 anyhow::bail!("git fetch PR ref failed with status {}", fetch_pr);

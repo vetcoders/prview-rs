@@ -21,9 +21,10 @@ Before the first automated release, the rules applying to `main` must:
 - allow merge commits only (no squash or rebase).
 
 **Prepare Release PR** queries the effective branch rules and fails before
-creating anything if any control is absent. This repository's live organization
-rules must be updated once after this workflow lands; the current baseline rule
-does not yet meet that prerequisite.
+creating anything if any control is absent. A repository-specific release
+safeguard ruleset can supply these controls alongside the organization baseline.
+Verify the effective rules for `main` before preparing a release; organization
+defaults alone do not establish that these prerequisites are enforced.
 
 Then:
 

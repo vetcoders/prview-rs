@@ -65,6 +65,7 @@ pub(crate) struct CallerGuard {
     first: Mutex<Option<CallerDriftError>>,
     observation_gate: Mutex<()>,
     owned_outputs: Mutex<BTreeMap<PathBuf, OwnedLeaf>>,
+    output_source_roots: Mutex<BTreeSet<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -136,9 +137,11 @@ impl CallerGuard {
             first: Mutex::new(None),
             observation_gate: Mutex::new(()),
             owned_outputs: Mutex::new(BTreeMap::new()),
+            output_source_roots: Mutex::new(BTreeSet::new()),
         })
     }
 
+    #[cfg(unix)]
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -200,36 +203,45 @@ impl CallerGuard {
         Ok(guard)
     }
 
+    /// Additional read-only identity roots for concrete output collision checks.
+    /// Their unrelated source is not a preservation baseline for this run.
+    pub(crate) fn protect_output_source(&self, root: PathBuf) {
+        self.output_source_roots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(root);
+    }
+
     fn output_is_tracked(&self, path: &Path) -> Result<bool> {
-        let root = fs::canonicalize(&self.root)?;
-        let repo = git2::Repository::open(&root)?;
-        let tracked = tracked_paths(&repo)?;
-        if let Ok(relative) = path.strip_prefix(&root)
-            && tracked.paths.iter().any(|bytes| {
-                git_path(bytes).is_ok_and(|p| {
-                    p == relative || (tracked.gitlinks.contains(bytes) && relative.starts_with(p))
-                })
-            })
-        {
+        if tracked_output_at(&self.root, path)? {
             return Ok(true);
         }
-        #[cfg(any(unix, windows))]
-        {
-            let identity = match existing_leaf_identity(path) {
-                Ok(identity) => identity,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(error) => return Err(error.into()),
-            };
-            for tracked_path in protected_tracked_paths(&root, 0)? {
-                match existing_leaf_identity(&tracked_path) {
-                    Ok(tracked_identity) if tracked_identity == identity => return Ok(true),
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+        let roots = self
+            .output_source_roots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for root in roots.iter() {
+            // This run does not own any write in its original caller, including
+            // an untracked destination reached through an external alias.
+            if output_leaf_path(path)?.starts_with(root) || tracked_output_at(root, path)? {
+                return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    pub(crate) fn namespace_source_visible(&self, path: &Path) -> Result<bool> {
+        if namespace_source_visible(&self.root, path)? {
+            return Ok(true);
+        }
+        let physical = planned_path(path)?;
+        let roots = self
+            .output_source_roots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Ok(roots
+            .iter()
+            .any(|root| physical.starts_with(root) || root.starts_with(&physical)))
     }
 
     pub(crate) fn owns_output(&self, path: &Path) -> bool {
@@ -1220,7 +1232,16 @@ impl CallerGuard {
                 },
                 receipt: None,
             };
-            match persist_receipt(&self.diagnostics, &receipt) {
+            let retained = self
+                .namespace_source_visible(&self.diagnostics)
+                .and_then(|visible| {
+                    ensure!(
+                        !visible,
+                        "caller diagnostic namespace redirects into protected source"
+                    );
+                    persist_receipt(&self.diagnostics, &receipt)
+                });
+            match retained {
                 Ok(path) => error.receipt = Some(path),
                 Err(failure) => error.detail.push_str(&format!(
                     "; diagnostic retention not confirmed: {failure:#}"
@@ -1659,6 +1680,38 @@ fn existing_leaf_identity(path: &Path) -> std::io::Result<(u64, u64)> {
         u64::from(information.dwVolumeSerialNumber),
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
     ))
+}
+
+fn tracked_output_at(root: &Path, path: &Path) -> Result<bool> {
+    let root = fs::canonicalize(root)?;
+    let repo = git2::Repository::open(&root)?;
+    let tracked = tracked_paths(&repo)?;
+    if let Ok(relative) = path.strip_prefix(&root)
+        && tracked.paths.iter().any(|bytes| {
+            git_path(bytes).is_ok_and(|p| {
+                p == relative || (tracked.gitlinks.contains(bytes) && relative.starts_with(p))
+            })
+        })
+    {
+        return Ok(true);
+    }
+    #[cfg(any(unix, windows))]
+    {
+        let identity = match existing_leaf_identity(path) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        for tracked_path in protected_tracked_paths(&root, 0)? {
+            match existing_leaf_identity(&tracked_path) {
+                Ok(tracked_identity) if tracked_identity == identity => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn ensure_untracked_output(guard: &CallerGuard, path: &Path) -> Result<()> {

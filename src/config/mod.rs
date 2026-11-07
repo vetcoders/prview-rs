@@ -2097,7 +2097,9 @@ fn non_empty_string(value: &str) -> Option<String> {
 
 /// Infer GitHub owner/repo from origin remote URL
 fn infer_gh_repo_from_origin(repo_root: &Path) -> Option<String> {
-    let output = git_cmd()
+    let mut command = git_cmd();
+    crate::git::transport::remove_tracing(&mut command);
+    let output = command
         .args(["remote", "get-url", "origin"])
         .current_dir(repo_root)
         .output()

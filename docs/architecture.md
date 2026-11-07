@@ -4852,3 +4852,116 @@ with the truncation marker (including the legacy prefix-only marker) are not
 indexed for advisory dependency paths. Neither PR_REVIEW nor FAILURES_SUMMARY
 may infer ancestry across an omitted portion; advisories remain visible without
 those paths. Complete trees keep their existing path enrichment.
+
+### Remote review repository ownership
+
+`--pr`, `--remote` and `--remote-only` runs transport local Git objects and refs
+into an independently owned temporary repository before refreshing refs or
+planning checks. Its Git common directory, target worktrees and cleanup are
+separate from the invocation checkout. The copy imports neither its index,
+untracked source, hooks or unrelated configuration, nor ambient
+`node_modules`/`.venv`. Available submodule object stores are transported separately, including retained
+historical stores and old-form checkouts. Active module names are mapped to
+their gitlink paths. Module ODB bytes include pins no longer reachable from
+module refs and alternate-backed objects; destination ODBs retain no alternates.
+Missing pinned objects still fail closed. No automatic checkout restoration is attempted.
+
+Shallow callers retain their Git shallow boundary during transport. For a
+partial clone, the owned repository copies only objects currently available in
+the caller and copies refs separately, without asking the caller's promisor to
+fill its object store. With fetch enabled it then performs an origin
+`--refetch` and, when requested, a PR ref `--refetch` in the owned repository
+before checkout, using the captured transport settings; this requires Git 2.36
+or newer. Origin cannot supply
+objects that are no longer reachable or otherwise unavailable there. With
+fetch disabled no network hydration occurs: the review can use locally
+available objects and reports an error when a required object is absent.
+Sparse partial checkouts can therefore require fetch even when their visible
+files are present. Module name/path mappings come from committed
+`.gitmodules` metadata read from the owned object store with includes disabled;
+a half-written invocation-checkout file does not control setup.
+
+The existing caller boundary guard observes that execution repository. An
+unrelated nested repository or concurrent caller edit is not an input to its
+baseline. The invocation checkout still has its own once-per-run provenance
+observation, including its actual dirty paths, digest and HEAD; it is not
+replaced by the clean execution checkout. TUI preflight ref refresh also uses
+an owned repository while retaining the original invocation config for later
+analysis. The private repository stays owned through the TUI session, so a
+preflight-only PR object survives a later force-push. Each run still refreshes
+refs and propagates fetch failures; retaining objects does not freeze symbolic
+refs or waive requested network refreshes. Selecting a local target in the
+wizard restores the ambient local-review path for that run; it does not reuse
+the remote execution repository. Every GUI analysis session, including a local
+startup followed by a remote wizard selection, retains the original profile and
+CLI-detection authority separately from prepared UI detections; each run uses
+that authority with the current selection before rebasing and refreshing its
+profile. Private display paths from a prior run do not become caller inputs.
+Relative local origin paths retain the invocation checkout as their
+resolution base. The ordered origin fetch refspecs, including exclusions and an
+empty mapping, retain their meaning. When fetch is enabled, the same workspace
+captures the caller's effective Git transport configuration at origin setup,
+including includes, conditional includes, worktree and command-scope entries.
+Only HTTP, credential and protocol settings, core SSH/proxy/askpass, SSH variant,
+and the origin proxy, proxy-auth, tag policy, upload-pack and VCS settings are
+admitted. Tag policy includes `remote.origin.tagOpt`,
+`remote.origin.pruneTags` and `fetch.pruneTags`. Both pruning settings are
+replayed so Git retains its native precedence: an explicit origin value
+overrides `fetch.pruneTags`, including `false`. The owned origin fetch uses
+`--prune`; when tag pruning is enabled it deletes copied tags absent upstream.
+Changed tags retain Git's normal refspec rules (Git 2.20+ rejects replacement
+without a forced tag refspec); PrView does not add `--force`. With `--no-fetch`,
+copied tags are left unchanged.
+Each fetch receives this snapshot through its child environment, with ambient
+system/global Git config replaced by empty config. Other caller config, hooks,
+includes and URL rewrites are not imported. Git still interprets URL-specific
+settings and ordered multivalues. URL and fetch mappings are checked against
+native Git before and after capture; this detects observed changes but is not a
+filesystem transaction. A retained TUI session retains that same origin and
+transport epoch; a new workspace is needed to enable fetch if it was created
+without fetch.
+
+The owned fetch runs from the caller directory for relative transport commands
+but explicitly targets the owned Git directory and worktree. Trusted helpers
+and commands can have external effects; this is not a host filesystem sandbox.
+The built-in credential-store helper is replaced by an inert marker when its
+configured or default files resolve inside the caller worktree, Git directory
+or common directory, or when its options or default locations cannot be
+interpreted safely. In particular, an unset HOME does not use Git's complete
+platform-specific fallback behavior; Windows compatibility for that case is
+not guaranteed. Git still selects helpers by URL and applies ordered resets; only invocation of
+the marker fails the review, even if the fetch itself succeeded. Objects and
+refs fetched before that failure remain confined to the owned repository. Cookie
+saving for the origin is refused because it can write to the caller. For a credential-bearing or
+query-bearing HTTP origin, a configured cookie-saving policy cannot be safely
+inspected and is refused. Non-UTF-8 admitted settings are refused. Replayed
+transport configuration values are not placed in arguments, repository config,
+review artifacts or diagnostic command labels; they exist in the fetch child
+environment and are not protected from other processes of the same user. The
+origin URL is still stored in the owned repository and may appear in artifact
+metadata; inline credentials in that URL have not been removed by this change.
+Git tracing is disabled for discovery and owned fetch; failure diagnostics redact known transport
+values. Arbitrary output from trusted helpers is not a confidentiality boundary.
+Remote setup explicitly rejects an origin URL that is not valid UTF-8,
+including with `--no-fetch`, because this transport path cannot preserve it
+losslessly. It also surfaces origin inspection errors; an unreadable origin is
+never treated as an absent remote and cannot silently suppress requested fetches. Concrete output collision checks still protect the original caller's
+tracked files and aliases. Remote home/output/Cargo/uv write roots must be outside
+the caller; an internal override is refused rather than silently dropping its
+protection. The same namespace admission runs before each retained-session
+analysis, so a late output/cache redirect is refused before directory allocation. Snapshot-integrity and exact owned-output pre/postimage checks remain
+active. Ambient local reviews retain their existing caller baseline.
+Cargo/uv scratch planning carries the original caller identity through both
+headless and TUI dispatchers, including pre-sync. It rechecks configured and
+effective roots and descendant links for late redirects before tool commands.
+
+`00_summary/EXECUTION_ROOTS.json` records caller, execution repository, target and
+output separately. Its `path_encoding: utf8_lossy_display` marks these strings
+as display paths, including on Unix paths containing non-UTF-8 bytes. It
+explicitly reports `host_write_confinement: false`.
+This is separation of Git ownership and ordinary execution paths, not OS access
+control: arbitrary tests/plugins may still address absolute host paths. Default
+host home/tool caches and target-owned external links are not made into a sandbox
+by this change. The issue #69 Semgrep baseline planner, pinned range and
+cancel/timeout process cleanup remain unchanged; its resets operate only on the
+owned detached snapshot. No new sandbox backend is required to run a review.

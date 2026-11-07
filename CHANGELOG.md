@@ -316,6 +316,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Remote reviews use an independently owned Git repository before ref refresh,
+  check planning and TUI preflight. Existing agent worktrees and concurrent
+  caller edits stay outside execution, while caller provenance and concrete
+  output protections are retained. This is not a host filesystem sandbox.
+- Report and merge-gate schema 3.2 distinguish requested security from recorded
+  execution, test-change matching from runtime coverage, and repository-wide
+  Loctree count deltas from finding identity. Coverage trends identify the
+  previous run supplying their metric without changing legacy policy semantics.
 - Update transitive `ctutils` to 0.4.4 and `libz-sys` to 1.1.31 to address
   RUSTSEC-2026-0385 and RUSTSEC-2026-0418 without adding advisory exceptions.
 

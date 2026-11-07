@@ -1447,3 +1447,34 @@ Coverage trends use a previous run, which can have a different pair of revisions
 `regression.tests.coverage_comparison` identifies that source explicitly and
 never labels it as a measurement of the current PR base. Slow-check messages
 name active checks without assuming that their delay is Cargo compilation.
+
+Remote reviews (`--pr`, `--remote`, `--remote-only`) use a private Git repository
+and target snapshot. Existing local agent worktrees and concurrent source edits
+are not review inputs. Ambient installed dependencies are not borrowed from your
+checkout; a check whose toolchain is unavailable records its existing explicit
+skip/error rather than scanning the live checkout. Put `PRVIEW_HOME`, explicit
+`--output-dir`, Cargo build cache and uv environment roots outside the caller.
+Internal write overrides are refused in remote mode; local ambient mode keeps
+its previous behavior. `00_summary/EXECUTION_ROOTS.json` shows the actual roots.
+When remote fetching is enabled, the workspace captures the origin and an
+allowlisted snapshot of the caller's Git transport settings together; retained
+sessions keep that snapshot, and enabling fetch after creating a workspace
+without it requires a new review. This includes origin tag selection and tag
+pruning: `remote.origin.pruneTags` overrides `fetch.pruneTags`, including an
+explicit `false`. Enabled pruning removes stale tags in the private repository;
+changed tags follow Git's normal refspec rules and can fail the fetch rather
+than being overwritten. `--no-fetch` leaves copied tags unchanged.
+If Git selects a credential-store helper
+whose destination is inside the caller or cannot be determined safely, the
+review fails; it also refuses cookie saving for the origin. Default credential
+store locations depend on HOME and XDG settings, and Windows HOME fallback
+compatibility is not guaranteed. Partial clones copy only locally available
+objects; with fetch enabled, the owned workspace refetches from origin before
+checkout and requires Git 2.36 or newer. With fetch disabled, missing objects
+required by the review are reported as errors; unneeded missing objects do not
+by themselves block setup. See
+[remote review repository ownership](architecture.md#remote-review-repository-ownership)
+for the supported settings and details.
+
+This separation is not a host filesystem sandbox: trusted custom transport
+helpers, project tests and plugins can perform arbitrary external writes.
