@@ -76,6 +76,7 @@ fn mock_checks() -> Vec<CheckResult> {
 
 fn mock_ctx() -> DashboardContext {
     DashboardContext {
+        has_api_comparison: true,
         verdict: "PASS",
         analysis_status: crate::policy::engine::AnalysisStatus::Complete,
         merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
