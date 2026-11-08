@@ -1050,7 +1050,11 @@ fn build_report_for_range(
         },
     };
 
-    let evidence = super::breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    let evidence = super::breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
     let rust_counts = ctx.rust_api_delta.as_ref().map(|view| &view.counts);
 
     let quality = Quality {
@@ -1485,6 +1489,7 @@ test result: FAILED. 0 passed; 1 failed
         }];
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "BLOCK",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Block,
@@ -1647,6 +1652,7 @@ test result: FAILED. 0 passed; 1 failed
             provenance: None,
         });
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -1774,6 +1780,7 @@ test result: FAILED. 0 passed; 1 failed
 
         // Pre-existing-only failures: quality_pass=true because no new issues
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -1896,6 +1903,7 @@ test result: FAILED. 0 passed; 1 failed
         config.execution_mode = ExecutionMode::Standard;
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "CONDITIONAL",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::ReviewRequired,
@@ -2001,6 +2009,7 @@ test result: FAILED. 0 passed; 1 failed
         config.execution_mode = ExecutionMode::Standard;
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "BLOCK",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Block,
@@ -2131,6 +2140,7 @@ test result: FAILED. 0 passed; 1 failed
         config.run_heuristics = true;
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -2261,6 +2271,7 @@ test result: FAILED. 0 passed; 1 failed
         coverage: crate::artifacts::signal::CoverageDelta,
     ) -> crate::artifacts::DashboardContext {
         crate::artifacts::DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -2700,6 +2711,7 @@ test result: FAILED. 0 passed; 1 failed
         }];
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -2958,5 +2970,30 @@ test result: FAILED. 0 passed; 1 failed
             "NOT_APPLICABLE"
         );
         assert_eq!(report["quality"]["breaking_changes"]["status"], "MEASURED");
+    }
+
+    #[test]
+    fn report_api_without_comparison_is_not_run_and_preserves_known_counts() {
+        let mut ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        ctx.has_api_comparison = false;
+        let report = skip_as_zero_report(&ctx, None, false);
+        let api = &report["quality"]["breaking_changes"];
+        assert_eq!(api["status"], "NOT_RUN");
+        assert_eq!(api["analysis_complete"], false);
+        assert_eq!(api["rust_status"], "NOT_RUN");
+        assert_eq!(api["has_breaking"], false);
+        ctx.breaking.push(super::super::signal::BreakingFinding {
+            file: "src/api.ts".into(),
+            kind: BreakingKind::RemovedSymbol {
+                symbol_type: "function".into(),
+            },
+            line: "export function removed()".into(),
+            risk_level: super::super::signal::BreakingRisk::High,
+        });
+        let report = skip_as_zero_report(&ctx, None, false);
+        let api = &report["quality"]["breaking_changes"];
+        assert_eq!(api["status"], "NOT_RUN");
+        assert_eq!(api["removed_public_symbols_count"], 1);
+        assert_eq!(api["has_breaking"], true);
     }
 }

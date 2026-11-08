@@ -78,6 +78,8 @@ pub(crate) struct DashboardContext {
     pub policy_mode: &'static str,
     pub blocking_issues: Vec<String>,
     pub check_gates: Vec<CheckGateEntry>,
+    /// At least one resolved revision comparison, including a valid empty diff.
+    pub has_api_comparison: bool,
     pub breaking: Vec<BreakingFinding>,
     pub rust_api_delta: Option<api_delta::ApiArtifactView>,
     pub coverage: CoverageDelta,
@@ -432,6 +434,7 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         policy_mode: config.policy.mode_str(),
         blocking_issues,
         check_gates,
+        has_api_comparison: !diffs.is_empty(),
         breaking,
         rust_api_delta,
         coverage,
@@ -445,5 +448,71 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         ownership_map,
         risk_scores,
         i18n_delta,
+    }
+}
+
+#[cfg(test)]
+mod api_comparison_tests {
+    use super::*;
+
+    #[test]
+    fn api_comparison_availability_distinguishes_no_range_from_empty_diff() {
+        let config = crate::config::test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let inline = InlineFindingsSummary {
+            status: "passed".into(),
+            findings_count: 0,
+            dashboard_findings: vec![],
+            cargo_audit: None,
+        };
+        let empty_diff = Diff {
+            base: "base".into(),
+            target: "target".into(),
+            base_commit_id: "a".into(),
+            target_commit_id: "b".into(),
+            files: vec![],
+            stats: crate::git::DiffStats::default(),
+            commits: vec![],
+        };
+        for diffs in [&[][..], std::slice::from_ref(&empty_diff)] {
+            let ctx = build_dashboard_context(DashboardContextInput {
+                review_range: &ReviewRange::default(),
+                config: &config,
+                checks: &[],
+                heuristics: None,
+                inline: &inline,
+                breaking: vec![],
+                rust_api_delta: None,
+                coverage: CoverageDelta {
+                    total_source: 0,
+                    covered_count: 0,
+                    pct: None,
+                    uncovered: vec![],
+                    covered: vec![],
+                    non_code_count: 0,
+                    ghost_tests: vec![],
+                },
+                diff_dir: dir.path(),
+                skipped_checks: vec![],
+                out_dir: dir.path(),
+                diffs,
+                ownership_map: vec![],
+                clean_comparison: CleanComparison::for_test(true, true),
+                snapshot_integrity: None,
+                provenance: &ProvenanceConsistency::default(),
+                scope: None,
+            });
+            assert_eq!(ctx.has_api_comparison, !diffs.is_empty());
+            let evidence = breaking_evidence(&ctx.breaking, None, ctx.has_api_comparison);
+            assert_eq!(
+                evidence.status,
+                if diffs.is_empty() {
+                    "NOT_RUN"
+                } else {
+                    "MEASURED"
+                }
+            );
+            assert_eq!(evidence.analysis_complete, !diffs.is_empty());
+        }
     }
 }

@@ -2944,6 +2944,12 @@ breaking. `rust_status: NOT_APPLICABLE` denotes a run outside Rust scope while
 the existing JS/TS structural scan remains measured. Neither `MEASURED` nor
 `analysis_complete` claims semantic compatibility.
 
+The presentation also receives `has_api_comparison` from the actual `Diff`
+collection. No comparison means `NOT_RUN` and incomplete analysis, even when
+the finding count is zero. A real comparison with an empty diff still provides
+structural input. This availability fact is independent of the global verdict
+and does not alter reference resolution or the canonical merge policy.
+
 Dependency regression carries current and baseline evidence separately through
 `RegressionContext`. A current measurement requires enabled heuristics, an
 available Loctree result and a positive scan scope. `HeuristicsRegression`

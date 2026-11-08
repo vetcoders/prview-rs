@@ -905,6 +905,19 @@ mod api_evidence_tests {
     use super::*;
 
     #[test]
+    fn api_missing_comparison_reaches_narrative_and_consolidated_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("PR_REVIEW.md"), "# PR Review\n").unwrap();
+        append_api_evidence(dir.path(), &breaking_evidence(&[], None, false)).unwrap();
+        super::super::review_html::generate_review_summary(dir.path(), &[]).unwrap();
+        for file in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+            let md = fs::read_to_string(dir.path().join(file)).unwrap();
+            assert!(md.contains("analysis: NOT_RUN; Rust: NOT_RUN"));
+            assert!(!md.contains("analysis: MEASURED"));
+        }
+    }
+
+    #[test]
     fn api_unknown_reaches_narrative_and_consolidated_summary() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("PR_REVIEW.md"), "# PR Review\n").unwrap();
@@ -923,7 +936,7 @@ mod api_evidence_tests {
             },
             findings: vec![],
         };
-        append_api_evidence(dir.path(), &breaking_evidence(&[], Some(&view))).unwrap();
+        append_api_evidence(dir.path(), &breaking_evidence(&[], Some(&view), true)).unwrap();
         super::super::review_html::generate_review_summary(dir.path(), &[]).unwrap();
         for file in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
             let md = fs::read_to_string(dir.path().join(file)).unwrap();

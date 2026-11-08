@@ -104,6 +104,7 @@ fn mock_checks() -> Vec<CheckResult> {
 
 pub(super) fn mock_ctx() -> DashboardContext {
     DashboardContext {
+        has_api_comparison: true,
         verdict: "PASS",
         analysis_status: crate::policy::engine::AnalysisStatus::Complete,
         merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -1790,7 +1791,7 @@ fn api_unknown_is_visible_in_hero_details_navigation_and_action_center() {
 #[test]
 fn js_ts_structural_zero_does_not_require_rust_evidence() {
     let ctx = mock_ctx();
-    let evidence = breaking_evidence(&ctx.breaking, None);
+    let evidence = breaking_evidence(&ctx.breaking, None, ctx.has_api_comparison);
     assert_eq!(evidence.status, "MEASURED");
     assert_eq!(evidence.rust_status, "NOT_APPLICABLE");
     assert!(build_action_center(&ctx, &[], None).contains("chip.publicApiStructuralChangesClear"));
@@ -1815,10 +1816,39 @@ fn added_only_rust_api_keeps_additions_without_claiming_zero_all_changes() {
         },
         findings: vec![],
     });
-    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    let evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
     assert_eq!(evidence.known_count, 0);
     assert_eq!(ctx.rust_api_delta.as_ref().unwrap().counts.added, 1);
     let html = build_action_center(&ctx, &[], None);
     assert!(html.contains("Structural compatibility-impact observations: 0"));
     assert!(!html.contains("Public API structural changes: 0"));
+}
+
+#[test]
+fn api_missing_comparison_is_not_run_in_hero_details_navigation_and_actions() {
+    let mut ctx = mock_ctx();
+    ctx.has_api_comparison = false;
+    let config = mock_config();
+    let dir = tempfile::tempdir().unwrap();
+    let html = build_html_test!(&config, &[], &[], None, &ctx, "{}", dir.path(), "", None);
+    let header = build_header(&config, None, &ctx, dir.path(), "{}");
+    assert!(header.contains("analysis: NOT_RUN; Rust: NOT_RUN"));
+    assert!(build_breaking_section(&ctx).contains("NOT_RUN"));
+    assert_eq!(html.matches("id=\"section-breaking\"").count(), 1);
+    let actions = build_action_center(&ctx, &[], None);
+    assert!(actions.contains("NOT_RUN"));
+    assert!(!actions.contains("chip.publicApiStructuralChangesClear"));
+    let navigation = html
+        .split("<nav")
+        .nth(1)
+        .unwrap()
+        .split("</nav>")
+        .next()
+        .unwrap();
+    assert!(navigation.contains("#section-breaking"));
+    assert!(navigation.contains("NOT_RUN"));
 }

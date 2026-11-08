@@ -910,7 +910,11 @@ pub(super) fn heuristic_confidence(kind: &str, count: usize) -> &'static str {
 }
 
 pub(super) fn breaking_evidence_html(ctx: &DashboardContext) -> String {
-    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    let evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
     i18n_template(
         "summary.apiEvidence",
         &format!(
@@ -1040,7 +1044,11 @@ pub(super) fn build_action_center(
         }
     }
 
-    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    let evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
     if !evidence.analysis_complete || evidence.known_count > 0 {
         let high_risk = ctx
             .breaking
@@ -1979,7 +1987,11 @@ pub(super) fn build_ownership_section(ctx: &DashboardContext) -> String {
 }
 
 pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
-    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    let evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
 
     let removed: Vec<_> = ctx
         .breaking

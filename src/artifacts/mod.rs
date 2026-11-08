@@ -1123,7 +1123,11 @@ fn generate_guarded(
     )?;
     pr_review::append_api_evidence(
         &out_dir,
-        &breaking_evidence(&breaking_findings, rust_breaking_view.as_ref()),
+        &breaking_evidence(
+            &breaking_findings,
+            rust_breaking_view.as_ref(),
+            !diffs.is_empty(),
+        ),
     )?;
     let mut range_notices = review_range.review_caveats();
     range_notices.push(prev_coverage.description());

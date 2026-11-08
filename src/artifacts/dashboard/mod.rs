@@ -938,7 +938,11 @@ fn build_html(input: BuildHtmlInput<'_>) -> String {
             ctx.coverage.covered_count, ctx.coverage.total_source,
         );
     }
-    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    let evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
     let _ = write!(
         nav,
         "<a href=\"#section-breaking\"><span data-i18n=\"nav.breaking\">Breaking</span> <span class=\"nav-badge badge-warn\">{} / {}</span></a>",

@@ -321,6 +321,7 @@ pub(crate) struct BreakingEvidence {
 pub(crate) fn breaking_evidence(
     breaking: &[BreakingFinding],
     rust: Option<&api_delta::ApiArtifactView>,
+    has_api_comparison: bool,
 ) -> BreakingEvidence {
     let breakdown = breaking_change_breakdown(breaking);
     let rust_known = rust.map_or(0, |view| {
@@ -331,15 +332,19 @@ pub(crate) fn breaking_evidence(
     });
     let unknown_count = rust.map_or(0, |view| view.counts.unknown);
     let known_count = breaking.len() + rust_known;
-    let analysis_complete = unknown_count == 0;
-    let status = if analysis_complete {
-        "MEASURED"
-    } else {
+    let analysis_complete = has_api_comparison && unknown_count == 0;
+    let status = if !has_api_comparison {
+        "NOT_RUN"
+    } else if unknown_count > 0 {
         "UNKNOWN"
+    } else {
+        "MEASURED"
     };
-    // The JS/TS structural scan always runs. No Rust view means Rust is outside
-    // this run's scope, not that the legacy structural scan failed to execute.
-    let rust_status = if rust.is_none() {
+    // No comparison is not a measured empty diff. Only a valid comparison
+    // without Rust evidence establishes that Rust is outside this run's scope.
+    let rust_status = if !has_api_comparison {
+        "NOT_RUN"
+    } else if rust.is_none() {
         "NOT_APPLICABLE"
     } else {
         status
