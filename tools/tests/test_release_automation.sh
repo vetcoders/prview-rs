@@ -145,6 +145,7 @@ assert_contains "$MERGED" 'event_type=prview-release-publish'
 assert_contains "$RELEASE" 'workflow_dispatch:'
 assert_contains "$RELEASE" 'repository_dispatch:'
 assert_contains "$RELEASE" "github.event_name == 'repository_dispatch'"
+assert_contains "$RELEASE" "PRVIEW_GENERATOR_RELEASE_TAG: \${{ github.event_name == 'repository_dispatch' && env.PRVIEW_RELEASE_TAG || '' }}"
 assert_contains "$RELEASE" 'pull-requests: read'
 assert_contains "$RELEASE" "git fetch --no-tags origin \"refs/tags/\$TAG:refs/tags/\$TAG\""
 assert_contains "$RELEASE" "TAG_COMMIT=\$(git rev-list -n 1 \"refs/tags/\$TAG\")"

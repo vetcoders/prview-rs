@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Export generator identity in `report.json`, `RUN.json` and human metadata:
+  embedded source SHA, executable SHA256 build ID, and an optional build-provided
+  release tag. Unknown or unreadable identity stays explicit, and copied ZIPs
+  preserve the same fields independently of the reviewed repository.
 - Release preparation is now an operator-selected, expected-SHA-pinned draft PR
   workflow. A separate fail-closed merge validator creates the immutable tag
   only for a machine-marked release PR, while the existing signed publish

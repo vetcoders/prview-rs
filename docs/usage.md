@@ -965,6 +965,23 @@ default dashboard. `MERGE_GATE.json` follows the selection: its
 `files.dashboard` names `review.html` for such a run, so the canonical decision
 never points at an HTML file the pack does not contain.
 
+### Identify the generator of a copied pack
+
+Read `report.json.meta.tool` or `00_summary/RUN.json.runner`. Both include the
+embedded `git_sha`, `binary_build_id` (SHA256 of the generator executable),
+`binary_build_id_status`, `binary_build_id_reason`, and optional `release_tag`.
+`00_summary/system_meta.txt` repeats these as `generator_*` fields for human
+inspection. They survive ordinary ZIP export and are independent of the
+reviewed repository's base and target SHAs.
+
+An unstamped source build reports `git_sha: "unknown"`; an untagged build has
+`release_tag: null`. If the executable cannot be read, the build ID is null and
+its status/reason explicitly say why. A package version alone does not prove a
+published release. The tag is build-provided metadata; the release workflow
+verifies its source binding. The executable digest is an identity check, not a
+signature or attestation. Report, RUN, PROVENANCE and layout schema versions
+are separate from the generator's package version.
+
 ### Read a pack in the browser
 
 Open `dashboard.html` from the extracted pack. Its reading path starts with

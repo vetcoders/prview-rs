@@ -11,6 +11,7 @@ pub use signal::{api_delta, api_surface, revision_source};
 mod context_artifacts;
 mod evidence_scope;
 mod findings;
+mod generator_identity;
 pub(crate) mod git_artifacts;
 mod merge_gate;
 mod review_range;
@@ -2421,6 +2422,12 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
 
     let generated_at = chrono::Local::now().to_rfc3339();
 
+    let mut runner = serde_json::to_value(generator_identity::current())?;
+    runner["tool"] = json!(env!("CARGO_PKG_NAME"));
+    runner["version"] = json!(env!("CARGO_PKG_VERSION"));
+    runner["os"] = json!(std::env::consts::OS);
+    runner["arch"] = json!(std::env::consts::ARCH);
+
     let run = json!({
         "schema_version": "1.0",
         "run_started_at": run_started_at,
@@ -2475,12 +2482,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             "backpressured": config.resource_plan.backpressured,
             "schedule": "cheap orientation/checks -> capped pools -> serialized uncapped tools -> artifacts",
         },
-        "runner": {
-            "tool": env!("CARGO_PKG_NAME"),
-            "version": env!("CARGO_PKG_VERSION"),
-            "os": std::env::consts::OS,
-            "arch": std::env::consts::ARCH,
-        },
+        "runner": runner,
         "checks": check_results,
         "analysis": {
             "mode": if !config.run_heuristics {
@@ -2561,6 +2563,15 @@ fn generate_system_meta(dir: &Path) -> Result<()> {
     }
 
     content.push_str(&format!("prview_version: {}\n", env!("CARGO_PKG_VERSION")));
+    let generator = generator_identity::current();
+    content.push_str(&format!(
+        "generator_git_sha: {}\ngenerator_binary_build_id: {}\ngenerator_binary_build_id_status: {}\ngenerator_binary_build_id_reason: {}\ngenerator_release_tag: {}\n",
+        generator.git_sha,
+        generator.binary_build_id.as_deref().unwrap_or("unavailable"),
+        generator.binary_build_id_status,
+        generator.binary_build_id_reason.as_deref().unwrap_or("none"),
+        generator.release_tag.unwrap_or("unknown"),
+    ));
 
     let mut command = Command::new("rustc");
     command.arg("--version");

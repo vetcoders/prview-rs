@@ -148,6 +148,8 @@ struct Meta {
 struct ToolMeta {
     name: &'static str,
     version: String,
+    #[serde(flatten)]
+    generator: &'static super::generator_identity::GeneratorIdentity,
 }
 
 #[derive(Serialize)]
@@ -730,6 +732,7 @@ fn build_report_for_range(
         tool: ToolMeta {
             name: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            generator: super::generator_identity::current(),
         },
         repo: config.gh_repo.as_ref().map(|r| RepoMeta {
             full_name: r.clone(),

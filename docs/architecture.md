@@ -2900,6 +2900,37 @@ has been written. Manifest and sanity generation follow HTML generation; those
 artifacts are available as original files rather than embedded copies of
 records that depend on the HTML itself.
 
+#### Generator identity
+
+The generator is distinct from the repository being reviewed. Additive fields
+in `report.json.meta.tool` and `00_summary/RUN.json.runner` identify the same
+executable: `git_sha`, `binary_build_id`, `binary_build_id_status`,
+`binary_build_id_reason`, and `release_tag`. `system_meta.txt` exposes the same
+values with a `generator_` prefix. The existing tool name/version and runner
+OS/architecture remain available.
+
+`git_sha` is the embedded `PRVIEW_BUILD_SOURCE_SHA`; an unstamped build reports
+`unknown`. A process-wide identity value hashes the executable with streaming
+SHA256 once, yielding `binary_build_id: "sha256:<64 lowercase hex digits>"`.
+An unreadable executable produces a null build ID, status `unavailable`, and an
+explicit reason. The digest identifies executable bytes; it is not a signature
+or build attestation. Neither the reviewed HEAD, the current directory nor
+runtime environment overrides supply generator identity.
+
+`release_tag` is optional build-provided metadata, embedded only with an exact
+source stamp and a tag matching the package version. The release workflow owns
+verification that the tag actually resolves to that source commit. Syntax and
+version checks in `build.rs` do not independently attest a release. A normal
+unstamped/untagged build retains null rather than inferring publication from
+the Cargo version.
+
+These additive identity fields preserve report schema `3.2`, RUN schema `1.0`,
+PROVENANCE schema `2.0`, and artifact layout `1.0`; each record's own version is
+authoritative. `PROVENANCE.json.target_sha` and `base_sha` still identify the
+reviewed input. Normal manifest hashing and ZIP export carry the generator
+record unchanged, so a copied pack remains attributable without the original
+host or executable path.
+
 The dashboard has one evidence reader, including file-row patches. It does not
 fall back to a second fetch-based diff modal. Complete original text is stored
 as an escaped JSON string inside its template so HTML newline normalization
