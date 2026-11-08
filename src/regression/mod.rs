@@ -34,6 +34,10 @@ pub struct RegressionContext {
     pub untested_critical_files: Vec<String>,
     pub base_untested_critical_count: Option<usize>,
 
+    /// Evidence metadata is independent of legacy counters and scoring.
+    pub deps_availability: deps::DependencyEvidence,
+    pub deps_base_availability: deps::DependencyEvidence,
+
     // Heuristics stats (current run)
     pub cycles: usize,
     pub dead_exports: usize,

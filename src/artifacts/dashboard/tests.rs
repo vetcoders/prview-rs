@@ -1740,3 +1740,85 @@ fn security_cards_never_report_a_metric_for_a_check_that_did_not_run() {
         }
     }
 }
+
+#[test]
+fn api_unknown_is_visible_in_hero_details_navigation_and_action_center() {
+    for (removed, unknown) in [(0, 1), (1, 1), (0, 0)] {
+        let mut ctx = mock_ctx();
+        ctx.rust_api_delta = Some(super::super::api_delta::ApiArtifactView {
+            view: super::super::api_delta::ApiArtifactViewKind::BreakingChanges,
+            analysis_source: "fixture",
+            base_revision: "base".into(),
+            target_revision: "target".into(),
+            counts: super::super::api_delta::ApiDeltaCounts {
+                added: 0,
+                removed,
+                changed: 0,
+                relocated: 0,
+                visibility_changed: 0,
+                unknown,
+            },
+            findings: vec![],
+        });
+        let config = mock_config();
+        let dir = tempfile::tempdir().unwrap();
+        let html = build_html_test!(&config, &[], &[], None, &ctx, "{}", dir.path(), "", None);
+        let status = if unknown == 0 { "MEASURED" } else { "UNKNOWN" };
+        let header = build_header(&config, None, &ctx, dir.path(), "{}");
+        assert!(header.contains(status));
+        assert!(html.contains(&format!("{removed} known; {unknown} unresolved")));
+        assert_eq!(html.matches("id=\"section-breaking\"").count(), 1);
+        let actions = build_action_center(&ctx, &[], None);
+        if unknown > 0 {
+            assert!(actions.contains("UNKNOWN"));
+            assert!(!actions.contains("chip.publicApiStructuralChangesClear"));
+        } else {
+            assert!(actions.contains("chip.publicApiStructuralChangesClear"));
+        }
+        let navigation = html
+            .split("<nav")
+            .nth(1)
+            .unwrap()
+            .split("</nav>")
+            .next()
+            .unwrap();
+        assert!(navigation.contains("#section-breaking"));
+        assert!(navigation.contains(status));
+    }
+}
+
+#[test]
+fn js_ts_structural_zero_does_not_require_rust_evidence() {
+    let ctx = mock_ctx();
+    let evidence = breaking_evidence(&ctx.breaking, None);
+    assert_eq!(evidence.status, "MEASURED");
+    assert_eq!(evidence.rust_status, "NOT_APPLICABLE");
+    assert!(build_action_center(&ctx, &[], None).contains("chip.publicApiStructuralChangesClear"));
+    assert!(!build_breaking_section(&ctx).is_empty());
+}
+
+#[test]
+fn added_only_rust_api_keeps_additions_without_claiming_zero_all_changes() {
+    let mut ctx = mock_ctx();
+    ctx.rust_api_delta = Some(super::super::api_delta::ApiArtifactView {
+        view: super::super::api_delta::ApiArtifactViewKind::BreakingChanges,
+        analysis_source: "fixture",
+        base_revision: "base".into(),
+        target_revision: "target".into(),
+        counts: super::super::api_delta::ApiDeltaCounts {
+            added: 1,
+            removed: 0,
+            changed: 0,
+            relocated: 0,
+            visibility_changed: 0,
+            unknown: 0,
+        },
+        findings: vec![],
+    });
+    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    assert_eq!(evidence.known_count, 0);
+    assert_eq!(ctx.rust_api_delta.as_ref().unwrap().counts.added, 1);
+    let html = build_action_center(&ctx, &[], None);
+    assert!(html.contains("Structural compatibility-impact observations: 0"));
+    assert!(!html.contains("Public API structural changes: 0"));
+}

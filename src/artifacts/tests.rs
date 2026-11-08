@@ -6838,6 +6838,7 @@ fn test_generate_heuristics_gate_result_with_regression() {
     use crate::heuristics::{HeuristicsRegression, HeuristicsResult, HeuristicsSummary};
 
     let regression = HeuristicsRegression {
+        base_scanned_files: None,
         base_sha: "aaaaaaa".to_string(),
         target_sha: "bbbbbbb".to_string(),
         dead_exports_delta: 3,

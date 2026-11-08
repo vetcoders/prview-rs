@@ -1081,6 +1081,26 @@ are discarded fail-closed, while coherent mode-only add/delete metadata remains
 valid. Confirmed removed, changed, relocated, and
 visibility-changed Rust facts are breaking; added-only facts are informational.
 
+The aggregate `quality.breaking_changes` in `report.json` states `status`
+(`MEASURED` or `UNKNOWN`), `analysis_complete`, and the separate `rust_status`.
+These describe the bounded structural observations, not semantic compatibility.
+`has_breaking: false` means no known compatibility-impact observation was found;
+when `analysis_complete` is false it does not establish absence of changes.
+Unknown observations remain visible alongside known counts in the dashboard,
+`PR_REVIEW.md`, `REVIEW_SUMMARY.md`, and the copied PR comment. Rust additions
+remain in the typed API view without becoming breaking observations. Outside
+Rust scope, `rust_status: NOT_APPLICABLE` does not invalidate the JS/TS structural
+scan. The details anchor is available even for a measured zero.
+
+`regression.deps` separately records `current_status`/`current_reason` and
+`comparison_status`/`comparison_reason`. Read the legacy numeric counts only
+with the relevant `MEASURED` state. Disabled analysis, unavailable Loctree and a
+zero-file scan cannot establish a measured zero. A measured target without a
+baseline retains its current counts, while comparison is `NOT_RUN`. Baseline
+counts alone are insufficient: comparison also requires a positive measured
+baseline scan. Older metadata without that proof remains `UNKNOWN`. The
+existing delta and score calculations are unchanged.
+
 A JS/TS export removed and added again in the same file under the same name
 (and, for `interface`/`type`, in the same type namespace) is paired rather than
 reported as a removal plus an addition. When the two lines agree once

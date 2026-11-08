@@ -19,7 +19,7 @@
   "badge.qualityPass": "Jakość: OK",
   "chip.artifactPackOk": "Pakiet artefaktów OK",
   "chip.artifactPackIntegrityOk": "Integralność paczki artefaktów: OK",
-  "chip.publicApiStructuralChangesClear": "Strukturalne zmiany publicznego API: 0",
+  "chip.publicApiStructuralChangesClear": "Obserwacje strukturalne dotyczące zgodności: 0",
   "chip.checksOk": "Kontrole zakończone powodzeniem: {passed}/{total}",
   "chip.coverageOk": "Pliki z dopasowanymi testami: {covered}/{total}",
   "chip.findingsClear": "Uwagi z narzędzi: 0",
@@ -345,5 +345,7 @@
   "evidence.downloadEmbeddedText": "Pobierz osadzony tekst",
   "evidence.openOriginalFile": "Otwórz oryginalny plik osobno",
   "evidence.originalNotEmbedded": "Pełny oryginał nie jest osadzony. Otwórz jego plik osobno; przeglądarka może go wyświetlić zamiast pobrać.",
-  "label.minimalStructural": "MINIMALNE"
+  "label.minimalStructural": "MINIMALNE",
+  "summary.apiEvidence": "Obserwacje strukturalne dotyczące zgodności: {known} znanych; {unknown} nierozstrzygniętych; analiza: {status}; Rust: {rust} (skan strukturalny; zgodność semantyczna nie jest oceniana)",
+  "message.rustApiDetails": "Dowody API Rust i nierozstrzygnięte obserwacje"
 }

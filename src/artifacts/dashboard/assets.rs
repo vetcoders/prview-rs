@@ -2659,8 +2659,10 @@ const JS_SUFFIX: &str = r##"
             var failed = checks.filter(function(c) { return c.status === 'FAIL' || c.status === 'ERROR'; }).length;
             comment += '**Checks:** ' + passed + ' passed, ' + failed + ' failed\n\n';
 
-            if (quality.breaking_changes && quality.breaking_changes.has_breaking) {
-                comment += '**Public API structural changes:** ' + (quality.breaking_changes.summary || 'Yes') + ' (structural scan; semantic compatibility not assessed)\n\n';
+            if (quality.breaking_changes) {
+                var api = quality.breaking_changes;
+                var apiStatus = api.status || 'UNKNOWN';
+                comment += '**Public API evidence:** ' + apiStatus + ' — ' + (api.summary || 'analysis completeness not recorded') + '\n\n';
             }
 
             if (quality.coverage) {

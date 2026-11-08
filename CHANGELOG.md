@@ -320,6 +320,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve incomplete API analysis through report, dashboard, narrative and
+  copied comments, with explicit UNKNOWN state and known observations retained.
+  Dependency regression now records current and baseline measurement evidence
+  instead of presenting an unavailable comparison as a measured zero.
 - Remote reviews use an independently owned Git repository before ref refresh,
   check planning and TUI preflight. Existing agent worktrees and concurrent
   caller edits stay outside execution, while caller provenance and concrete

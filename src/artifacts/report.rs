@@ -8,8 +8,7 @@ use super::api_delta;
 use super::parsers::cargo_test::extract_failed_test_names;
 use super::signal::BreakingKind;
 use super::{
-    DashboardContext, breaking_change_breakdown, build_merge_decision_view, build_review_caveats,
-    cargo_audit_review_caveats,
+    DashboardContext, build_merge_decision_view, build_review_caveats, cargo_audit_review_caveats,
 };
 use crate::checks::{CheckResult, CheckStatus};
 use crate::config::Config;
@@ -567,7 +566,11 @@ struct HeuristicsSection {
 
 #[derive(Serialize)]
 struct BreakingSection {
+    /// Whether known changes were detected; false does not establish completeness.
     has_breaking: bool,
+    status: &'static str,
+    analysis_complete: bool,
+    rust_status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
     md_path: Option<&'static str>,
@@ -1047,28 +1050,16 @@ fn build_report_for_range(
         },
     };
 
-    let breaking_breakdown = breaking_change_breakdown(&ctx.breaking);
+    let evidence = super::breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
     let rust_counts = ctx.rust_api_delta.as_ref().map(|view| &view.counts);
-    let rust_breaking_count = rust_counts.map_or(0, |counts| {
-        counts.removed + counts.changed + counts.relocated + counts.visibility_changed
-    });
 
     let quality = Quality {
         breaking_changes: BreakingSection {
-            has_breaking: !ctx.breaking.is_empty() || rust_breaking_count > 0,
-            summary: breaking_breakdown.summary().or_else(|| {
-                (rust_breaking_count > 0)
-                    .then(|| {
-                        format!(
-                            "{} confirmed Rust API breaking findings",
-                            rust_breaking_count
-                        )
-                    })
-                    .or_else(|| {
-                        (!ctx.breaking.is_empty())
-                            .then(|| format!("{} breaking findings", ctx.breaking.len()))
-                    })
-            }),
+            has_breaking: evidence.known_count > 0,
+            status: evidence.status,
+            analysis_complete: evidence.analysis_complete,
+            rust_status: evidence.rust_status,
+            summary: Some(evidence.summary),
             // A Rust API report can exist without a breaking finding. Link the
             // emitted artifact, rather than inferring its presence from severity.
             md_path: input
@@ -2116,10 +2107,11 @@ test result: FAILED. 0 passed; 1 failed
         assert_eq!(breaking["removed_public_symbols_count"].as_u64(), Some(1));
         assert_eq!(breaking["signature_changes_count"].as_u64(), Some(1));
         assert_eq!(breaking["new_env_vars_count"].as_u64(), Some(1));
-        assert_eq!(
-            breaking["summary"].as_str(),
-            Some("1 removed public symbol, 1 signature change, 1 new env requirement")
+        let summary = breaking["summary"].as_str().expect("breaking summary");
+        assert!(
+            summary.contains("1 removed public symbol, 1 signature change, 1 new env requirement")
         );
+        assert!(summary.contains("analysis: MEASURED"));
     }
 
     #[test]
@@ -2922,5 +2914,49 @@ test result: FAILED. 0 passed; 1 failed
             0
         );
         assert_eq!(consistency["provenance_comparisons"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn report_api_unknown_preserves_known_counts_and_completeness() {
+        for (added, removed, unknown) in [(0, 0, 1), (0, 1, 1), (0, 0, 0), (1, 0, 0)] {
+            let mut ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+            ctx.rust_api_delta = Some(api_delta::ApiArtifactView {
+                view: api_delta::ApiArtifactViewKind::BreakingChanges,
+                analysis_source: "fixture",
+                base_revision: "base".into(),
+                target_revision: "target".into(),
+                counts: api_delta::ApiDeltaCounts {
+                    added,
+                    removed,
+                    changed: 0,
+                    relocated: 0,
+                    visibility_changed: 0,
+                    unknown,
+                },
+                findings: vec![],
+            });
+            let report = skip_as_zero_report(&ctx, None, false);
+            let evidence = &report["quality"]["breaking_changes"];
+            assert_eq!(evidence["removed_public_symbols_count"], removed);
+            assert_eq!(evidence["unknown_count"], unknown);
+            assert_eq!(evidence["has_breaking"], removed > 0);
+            assert_eq!(evidence["analysis_complete"], unknown == 0);
+            assert_eq!(
+                evidence["status"],
+                if unknown == 0 { "MEASURED" } else { "UNKNOWN" }
+            );
+            let summary = evidence["summary"].as_str().unwrap();
+            assert!(summary.contains("Structural compatibility-impact observations:"));
+            assert!(!summary.contains("Public API structural changes: 0"));
+            assert!(summary.contains("unresolved"));
+            assert_eq!(evidence["rust_api_delta"]["counts"]["added"], added);
+        }
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let report = skip_as_zero_report(&ctx, None, false);
+        assert_eq!(
+            report["quality"]["breaking_changes"]["rust_status"],
+            "NOT_APPLICABLE"
+        );
+        assert_eq!(report["quality"]["breaking_changes"]["status"], "MEASURED");
     }
 }

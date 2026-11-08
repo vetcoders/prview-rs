@@ -19,7 +19,7 @@
   "badge.qualityPass": "Quality: PASS",
   "chip.artifactPackOk": "Artifact Pack OK",
   "chip.artifactPackIntegrityOk": "Artifact pack integrity: OK",
-  "chip.publicApiStructuralChangesClear": "Public API structural changes: 0",
+  "chip.publicApiStructuralChangesClear": "Structural compatibility-impact observations: 0",
   "chip.checksOk": "Checks passed: {passed}/{total}",
   "chip.coverageOk": "Test matches: {covered}/{total}",
   "chip.findingsClear": "Tool observations: 0",
@@ -345,5 +345,7 @@
   "evidence.downloadEmbeddedText": "Download embedded text",
   "evidence.openOriginalFile": "Open original file separately",
   "evidence.originalNotEmbedded": "The complete original is not embedded. Open its file separately; the browser may display it instead of downloading it.",
-  "label.minimalStructural": "MINIMAL"
+  "label.minimalStructural": "MINIMAL",
+  "summary.apiEvidence": "Structural compatibility-impact observations: {known} known; {unknown} unresolved; analysis: {status}; Rust: {rust} (structural scan; semantic compatibility not assessed)",
+  "message.rustApiDetails": "Rust API evidence and unresolved observations"
 }

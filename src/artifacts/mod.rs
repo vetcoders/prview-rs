@@ -1121,6 +1121,10 @@ fn generate_guarded(
         &coverage_delta,
         heuristics,
     )?;
+    pr_review::append_api_evidence(
+        &out_dir,
+        &breaking_evidence(&breaking_findings, rust_breaking_view.as_ref()),
+    )?;
     let mut range_notices = review_range.review_caveats();
     range_notices.push(prev_coverage.description());
     if !range_notices.is_empty() {
@@ -1213,6 +1217,13 @@ fn generate_guarded(
             cycles,
             dead_exports,
             unused_symbols,
+            deps_availability: regression::deps::current_evidence(
+                config.run_heuristics,
+                heuristics,
+            ),
+            deps_base_availability: regression::deps::baseline_evidence(
+                heuristics.and_then(|h| h.regression.as_ref()),
+            ),
             base_cycles,
             base_dead_exports,
             base_unused_symbols,

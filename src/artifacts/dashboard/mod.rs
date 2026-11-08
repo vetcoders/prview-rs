@@ -12,7 +12,7 @@
 //! - Dark theme, responsive, fully interactive (vanilla JS)
 
 use super::{
-    DashboardContext, build_merge_decision_view, build_review_caveats,
+    DashboardContext, breaking_evidence, build_merge_decision_view, build_review_caveats,
     signal::{BreakingKind, BreakingRisk, ReviewFileCategory, classify_review_file},
 };
 use crate::checks::{CheckResult, CheckStatus};
@@ -553,15 +553,7 @@ fn build_html(input: BuildHtmlInput<'_>) -> String {
         )
     };
 
-    let breaking_summary = if ctx.breaking.is_empty() {
-        i18n_template("summary.none", "none", &[])
-    } else {
-        i18n_template(
-            "summary.findingsCount",
-            &format!("{} findings", ctx.breaking.len()),
-            &[("count", ctx.breaking.len().to_string())],
-        )
-    };
+    let breaking_summary = breaking_evidence_html(ctx);
 
     let coverage_summary = match ctx.coverage.pct {
         Some(pct) => i18n_template(
@@ -946,13 +938,12 @@ fn build_html(input: BuildHtmlInput<'_>) -> String {
             ctx.coverage.covered_count, ctx.coverage.total_source,
         );
     }
-    if !ctx.breaking.is_empty() {
-        let _ = write!(
-            nav,
-            "<a href=\"#section-breaking\"><span data-i18n=\"nav.breaking\">Breaking</span> <span class=\"nav-badge badge-warn\">{}</span></a>",
-            ctx.breaking.len()
-        );
-    }
+    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    let _ = write!(
+        nav,
+        "<a href=\"#section-breaking\"><span data-i18n=\"nav.breaking\">Breaking</span> <span class=\"nav-badge badge-warn\">{} / {}</span></a>",
+        evidence.known_count, evidence.status
+    );
     if !ctx.findings.is_empty() {
         let _ = write!(
             nav,

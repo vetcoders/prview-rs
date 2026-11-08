@@ -2931,6 +2931,30 @@ reviewed input. Normal manifest hashing and ZIP export carry the generator
 record unchanged, so a copied pack remains attributable without the original
 host or executable path.
 
+#### Availability of structural evidence
+
+`breaking_evidence` projects the existing legacy findings and typed Rust
+`ApiArtifactView` into one presentation value. It preserves known
+compatibility-impact counts and unknown observations independently. Report
+`quality.breaking_changes.status` and `analysis_complete`, the dashboard's
+hero/details/navigation, narrative and copied comment use that value. The
+legacy `has_breaking` bool retains its count-only meaning; it is not proof of
+completeness. Rust additions remain in the typed view and are not relabelled as
+breaking. `rust_status: NOT_APPLICABLE` denotes a run outside Rust scope while
+the existing JS/TS structural scan remains measured. Neither `MEASURED` nor
+`analysis_complete` claims semantic compatibility.
+
+Dependency regression carries current and baseline evidence separately through
+`RegressionContext`. A current measurement requires enabled heuristics, an
+available Loctree result and a positive scan scope. `HeuristicsRegression`
+records optional `base_scanned_files` from the actual available baseline;
+historical records lacking the field deserialize safely without inventing a
+measurement. Comparison is `MEASURED` only when both sides have positive
+measured scope and all baseline counters exist. A zero-file baseline is
+`NOT_RUN`; absent historical proof is `UNKNOWN`. Additive status/reason fields
+on `DepsRegression` qualify its legacy counters. This metadata changes neither
+the delta algorithm nor scoring or merge policy.
+
 The dashboard has one evidence reader, including file-row patches. It does not
 fall back to a second fetch-based diff modal. Complete original text is stored
 as an escaped JSON string inside its template so HTML newline normalization

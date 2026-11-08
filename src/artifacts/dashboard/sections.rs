@@ -406,6 +406,7 @@ pub(super) fn build_header(
             {qb}
             {policy}
             {review_note}
+            <a href="{api_anchor}">{api_evidence}</a>
         </div>
     </div>
 </header>"#,
@@ -431,6 +432,8 @@ pub(super) fn build_header(
         qb = quality_badge,
         policy = policy_html,
         review_note = review_note_html,
+        api_evidence = breaking_evidence_html(ctx),
+        api_anchor = "#section-breaking",
     )
 }
 
@@ -906,6 +909,23 @@ pub(super) fn heuristic_confidence(kind: &str, count: usize) -> &'static str {
     }
 }
 
+pub(super) fn breaking_evidence_html(ctx: &DashboardContext) -> String {
+    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    i18n_template(
+        "summary.apiEvidence",
+        &format!(
+            "Structural compatibility-impact observations: {} known; {} unresolved; analysis: {}; Rust: {} (structural scan; semantic compatibility not assessed)",
+            evidence.known_count, evidence.unknown_count, evidence.status, evidence.rust_status
+        ),
+        &[
+            ("known", evidence.known_count.to_string()),
+            ("unknown", evidence.unknown_count.to_string()),
+            ("status", evidence.status.to_string()),
+            ("rust", evidence.rust_status.to_string()),
+        ],
+    )
+}
+
 pub(super) fn build_action_center(
     ctx: &DashboardContext,
     checks: &[CheckResult],
@@ -1020,43 +1040,29 @@ pub(super) fn build_action_center(
         }
     }
 
-    if !ctx.breaking.is_empty() {
+    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
+    if !evidence.analysis_complete || evidence.known_count > 0 {
         let high_risk = ctx
             .breaking
             .iter()
-            .filter(|f| f.risk_level == BreakingRisk::High)
-            .count();
+            .any(|f| f.risk_level == BreakingRisk::High);
         push_card(
             &mut cards,
             "#section-breaking",
-            if high_risk > 0 {
+            if high_risk {
                 "alert-error"
             } else {
                 "alert-warning"
             },
             r#"<span data-i18n="section.breaking">Breaking</span>"#.to_string(),
+            breaking_evidence_html(ctx),
             i18n_template(
-                "count.changes",
-                &format!("{} changes", ctx.breaking.len(),),
-                &[("count", ctx.breaking.len().to_string())],
+                "message.structuralScanScope",
+                "structural scan; semantic compatibility not assessed",
+                &[],
             ),
-            if high_risk > 0 {
-                i18n_template(
-                    "message.publicApiImpactDetected",
-                    "Public API / env impact detected",
-                    &[],
-                )
-            } else {
-                i18n_template(
-                    "message.verifyCompatibilityBeforeMerge",
-                    "Verify compatibility before merge",
-                    &[],
-                )
-            },
         );
     } else {
-        // A structural scanner can only speak about structure: the chip says
-        // what was counted, and the note says what was not assessed.
         push_chip(
             &mut chips,
             "#section-breaking",
@@ -1065,8 +1071,8 @@ pub(super) fn build_action_center(
                 r#"<span class="chip-ok-check">&#x2713;</span> {} <span class="chip-note" data-i18n="message.structuralScanScope">structural scan; semantic compatibility not assessed</span>"#,
                 i18n_template(
                     "chip.publicApiStructuralChangesClear",
-                    "Public API structural changes: 0",
-                    &[],
+                    "Structural compatibility-impact observations: 0",
+                    &[]
                 )
             ),
         );
@@ -1973,9 +1979,7 @@ pub(super) fn build_ownership_section(ctx: &DashboardContext) -> String {
 }
 
 pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
-    if ctx.breaking.is_empty() {
-        return String::new();
-    }
+    let evidence = breaking_evidence(&ctx.breaking, ctx.rust_api_delta.as_ref());
 
     let removed: Vec<_> = ctx
         .breaking
@@ -1993,7 +1997,10 @@ pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
         .filter(|f| matches!(&f.kind, BreakingKind::NewEnvRequirement { .. }))
         .collect();
 
-    let mut content = String::new();
+    let mut content = format!("<p>{}</p>", breaking_evidence_html(ctx));
+    if ctx.rust_api_delta.is_some() {
+        content.push_str(r#"<p><a href="20_quality/BREAKING_CHANGES.md" data-i18n="message.rustApiDetails">Rust API evidence and unresolved observations</a></p>"#);
+    }
     content.push_str(r#"<p style="color:var(--muted);font-size:12px;margin-bottom:12px" data-i18n="message.heuristicScanNote">Heuristic scan — may contain false positives. Verify manually.</p>"#);
 
     if !removed.is_empty() {
@@ -2053,7 +2060,7 @@ pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
     }
 
     format!(
-        r#"<div class="section" id="section-breaking">
+        r#"<div class="section breaking-evidence-details">
     <div class="section-header">
         <span class="section-title" data-i18n="section.breaking">Breaking</span>
         <span class="section-count">{count_label}</span>
@@ -2062,8 +2069,8 @@ pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
 </div>"#,
         count_label = i18n_template(
             "count.detected",
-            &format!("{} detected", ctx.breaking.len()),
-            &[("count", ctx.breaking.len().to_string())],
+            &format!("{} detected", evidence.known_count),
+            &[("count", evidence.known_count.to_string())],
         ),
         content = content,
     )

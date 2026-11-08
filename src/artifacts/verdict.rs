@@ -308,6 +308,59 @@ pub(crate) fn breaking_change_breakdown(breaking: &[BreakingFinding]) -> Breakin
     }
 }
 
+/// Presentation evidence only: never changes the analyzer or merge policy.
+pub(crate) struct BreakingEvidence {
+    pub status: &'static str,
+    pub analysis_complete: bool,
+    pub rust_status: &'static str,
+    pub known_count: usize,
+    pub unknown_count: usize,
+    pub summary: String,
+}
+
+pub(crate) fn breaking_evidence(
+    breaking: &[BreakingFinding],
+    rust: Option<&api_delta::ApiArtifactView>,
+) -> BreakingEvidence {
+    let breakdown = breaking_change_breakdown(breaking);
+    let rust_known = rust.map_or(0, |view| {
+        view.counts.removed
+            + view.counts.changed
+            + view.counts.relocated
+            + view.counts.visibility_changed
+    });
+    let unknown_count = rust.map_or(0, |view| view.counts.unknown);
+    let known_count = breaking.len() + rust_known;
+    let analysis_complete = unknown_count == 0;
+    let status = if analysis_complete {
+        "MEASURED"
+    } else {
+        "UNKNOWN"
+    };
+    // The JS/TS structural scan always runs. No Rust view means Rust is outside
+    // this run's scope, not that the legacy structural scan failed to execute.
+    let rust_status = if rust.is_none() {
+        "NOT_APPLICABLE"
+    } else {
+        status
+    };
+    let mut summary = format!(
+        "Structural compatibility-impact observations: {known_count} known; {unknown_count} unresolved; analysis: {status}; Rust: {rust_status}"
+    );
+    if let Some(details) = breakdown.summary() {
+        summary.push_str(&format!("; {details}"));
+    }
+    summary.push_str(" (structural scan; semantic compatibility not assessed)");
+    BreakingEvidence {
+        status,
+        analysis_complete,
+        rust_status,
+        known_count,
+        unknown_count,
+        summary,
+    }
+}
+
 /// Escalate the merge axis when the diff carries genuine breaking API changes.
 ///
 /// Real breaking findings (removed public symbols, changed signatures, new env
