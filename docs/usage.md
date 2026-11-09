@@ -1500,10 +1500,13 @@ do not establish identical finding sets and do not automatically produce PASS.
 Coverage trends use a previous run, which can have a different pair of revisions;
 `regression.tests.coverage_comparison` identifies that source explicitly and
 never labels it as a measurement of the current PR base. A trend is only derived
-when the previous run carries the same `metric_fingerprint`; otherwise
-`comparison_status` says `not_comparable` or `unavailable` and no coverage
-regression is reported. Low matching in the current change is a separate
-signal, `low_test_match_detected`, not a regression. Slow-check messages
+when both runs name the same repository (a GitHub `origin`), both measured a
+ratio over changed source files and the previous run carries the same
+`metric_fingerprint`; otherwise `comparison_status` says `not_comparable` or
+`unavailable`, the `PR_REVIEW.md` notice says the previous run was not
+compared, and no coverage regression is reported. Low matching in the current
+change is a separate signal, `low_test_match_detected`, not a regression.
+Slow-check messages
 name active checks without assuming that their delay is Cargo compilation.
 
 Remote reviews (`--pr`, `--remote`, `--remote-only`) use a private Git repository

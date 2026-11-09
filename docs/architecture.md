@@ -228,13 +228,16 @@ Artifact diffs use `resolve_diff_bases()` before `generate_diffs()`, so the
 review pack matches GitHub's three-dot "Files changed" model: branch names stay
 displayable as bases, while each diff is anchored at the target/base merge-base.
 
-Every tree-to-tree diff that yields line counts or a patch — `diff_refs` (per-file
-additions/deletions and totals), `full_diff`, `file_diff` and `scoped_full_diff`
-— is built from one `canonical_diff_options()`: libgit2's default Myers algorithm
-with three context lines, the same hunks `git diff --numstat` and GitHub count.
-Only the pathspec of a single-file diff and rename/copy detection are added per
-call. `changed_paths` deliberately uses zero context because it reads deltas, not
-hunks.
+The four diffs behind the review pack's line counts and patches — `diff_refs`
+(per-file additions/deletions and totals), `full_diff`, `file_diff` and
+`scoped_full_diff` — are built from one `canonical_diff_options()`: libgit2's
+default Myers algorithm with three context lines pinned explicitly (a
+`diff.context` git setting no longer changes them), the same hunks
+`git diff --numstat` and GitHub count. Only the pathspec of a single-file diff
+and rename/copy detection are added per call. `changed_paths` deliberately uses
+zero context because it reads deltas, not hunks; the per-commit patches
+(`commit_patch`, `commit_patch_scoped`) are separate Myers diffs that do not feed
+the numstat.
 
 `Config::required_base_exact` is the single opt-out, set by `prview gate --base
 <REF> --exact-base`. It keeps the one requested base pinned at the commit it
@@ -4346,7 +4349,11 @@ previous run recorded another or no `meta.repo.full_name`, or either side has
 no measured ratio: a count-only previous record or a current run without
 changed source files) or `unavailable` (no previous metric), `coverage_delta`
 is null, no historical regression is derived and the score awards no
-"coverage dropped" points.
+"coverage dropped" points. The `PR_REVIEW.md` notice is written after the
+regression is computed and states whether the previous run was compared.
+Known limit: `meta.repo.full_name` is inferred from a GitHub `origin` only
+(compared case-insensitively), so repositories hosted elsewhere or without a
+remote are `not_comparable` until a host-independent identity is recorded.
 `base_coverage_ratio` keeps the raw previous value as provenance either way.
 
 #### signal/coverage.rs — source-to-test matching
@@ -4431,7 +4438,10 @@ the `test_` basename prefix, a bare `tests`/`test` stem, and the Swift XCTest
 convention: a `.swift` file inside a `<Target>Tests/` directory or named
 `SomethingTests.swift`. `Tests` is a CamelCase word boundary there, so
 `Protests.swift` is not a test; and the XCTest rule is Swift-only, so a README
-or JSON fixture inside the test target stays non-code. The 184-path reference
+or JSON fixture inside the test target stays non-code. The boundary is a plain
+suffix check, so a domain name ending in `Tests` (`BloodTests.swift`, a
+`LabTests/` feature folder) is classified as a test as well; Objective-C XCTest
+files are not covered. The 184-path reference
 fixture `tests/fixtures/review_file_paths/codescribe_pr225.paths` pins the
 corrected classification (86 code / 83 test / 15 other).
 

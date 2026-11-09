@@ -331,7 +331,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the review score (63 of 184 files in one macOS review). The rule is Swift-only
   and matches `Tests` as a CamelCase word boundary, so a README or fixture inside
   the test target, `Protests.swift`, `Latest.swift` or `FooTests.rs` are
-  unaffected; Rust, JS/TS and Python markers are unchanged. A 184-path reference
+  unaffected; Rust, JS/TS and Python markers are unchanged. Any Swift stem or
+  directory segment ending in `Tests` qualifies, so a domain name such as
+  `BloodTests.swift` would also be classified as a test; Objective-C XCTest
+  files (`.m`/`.mm`) are out of scope. A 184-path reference
   fixture (`tests/fixtures/review_file_paths/codescribe_pr225.paths`) pins the
   corrected classification. Matching ratio and score are recomputed from the
   corrected classification on the next run, not rescaled.
@@ -342,15 +345,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   differ from `git diff --numstat` and from GitHub by the same +N/-N on both
   sides (11 files in one 184-file review). All four paths now share one set of
   diff options (Myers, 3 context lines); rename/copy detection is unchanged.
-  Existing regression snapshots may show a one-time numstat delta.
+  Because the options are now explicit, a `diff.context` setting in git config
+  no longer changes `full.patch`, per-file or scoped patches. Existing
+  regression snapshots may show a one-time numstat delta.
 - Low source/test-change matching in the current change is no longer reported
   as a coverage regression. `regression.tests.coverage_regression_detected` now
   means a historical decline against a *comparable* previous run only; the
   current-change signal is the new `low_test_match_detected`. A previous run is
-  comparable when it carries the same `metric_fingerprint`
-  (`source_test_change_match/xctest-v2`, the definition of the classifier and
-  the matching, not the generator SHA); `comparison_status` is `comparable`,
-  `not_comparable` or `unavailable` with a `comparison_reason`. Without a
+  comparable only when both runs name the same repository
+  (`meta.repo.full_name`, today inferred from a GitHub `origin` only, compared
+  case-insensitively), both carry a measured ratio in `0..=1` (a count-only or
+  0/0 record is provenance, not a measurement) and the previous run carries the
+  same `metric_fingerprint` (`source_test_change_match/xctest-v2`, the
+  definition of the classifier and the matching, not the generator SHA);
+  `comparison_status` is `comparable`, `not_comparable` or `unavailable` with a
+  `comparison_reason`, and the `PR_REVIEW.md` notice now says whether the
+  previous run was compared. Repositories without a GitHub `origin` currently
+  get `not_comparable` (identity not established) instead of a trend; a
+  host-independent repository identity is a tracked follow-up. Without a
   comparable baseline `coverage_delta` is null and the score's "coverage
   dropped" points are not awarded, because they were never supported; the
   untested-code-file points are unchanged. `base_coverage_ratio` keeps the raw
