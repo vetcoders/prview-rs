@@ -1410,13 +1410,33 @@ contains the report path, run ID, nullable ratio and count JSON pointers
 `review_range`/adjacent `RUN.json.freshness`, when available. Missing historical
 revision metadata stays null; a branch label is not promoted to a SHA. A prior
 0/0 run still supplies provenance when its untested-file count is consumed, even
-though its ratio is null. Existing
-`base_coverage_ratio`, delta and regression flags are unchanged: this comparison
-is a previous-run trend, not a coverage scan of the current PR's base commit.
-Dependency-availability metadata adds explicit fields to the Rust regression
-and context records, plus optional baseline scan scope in heuristics metadata.
-Exhaustive Rust constructors must supply those fields or use their defaults;
-older serialized availability defaults to UNKNOWN, never a measured zero.
-The CLI JSON summary keeps its
+though its ratio is null. `base_coverage_ratio` keeps the raw previous-run value:
+this comparison is a previous-run trend, not a coverage scan of the current PR's
+base commit.
+
+`regression.tests` additionally carries `metric_fingerprint` (the current
+definition of the test-file classifier and matching,
+`source_test_change_match/xctest-v2`), `comparison_status` (`comparable`,
+`not_comparable`, `unavailable`), a nullable `comparison_reason` and
+`low_test_match_detected`. A comparison is `comparable` only when both runs
+record the same repository (`meta.repo.full_name`, inferred from `origin`; an
+explicit `--output-dir` may hold runs of several repositories), both carry a
+measured ratio in `0..=1` (a count-only or 0/0 record of a run without changed
+source files is provenance, not a measurement) and the previous run carries
+the identical fingerprint. A different review range alone does not break
+comparability. `coverage_comparison` repeats the current fingerprint as
+`current_metric_fingerprint`, the status as `comparison_status`, and the
+previous run's `source.metric_fingerprint` and `source.repo_identity` (null
+when that run predates them). `coverage_delta` and
+`coverage_regression_detected` are derived only when the status is
+`comparable`; `low_test_match_detected` describes the current change and needs
+no previous run. Reports written before these fields deserialize with an empty
+fingerprint, `unavailable` status and `false` for the current signal; an older
+`coverage_regression_detected:true` is kept as written and is not reinterpreted
+as a confirmed historical regression. Dependency-availability metadata adds
+explicit fields to the Rust regression and context records, plus optional
+baseline scan scope in heuristics metadata. Exhaustive Rust constructors must
+supply those fields or use their defaults; older serialized availability
+defaults to UNKNOWN, never a measured zero. The CLI JSON summary keeps its
 existing schema and public Rust shape; it carries the clarified review caveats
 and links to these canonical artifacts.

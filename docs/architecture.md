@@ -4333,6 +4333,22 @@ Missing historical metadata stays unknown. The source/test matching ratio and
 its thresholds are unchanged; `measured` retains its legacy availability meaning
 and `execution_coverage_measured:false` states the narrower evidence explicitly.
 
+`regression::tests::analyze` separates two signals. `low_test_match_detected`
+describes the current change only: fewer than 40% of its changed code files have
+a matching test change, or more than ten untested files below 50%. It needs no
+previous run. `coverage_regression_detected` is historical and requires a
+comparable previous run: the previous `report.json` must carry the same
+`regression.tests.metric_fingerprint` (`COVERAGE_METRIC_FINGERPRINT`, the
+definition of the test-file classifier and the matching; bumped when either
+changes, independent of the generator SHA and of the review range). Otherwise
+`comparison_status` is `not_comparable` (fingerprint missing or different, the
+previous run recorded another or no `meta.repo.full_name`, or either side has
+no measured ratio: a count-only previous record or a current run without
+changed source files) or `unavailable` (no previous metric), `coverage_delta`
+is null, no historical regression is derived and the score awards no
+"coverage dropped" points.
+`base_coverage_ratio` keeps the raw previous value as provenance either way.
+
 #### signal/coverage.rs — source-to-test matching
 
 Cross-references changed source files with test files. This is structural

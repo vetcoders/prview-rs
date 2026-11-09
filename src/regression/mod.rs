@@ -30,9 +30,19 @@ pub struct RegressionContext {
 
     // Coverage stats
     pub coverage_ratio: Option<f64>,
+    /// Previous-run ratio as recorded; comparability is decided in `tests::analyze`.
     pub base_coverage_ratio: Option<f64>,
     pub untested_critical_files: Vec<String>,
     pub base_untested_critical_count: Option<usize>,
+    /// Definition fingerprint recorded by the previous run, if any
+    /// (`regression.tests.metric_fingerprint`). `None` means the previous run
+    /// predates fingerprints and is therefore not comparable.
+    pub base_metric_fingerprint: Option<String>,
+    /// Repository identity of this run (`meta.repo.full_name`, the GitHub slug
+    /// inferred from `origin`), and the one recorded by the previous run.
+    /// Both must be present and equal for a previous-run comparison.
+    pub repo_identity: Option<String>,
+    pub base_repo_identity: Option<String>,
 
     /// Evidence metadata is independent of legacy counters and scoring.
     pub deps_availability: deps::DependencyEvidence,
@@ -179,6 +189,9 @@ mod regression_tests {
             file_stats: vec![("huge.rs".into(), 'M', 5000, 3000)],
             coverage_ratio: Some(0.2),
             base_coverage_ratio: Some(0.8),
+            base_metric_fingerprint: Some(tests::COVERAGE_METRIC_FINGERPRINT.into()),
+            repo_identity: Some("acme/widgets".into()),
+            base_repo_identity: Some("acme/widgets".into()),
             untested_critical_files: (0..10)
                 .map(|i| format!("file_{}.rs", i))
                 .collect(),
@@ -205,12 +218,59 @@ mod regression_tests {
         let ctx = RegressionContext {
             coverage_ratio: Some(0.5),
             base_coverage_ratio: Some(0.8),
+            base_metric_fingerprint: Some(tests::COVERAGE_METRIC_FINGERPRINT.into()),
+            repo_identity: Some("acme/widgets".into()),
+            base_repo_identity: Some("acme/widgets".into()),
             ..Default::default()
         };
 
         let report = compute_regression(&ctx);
         assert!(report.tests.coverage_regression_detected);
         assert!(report.tests.coverage_delta.unwrap() < -0.01);
+        assert!(
+            report
+                .score
+                .score_reasons
+                .iter()
+                .any(|reason| reason.starts_with("coverage dropped"))
+        );
+    }
+
+    /// Score weights are unchanged: low current matching keeps its untested-file
+    /// points, while the coverage-drop points need a comparable previous run.
+    #[test]
+    fn test_score_without_comparable_baseline_has_no_coverage_drop_penalty() {
+        let ctx = RegressionContext {
+            coverage_ratio: Some(0.0),
+            base_coverage_ratio: Some(0.8), // recorded without a fingerprint
+            untested_critical_files: (0..8).map(|i| format!("src/m{}.rs", i)).collect(),
+            file_stats: (0..8)
+                .map(|i| (format!("src/m{}.rs", i), 'M', 10, 5))
+                .collect(),
+            ..Default::default()
+        };
+
+        let report = compute_regression(&ctx);
+        assert!(report.tests.low_test_match_detected);
+        assert!(!report.tests.coverage_regression_detected);
+        assert_eq!(
+            report.tests.comparison_status,
+            tests::CoverageComparisonStatus::NotComparable
+        );
+        assert!(
+            report
+                .score
+                .score_reasons
+                .iter()
+                .any(|reason| reason.contains("8 untested code files (+10)"))
+        );
+        assert!(
+            !report
+                .score
+                .score_reasons
+                .iter()
+                .any(|reason| reason.starts_with("coverage dropped"))
+        );
     }
 
     #[test]
@@ -322,6 +382,9 @@ mod regression_tests {
             file_stats: vec![("huge.rs".into(), 'M', 50000, 20000)],
             coverage_ratio: Some(0.0),
             base_coverage_ratio: Some(1.0),
+            base_metric_fingerprint: Some(tests::COVERAGE_METRIC_FINGERPRINT.into()),
+            repo_identity: Some("acme/widgets".into()),
+            base_repo_identity: Some("acme/widgets".into()),
             untested_critical_files: (0..50)
                 .map(|i| format!("f{}.rs", i))
                 .collect(),

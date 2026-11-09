@@ -343,6 +343,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sides (11 files in one 184-file review). All four paths now share one set of
   diff options (Myers, 3 context lines); rename/copy detection is unchanged.
   Existing regression snapshots may show a one-time numstat delta.
+- Low source/test-change matching in the current change is no longer reported
+  as a coverage regression. `regression.tests.coverage_regression_detected` now
+  means a historical decline against a *comparable* previous run only; the
+  current-change signal is the new `low_test_match_detected`. A previous run is
+  comparable when it carries the same `metric_fingerprint`
+  (`source_test_change_match/xctest-v2`, the definition of the classifier and
+  the matching, not the generator SHA); `comparison_status` is `comparable`,
+  `not_comparable` or `unavailable` with a `comparison_reason`. Without a
+  comparable baseline `coverage_delta` is null and the score's "coverage
+  dropped" points are not awarded, because they were never supported; the
+  untested-code-file points are unchanged. `base_coverage_ratio` keeps the raw
+  previous-run value as provenance, and `coverage_comparison` names the current
+  and previous fingerprints.
 - Preserve incomplete API analysis through report, dashboard, narrative and
   copied comments, with explicit UNKNOWN state and known observations retained.
   Dependency regression now records current and baseline measurement evidence

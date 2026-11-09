@@ -1218,6 +1218,9 @@ fn generate_guarded(
                 .map(|f| f.path.clone())
                 .collect(),
             base_untested_critical_count: prev_coverage.untested_count,
+            base_metric_fingerprint: prev_coverage.metric_fingerprint.clone(),
+            repo_identity: config.gh_repo.clone(),
+            base_repo_identity: prev_coverage.repo_identity.clone(),
             cycles,
             dead_exports,
             unused_symbols,
