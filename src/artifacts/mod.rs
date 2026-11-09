@@ -1129,14 +1129,6 @@ fn generate_guarded(
             !diffs.is_empty(),
         ),
     )?;
-    let mut range_notices = review_range.review_caveats();
-    range_notices.push(prev_coverage.description());
-    if !range_notices.is_empty() {
-        let path = out_dir.join("PR_REVIEW.md");
-        let narrative = fs::read_to_string(&path)?;
-        let notice = format!("# PR Review\n\n{}\n", range_notices.join("\n\n"));
-        fs::write(path, narrative.replacen("# PR Review\n", &notice, 1))?;
-    }
     stage_timings.push(finish_timing(emit_human_stdout, "PR_REVIEW", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PrReview)?;
 
@@ -1241,6 +1233,19 @@ fn generate_guarded(
 
         regression::compute_regression(&reg_ctx)
     };
+
+    // The previous-run notice needs the computed comparison status, so the
+    // review-range caveats and that notice are written once the regression
+    // report exists. The header replacement does not depend on what the
+    // narrative generators appended before it.
+    let mut range_notices = review_range.review_caveats();
+    range_notices.push(prev_coverage.description(&regression_report.tests));
+    if !range_notices.is_empty() {
+        let path = out_dir.join("PR_REVIEW.md");
+        let narrative = fs::read_to_string(&path)?;
+        let notice = format!("# PR Review\n\n{}\n", range_notices.join("\n\n"));
+        fs::write(path, narrative.replacen("# PR Review\n", &notice, 1))?;
+    }
 
     let file_paths: Vec<String> = diffs
         .iter()

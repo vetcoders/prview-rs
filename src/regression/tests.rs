@@ -311,7 +311,7 @@ fn comparison_status(ctx: &RegressionContext) -> (CoverageComparisonStatus, Opti
         ctx.repo_identity.as_deref(),
         ctx.base_repo_identity.as_deref(),
     ) {
-        (Some(current), Some(previous)) if current == previous => {}
+        (Some(current), Some(previous)) if current.eq_ignore_ascii_case(previous) => {}
         (Some(current), Some(previous)) => {
             return (
                 CoverageComparisonStatus::NotComparable,
@@ -991,6 +991,27 @@ mod tests_unit {
                 .contains("out of range")
         );
         assert!(!result.coverage_regression_detected);
+    }
+
+    /// GitHub slugs are case-insensitive: `--gh-repo Acme/Widgets` and an
+    /// origin inferred as `acme/widgets` name the same repository.
+    #[test]
+    fn test_repository_identity_compares_case_insensitively() {
+        let ctx = RegressionContext {
+            coverage_ratio: Some(0.5),
+            base_coverage_ratio: Some(0.8),
+            base_metric_fingerprint: Some(COVERAGE_METRIC_FINGERPRINT.into()),
+            repo_identity: Some("Acme/Widgets".into()),
+            base_repo_identity: Some("acme/widgets".into()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert_eq!(
+            result.comparison_status,
+            CoverageComparisonStatus::Comparable
+        );
+        assert!(result.coverage_regression_detected);
     }
 
     /// Same fingerprint, other repository (an explicit `--output-dir` shared by

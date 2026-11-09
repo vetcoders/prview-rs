@@ -29,10 +29,30 @@ struct CoverageHistorySource {
 }
 
 impl PreviousCoverage {
-    pub(crate) fn description(&self) -> String {
-        match self.source.as_ref() {
-            Some(source) => format!("Coverage trend compares source/test-change matching with previous run `{}` (`{}`), not with the PR base commit. Historical revision metadata is in report.json regression.tests.coverage_comparison.", source.run_id.as_deref().unwrap_or("unknown"), source.report_path),
-            None => "Coverage trend: no previous-run metric available; this is not a PR-base coverage comparison.".into(),
+    /// Narrative for `PR_REVIEW.md`. Takes the computed regression so the
+    /// sentence states whether the previous run was actually compared; a
+    /// found-but-not-comparable run must not read as a trend.
+    pub(crate) fn description(&self, tests: &regression::tests::TestRegression) -> String {
+        use regression::tests::CoverageComparisonStatus;
+        let Some(source) = self.source.as_ref() else {
+            return "Coverage trend: no previous-run metric available; this is not a PR-base coverage comparison.".into();
+        };
+        let run = source.run_id.as_deref().unwrap_or("unknown");
+        match tests.comparison_status {
+            CoverageComparisonStatus::Comparable => format!(
+                "Coverage trend compares source/test-change matching with previous run `{run}` (`{}`), not with the PR base commit. Historical revision metadata is in report.json regression.tests.coverage_comparison.",
+                source.report_path
+            ),
+            CoverageComparisonStatus::NotComparable | CoverageComparisonStatus::Unavailable => {
+                format!(
+                    "Coverage trend: previous run `{run}` (`{}`) was found but is not comparable ({}); no trend or historical regression is derived, and this is not a PR-base coverage comparison. Details: report.json regression.tests.coverage_comparison.",
+                    source.report_path,
+                    tests
+                        .comparison_reason
+                        .as_deref()
+                        .unwrap_or("no reason recorded")
+                )
+            }
         }
     }
 }
@@ -511,10 +531,25 @@ mod dogfood_tests {
             Some(regression::tests::COVERAGE_METRIC_FINGERPRINT)
         );
         assert_eq!(history.repo_identity.as_deref(), Some("acme/widgets"));
+        let not_compared = history.description(&regression::tests::TestRegression::default());
+        assert!(not_compared.contains("is not comparable"), "{not_compared}");
         assert!(
-            history
-                .description()
-                .contains("not with the PR base commit")
+            not_compared.contains("20261015-225515-old"),
+            "{not_compared}"
+        );
+        let compared = history.description(&regression::tests::TestRegression {
+            comparison_status: regression::tests::CoverageComparisonStatus::Comparable,
+            ..Default::default()
+        });
+        assert!(
+            compared.contains(
+                "compares source/test-change matching with previous run `20261015-225515-old`"
+            ),
+            "{compared}"
+        );
+        assert!(
+            compared.contains("not with the PR base commit"),
+            "{compared}"
         );
         let report = regression::RegressionReport::default();
         let mut emitted = regression_with_coverage_history(&report, Some(&history));
@@ -561,7 +596,11 @@ mod dogfood_tests {
             let history = load_previous_coverage(&current);
             assert_eq!(history.ratio, None);
             assert_eq!(history.untested_count, Some(0));
-            assert!(history.description().contains("20261017-empty"));
+            assert!(
+                history
+                    .description(&regression::tests::TestRegression::default())
+                    .contains("20261017-empty")
+            );
             let value = regression_with_coverage_history(
                 &regression::RegressionReport::default(),
                 Some(&history),
