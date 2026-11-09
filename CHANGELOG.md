@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not a sandbox and host-write confinement remains false. Public Rust `Cli` and
   `Config` exhaustive constructors must supply the new boolean; RUN.json adds
   `project_execution` metadata without changing the schema version.
+  The command-backed Cargo workspace reader is private; library scope discovery
+  goes through the Config-authorized `resolve_run_scope` entrypoint.
 
 - Export generator identity in `report.json`, `RUN.json` and human metadata:
   embedded source SHA, executable SHA256 build ID, and an optional build-provided

@@ -887,7 +887,9 @@ impl CargoWorkspace {
 /// `--frozen` guarantees no network and no lockfile write; `--no-deps` keeps it
 /// to the members' own manifests. Any failure at all is the caller's signal to
 /// run the full workspace.
-pub async fn read_cargo_workspace(cargo_root: &Path) -> Result<CargoWorkspace, WorkspaceError> {
+// Keep command-backed discovery behind the Config-authorized scope resolver.
+// A public read-only-looking helper must not bypass review execution consent.
+async fn read_cargo_workspace(cargo_root: &Path) -> Result<CargoWorkspace, WorkspaceError> {
     let output = crate::checks::run_command_with_timeout_and_env(
         "cargo",
         &["metadata", "--format-version", "1", "--no-deps", "--frozen"],

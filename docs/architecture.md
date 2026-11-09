@@ -22,6 +22,8 @@ false, and explicitly forwards the flag to both quick and detached deep children
 The public Rust structs gained this field; exhaustive constructors/destructures
 must add it. This is a source compatibility change, with no artifact schema
 version bump: RUN.json's `project_execution` object is additive.
+The command-backed `read_cargo_workspace` helper is now private; library callers
+use the consent-aware `resolve_run_scope` entrypoint instead.
 
 Both check dispatchers gate before cache replay, scope discovery and Python
 presync. Each concrete `Check::run` also refuses independently. The artifact
