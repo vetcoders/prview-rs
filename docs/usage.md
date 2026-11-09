@@ -1506,6 +1506,10 @@ ratio over changed source files and the previous run carries the same
 `unavailable`, the `PR_REVIEW.md` notice says the previous run was not
 compared, and no coverage regression is reported. Low matching in the current
 change is a separate signal, `low_test_match_detected`, not a regression.
+Swift matching pairs a changed `FooTests.swift` with `Foo.swift`; unrelated test
+names do not cover a source file merely by sharing the test directory. This
+matching definition uses fingerprint `source_test_change_match/xctest-v3`, so a
+previous v2 metric remains provenance and is not compared to v3.
 Slow-check messages
 name active checks without assuming that their delay is Cargo compilation.
 

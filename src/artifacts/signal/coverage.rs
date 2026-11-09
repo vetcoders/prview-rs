@@ -535,6 +535,11 @@ fn find_matching_test<'a>(
             .or_else(|| test_stem.strip_suffix(".test"))
             .or_else(|| test_stem.strip_suffix(".spec"))
             .or_else(|| test_stem.strip_prefix("test_"))
+            .or_else(|| {
+                test_stem
+                    .strip_suffix("Tests")
+                    .filter(|_| test.path.ends_with(".swift"))
+            })
             .unwrap_or(test_stem);
 
         if test_base == src_stem {
@@ -857,6 +862,67 @@ mod tests {
         assert_eq!(signal.total_source_files, 1);
         assert_eq!(signal.covered_count, 1);
         assert_eq!(signal.covered_files[0].2, CoverageMatchTier::High);
+    }
+
+    #[test]
+    fn coverage_xctest_suffix_pairs_changed_source_and_test() {
+        for (source, test) in [
+            (
+                "Sources/App/Parser.swift",
+                "Tests/AppTests/ParserTests.swift",
+            ),
+            ("src/Parser.swift", "src/ParserTests.swift"),
+            (
+                "Sources/App/ParserUI.swift",
+                "Tests/AppUITests/ParserUITests.swift",
+            ),
+        ] {
+            let diff = mock_diff(vec![
+                mock_file_change(source, FileStatus::Modified, 2, 1),
+                mock_file_change(test, FileStatus::Modified, 2, 1),
+                mock_file_change("macos/AppTests/README.md", FileStatus::Modified, 2, 1),
+            ]);
+            let signal = compute_coverage_signal(&[diff], None, None);
+            assert_eq!(signal.total_source_files, 1, "{test}");
+            assert_eq!(signal.covered_count, 1, "{test}");
+            assert_eq!(signal.coverage_pct, Some(100), "{test}");
+            assert_eq!(signal.covered_files[0].0, source);
+            assert_eq!(signal.covered_files[0].1, test);
+            assert!(signal.uncovered_files.is_empty());
+            assert_eq!(signal.non_code_count, 1);
+            let expected_tier = if source.starts_with("src/") {
+                CoverageMatchTier::High
+            } else {
+                CoverageMatchTier::Low
+            };
+            assert_eq!(signal.covered_files[0].2, expected_tier);
+        }
+    }
+
+    #[test]
+    fn coverage_xctest_suffix_does_not_pair_unrelated_files_or_other_languages() {
+        for (source, test) in [
+            (
+                "Sources/App/Parser.swift",
+                "Tests/AppTests/OtherTests.swift",
+            ),
+            (
+                "Sources/App/Parser.swift",
+                "Tests/AppTests/ParserHelpers.swift",
+            ),
+            ("Sources/App/Parser.swift", "Tests/AppTests/README.md"),
+            ("src/Parser.rs", "tests/ParserTests.rs"),
+            ("src/Parser.js", "tests/ParserTests.js"),
+            ("src/Parser.swift", "tests/ParserTests.rs"),
+        ] {
+            let source = mock_file_change(source, FileStatus::Modified, 2, 1);
+            let test = mock_file_change(test, FileStatus::Modified, 2, 1);
+            assert!(
+                find_matching_test(&source, &[&test]).is_none(),
+                "{}",
+                test.path
+            );
+        }
     }
 
     #[test]

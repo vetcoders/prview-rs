@@ -39,8 +39,9 @@ const TEST_SUFFIX_MARKERS: &[&str] = &["_test", "_tests", ".test", "_spec", ".sp
 /// definition stay comparable, and a different review range alone does not
 /// break comparability either (the trend is previous-run, never PR-base).
 ///
-/// `xctest-v2`: Swift XCTest sources count as tests ([`is_test_file`]).
-pub const COVERAGE_METRIC_FINGERPRINT: &str = "source_test_change_match/xctest-v2";
+/// `xctest-v3`: Swift XCTest sources count as tests ([`is_test_file`]) and
+/// `FooTests.swift` can match `Foo.swift` in the source/test-change signal.
+pub const COVERAGE_METRIC_FINGERPRINT: &str = "source_test_change_match/xctest-v3";
 
 // ---------------------------------------------------------------------------
 // Classification helpers
@@ -842,6 +843,33 @@ mod tests_unit {
         assert_eq!(result.coverage_delta, None);
         assert!(!result.coverage_regression_detected); // neither ratio nor count may be compared
         assert!(result.low_test_match_detected); // 3 untested of 3 is still low current matching
+    }
+
+    #[test]
+    fn test_xctest_matching_v2_baseline_is_not_compared() {
+        let ctx = RegressionContext {
+            coverage_ratio: Some(0.5),
+            base_coverage_ratio: Some(0.8),
+            base_metric_fingerprint: Some("source_test_change_match/xctest-v2".into()),
+            repo_identity: Some("acme/widgets".into()),
+            base_repo_identity: Some("acme/widgets".into()),
+            ..Default::default()
+        };
+        let result = analyze(&ctx);
+        assert_eq!(
+            result.comparison_status,
+            CoverageComparisonStatus::NotComparable
+        );
+        assert_eq!(result.base_coverage_ratio, Some(0.8));
+        assert_eq!(result.coverage_delta, None);
+        assert!(!result.coverage_regression_detected);
+        assert!(
+            result
+                .comparison_reason
+                .as_deref()
+                .unwrap()
+                .contains("xctest-v2")
+        );
     }
 
     /// Comparable inputs without a drop: no regression, and the status says

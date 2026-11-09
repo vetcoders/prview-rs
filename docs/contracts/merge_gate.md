@@ -1416,7 +1416,7 @@ base commit.
 
 `regression.tests` additionally carries `metric_fingerprint` (the current
 definition of the test-file classifier and matching,
-`source_test_change_match/xctest-v2`), `comparison_status` (`comparable`,
+`source_test_change_match/xctest-v3`), `comparison_status` (`comparable`,
 `not_comparable`, `unavailable`), `comparison_reason` (present only when the
 status is not `comparable`) and `low_test_match_detected`. A comparison is
 `comparable` only when both runs record the same repository
@@ -1426,7 +1426,9 @@ repositories, and a repository without a GitHub `origin` is `not_comparable`
 because its identity is not recorded), both carry a
 measured ratio in `0..=1` (a count-only or 0/0 record of a run without changed
 source files is provenance, not a measurement) and the previous run carries
-the identical fingerprint. A different review range alone does not break
+the identical fingerprint. The v3 definition additionally pairs Swift
+`FooTests.swift` with `Foo.swift`; a v2 previous run retains its source and raw
+ratio but is not comparable to v3. A different review range alone does not break
 comparability. `coverage_comparison` repeats the current fingerprint as
 `current_metric_fingerprint`, the status as `comparison_status`, and the
 previous run's `source.metric_fingerprint` and `source.repo_identity` (null

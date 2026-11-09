@@ -4332,7 +4332,7 @@ The same pure projections feed gate/report/RUN and the narrative warning.
 its original review-range and run-freshness metadata travel to report/RUN under
 `regression.tests.coverage_comparison`. Legacy ratio/delta fields still describe
 a previous-run trend. They never become measurements of the PR base commit.
-Missing historical metadata stays unknown. The source/test matching ratio and
+Missing historical metadata stays unknown. The source/test matching ratio formula and
 its thresholds are unchanged; `measured` retains its legacy availability meaning
 and `execution_coverage_measured:false` states the narrower evidence explicitly.
 
@@ -4343,7 +4343,12 @@ previous run. `coverage_regression_detected` is historical and requires a
 comparable previous run: the previous `report.json` must carry the same
 `regression.tests.metric_fingerprint` (`COVERAGE_METRIC_FINGERPRINT`, the
 definition of the test-file classifier and the matching; bumped when either
-changes, independent of the generator SHA and of the review range). Otherwise
+changes, independent of the generator SHA and of the review range). The current
+`source_test_change_match/xctest-v3` definition strips the CamelCase `Tests`
+suffix only for Swift matching, so `FooTests.swift` can pair with `Foo.swift`.
+It preserves the existing confidence rules: a stem match across different
+modules remains low confidence. Previous v2 metrics retain their provenance
+but are not compared to v3. Otherwise
 `comparison_status` is `not_comparable` (fingerprint missing or different, the
 previous run recorded another or no `meta.repo.full_name`, or either side has
 no measured ratio: a count-only previous record or a current run without

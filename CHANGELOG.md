@@ -338,6 +338,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixture (`tests/fixtures/review_file_paths/codescribe_pr225.paths`) pins the
   corrected classification. Matching ratio and score are recomputed from the
   corrected classification on the next run, not rescaled.
+- Swift source/test-change matching now pairs `Foo.swift` with `FooTests.swift`,
+  including the XCTest target convention. The suffix is stripped only for Swift;
+  unrelated test files, README files and other languages keep the existing rules.
+  The metric fingerprint is now `source_test_change_match/xctest-v3`; v2 history
+  remains provenance and does not produce a trend against v3. Existing confidence
+  levels and score weights are unchanged.
 - Per-file and total line counts in `report.json`, the dashboard and the
   `full.patch` header now come from the same diff as the shipped patches.
   `diff_refs` used the patience algorithm while `full.patch`, per-file and
@@ -356,7 +362,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`meta.repo.full_name`, today inferred from a GitHub `origin` only, compared
   case-insensitively), both carry a measured ratio in `0..=1` (a count-only or
   0/0 record is provenance, not a measurement) and the previous run carries the
-  same `metric_fingerprint` (`source_test_change_match/xctest-v2`, the
+  same `metric_fingerprint` (`source_test_change_match/xctest-v3`, the
   definition of the classifier and the matching, not the generator SHA);
   `comparison_status` is `comparable`, `not_comparable` or `unavailable` with a
   `comparison_reason`, and the `PR_REVIEW.md` notice now says whether the
