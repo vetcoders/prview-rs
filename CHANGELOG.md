@@ -340,6 +340,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incomplete metadata fail closed. The affected version remains required by Loctree;
   no global advisory ignore is added, and raw `cargo audit` still reports them.
 
+- Preserve caller filter-conversion requirements as non-executable evidence
+  across independent remote root/module stores, and release successful baseline
+  proof checkouts before archive extraction. Add depth-two conversion and
+  explicit baseline-refusal controls.
+
 - Preserve nested gitlink support in the built-in conversion probe by binding
   its private handle to an owned workdir without operator configuration writes.
 - Confirm Deep/CI baseline conversion before Loctree scans, cover clean

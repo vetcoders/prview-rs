@@ -3002,6 +3002,16 @@ registry covers canonical roots and descendant overrides, including pinned
 submodules. Attribute lookup uses a private bare handle with an in-memory pinned
 index, so dirty operator workdir symlinks cannot hide target attributes.
 
+Independent remote repositories retain the caller's effective filter
+requirements separately from executable Git configuration. Root and module
+stores capture per-driver checkout/clean requirements as boolean or unknown
+data, keyed by the owned common directory and retained for the owned review's
+lifetime. This preserves required/smudge/process behavior, including explicit
+identity overrides, without copying driver commands or arbitrary caller config.
+Snapshot attribute views read this captured context after repository rebasing;
+an undefined driver is an identity conversion only when it was undefined in
+that caller context. The context is removed when the owned review is dropped.
+
 Effective required/process/smudge settings determine whether checkout conversion
 is needed. Optional undefined and clean-only checkout drivers do not block an
 identity checkout; an explicitly empty process suppresses the one-shot side as
@@ -3021,6 +3031,9 @@ unavailable error without executing callbacks.
 Deep/CI baseline heuristics confirm checkout-conversion availability at the pinned
 base before extracting and reading its archive. A failed proof leaves the baseline
 unavailable and produces no comparison; archive success cannot override it.
+After a successful proof, its checkout is dropped before extracting the same
+immutable base commit. The archive is the sole retained baseline source copy
+during heuristic comparison; cancellation is checked again before extraction.
 
 #### Availability of structural evidence
 

@@ -541,10 +541,13 @@ impl App {
                 // the archive can run filters or Loctree can count a subset.
                 let checkout = git::create_worktree_snapshot(self.repo.path(), &base.commit_id)?;
                 git::WorktreeSnapshot::ensure_checkout_complete(&checkout.worktree_path)?;
-                let archive = self.repo.create_snapshot(&base.commit_id)?;
-                Ok((archive, checkout))
+                // The proof names an immutable commit. Retaining its checkout
+                // cannot strengthen that proof while the same commit is archived.
+                drop(checkout);
+                self.ensure_not_cancelled()?;
+                self.repo.create_snapshot(&base.commit_id)
             }) {
-                Ok((base_snap, _base_checkout)) => {
+                Ok(base_snap) => {
                     if emit {
                         println!(
                             "  {} Snapshot (base): {} → {}",
@@ -2477,6 +2480,38 @@ mod tests {
 
     #[tokio::test]
     async fn review80_round3_baseline_conversion_must_be_available_before_loctree() {
+        if std::env::var_os("PRVIEW_ROUND4_BASELINE_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::review80_round3_baseline_conversion_must_be_available_before_loctree",
+                    "--nocapture",
+                ])
+                .env("PRVIEW_ROUND4_BASELINE_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                diagnostic.matches("Snapshot failed for base").count(),
+                2,
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("working-tree-encoding=UTF-16LE"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("filter=review80base"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("source analysis NOT_RUN"),
+                "{diagnostic}"
+            );
+            return;
+        }
         for conversion in ["working-tree-encoding=UTF-16LE", "filter=review80base"] {
             let repo_dir = tempfile::tempdir().unwrap();
             let out = tempfile::tempdir().unwrap();
@@ -2529,6 +2564,8 @@ mod tests {
             config.run_heuristics = true;
             config.execution_mode = ExecutionMode::Deep;
             config.allow_project_execution = false;
+            config.quiet = false;
+            config.json = false;
             let app = crate::App::from_config(config).unwrap();
             let result = app
                 .run_heuristics_with_snapshots(
@@ -2547,5 +2584,45 @@ mod tests {
                 "baseline conversion {conversion} must not become a measured archive comparison"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review80_round4_base_checkout_is_released_before_archive_extraction() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(root.path(), out.path());
+        let repo = git2::Repository::open(root.path()).unwrap();
+        let base = repo.head().unwrap().peel_to_commit().unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn target_only() {}\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        let target = repo
+            .commit(Some("HEAD"), &sig, &sig, "target", &tree, &[&base])
+            .unwrap();
+        let marker = out.path().join("archive-worktree-counts");
+        let tar = out.path().join("owned-tar");
+        std::fs::write(&tar, format!("#!/bin/sh\nGIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 /usr/bin/git -c core.fsmonitor=false -C '{}' worktree list --porcelain | /usr/bin/awk '/^worktree / {{ count++ }} END {{ print count }}' >> '{}'\nexec /usr/bin/tar \"$@\"\n", root.path().display(), marker.display())).unwrap();
+        std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _tar = crate::git::override_test_tar_program(tar.into_os_string());
+        config.run_heuristics = true;
+        config.execution_mode = ExecutionMode::Deep;
+        let app = crate::App::from_config(config).unwrap();
+        app.run_heuristics_with_snapshots(
+            &app.config,
+            &resolved(&target.to_string()),
+            &[resolved(&base.id().to_string())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "1\n1\n",
+            "neither target nor base archive extraction may retain the proof checkout"
+        );
     }
 }

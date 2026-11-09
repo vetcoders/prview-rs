@@ -64,7 +64,10 @@ the preset.
 
 Exact-target snapshots never run Git clean, smudge or process filters. PrView
 checks the effective checkout configuration, including pinned submodules. An
-optional undefined driver, a clean-only driver, or a configured checkout no-op
+independent remote review retains the caller's effective filter requirements
+for the root and module stores as process-owned evidence. It does not copy
+driver commands into the review repository or execute them to classify input.
+An optional undefined driver, a clean-only driver, or a configured checkout no-op
 can retain normal source analysis. A required unavailable driver, a configured
 smudge/process transformation, an invalid encoding attribute, or an unsupported
 `working-tree-encoding` (such as UTF-16LE) prevents source stages from using raw
@@ -77,7 +80,9 @@ For pinned submodules, built-in conversions that would change the retained raw
 bytes (for example CRLF or ident expansion) also leave source materialization
 unconfirmed. Byte-identical cases remain supported. Deep/CI baseline comparisons
 are unavailable when baseline conversion cannot be confirmed, even if a Git
-archive could be extracted.
+archive could be extracted. A confirmed baseline proof checkout is released
+before archive extraction, so both full temporary copies do not remain resident
+through baseline analysis.
 
 This is **not a sandbox**: with consent, project code can access the host as the
 running user. Process supervision, temporary snapshots and caller drift checks

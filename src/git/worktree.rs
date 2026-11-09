@@ -1174,6 +1174,22 @@ fn snapshot_filter_registry()
     REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+#[derive(Clone)]
+struct CapturedFilterRequirement {
+    checkout: std::result::Result<bool, ()>,
+    clean: std::result::Result<bool, ()>,
+}
+
+type CapturedFilterPolicy = std::collections::BTreeMap<String, CapturedFilterRequirement>;
+
+fn caller_filter_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, CapturedFilterPolicy>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, CapturedFilterPolicy>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 #[derive(Debug)]
 struct UnsupportedGitConversion(Vec<String>);
 
@@ -1228,6 +1244,73 @@ impl Drop for WorktreeSnapshot {
 }
 
 impl WorktreeSnapshot {
+    /// Preserve conversion requirements across the independent-repository
+    /// boundary as process-owned data, never as executable Git configuration.
+    pub(crate) fn retain_caller_filter_requirements(
+        source: &git2::Repository,
+        destination: &git2::Repository,
+    ) -> Result<PathBuf> {
+        let inherited = caller_filter_registry()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("caller filter evidence unavailable"))?
+            .get(&comparable_worktree_path(source.commondir()))
+            .cloned();
+        let policy = match inherited {
+            Some(policy) => policy,
+            None => {
+                let config = source.config()?.snapshot()?;
+                let mut drivers = std::collections::BTreeSet::new();
+                let mut entries = config.entries(Some(r"^filter\."))?;
+                while let Some(entry) = entries.next() {
+                    let entry = entry?;
+                    let key = entry
+                        .name()
+                        .context("filter configuration key is not UTF-8")?;
+                    if let Some((driver, variable)) = key
+                        .strip_prefix("filter.")
+                        .and_then(|key| key.rsplit_once('.'))
+                        && matches!(variable, "required" | "process" | "smudge" | "clean")
+                    {
+                        drivers.insert(driver.to_owned());
+                    }
+                }
+                drivers
+                    .into_iter()
+                    .map(|driver| {
+                        let requirement = CapturedFilterRequirement {
+                            checkout: configured_filter_required(
+                                &config,
+                                &driver,
+                                GitConversion::Checkout,
+                            )
+                            .map_err(|_| ()),
+                            clean: configured_filter_required(
+                                &config,
+                                &driver,
+                                GitConversion::Clean,
+                            )
+                            .map_err(|_| ()),
+                        };
+                        (driver, requirement)
+                    })
+                    .collect()
+            }
+        };
+        let key = comparable_worktree_path(destination.commondir());
+        caller_filter_registry()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("caller filter evidence unavailable"))?
+            .entry(key.clone())
+            .or_insert(policy);
+        Ok(key)
+    }
+
+    pub(crate) fn release_caller_filter_requirements(key: &Path) {
+        if let Ok(mut registry) = caller_filter_registry().lock() {
+            registry.remove(key);
+        }
+    }
+
     /// Raw objects remain available to inert analysis, but external Git
     /// filters were deliberately never run. Only snapshots owned by this
     /// process carry this materialization evidence; arbitrary caller trees
@@ -1588,7 +1671,32 @@ fn external_filter_required(
     driver: &str,
     conversion: GitConversion,
 ) -> Result<bool> {
+    {
+        let registry = caller_filter_registry()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("caller filter evidence unavailable"))?;
+        if let Some(policy) = registry.get(&comparable_worktree_path(repo.commondir())) {
+            return match policy.get(driver) {
+                None => Ok(false),
+                Some(requirement) => match conversion {
+                    GitConversion::Checkout => requirement.checkout,
+                    GitConversion::Clean => requirement.clean,
+                }
+                .map_err(|()| {
+                    anyhow::anyhow!("caller filter configuration could not be classified")
+                }),
+            };
+        }
+    }
     let config = repo.config()?;
+    configured_filter_required(&config, driver, conversion)
+}
+
+fn configured_filter_required(
+    config: &git2::Config,
+    driver: &str,
+    conversion: GitConversion,
+) -> Result<bool> {
     let required = match config.get_bool(&format!("filter.{driver}.required")) {
         Ok(value) => value,
         Err(error) if error.code() == git2::ErrorCode::NotFound => false,
@@ -1597,11 +1705,11 @@ fn external_filter_required(
     if required {
         return Ok(true);
     }
-    let process = optional_config_string(&config, &format!("filter.{driver}.process"))?;
+    let process = optional_config_string(config, &format!("filter.{driver}.process"))?;
     let command = match process {
         Some(process) => Some(process),
         None => optional_config_string(
-            &config,
+            config,
             &format!(
                 "filter.{driver}.{}",
                 match conversion {
@@ -3208,6 +3316,22 @@ mod tests {
         expected_complete: bool,
         nested_gitlink: bool,
     ) {
+        round4_gitlink_builtin_fixture_case(
+            attributes,
+            raw,
+            expected_complete,
+            nested_gitlink,
+            None,
+        );
+    }
+
+    fn round4_gitlink_builtin_fixture_case(
+        attributes: &str,
+        raw: &[u8],
+        expected_complete: bool,
+        nested_gitlink: bool,
+        nested_conversion: Option<(&str, &[u8])>,
+    ) {
         let (tmp, repo) = repo_with_commit();
         let module = tmp.path().join("module");
         std::fs::create_dir(&module).unwrap();
@@ -3240,12 +3364,29 @@ mod tests {
             let nested_path = module.join("engine");
             std::fs::create_dir(&nested_path).unwrap();
             let nested = git2::Repository::init(&nested_path).unwrap();
-            std::fs::write(nested_path.join("payload.txt"), "pinned nested bytes\n").unwrap();
-            let blob = nested.blob(b"pinned nested bytes\n").unwrap();
+            nested
+                .config()
+                .unwrap()
+                .set_bool("core.autocrlf", false)
+                .unwrap();
+            let nested_raw =
+                nested_conversion.map_or(b"pinned nested bytes\n".as_slice(), |(_, raw)| raw);
+            std::fs::write(nested_path.join("payload.txt"), nested_raw).unwrap();
+            let blob = nested.blob(nested_raw).unwrap();
             let mut nested_builder = nested.treebuilder(None).unwrap();
             nested_builder
                 .insert("payload.txt", blob, 0o100644)
                 .unwrap();
+            if let Some((attributes, _)) = nested_conversion {
+                std::fs::write(nested_path.join(".gitattributes"), attributes).unwrap();
+                nested_builder
+                    .insert(
+                        ".gitattributes",
+                        nested.blob(attributes.as_bytes()).unwrap(),
+                        0o100644,
+                    )
+                    .unwrap();
+            }
             let tree_id = nested_builder.write().unwrap();
             let nested_tree = nested.find_tree(tree_id).unwrap();
             let signature = repo.signature().unwrap();
@@ -3262,6 +3403,20 @@ mod tests {
             let mut nested_index = nested.index().unwrap();
             nested_index.read_tree(&nested_tree).unwrap();
             nested_index.write().unwrap();
+            if nested_conversion.is_some() {
+                let native = git_cmd()
+                    .args(["cat-file", "--filters", "HEAD:payload.txt"])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .current_dir(&nested_path)
+                    .output()
+                    .unwrap();
+                assert!(native.status.success());
+                assert_ne!(
+                    native.stdout, nested_raw,
+                    "the depth-two conversion is the only nonidentity checkout"
+                );
+            }
             builder.insert("engine", pinned, 0o160000).unwrap();
             drop(nested_tree);
             drop(nested_builder);
@@ -3297,7 +3452,11 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&native.stderr)
         );
-        assert_eq!(native.stdout == raw, expected_complete, "{attributes}");
+        assert_eq!(
+            native.stdout == raw,
+            expected_complete || nested_conversion.is_some(),
+            "{attributes}"
+        );
 
         // Move the operator's own HEAD/index/attributes to a different
         // policy: the superproject still pins the earlier attribute tree.
@@ -3383,7 +3542,7 @@ mod tests {
         if let Some(nested) = &nested_repo {
             assert_eq!(
                 std::fs::read(snapshot.worktree_path.join("module/engine/payload.txt")).unwrap(),
-                b"pinned nested bytes\n"
+                nested_conversion.map_or(b"pinned nested bytes\n".as_slice(), |(_, raw)| raw)
             );
             assert!(!snapshot.worktree_path.join("module/engine/.git").exists());
             assert_eq!(
@@ -3401,6 +3560,17 @@ mod tests {
             "{attributes}: {completeness:?}"
         );
         if !expected_complete {
+            if nested_conversion.is_some() {
+                assert!(
+                    completeness.as_ref().unwrap_err().to_string().contains(
+                        &Path::new("module")
+                            .join("engine/payload.txt")
+                            .display()
+                            .to_string()
+                    ),
+                    "{completeness:?}"
+                );
+            }
             assert!(
                 completeness
                     .as_ref()
@@ -3420,6 +3590,22 @@ mod tests {
                 )
                 .status,
                 crate::checks::snapshot_integrity::SnapshotIntegrityStatus::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn review80_round4_depth_two_builtin_conversion_cannot_hide_behind_identity_parent() {
+        for (attributes, raw) in [
+            ("payload.txt text eol=crlf\n", b"hello\n".as_slice()),
+            ("payload.txt ident\n", b"$Id$\n".as_slice()),
+        ] {
+            round4_gitlink_builtin_fixture_case(
+                "asset.txt -text -ident\n",
+                b"identity parent\n",
+                false,
+                true,
+                Some((attributes, raw)),
             );
         }
     }
