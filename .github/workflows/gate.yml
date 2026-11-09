@@ -70,7 +70,7 @@ jobs:
           fi
 
           set +e
-          ./target/release/prview gate "${gate_args[@]}" --json > "$json_path"
+          ./target/release/prview gate "${gate_args[@]}" --allow-project-execution --json > "$json_path"
           status=$?
           set -e
 
