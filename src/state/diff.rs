@@ -17,6 +17,66 @@ pub(super) fn with_worktree_diff<T>(
     let repo = git2::Repository::discover(root)?;
     let tree = repo.head()?.peel_to_tree()?;
     let mut diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None)?;
+    // libgit2 merges HEAD→index and index→workdir without cancelling a
+    // Modified delta whose final workdir bytes equal HEAD. Reconcile those
+    // candidates against the actual tree→workdir diff. Keep the merged diff
+    // for every other path: a staged deletion must remain a deletion even if
+    // an untracked replacement exists at that path, as in native git diff HEAD.
+    let modified: std::collections::BTreeSet<Vec<u8>> = diff
+        .deltas()
+        .filter(|delta| delta.status() == git2::Delta::Modified)
+        .filter_map(|delta| delta.new_file().path_bytes().map(<[u8]>::to_vec))
+        .collect();
+    if !modified.is_empty() {
+        let mut options = git2::DiffOptions::new();
+        options
+            .disable_pathspec_match(true)
+            .include_typechange(true);
+        for path in &modified {
+            options.pathspec(path.as_slice());
+        }
+        let actual = repo.diff_tree_to_workdir(Some(&tree), Some(&mut options))?;
+        let changed: std::collections::BTreeSet<Vec<u8>> = actual
+            .deltas()
+            .flat_map(|delta| {
+                [delta.old_file().path_bytes(), delta.new_file().path_bytes()]
+                    .into_iter()
+                    .flatten()
+                    .map(<[u8]>::to_vec)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let cancelled: std::collections::BTreeSet<Vec<u8>> =
+            modified.difference(&changed).cloned().collect();
+        if !cancelled.is_empty() {
+            let retained: std::collections::BTreeSet<Vec<u8>> = diff
+                .deltas()
+                .filter(|delta| {
+                    !delta
+                        .new_file()
+                        .path_bytes()
+                        .is_some_and(|path| cancelled.contains(path))
+                })
+                .flat_map(|delta| {
+                    [delta.old_file().path_bytes(), delta.new_file().path_bytes()]
+                        .into_iter()
+                        .flatten()
+                        .map(<[u8]>::to_vec)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            diff = if retained.is_empty() {
+                repo.diff_tree_to_tree(Some(&tree), Some(&tree), None)?
+            } else {
+                let mut options = git2::DiffOptions::new();
+                options.disable_pathspec_match(true);
+                for path in retained {
+                    options.pathspec(path);
+                }
+                repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))?
+            };
+        }
+    }
     diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)))?;
     read(&diff)
 }
@@ -283,5 +343,107 @@ mod tests {
 
         let stats = get_diff_stats(&path).unwrap();
         assert_eq!(stats.files_changed, 0);
+    }
+
+    #[test]
+    fn review80_staged_change_restored_to_head_matches_native_git() {
+        let (_dir, path) = make_temp_repo();
+        std::fs::write(path.join("init.txt"), "staged content\n").unwrap();
+        let staged = git_cmd()
+            .args(["add", "init.txt"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        std::fs::write(path.join("init.txt"), "init\n").unwrap();
+
+        let native = git_cmd()
+            .args(["-c", "core.fsmonitor=false", "diff", "--numstat", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert!(
+            native.stdout.is_empty(),
+            "native Git sees the restored bytes"
+        );
+
+        let stats = get_diff_stats(&path).unwrap();
+        assert_eq!(stats.files_changed, 0, "match native git diff HEAD");
+        assert_eq!((stats.insertions, stats.deletions), (0, 0));
+        assert!(super::super::hot::get_hot_files(&path).unwrap().is_empty());
+
+        // Cancellation of one path must not hide another path's staged edit.
+        std::fs::write(path.join("other.txt"), "staged addition\n").unwrap();
+        let staged = git_cmd()
+            .args(["add", "other.txt"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        let stats = get_diff_stats(&path).unwrap();
+        assert_eq!(stats.files_changed, 1);
+        assert_eq!((stats.insertions, stats.deletions), (1, 0));
+        let hot = super::super::hot::get_hot_files(&path).unwrap();
+        assert_eq!(hot.len(), 1);
+        assert_eq!(hot[0].path, "other.txt");
+    }
+
+    #[test]
+    fn review80_staged_deletion_retains_native_git_index_semantics() {
+        let (_dir, path) = make_temp_repo();
+        let removed = git_cmd()
+            .args(["rm", "init.txt"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(removed.status.success());
+        std::fs::write(path.join("init.txt"), "init\nrestored as untracked\n").unwrap();
+        let native = git_cmd()
+            .args(["-c", "core.fsmonitor=false", "diff", "--numstat", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert_eq!(native.stdout, b"0\t1\tinit.txt\n");
+        let stats = get_diff_stats(&path).unwrap();
+        assert_eq!(stats.files_changed, 1);
+        assert_eq!((stats.insertions, stats.deletions), (0, 1));
+    }
+
+    #[test]
+    fn review80_binary_cancellation_does_not_hide_a_real_binary_change() {
+        let (_dir, path) = make_temp_repo();
+        let original = b"original\0binary\n";
+        std::fs::write(path.join("binary.bin"), original).unwrap();
+        let repo = git2::Repository::open(&path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("binary.bin")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = repo.signature().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "binary fixture",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        std::fs::write(path.join("binary.bin"), b"staged\0binary\n").unwrap();
+        index.add_path(Path::new("binary.bin")).unwrap();
+        index.write().unwrap();
+        std::fs::write(path.join("binary.bin"), original).unwrap();
+        assert_eq!(get_diff_stats(&path).unwrap().files_changed, 0);
+        std::fs::write(path.join("binary.bin"), b"real\0binary\n").unwrap();
+        let stats = get_diff_stats(&path).unwrap();
+        assert_eq!(
+            stats.files_changed, 1,
+            "zero text churn is still a binary change"
+        );
+        assert_eq!((stats.insertions, stats.deletions), (0, 0));
     }
 }
