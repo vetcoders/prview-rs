@@ -68,6 +68,7 @@ fn observe_tracked_changes(
         std::fs::canonicalize(repo.commondir())? == std::fs::canonicalize(owner.commondir())?,
         "snapshot no longer belongs to the reviewed repository"
     );
+    crate::git::WorktreeSnapshot::ensure_checkout_complete(snapshot)?;
     let head = repo.head()?.peel_to_commit()?.id();
     let tree = repo.find_commit(git2::Oid::from_str(target)?)?.tree()?;
     let index = repo.index()?;
