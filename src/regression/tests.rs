@@ -39,9 +39,9 @@ const TEST_SUFFIX_MARKERS: &[&str] = &["_test", "_tests", ".test", "_spec", ".sp
 /// definition stay comparable, and a different review range alone does not
 /// break comparability either (the trend is previous-run, never PR-base).
 ///
-/// `xctest-v3`: Swift XCTest sources count as tests ([`is_test_file`]) and
-/// `FooTests.swift` can match `Foo.swift` in the source/test-change signal.
-pub const COVERAGE_METRIC_FINGERPRINT: &str = "source_test_change_match/xctest-v3";
+/// `xctest-v4`: Swift XCTest sources count as tests ([`is_test_file`]) and
+/// `FooTests.swift` can match `Foo.swift`, with case-insensitive Swift extensions.
+pub const COVERAGE_METRIC_FINGERPRINT: &str = "source_test_change_match/xctest-v4";
 
 // ---------------------------------------------------------------------------
 // Classification helpers
@@ -846,6 +846,26 @@ mod tests_unit {
     }
 
     #[test]
+    fn review80_case_insensitive_swift_matching_rejects_v3_history() {
+        let ctx = RegressionContext {
+            coverage_ratio: Some(0.5),
+            base_coverage_ratio: Some(0.8),
+            base_metric_fingerprint: Some("source_test_change_match/xctest-v3".into()),
+            repo_identity: Some("acme/widgets".into()),
+            base_repo_identity: Some("acme/widgets".into()),
+            ..Default::default()
+        };
+        let result = analyze(&ctx);
+        assert_eq!(
+            result.comparison_status,
+            CoverageComparisonStatus::NotComparable
+        );
+        assert_eq!(result.base_coverage_ratio, Some(0.8));
+        assert_eq!(result.coverage_delta, None);
+        assert!(!result.coverage_regression_detected);
+    }
+
+    #[test]
     fn test_xctest_matching_v2_baseline_is_not_compared() {
         let ctx = RegressionContext {
             coverage_ratio: Some(0.5),
@@ -1380,6 +1400,46 @@ mod tests_unit {
         assert!(result.low_test_match_detected); // 20% < 50%, hard_cap fires
         assert!(!result.coverage_regression_detected); // still no previous run
         assert!(!result.coverage_improvement_detected);
+    }
+
+    #[test]
+    fn review80_hard_cap_fires_for_eleven_untested_at_47_percent() {
+        // 11/21 untested leaves 10/21 matched (47.6%): above 40%, below 50%,
+        // with more than ten untested files, so only the hard cap should fire.
+        let untested: Vec<String> = (0..11).map(|i| format!("src/mod_{i}.rs")).collect();
+        let file_stats: Vec<(String, char, usize, usize)> = (0..21)
+            .map(|i| (format!("src/mod_{i}.rs"), 'M', 10, 5))
+            .collect();
+
+        let result = analyze(&RegressionContext {
+            untested_critical_files: untested,
+            file_stats,
+            ..Default::default()
+        });
+
+        assert_eq!(result.untested_code_count, 11);
+        assert!(result.low_test_match_detected);
+        assert!(!result.coverage_regression_detected);
+    }
+
+    #[test]
+    fn review80_hard_cap_stays_off_for_ten_untested_at_47_percent() {
+        // 10/19 untested leaves 9/19 matched (47.4%): below 50%, but exactly
+        // ten misses does not meet the strict more-than-ten hard-cap condition.
+        let untested: Vec<String> = (0..10).map(|i| format!("src/mod_{i}.rs")).collect();
+        let file_stats: Vec<(String, char, usize, usize)> = (0..19)
+            .map(|i| (format!("src/mod_{i}.rs"), 'M', 10, 5))
+            .collect();
+
+        let result = analyze(&RegressionContext {
+            untested_critical_files: untested,
+            file_stats,
+            ..Default::default()
+        });
+
+        assert_eq!(result.untested_code_count, 10);
+        assert!(!result.low_test_match_detected);
+        assert!(!result.coverage_regression_detected);
     }
 
     #[test]

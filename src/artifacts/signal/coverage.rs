@@ -536,9 +536,12 @@ fn find_matching_test<'a>(
             .or_else(|| test_stem.strip_suffix(".spec"))
             .or_else(|| test_stem.strip_prefix("test_"))
             .or_else(|| {
-                test_stem
-                    .strip_suffix("Tests")
-                    .filter(|_| test.path.ends_with(".swift"))
+                test_stem.strip_suffix("Tests").filter(|_| {
+                    Path::new(&test.path)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("swift"))
+                })
             })
             .unwrap_or(test_stem);
 
@@ -628,6 +631,7 @@ fn find_matching_test<'a>(
 fn compatible_test_language(source: &str, test: &str) -> bool {
     let source_ext = Path::new(source).extension().and_then(|ext| ext.to_str());
     let test_ext = Path::new(test).extension().and_then(|ext| ext.to_str());
+    let is_swift = |ext: Option<&str>| ext.is_some_and(|ext| ext.eq_ignore_ascii_case("swift"));
     let is_js_ts = |ext| {
         matches!(
             ext,
@@ -643,6 +647,7 @@ fn compatible_test_language(source: &str, test: &str) -> bool {
     let is_jvm = |ext| matches!(ext, Some("java" | "kt" | "kts"));
     source_ext.is_some()
         && (source_ext == test_ext
+            || is_swift(source_ext) && is_swift(test_ext)
             || is_js_ts(source_ext) && is_js_ts(test_ext)
             || is_c_cpp(source_ext) && is_c_cpp(test_ext)
             || is_jvm(source_ext) && is_jvm(test_ext))
@@ -897,6 +902,29 @@ mod tests {
             };
             assert_eq!(signal.covered_files[0].2, expected_tier);
         }
+    }
+
+    #[test]
+    fn review80_xctest_match_accepts_case_insensitive_swift_extension() {
+        let diff = mock_diff(vec![
+            mock_file_change("Sources/App/Parser.swift", FileStatus::Modified, 2, 1),
+            mock_file_change(
+                "Tests/AppTests/ParserTests.SWIFT",
+                FileStatus::Modified,
+                2,
+                1,
+            ),
+        ]);
+
+        let signal = compute_coverage_signal(&[diff], None, None);
+
+        assert_eq!(signal.total_source_files, 1);
+        assert_eq!(signal.covered_count, 1);
+        assert_eq!(signal.covered_files[0].0, "Sources/App/Parser.swift");
+        assert_eq!(
+            signal.covered_files[0].1,
+            "Tests/AppTests/ParserTests.SWIFT"
+        );
     }
 
     #[test]
