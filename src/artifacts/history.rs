@@ -45,7 +45,7 @@ impl PreviousCoverage {
             ),
             CoverageComparisonStatus::NotComparable | CoverageComparisonStatus::Unavailable => {
                 format!(
-                    "Coverage trend: previous run `{run}` (`{}`) was found but is not comparable ({}); no trend or historical regression is derived, and this is not a PR-base coverage comparison. Details: report.json regression.tests.coverage_comparison.",
+                    "Coverage trend: previous run `{run}` (`{}`) was found but is not comparable ({}); no trend or historical regression is derived. Coverage trends compare source/test-change matching with a previous run, not with the PR base commit. Details: report.json regression.tests.coverage_comparison.",
                     source.report_path,
                     tests
                         .comparison_reason
