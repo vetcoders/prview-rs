@@ -73,6 +73,11 @@ presync or context, reports the affected path and `NOT_RUN`, and produces no
 verdict. This refusal applies without execution consent as well. UTF-8/UTF8 and
 unset/unspecified encoding controls remain supported. PrView neither downloads
 LFS data nor runs custom drivers to repair that input.
+For pinned submodules, built-in conversions that would change the retained raw
+bytes (for example CRLF or ident expansion) also leave source materialization
+unconfirmed. Byte-identical cases remain supported. Deep/CI baseline comparisons
+are unavailable when baseline conversion cannot be confirmed, even if a Git
+archive could be extracted.
 
 This is **not a sandbox**: with consent, project code can access the host as the
 running user. Process supervision, temporary snapshots and caller drift checks

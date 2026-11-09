@@ -332,6 +332,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Confirm Deep/CI baseline conversion before Loctree scans, cover clean
+  normalization after tracked symlinks become regular files, and reject raw
+  pinned-module bytes when built-in checkout conversions would change them.
 - Preserve unavailable structural API baselines and malformed failure-detail
   containers as unknown, retain base Rust scope after Cargo manifest deletion,
   and count JS/TS relocations on the same axis as Rust observations.

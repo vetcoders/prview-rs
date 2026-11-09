@@ -3008,8 +3008,17 @@ identity checkout; an explicitly empty process suppresses the one-shot side as
 in native Git. Unsupported encodings and non-string encoding declarations remain
 unconfirmed. Actual missing transformations refuse source analysis even without
 execution consent, rather than publishing empty structural scans from pointers.
-Live state probes separately require the clean side of conversion; unsupported
-normalization produces a typed unavailable error without executing callbacks.
+Pinned modules retain raw blobs. A separate libgit2 checkout at the pinned
+attribute tree, without external drivers, checks built-in conversions such as
+CRLF and ident expansion. Changed bytes or an unavailable comparison leave module
+materialization unconfirmed; byte-identical conversions remain available.
+Live state probes separately require the clean side of conversion. Actual regular
+files are checked even when their index entries are symlinks or gitlinks, while
+actual symlinks are never followed. Unsupported normalization produces a typed
+unavailable error without executing callbacks.
+Deep/CI baseline heuristics confirm checkout-conversion availability at the pinned
+base before extracting and reading its archive. A failed proof leaves the baseline
+unavailable and produces no comparison; archive success cannot override it.
 
 #### Availability of structural evidence
 
