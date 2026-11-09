@@ -15,6 +15,11 @@ evidence that checks ran. `--allow-project-execution` does not enable tests/lint
 disabled by the fast gate preset and does not provide host isolation. Apply
 this acknowledgement to the execution recipes below only in trusted environments.
 
+For the composite GitHub Action, pass the acknowledgement through its existing
+`args` input. The action appends those arguments after `prview gate`; for example
+`args: --allow-project-execution`. Without it, the action retains the analytical
+default rather than granting execution on behalf of its caller.
+
 ## Exit-code contract
 
 | Exit code | Meaning | Default hook effect |
@@ -101,7 +106,7 @@ branch is the right base:
   with:
     strict: "true"
     version: "X.Y.Z"
-    args: ${{ github.event_name == 'push' && format('--base {0} --exact-base', github.event.before) || '' }}
+    args: ${{ github.event_name == 'push' && format('--allow-project-execution --base {0} --exact-base', github.event.before) || '--allow-project-execution' }}
 ```
 
 `--exact-base` makes the review the literal `before..HEAD` range instead of

@@ -68,7 +68,7 @@ fn run_json_quiet_in_home(repo: &Path, extra_args: &[&str], home: &Path) -> serd
 fn gate_help_documents_exit_code_contract() {
     let environment = support::ContractEnvironment::new();
     environment
-        .command()
+        .bare_command()
         .args(["gate", "--help"])
         .assert()
         .success()
@@ -116,9 +116,9 @@ fn gate_json_emits_verdict_and_caveats_from_merge_gate() {
     let repo = temp.path();
 
     let assert = environment
-        .command()
+        .bare_command()
         .current_dir(repo)
-        .args(["gate", "--json"])
+        .args(["gate", "--allow-project-execution", "--json"])
         .assert()
         .success();
 
@@ -2418,9 +2418,10 @@ fn doctor_surfaces_config_error_cause_instead_of_blanket_message() {
     let temp = tempfile::tempdir().expect("tempdir");
 
     environment
-        .command()
+        .bare_command()
         .current_dir(temp.path())
         .arg("doctor")
+        .arg("--allow-project-execution")
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -2434,7 +2435,7 @@ fn completions_generates_valid_output_with_known_subcommands() {
     let environment = support::ContractEnvironment::new();
     for shell in &["bash", "zsh", "fish"] {
         let output = environment
-            .command()
+            .bare_command()
             .args(["completions", shell])
             .output()
             .expect("run completions");
@@ -2476,7 +2477,7 @@ fn init_command_creates_policy_and_updates_gitignore() {
 
     // 2. Run prview init
     environment
-        .command()
+        .bare_command()
         .current_dir(repo)
         .arg("init")
         .assert()
@@ -2502,7 +2503,7 @@ fn init_command_creates_policy_and_updates_gitignore() {
 
     // 4. Running init again should be idempotent (skipping)
     environment
-        .command()
+        .bare_command()
         .current_dir(repo)
         .arg("init")
         .assert()

@@ -39,7 +39,7 @@ Generates Artifact Pack v1 with structured, verifiable PR review artifacts:\n\n\
     - Hard fail signatures: Rust panics, Node rejections, Python tracebacks,\n\
       segfaults, sanitizers (live + cached results validated)\n\
     - MANIFEST.json: SHA256 hashes of all generated files\n\
-    - SANITY.json: post-generation integrity checks (4 validators)\n\n\
+    - SANITY.json: selected post-generation integrity checks\n\n\
   Supported profiles: Rust, JavaScript/TypeScript, Python, Mixed, Generic (with Loctree heuristics)"
 )]
 #[command(after_help = "Examples:
@@ -64,6 +64,7 @@ Generates Artifact Pack v1 with structured, verifiable PR review artifacts:\n\n\
 pub struct Cli {
     /// Allow this invocation to run project tools, build scripts, plugins and tests.
     /// This is an acknowledgement of code execution, not a sandbox.
+    /// For subcommands, place it after the command name, e.g. gate --allow-project-execution.
     #[arg(long, global = true)]
     pub allow_project_execution: bool,
 
@@ -1271,6 +1272,18 @@ mod tests {
             }))
         );
         assert_eq!(cli.target, None);
+    }
+
+    #[test]
+    fn project_execution_consent_after_subcommand_preserves_command_selection() {
+        for command in ["gate", "doctor", "fix", "mcp"] {
+            let cli = Cli::try_parse_from(["prview", command, "--allow-project-execution"])
+                .expect("global consent follows a selected subcommand");
+            assert!(cli.allow_project_execution, "{command}");
+            assert!(cli.command.is_some(), "{command} must remain a subcommand");
+            assert!(cli.target.is_none(), "{command} must not become a branch");
+            assert!(cli.bases.is_empty());
+        }
     }
 
     #[test]

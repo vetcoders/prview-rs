@@ -152,7 +152,6 @@ fn path_without_semgrep(repo: &Path) -> OsString {
 
 fn prview_gate_command(repo: &Path, home: &Path) -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("prview"));
-    command.arg("--allow-project-execution");
     command
         .current_dir(repo)
         .env("PATH", path_without_semgrep(repo))
@@ -168,7 +167,7 @@ fn gate_exits_zero_for_non_strict_conditional() {
     // Default policy: the skipped Semgrep check is advisory → CONDITIONAL,
     // which is accepted (exit 0) without --strict.
     prview_gate_command(temp.path(), home.path())
-        .arg("gate")
+        .args(["gate", "--allow-project-execution"])
         .assert()
         .code(0);
 }
@@ -182,7 +181,7 @@ fn gate_exits_two_for_strict_conditional() {
     // exact code clap also uses for usage errors, which is why the action must
     // distinguish the two (see action.yml) — here we pin the contract value.
     prview_gate_command(temp.path(), home.path())
-        .args(["gate", "--strict"])
+        .args(["gate", "--allow-project-execution", "--strict"])
         .assert()
         .code(2);
 }
@@ -198,7 +197,7 @@ fn gate_exits_two_for_strict_conditional_with_breaking_change() {
     // (The skipped Semgrep check is also advisory here; either way the process
     // must exit 2 with a real breaking finding present in the pack.)
     prview_gate_command(temp.path(), home.path())
-        .args(["gate", "--strict"])
+        .args(["gate", "--allow-project-execution", "--strict"])
         .assert()
         .code(2);
 }
@@ -210,11 +209,10 @@ fn operator_policy_real_gate_warning_lane() {
     let path = path_without_semgrep(temp.path());
 
     let strict = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
-        .arg("--allow-project-execution")
         .current_dir(temp.path())
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
-        .args(["gate", "--strict", "--json"])
+        .args(["gate", "--allow-project-execution", "--strict", "--json"])
         .output()
         .expect("run strict warning gate");
     assert_eq!(
@@ -229,11 +227,16 @@ fn operator_policy_real_gate_warning_lane() {
     assert_eq!(strict_json["exit_code"], 0);
 
     let hardened = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
-        .arg("--allow-project-execution")
         .current_dir(temp.path())
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
-        .args(["gate", "--strict", "--fail-on-warnings", "--json"])
+        .args([
+            "gate",
+            "--allow-project-execution",
+            "--strict",
+            "--fail-on-warnings",
+            "--json",
+        ])
         .output()
         .expect("run warnings-clean gate");
     assert_eq!(hardened.status.code(), Some(2));
@@ -259,7 +262,7 @@ fn gate_exits_one_for_block_verdict() {
     run_git(repo, &["commit", "-m", "block policy"]);
 
     prview_gate_command(repo, home.path())
-        .arg("gate")
+        .args(["gate", "--allow-project-execution"])
         .assert()
         .code(1);
 }
@@ -345,11 +348,10 @@ fn gate_exits_three_when_it_cannot_execute() {
     let temp = tempfile::tempdir().expect("tempdir");
 
     Command::new(assert_cmd::cargo::cargo_bin!("prview"))
-        .arg("--allow-project-execution")
         .current_dir(temp.path())
         .env("GIT_CEILING_DIRECTORIES", temp.path())
         .env("PRVIEW_HOME", home.path())
-        .arg("gate")
+        .args(["gate", "--allow-project-execution"])
         .assert()
         .code(3);
 }
@@ -393,11 +395,10 @@ fn create_pushed_main_fixture() -> (TempDir, String) {
 /// The pack lives under `home`, which must outlive the caller's assertions.
 fn run_gate_json(repo: &Path, path: &OsString, home: &Path, extra: &[&str]) -> serde_json::Value {
     let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
-        .arg("--allow-project-execution")
         .current_dir(repo)
         .env("PATH", path)
         .env("PRVIEW_HOME", home)
-        .arg("gate")
+        .args(["gate", "--allow-project-execution"])
         .args(extra)
         .arg("--json")
         .output()
@@ -891,11 +892,16 @@ fn gate_exits_three_for_unresolvable_explicit_base() {
     for base in ["does-not-exist", "remote-fetch-git"] {
         let home = tempfile::tempdir().expect("prview home");
         let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
-            .arg("--allow-project-execution")
             .current_dir(temp.path())
             .env("PATH", &path)
             .env("PRVIEW_HOME", home.path())
-            .args(["gate", "--base", base, "--json"])
+            .args([
+                "gate",
+                "--allow-project-execution",
+                "--base",
+                base,
+                "--json",
+            ])
             .output()
             .expect("run gate");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -940,7 +946,6 @@ fn gate_base_cannot_be_combined_with_pr() {
         &["gate", "--base", "main", "--pr", "42", "--json"][..],
     ] {
         let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
-            .arg("--allow-project-execution")
             .current_dir(temp.path())
             .env("PRVIEW_HOME", home.path())
             .env("PATH", &path)

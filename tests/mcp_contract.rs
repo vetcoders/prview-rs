@@ -257,7 +257,7 @@ impl McpSession {
 
     fn start_in(cwd: Option<&Path>, envs: &[(&str, &str)]) -> Self {
         let environment = support::ContractEnvironment::new();
-        let mut cmd = environment.command();
+        let mut cmd = environment.bare_command();
         cmd.arg("mcp");
         if let Some(dir) = cwd {
             cmd.current_dir(dir);

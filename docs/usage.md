@@ -41,6 +41,11 @@ prview gate --allow-project-execution      # permit tools within the gate preset
 prview --ci --allow-project-execution      # explicit CI execution consent
 ```
 
+For subcommands, put the command name before the consent flag, for example
+`prview gate --allow-project-execution` or `prview fix --allow-project-execution`.
+The existing CLI grammar treats root-level review options before a command as
+an ordinary branch review, so the command-first form preserves its meaning.
+
 The acknowledgement applies only to this invocation. It does not enable checks
 disabled by the selected preset. It is independent of `--full-tests`, `--with-tests`,
 `--with-lint`, `--security-full`, the chosen target and project policy files.
