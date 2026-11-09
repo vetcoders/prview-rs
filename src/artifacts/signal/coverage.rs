@@ -905,6 +905,44 @@ mod tests {
     }
 
     #[test]
+    fn review80_round2_swift_source_and_test_extension_case_matrix() {
+        for source_extension in ["swift", "SWIFT", "SwIfT"] {
+            for test_extension in ["swift", "SWIFT", "SwIfT"] {
+                let source = format!("Sources/App/Parser.{source_extension}");
+                let test = format!("Tests/AppTests/ParserTests.{test_extension}");
+                let diff = mock_diff(vec![
+                    mock_file_change(&source, FileStatus::Modified, 2, 1),
+                    mock_file_change(&test, FileStatus::Modified, 2, 1),
+                ]);
+                let signal = compute_coverage_signal(&[diff], None, None);
+                assert_eq!(signal.total_source_files, 1, "{source} / {test}");
+                assert_eq!(signal.covered_count, 1, "{source} / {test}");
+                assert_eq!(signal.non_code_count, 0, "{source} / {test}");
+                assert_eq!(signal.covered_files[0].0, source);
+                assert_eq!(signal.covered_files[0].1, test);
+            }
+        }
+        for test in [
+            "Tests/AppTests/OtherTests.SWIFT",
+            "tests/ParserTests.rs",
+            "tests/ParserTests.js",
+        ] {
+            let diff = mock_diff(vec![
+                mock_file_change("Sources/App/Parser.SWIFT", FileStatus::Modified, 2, 1),
+                mock_file_change(test, FileStatus::Modified, 2, 1),
+            ]);
+            let signal = compute_coverage_signal(&[diff], None, None);
+            assert_eq!(signal.total_source_files, 1, "{test}");
+            assert_eq!(signal.covered_count, 0, "{test}");
+            assert_eq!(
+                signal.uncovered_files,
+                vec!["Sources/App/Parser.SWIFT"],
+                "{test}"
+            );
+        }
+    }
+
+    #[test]
     fn review80_xctest_match_accepts_case_insensitive_swift_extension() {
         let diff = mock_diff(vec![
             mock_file_change("Sources/App/Parser.swift", FileStatus::Modified, 2, 1),

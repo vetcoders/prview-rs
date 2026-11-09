@@ -39,9 +39,9 @@ const TEST_SUFFIX_MARKERS: &[&str] = &["_test", "_tests", ".test", "_spec", ".sp
 /// definition stay comparable, and a different review range alone does not
 /// break comparability either (the trend is previous-run, never PR-base).
 ///
-/// `xctest-v4`: Swift XCTest sources count as tests ([`is_test_file`]) and
-/// `FooTests.swift` can match `Foo.swift`, with case-insensitive Swift extensions.
-pub const COVERAGE_METRIC_FINGERPRINT: &str = "source_test_change_match/xctest-v4";
+/// `xctest-v5`: Swift source classification and XCTest source/test matching
+/// accept case-insensitive Swift extensions. Other language classification is unchanged.
+pub const COVERAGE_METRIC_FINGERPRINT: &str = "source_test_change_match/xctest-v5";
 
 // ---------------------------------------------------------------------------
 // Classification helpers
@@ -52,7 +52,7 @@ pub fn is_code_file(path: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| CODE_EXTENSIONS.contains(&ext))
+        .is_some_and(|ext| CODE_EXTENSIONS.contains(&ext) || ext.eq_ignore_ascii_case("swift"))
 }
 
 /// Returns `true` if `path` is a config-like file that has a code extension
@@ -843,6 +843,54 @@ mod tests_unit {
         assert_eq!(result.coverage_delta, None);
         assert!(!result.coverage_regression_detected); // neither ratio nor count may be compared
         assert!(result.low_test_match_detected); // 3 untested of 3 is still low current matching
+    }
+
+    #[test]
+    fn review80_round2_swift_code_classification_is_case_insensitive_only_for_swift() {
+        for path in [
+            "Sources/App/Parser.swift",
+            "Sources/App/Parser.SWIFT",
+            "Sources/App/Parser.SwIfT",
+        ] {
+            assert!(is_code_file(path), "{path}");
+            assert!(!is_test_file(path), "{path}");
+        }
+        for path in [
+            "src/Parser.RS",
+            "src/Parser.JS",
+            "Sources/Parser.SWIFT.txt",
+            "Sources/Parser.swift.md",
+        ] {
+            assert!(
+                !is_code_file(path),
+                "unrelated extension behavior changed: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn review80_round2_swift_source_classification_rejects_v4_history() {
+        assert_eq!(
+            COVERAGE_METRIC_FINGERPRINT,
+            "source_test_change_match/xctest-v5"
+        );
+        let ctx = RegressionContext {
+            coverage_ratio: Some(0.5),
+            base_coverage_ratio: Some(0.8),
+            base_metric_fingerprint: Some("source_test_change_match/xctest-v4".into()),
+            repo_identity: Some("acme/widgets".into()),
+            base_repo_identity: Some("acme/widgets".into()),
+            ..Default::default()
+        };
+        let result = analyze(&ctx);
+        assert_eq!(
+            result.comparison_status,
+            CoverageComparisonStatus::NotComparable
+        );
+        assert_eq!(result.base_coverage_ratio, Some(0.8));
+        assert_eq!(result.coverage_delta, None);
+        assert!(!result.coverage_regression_detected);
+        assert!(!result.coverage_improvement_detected);
     }
 
     #[test]
