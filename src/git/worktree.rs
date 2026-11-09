@@ -1660,6 +1660,7 @@ fn collect_tree_filters(
     relative: &Path,
     display_prefix: &Path,
     filters: &mut Vec<String>,
+    builtin_checkout: Option<&Path>,
 ) -> Result<()> {
     for entry in tree {
         let path = relative.join(git_tree_component(entry.name_bytes())?);
@@ -1670,6 +1671,7 @@ fn collect_tree_filters(
                 &path,
                 display_prefix,
                 filters,
+                builtin_checkout,
             )?;
         } else if matches!(entry.filemode(), 0o100644 | 0o100755) {
             for issue in path_conversion_issues(
@@ -1682,6 +1684,31 @@ fn collect_tree_filters(
                     "{} ({issue})",
                     display_prefix.join(&path).display()
                 ));
+            }
+            if let Some(checkout) = builtin_checkout {
+                let converted_path = checkout.join(&path);
+                let converted = (|| -> Result<Vec<u8>> {
+                    anyhow::ensure!(
+                        std::fs::symlink_metadata(&converted_path)?
+                            .file_type()
+                            .is_file(),
+                        "built-in checkout did not produce a regular file"
+                    );
+                    Ok(std::fs::read(&converted_path)?)
+                })();
+                match converted {
+                    Ok(bytes) if bytes.as_slice() != repo.find_blob(entry.id())?.content() => {
+                        filters.push(format!(
+                            "{} (built-in checkout conversion changes raw gitlink bytes)",
+                            display_prefix.join(&path).display()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => filters.push(format!(
+                        "{} (built-in checkout conversion unconfirmed: {error:#})",
+                        display_prefix.join(&path).display()
+                    )),
+                }
             }
         }
     }
@@ -1711,12 +1738,39 @@ fn collect_checkout_filters(
     let mut index = git2::Index::new()?;
     index.read_tree(&tree)?;
     attributes_repo.set_index(&mut index)?;
+    // Root bytes already went through libgit2 checkout. Gitlinks deliberately
+    // contain raw blobs, so prove any built-in conversion separately without
+    // changing those materialized bytes or executing external filter drivers.
+    // The bare view and no-refresh target index keep operator HEAD/attributes
+    // out of this proof; no-update-index protects the caller's on-disk index.
+    let builtin_checkout = if depth > 0 {
+        let scratch = tempfile::tempdir()?;
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout
+            .force()
+            .target_dir(scratch.path())
+            .update_index(false)
+            .refresh(false);
+        match attributes_repo.checkout_tree(tree.as_object(), Some(&mut checkout)) {
+            Ok(()) => Some(scratch),
+            Err(error) => {
+                filters.push(format!(
+                    "{} (built-in checkout conversion unconfirmed: {error})",
+                    display_prefix.display()
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
     collect_tree_filters(
         &attributes_repo,
         &tree,
         Path::new(""),
         display_prefix,
         filters,
+        builtin_checkout.as_ref().map(tempfile::TempDir::path),
     )?;
     for (relative, pinned) in pinned_gitlinks(repo, commit, false)? {
         let sub_repo = open_pinned_gitlink(repo, operator_root, &relative, pinned)?;
@@ -3135,6 +3189,172 @@ mod tests {
                     .to_path_buf()
             })
             .collect()
+    }
+
+    fn round3_gitlink_builtin_case(attributes: &str, raw: &[u8], expected_complete: bool) {
+        let (tmp, repo) = repo_with_commit();
+        let module = tmp.path().join("module");
+        std::fs::create_dir(&module).unwrap();
+        let sub_repo = git2::Repository::init(&module).unwrap();
+        sub_repo
+            .config()
+            .unwrap()
+            .set_bool("core.autocrlf", false)
+            .unwrap();
+        // A clean-only driver is identity on checkout. Do not run it while
+        // probing built-in eol/ident conversion, or from PrView at all.
+        sub_repo
+            .config()
+            .unwrap()
+            .set_str(
+                "filter.round3clean.clean",
+                "unavailable-round3-clean-driver",
+            )
+            .unwrap();
+        std::fs::write(module.join(".gitattributes"), attributes).unwrap();
+        std::fs::write(module.join("asset.txt"), raw).unwrap();
+        let attributes_oid = sub_repo.blob(attributes.as_bytes()).unwrap();
+        let raw_oid = sub_repo.blob(raw).unwrap();
+        let mut builder = sub_repo.treebuilder(None).unwrap();
+        builder
+            .insert(".gitattributes", attributes_oid, 0o100644)
+            .unwrap();
+        builder.insert("asset.txt", raw_oid, 0o100644).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = sub_repo.find_tree(tree_oid).unwrap();
+        let signature = repo.signature().unwrap();
+        let pinned = sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "pinned module",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let mut index = sub_repo.index().unwrap();
+        index.read_tree(&tree).unwrap();
+        index.write().unwrap();
+        let native = git_cmd()
+            .args(["cat-file", "--filters", "HEAD:asset.txt"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(&module)
+            .output()
+            .unwrap();
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert_eq!(native.stdout == raw, expected_complete, "{attributes}");
+
+        // Move the operator's own HEAD/index/attributes to a different
+        // policy: the superproject still pins the earlier attribute tree.
+        let mut next_builder = sub_repo.treebuilder(Some(&tree)).unwrap();
+        next_builder
+            .insert(
+                ".gitattributes",
+                sub_repo.blob(b"asset.txt -text -ident -filter\n").unwrap(),
+                0o100644,
+            )
+            .unwrap();
+        let next_tree_id = next_builder.write().unwrap();
+        let next_tree = sub_repo.find_tree(next_tree_id).unwrap();
+        let parent = sub_repo.find_commit(pinned).unwrap();
+        sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "operator policy changed",
+                &next_tree,
+                &[&parent],
+            )
+            .unwrap();
+        index.read_tree(&next_tree).unwrap();
+        index.write().unwrap();
+        std::fs::write(
+            module.join(".gitattributes"),
+            "asset.txt -text -ident -filter\n",
+        )
+        .unwrap();
+        let original_index = std::fs::read(sub_repo.path().join("index")).unwrap();
+        let super_parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let mut super_builder = repo.treebuilder(None).unwrap();
+        super_builder.insert("module", pinned, 0o160000).unwrap();
+        let super_tree_id = super_builder.write().unwrap();
+        let super_tree = repo.find_tree(super_tree_id).unwrap();
+        let target = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "pinned gitlink",
+                &super_tree,
+                &[&super_parent],
+            )
+            .unwrap()
+            .to_string();
+        let snapshot = create_worktree_snapshot(tmp.path(), &target).unwrap();
+        assert_eq!(
+            std::fs::read(snapshot.worktree_path.join("module/asset.txt")).unwrap(),
+            raw
+        );
+        assert_eq!(
+            std::fs::read(sub_repo.path().join("index")).unwrap(),
+            original_index
+        );
+        let completeness = WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path);
+        assert_eq!(
+            completeness.is_ok(),
+            expected_complete,
+            "{attributes}: {completeness:?}"
+        );
+        if !expected_complete {
+            assert!(WorktreeSnapshot::is_materialization_error(
+                &completeness.unwrap_err()
+            ));
+            assert_eq!(
+                crate::checks::snapshot_integrity::SnapshotObservation::observe(
+                    &snapshot.worktree_path,
+                    tmp.path(),
+                    &target
+                )
+                .status,
+                crate::checks::snapshot_integrity::SnapshotIntegrityStatus::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn review80_round3_raw_gitlinks_do_not_certify_builtin_checkout_conversions() {
+        round3_gitlink_builtin_case(
+            "asset.txt text eol=crlf filter=round3clean\n",
+            b"hello\n",
+            false,
+        );
+        round3_gitlink_builtin_case("asset.txt ident filter=round3clean\n", b"$Id$\n", false);
+    }
+
+    #[test]
+    fn review80_round3_identity_gitlink_attributes_keep_checkout_available() {
+        round3_gitlink_builtin_case(
+            "asset.txt ident filter=round3clean\n",
+            b"no ident placeholder\n",
+            true,
+        );
+        round3_gitlink_builtin_case(
+            "asset.txt text eol=crlf filter=round3clean\n",
+            b"already\r\n",
+            true,
+        );
+        round3_gitlink_builtin_case(
+            "asset.txt -text -ident filter=round3clean\n",
+            b"ordinary bytes\n",
+            true,
+        );
     }
 
     #[test]
