@@ -182,7 +182,7 @@ impl PrviewMcp {
             Ok(s) => s,
             Err(e) => {
                 return types::tool_error(
-                    error_class::NOT_A_GIT_REPO,
+                    types::state_read_error_class(&e),
                     &format!("failed to read repo state: {e}"),
                     json!({}),
                 );

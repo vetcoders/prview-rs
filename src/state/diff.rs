@@ -15,6 +15,7 @@ pub(super) fn with_worktree_diff<T>(
     read: impl FnOnce(&git2::Diff<'_>) -> Result<T>,
 ) -> Result<T> {
     let repo = git2::Repository::discover(root)?;
+    crate::git::WorktreeSnapshot::ensure_worktree_comparison_complete(&repo)?;
     let tree = repo.head()?.peel_to_tree()?;
     let mut diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None)?;
     // libgit2 merges HEAD→index and index→workdir without cancelling a
@@ -343,6 +344,71 @@ mod tests {
 
         let stats = get_diff_stats(&path).unwrap();
         assert_eq!(stats.files_changed, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review80_round2_state_refuses_unsupported_clean_normalization_without_callbacks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, path) = make_temp_repo();
+        let marker = path.join("clean-marker");
+        let script = path.join("owned-clean");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf 'init\n'\nprintf x >> '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(path.join(".gitattributes"), "init.txt filter=round2\n").unwrap();
+        let repo = git2::Repository::open(&path).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("filter.round2.clean", script.to_str().unwrap())
+            .unwrap();
+        std::fs::write(
+            path.join("init.txt"),
+            "DISPLAY CONTENT WITH DIFFERENT SIZE\n",
+        )
+        .unwrap();
+        let error = match get_diff_stats(&path) {
+            Ok(stats) => panic!(
+                "unsupported clean normalization cannot certify {} changed files",
+                stats.files_changed
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("init.txt (filter=round2)"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+        assert!(
+            super::super::collect_state(
+                &path,
+                &super::super::StateOpts {
+                    fast: true,
+                    json: true,
+                    hot: true
+                }
+            )
+            .is_err()
+        );
+        assert!(!marker.exists());
+        // Remove the untracked attribute file from native output by asking
+        // only about the tracked path; Git's owned clean driver proves identity.
+        let native = git_cmd()
+            .args(["diff", "--numstat", "HEAD", "--", "init.txt"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert!(native.stdout.is_empty());
+        assert!(!std::fs::read_to_string(&marker).unwrap().is_empty());
     }
 
     #[test]

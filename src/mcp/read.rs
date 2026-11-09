@@ -545,7 +545,7 @@ pub fn resolve_run(root: &Path, run_id: Option<&str>) -> Result<ResolvedRun, Too
             )
             .map_err(|e| {
                 ToolError::new(
-                    error_class::NOT_A_GIT_REPO,
+                    super::types::state_read_error_class(&e),
                     format!("failed to read repo state: {e}"),
                 )
             })?;

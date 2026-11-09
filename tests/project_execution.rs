@@ -164,7 +164,7 @@ fn project_execution_state_does_not_invoke_git_filters() {
         .set_str("filter.fixture.clean", filter.to_str().unwrap())
         .unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
-    let state = prview::state::collect_state(
+    let error = prview::state::collect_state(
         dir.path(),
         &prview::state::StateOpts {
             fast: false,
@@ -172,8 +172,8 @@ fn project_execution_state_does_not_invoke_git_filters() {
             hot: true,
         },
     )
-    .unwrap();
-    assert!(state.is_dirty());
+    .unwrap_err();
+    assert!(error.to_string().contains("filter=fixture"), "{error}");
     assert!(!marker.exists());
 }
 
