@@ -315,3 +315,89 @@ fn project_execution_state_preserves_staged_rename_accounting() {
     assert_eq!(state.deletions, 0);
     assert!(state.hot_files.is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn review80_round2_inert_review_refuses_unmaterialized_source() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let owned = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("deleted.js"), "export const gone = 1;\n").unwrap();
+    std::fs::write(dir.path().join("consumer.js"), "import './deleted.js';\n").unwrap();
+    commit(dir.path());
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let base = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("main", &base, false).unwrap();
+    std::fs::remove_file(dir.path().join("deleted.js")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.remove_path(Path::new("deleted.js")).unwrap();
+    index.write().unwrap();
+    std::fs::write(
+        dir.path().join("consumer.js"),
+        "version https://git-lfs.github.com/spec/v1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".gitattributes"),
+        "consumer.js filter=review80static\n",
+    )
+    .unwrap();
+    commit(dir.path());
+    let marker = owned.path().join("driver-ran");
+    let driver = owned.path().join("owned-smudge");
+    std::fs::write(
+        &driver,
+        format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf \"import './deleted.js';\\n\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+    repo.config()
+        .unwrap()
+        .set_str("filter.review80static.smudge", driver.to_str().unwrap())
+        .unwrap();
+    let before_head = std::fs::read(repo.path().join("HEAD")).unwrap();
+    let before_index = std::fs::read(repo.path().join("index")).unwrap();
+    let pack = owned.path().join("pack");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_prview"))
+        .current_dir(dir.path())
+        .env("PRVIEW_HOME", owned.path().join("home"))
+        .args([
+            "--quick",
+            "--no-fetch",
+            "--no-cache",
+            "--no-heuristics",
+            "--no-zip",
+            "--no-dashboard",
+            "--quiet",
+            "--deadline",
+            "20s",
+            "--output-dir",
+        ])
+        .arg(&pack)
+        .args(["HEAD", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "raw filtered source must not earn a static-analysis pack: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("conversion incomplete"));
+    assert!(!pack.join("00_summary/MERGE_GATE.json").exists());
+    assert!(!pack.join("report.json").exists());
+    assert!(
+        !marker.exists(),
+        "inert review must not run the smudge driver"
+    );
+    assert_eq!(
+        std::fs::read(repo.path().join("HEAD")).unwrap(),
+        before_head
+    );
+    assert_eq!(
+        std::fs::read(repo.path().join("index")).unwrap(),
+        before_index
+    );
+}

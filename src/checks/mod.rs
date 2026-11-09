@@ -2598,9 +2598,7 @@ pub struct CheckPlan {
 /// lock and re-check-out the whole tree repeatedly.
 pub fn plan_check_run(config: &Config) -> Result<CheckPlan> {
     if let Some(scan_dir) = &config.scan_dir_override {
-        if config.allow_project_execution {
-            crate::git::WorktreeSnapshot::ensure_checkout_complete(scan_dir)?;
-        }
+        crate::git::WorktreeSnapshot::ensure_checkout_complete(scan_dir)?;
         return Ok(CheckPlan {
             scan_dir: scan_dir.clone(),
             _snapshot: None,
@@ -2619,9 +2617,7 @@ pub fn plan_check_run(config: &Config) -> Result<CheckPlan> {
     };
 
     let snapshot = crate::git::create_worktree_snapshot(&repo_root, &target.commit_id)?;
-    if config.allow_project_execution {
-        crate::git::WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path)?;
-    }
+    crate::git::WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path)?;
     Ok(CheckPlan {
         scan_dir: snapshot.worktree_path.clone(),
         _snapshot: Some(snapshot),

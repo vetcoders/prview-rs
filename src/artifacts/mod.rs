@@ -772,6 +772,9 @@ fn generate_guarded(
     let context_scan_root = ledger
         .scan_dir()
         .unwrap_or_else(|| config.repo_root.clone());
+    // Every source consumer needs materialized bytes, including inert static
+    // analysis. Raw Git snapshots remain usable for raw Git operations only.
+    crate::git::WorktreeSnapshot::ensure_checkout_complete(&context_scan_root)?;
     // Freeze this run-wide observation before context commands can write more files.
     let snapshot_integrity = match ledger.current_snapshot_observation() {
         Some(observation) => {
