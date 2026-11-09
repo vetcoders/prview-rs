@@ -324,6 +324,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the dashboard, narratives and copied PR comment. Change quality is distinct
   from all-check status; incomplete classification remains UNKNOWN, warning
   results are not failures, and source/dependency scan statuses stay separate.
+- The shared test-file classifier now recognises the Swift XCTest convention:
+  `.swift` files inside a `<Target>Tests/` (or `<Target>UITests/`) directory and
+  files named `SomethingTests.swift` are tests. They used to count as production
+  code, which inflated code-file counts, the untested denominator, hotspots and
+  the review score (63 of 184 files in one macOS review). The rule is Swift-only
+  and matches `Tests` as a CamelCase word boundary, so a README or fixture inside
+  the test target, `Protests.swift`, `Latest.swift` or `FooTests.rs` are
+  unaffected; Rust, JS/TS and Python markers are unchanged. A 184-path reference
+  fixture (`tests/fixtures/review_file_paths/codescribe_pr225.paths`) pins the
+  corrected classification. Matching ratio and score are recomputed from the
+  corrected classification on the next run, not rescaled.
 - Preserve incomplete API analysis through report, dashboard, narrative and
   copied comments, with explicit UNKNOWN state and known observations retained.
   Dependency regression now records current and baseline measurement evidence

@@ -2103,6 +2103,84 @@ mod tests {
         );
     }
 
+    /// One classifier for every consumer: XCTest sources are tests, the README
+    /// next to them is still non-code, production Swift is still code.
+    #[test]
+    fn test_classify_xctest_swift() {
+        assert_eq!(
+            classify_review_file("macos/CodescribeTests/OverlayChannelMapTests.swift"),
+            ReviewFileCategory::Test
+        );
+        assert_eq!(
+            classify_review_file("macos/CodescribeTests/NativeAccessibilityProbe.swift"),
+            ReviewFileCategory::Test
+        );
+        assert_eq!(
+            classify_review_file("macos/CodescribeTests/README.md"),
+            ReviewFileCategory::NonCode
+        );
+        assert_eq!(
+            classify_review_file("macos/Codescribe/Screens/Overlay/OverlayChannelMapModel.swift"),
+            ReviewFileCategory::Code
+        );
+        assert!(!is_non_code_file(
+            "macos/CodescribeTests/OverlayChannelMapTests.swift"
+        ));
+        assert!(is_non_code_file("macos/CodescribeTests/README.md"));
+    }
+
+    /// The 184 paths of one real review (Codescribe PR #225 pack, 2026-11-07),
+    /// classified by the same helper the report, dashboard, coverage and risk
+    /// signals read. Asserted is only the correction this fixture documents:
+    /// the 63 Swift sources under `macos/CodescribeTests/` are tests and the
+    /// README beside them is not, which moves the aggregate from
+    /// 149 code / 20 test / 15 other to 86 / 83 / 15. Nothing here claims the
+    /// remaining categories are right; they are recorded as the classifier
+    /// sees them today.
+    #[test]
+    fn classify_review_file_pr225_paths_count_xctest_sources_as_tests() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/review_file_paths/codescribe_pr225.paths");
+        let text = std::fs::read_to_string(&fixture).expect("fixture");
+        let paths: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(paths.len(), 184);
+
+        let (mut code, mut test, mut other) = (0usize, 0usize, 0usize);
+        for path in &paths {
+            match classify_review_file(path) {
+                ReviewFileCategory::Code => code += 1,
+                ReviewFileCategory::Test => test += 1,
+                _ => other += 1,
+            }
+        }
+        assert_eq!((code, test, other), (86, 83, 15));
+
+        let xctest: Vec<&str> = paths
+            .iter()
+            .copied()
+            .filter(|path| path.starts_with("macos/CodescribeTests/") && path.ends_with(".swift"))
+            .collect();
+        assert_eq!(xctest.len(), 63);
+        for path in xctest {
+            assert_eq!(
+                classify_review_file(path),
+                ReviewFileCategory::Test,
+                "{path}"
+            );
+        }
+
+        assert!(paths.contains(&"macos/CodescribeTests/README.md"));
+        assert_eq!(
+            classify_review_file("macos/CodescribeTests/README.md"),
+            ReviewFileCategory::NonCode
+        );
+        assert!(paths.contains(&"macos/Codescribe/Screens/Overlay/OverlayChannelMapModel.swift"));
+        assert_eq!(
+            classify_review_file("macos/Codescribe/Screens/Overlay/OverlayChannelMapModel.swift"),
+            ReviewFileCategory::Code
+        );
+    }
+
     #[test]
     fn test_classify_json_i18n_file() {
         assert_eq!(

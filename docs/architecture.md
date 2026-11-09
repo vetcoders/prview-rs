@@ -4398,6 +4398,19 @@ Unrelated languages such as JavaScript and Rust cannot match each other:
 A nearby `tests.rs` or tests directory does not by itself match every source
 in that directory. Test files are excluded from the evaluated source count.
 
+Test files are recognised by one shared rule set, `regression::tests::is_test_file`,
+which every consumer reads (report `diff.files` categories, dashboard filters,
+this matching, risk/breaking/perf signals and the regression analysis): the
+`tests/`, `test/`, `__tests__/`, `e2e/`, `spec/`, `__mocks__/`, `__fixtures__/`
+directory markers, the `_test`/`_tests`/`.test`/`_spec`/`.spec` stem suffixes,
+the `test_` basename prefix, a bare `tests`/`test` stem, and the Swift XCTest
+convention: a `.swift` file inside a `<Target>Tests/` directory or named
+`SomethingTests.swift`. `Tests` is a CamelCase word boundary there, so
+`Protests.swift` is not a test; and the XCTest rule is Swift-only, so a README
+or JSON fixture inside the test target stays non-code. The 184-path reference
+fixture `tests/fixtures/review_file_paths/codescribe_pr225.paths` pins the
+corrected classification (86 code / 83 test / 15 other).
+
 #### signal/diffs.rs — per-file diff generation
 
 - `generate_per_file_diffs(dir, repo, diffs)` — creates `per-file-diffs/` directory with

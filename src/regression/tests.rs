@@ -110,6 +110,8 @@ pub fn is_config_like(path: &str) -> bool {
 /// - Directory markers must be at path start or after `/` (no `contest/` match)
 /// - Suffix markers checked against the file stem (no `latest_version.ts` match)
 /// - `test_` prefix checked only on the basename (no `src/contest_handler.rs` match)
+/// - Swift XCTest targets (`<Target>Tests/` directory, `SomethingTests.swift`)
+///   count only for `.swift` files; see [`is_xctest_file`]
 pub fn is_test_file(path: &str) -> bool {
     let lower = path.to_lowercase();
 
@@ -144,7 +146,42 @@ pub fn is_test_file(path: &str) -> bool {
         return true;
     }
 
+    // 6. Swift XCTest convention (Swift files only)
+    if is_xctest_file(path) {
+        return true;
+    }
+
     false
+}
+
+/// Swift XCTest convention: Xcode names a test target `<Target>Tests` (or
+/// `<Target>UITests`) and that name is both the directory holding its sources
+/// and the `SomethingTests.swift` basename of each test case.
+///
+/// `Tests` is matched as a CamelCase word boundary, so the check is
+/// case-sensitive on purpose: `Protests.swift` or `requests/` are not tests,
+/// while `OverlayChannelMapTests.swift` and `CodescribeTests/Helpers.swift`
+/// are. The lowercase markers in [`is_test_file`] keep handling `tests/`,
+/// `_tests` and the other cross-language conventions.
+///
+/// Only `.swift` files qualify. The directory marker alone would otherwise turn
+/// a `README.md` or a fixture inside the test target into a test file, and
+/// Rust/JS/Python keep their existing markers unchanged.
+fn is_xctest_file(path: &str) -> bool {
+    let (dirs, basename) = path.rsplit_once('/').unwrap_or(("", path));
+    let basename = Path::new(basename);
+    let is_swift = basename
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("swift"));
+    if !is_swift {
+        return false;
+    }
+    let stem = basename
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    stem.ends_with("Tests") || dirs.split('/').any(|dir| dir.ends_with("Tests"))
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +449,51 @@ mod tests_unit {
         assert!(!is_test_file("src/app.ts"));
         assert!(!is_test_file("src/testsupport.rs"));
         assert!(!is_test_file("src/evidence_tests_support.rs"));
+    }
+
+    /// XCTest: the `<Target>Tests` directory and the `SomethingTests.swift`
+    /// basename are both test markers for Swift sources, including helper
+    /// Swift files inside the target that carry no suffix of their own.
+    #[test]
+    fn test_is_test_file_xctest_convention() {
+        assert!(is_test_file(
+            "macos/CodescribeTests/OverlayChannelMapTests.swift"
+        ));
+        assert!(is_test_file(
+            "macos/CodescribeTests/NativeAccessibilityProbe.swift"
+        ));
+        assert!(is_test_file(
+            "macos/CodescribeTests/Support/XCTestHelpers.swift"
+        ));
+        assert!(is_test_file("macos/CodescribeUITests/LaunchTests.swift"));
+        assert!(is_test_file("Sources/Feature/SomethingTests.swift"));
+        assert!(is_test_file("SomethingTests.swift"));
+        assert!(is_test_file("App/Tests.swift"));
+        // Lowercase conventions keep working for Swift as before
+        assert!(is_test_file("scripts/tests/native-ax-probe.swift"));
+        assert!(is_test_file("Sources/Feature/something_tests.swift"));
+    }
+
+    /// The XCTest marker is Swift-only and `Tests` is a CamelCase boundary:
+    /// documentation and data inside the target, production Swift next to it,
+    /// ordinary names that merely contain `test`, and other languages stay out.
+    #[test]
+    fn test_is_not_test_file_xctest_lookalikes() {
+        assert!(!is_test_file("macos/CodescribeTests/README.md"));
+        assert!(!is_test_file("macos/CodescribeTests/Fixtures/sample.json"));
+        assert!(!is_test_file(
+            "macos/Codescribe/Screens/Overlay/OverlayChannelMapModel.swift"
+        ));
+        assert!(!is_test_file("macos/Codescribe/Latest.swift"));
+        assert!(!is_test_file("macos/Codescribe/Contest.swift"));
+        assert!(!is_test_file("macos/Codescribe/TestSupport.swift"));
+        assert!(!is_test_file("macos/Codescribe/Protests.swift"));
+        assert!(!is_test_file("macos/Codescribe/Requests.swift"));
+        assert!(!is_test_file("macos/Codescribe/Manifests.swift"));
+        assert!(!is_test_file("macos/Protests/Banner.swift"));
+        assert!(!is_test_file("scripts/test-swift.sh"));
+        assert!(!is_test_file("src/FooTests.rs"));
+        assert!(!is_test_file("packages/CodescribeTests/index.ts"));
     }
 
     // -- Analyze: classification --
