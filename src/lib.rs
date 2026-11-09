@@ -536,9 +536,15 @@ impl App {
         {
             match run_headless_sync_stage(&self.governor, || {
                 self.ensure_not_cancelled()?;
-                self.repo.create_snapshot(&base.commit_id)
+                // Archive extraction can succeed with bytes that require an
+                // unsupported checkout conversion. Prove availability before
+                // the archive can run filters or Loctree can count a subset.
+                let checkout = git::create_worktree_snapshot(self.repo.path(), &base.commit_id)?;
+                git::WorktreeSnapshot::ensure_checkout_complete(&checkout.worktree_path)?;
+                let archive = self.repo.create_snapshot(&base.commit_id)?;
+                Ok((archive, checkout))
             }) {
-                Ok(base_snap) => {
+                Ok((base_snap, _base_checkout)) => {
                     if emit {
                         println!(
                             "  {} Snapshot (base): {} → {}",
@@ -2467,5 +2473,79 @@ mod tests {
             reg_mb.base_sha, reg_tip.base_sha,
             "the chosen base ref changes which tree the regression is computed against"
         );
+    }
+
+    #[tokio::test]
+    async fn review80_round3_baseline_conversion_must_be_available_before_loctree() {
+        for conversion in ["working-tree-encoding=UTF-16LE", "filter=review80base"] {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let out = tempfile::tempdir().unwrap();
+            let mut config = reviewable_repo(repo_dir.path(), out.path());
+            let repo = git2::Repository::open(repo_dir.path()).unwrap();
+            std::fs::write(
+                repo_dir.path().join(".gitattributes"),
+                format!("src/lib.rs {conversion}\n"),
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index
+                .add_path(std::path::Path::new(".gitattributes"))
+                .unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let sig = repo.signature().unwrap();
+            let base = repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    "base conversion",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            index
+                .remove_path(std::path::Path::new(".gitattributes"))
+                .unwrap();
+            index.write().unwrap();
+            std::fs::remove_file(repo_dir.path().join(".gitattributes")).unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.find_commit(base).unwrap();
+            let target = repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    "target identity checkout",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            repo.config()
+                .unwrap()
+                .set_str("filter.review80base.smudge", "review80-unavailable-driver")
+                .unwrap();
+            config.run_heuristics = true;
+            config.execution_mode = ExecutionMode::Deep;
+            config.allow_project_execution = false;
+            let app = crate::App::from_config(config).unwrap();
+            let result = app
+                .run_heuristics_with_snapshots(
+                    &app.config,
+                    &resolved(&target.to_string()),
+                    &[resolved(&base.to_string())],
+                )
+                .await
+                .unwrap();
+            assert!(
+                result.loctree.is_some() && result.summary.total_files > 0,
+                "the target identity checkout remains measured"
+            );
+            assert!(
+                result.regression.is_none(),
+                "baseline conversion {conversion} must not become a measured archive comparison"
+            );
+        }
     }
 }
