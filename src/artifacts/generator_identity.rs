@@ -26,9 +26,22 @@ pub(super) fn current() -> &'static GeneratorIdentity {
         GeneratorIdentity::collect(
             env!("PRVIEW_BUILD_SOURCE_SHA"),
             option_env!("PRVIEW_BUILD_RELEASE_TAG").filter(|tag| !tag.is_empty()),
-            std::env::current_exe(),
+            running_executable(),
         )
     })
+}
+
+fn running_executable() -> io::Result<PathBuf> {
+    // Open the executing image, not a pathname that an upgrade can replace.
+    // Linux keeps this handle usable after the installed inode is unlinked.
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PathBuf::from("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe()
+    }
 }
 
 impl GeneratorIdentity {
@@ -121,6 +134,47 @@ mod tests {
         assert_eq!(
             identity.binary_build_id_reason.as_deref(),
             Some("executable_path_unavailable: no executable path")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review80_running_executable_survives_replacement() {
+        const CHILD: &str = "PRVIEW_TEST_REPLACED_EXECUTABLE_HASH";
+        if let Some(expected) = std::env::var_os(CHILD) {
+            let installed = std::env::current_exe().unwrap();
+            assert_eq!(
+                installed.file_name().and_then(|name| name.to_str()),
+                Some("owned-identity-test")
+            );
+            let retired = installed.with_extension("retired");
+            std::fs::rename(&installed, &retired).unwrap();
+            std::fs::write(&installed, b"replacement executable bytes").unwrap();
+            std::fs::remove_file(&retired).unwrap();
+            let identity = current();
+            assert_eq!(identity.binary_build_id_status, "available");
+            assert_eq!(identity.binary_build_id.as_deref(), expected.to_str());
+            return;
+        }
+        let owned = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let expected = hash_executable(&executable).unwrap();
+        let installed = owned.path().join("owned-identity-test");
+        std::fs::copy(&executable, &installed).unwrap();
+        let output = std::process::Command::new(&installed)
+            .args([
+                "--exact",
+                "artifacts::generator_identity::tests::review80_running_executable_survives_replacement",
+                "--nocapture",
+            ])
+            .env(CHILD, &expected)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
