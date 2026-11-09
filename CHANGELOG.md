@@ -320,6 +320,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- State the limited scope of artifact self-checks in the AI index and reading
+  guide. Their successful integrity/consistency result does not independently
+  validate classifier or matching results, security-scan completeness, or code.
+
 - Keep SARIF observation kind (`source`, `dependency`, `general`) separate from
   the existing diff-origin classification. The AI index counts emitted rows by
   kind, so dependency advisories and unlocated check failures are not presented

@@ -66,6 +66,12 @@ scanned, and any `PROVENANCE_CONTRADICTION` between those statements) next to th
 mandatory for every pack, so the reference is unconditional rather than
 existence-guarded.
 
+The index states the limited self-check scope: SANITY/CONSISTENCY_CHECK test
+selected artifact invariants, counters, provenance and checklist consistency;
+manifest verification samples at most five files. Their success does not
+independently validate classifier or matching results, scan completeness, or
+the reviewed code.
+
 The deeper-context section must always include references to:
 
 - `20_quality/full-checks.log`

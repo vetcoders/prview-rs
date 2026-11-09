@@ -848,6 +848,10 @@ On Unix, a `latest` symlink points at the most recent **completed** run in
 An unexpected invalid `00_summary/SANITY.json` is a fatal generation result:
 the diagnostic directory and SANITY evidence remain on disk, but no ZIP,
 `latest` update, index row, or successful completion message is produced.
+SANITY and CONSISTENCY_CHECK cover selected pack invariants, counters,
+provenance and checklist consistency; manifest verification samples at most
+five files. A valid/consistent pack is not independent proof that its
+classifier, matching, security analysis, or the reviewed code is correct.
 A cancellation observed before the durable publication commit writes
 `00_summary/INCOMPLETE.json` and does not update `latest` or the run index. The
 marker names its cause: `reason: "cancelled"` for the operator's Ctrl-C, and

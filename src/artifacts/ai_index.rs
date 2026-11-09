@@ -219,6 +219,11 @@ pub(crate) fn generate_ai_index(
     }
     writeln!(md)?;
 
+    writeln!(md, "## Self-check scope\n")?;
+    writeln!(
+        md,
+        "`00_summary/SANITY.json` and `00_summary/CONSISTENCY_CHECK.json` check selected artifact invariants, counters, provenance and checklist consistency. Manifest verification samples at most five files. Passing self-checks do not independently validate classifier or matching results, security-scan completeness, or the reviewed code.\n"
+    )?;
     writeln!(md, "## If you need deeper context\n")?;
     writeln!(md, "- `20_quality/full-checks.log` — combined quality log.")?;
     writeln!(md, "- `10_diff/full.patch` — canonical patch text.")?;
