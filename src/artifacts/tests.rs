@@ -10104,7 +10104,10 @@ fn reporting_prv10_commit_limit_matches_generated_files_and_index() {
     let mut parent_id = None;
     let mut commits = Vec::new();
     for i in 0..51 {
-        let blob = raw.blob(format!("fixture {i}\n").as_bytes()).expect("blob");
+        let content = (0..=i)
+            .map(|line| format!("commit-{i}-line-{line}\n"))
+            .collect::<String>();
+        let blob = raw.blob(content.as_bytes()).expect("blob");
         let mut builder = raw.treebuilder(None).expect("tree builder");
         builder
             .insert("fixture.txt", blob, 0o100644)
@@ -10154,7 +10157,7 @@ fn reporting_prv10_commit_limit_matches_generated_files_and_index() {
             .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
             .collect();
         let full_patch = std::fs::read_to_string(diff_dir.join("full.patch")).expect("full patch");
-        assert!(full_patch.contains(&format!("+fixture {}", count - 1)));
+        assert!(full_patch.contains(&format!("+commit-{}-line-", count - 1)));
         assert!(!full_patch.contains("# Error generating diff"));
         assert!(index.contains("10_diff/full.patch"));
         assert!(index.contains("10_diff/per-commit-diffs/00-SUMMARY.md"));
@@ -10178,7 +10181,36 @@ fn reporting_prv10_commit_limit_matches_generated_files_and_index() {
             assert!(index.contains("summary-only: 51 commits exceed the limit of 50"));
             assert!(!index.contains("commit-by-commit patches"));
             assert!(summary.contains("51 > 50"));
-            assert!(summary.contains("Top 10 commits by churn"));
+            let top_table = summary
+                .split("## Top 10 commits by churn\n\n")
+                .nth(1)
+                .expect("top-churn table")
+                .split("\n\nSummary-only")
+                .next()
+                .expect("table before summary-only note");
+            let actual_rows: Vec<_> = top_table
+                .lines()
+                .filter(|line| line.starts_with('|'))
+                .collect();
+            let expected_rows: Vec<_> =
+                std::iter::once("| # | Churn | Commit | Message |".to_owned())
+                    .chain(std::iter::once(
+                        "|---|-------|--------|---------|".to_owned(),
+                    ))
+                    .chain((41..=50).rev().enumerate().map(|(rank, i)| {
+                        format!(
+                            "| {} | {} | `{}` | {} |",
+                            rank + 1,
+                            2 * i + 1,
+                            commits[i].short_id,
+                            commits[i].message,
+                        )
+                    }))
+                    .collect();
+            assert_eq!(
+                actual_rows, expected_rows,
+                "51-commit summary must contain exactly the ten highest-churn commits in descending order",
+            );
             assert!(summary.contains("Summary-only: no per-commit patch files were emitted"));
             assert!(summary.contains("10_diff/full.patch"));
         }
