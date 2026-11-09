@@ -145,6 +145,89 @@ fn assert_no_success_surfaces(output_dir: &Path, seam: ArtifactGenerationSeam) {
 }
 
 #[test]
+fn review80_deleted_cargo_manifest_keeps_base_rust_api_in_scope() {
+    let repo = tempfile::tempdir().unwrap();
+    run_git_fixture(repo.path(), &["init", "-q", "-b", "main"]);
+    write_commit_fixture(
+        repo.path(),
+        "Cargo.toml",
+        "[package]\nname=\"manifest_scope\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[lib]\npath=\"own.rs\"\n",
+    );
+    let base = write_commit_fixture(repo.path(), "own.rs", "pub fn still_present() {}\n");
+    run_git_fixture(repo.path(), &["rm", "--", "Cargo.toml"]);
+    run_git_fixture(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=prview test",
+            "-c",
+            "user.email=prview@example.test",
+            "commit",
+            "-qm",
+            "remove manifest",
+        ],
+    );
+    let git_repo = Repository::open(repo.path()).unwrap();
+    let target = ResolvedRef {
+        name: "HEAD".into(),
+        commit_id: git2::Repository::open(repo.path())
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+            .to_string(),
+        is_remote: false,
+    };
+    let base_ref = ResolvedRef {
+        name: "base".into(),
+        commit_id: base.clone(),
+        is_remote: false,
+    };
+    let diffs = git_repo.generate_diffs(&target, &[base_ref], true).unwrap();
+    let native = git_cmd()
+        .current_dir(repo.path())
+        .args(["diff", "--name-status", &base, &target.commit_id])
+        .output()
+        .unwrap();
+    assert!(native.status.success());
+    assert_eq!(String::from_utf8(native.stdout).unwrap(), "D\tCargo.toml\n");
+    assert_eq!(diffs[0].files.len(), 1);
+    assert_eq!(diffs[0].files[0].path, "Cargo.toml");
+    let output = tempfile::tempdir().unwrap();
+    let publication_home = tempfile::tempdir().unwrap();
+    let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let pack = generate_fixture_pack_with_ledger_and_diffs(
+        repo.path(),
+        &output.path().join("pack"),
+        &target.commit_id,
+        &base,
+        &crate::governor::ResourceGovernor::new(),
+        &TaskLedger::new(),
+        FixturePackOptions {
+            diffs: &diffs,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(pack.join("report.json")).unwrap()).unwrap();
+    let api = &report["quality"]["breaking_changes"];
+    assert_ne!(
+        api["rust_status"], "NOT_APPLICABLE",
+        "base Rust scope was discarded: {api}"
+    );
+    assert!(
+        api["rust_api_delta"].is_object(),
+        "base Rust scope requires API evidence: {api}"
+    );
+    if api["status"] == "UNKNOWN" {
+        assert_eq!(api["analysis_complete"], false);
+    }
+}
+
+#[test]
 fn snapshot_final_observation_keeps_creation_target_after_branch_moves() {
     let (repo, base, target) = init_advanced_base_fixture();
     let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target).unwrap();

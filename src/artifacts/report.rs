@@ -1077,7 +1077,12 @@ fn build_report_for_range(
             signature_changes_count: signature_changes
                 + rust_counts.map_or(0, |counts| counts.changed),
             new_env_vars_count: new_env_vars,
-            relocated_count: rust_counts.map_or(0, |counts| counts.relocated),
+            relocated_count: ctx
+                .breaking
+                .iter()
+                .filter(|finding| matches!(finding.kind, BreakingKind::RelocatedSymbol { .. }))
+                .count()
+                + rust_counts.map_or(0, |counts| counts.relocated),
             visibility_changed_count: rust_counts.map_or(0, |counts| counts.visibility_changed),
             unknown_count: rust_counts.map_or(0, |counts| counts.unknown),
             rust_api_delta: ctx.rust_api_delta.clone(),
@@ -2934,6 +2939,55 @@ test result: FAILED. 0 passed; 1 failed
             0
         );
         assert_eq!(consistency["provenance_comparisons"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn review80_report_relocation_count_matches_known_evidence_axis() {
+        for rust_relocated in [0, 2] {
+            let mut ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+            ctx.breaking.push(super::super::signal::BreakingFinding {
+                file: "api.ts".into(),
+                kind: BreakingKind::RelocatedSymbol {
+                    symbol_type: "function".into(),
+                },
+                line: "export function moved()".into(),
+                risk_level: super::super::signal::BreakingRisk::High,
+            });
+            ctx.rust_api_delta = Some(api_delta::ApiArtifactView {
+                view: api_delta::ApiArtifactViewKind::BreakingChanges,
+                analysis_source: "fixture",
+                base_revision: "base".into(),
+                target_revision: "target".into(),
+                counts: api_delta::ApiDeltaCounts {
+                    added: 0,
+                    removed: 0,
+                    changed: 0,
+                    relocated: rust_relocated,
+                    visibility_changed: 0,
+                    unknown: 0,
+                },
+                findings: vec![],
+            });
+            let report = skip_as_zero_report(&ctx, None, false);
+            let api = &report["quality"]["breaking_changes"];
+            assert_eq!(api["relocated_count"], 1 + rust_relocated);
+            let total: u64 = [
+                "removed_public_symbols_count",
+                "signature_changes_count",
+                "new_env_vars_count",
+                "relocated_count",
+                "visibility_changed_count",
+            ]
+            .into_iter()
+            .map(|key| api[key].as_u64().unwrap())
+            .sum();
+            let evidence = super::super::breaking_evidence(
+                &ctx.breaking,
+                ctx.rust_api_delta.as_ref(),
+                ctx.has_api_comparison,
+            );
+            assert_eq!(total as usize, evidence.known_count);
+        }
     }
 
     #[test]

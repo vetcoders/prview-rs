@@ -486,7 +486,12 @@ pub(super) fn build_delta_section(ctx: &DashboardContext, checks: &[CheckResult]
         .filter(|c| matches!(c.status, CheckStatus::Failed | CheckStatus::Error))
         .count();
     let findings_now = ctx.findings.len();
-    let breaking_now = ctx.breaking.len();
+    let api_evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
+    let breaking_now = api_evidence.known_count;
 
     let mut badges = String::new();
 
@@ -557,24 +562,32 @@ pub(super) fn build_delta_section(ctx: &DashboardContext, checks: &[CheckResult]
     }
 
     // Breaking changes delta
-    if prev.breaking_before > 0 || breaking_now > 0 {
-        let before = prev.breaking_before;
-        let diff_val = breaking_now as isize - before as isize;
-        let (class, arrow) = if diff_val < 0 {
-            ("delta-better", "")
-        } else if diff_val > 0 {
-            ("delta-worse", "+")
-        } else {
-            ("delta-same", "")
-        };
-        let _ = write!(
-            badges,
-            r#"<span class="delta-badge {cls}"><span class="delta-label" data-i18n="section.breaking">Breaking</span> {before}&#x2192;{now} ({arrow}{diff})</span>"#,
-            cls = class,
-            before = before,
-            now = breaking_now,
-            arrow = arrow,
-            diff = diff_val,
+    if let Some(before) = prev
+        .breaking_before
+        .filter(|_| api_evidence.analysis_complete)
+    {
+        if before > 0 || breaking_now > 0 {
+            let diff_val = breaking_now as isize - before as isize;
+            let (class, arrow) = if diff_val < 0 {
+                ("delta-better", "")
+            } else if diff_val > 0 {
+                ("delta-worse", "+")
+            } else {
+                ("delta-same", "")
+            };
+            let _ = write!(
+                badges,
+                r#"<span class="delta-badge {cls}"><span class="delta-label" data-i18n="section.breaking">Breaking</span> {before}&#x2192;{now} ({arrow}{diff})</span>"#,
+                cls = class,
+                before = before,
+                now = breaking_now,
+                arrow = arrow,
+                diff = diff_val,
+            );
+        }
+    } else {
+        badges.push_str(
+            r#"<span class="delta-badge delta-same"><span class="delta-label" data-i18n="section.breaking">Breaking</span> <span data-i18n="label.apiDeltaNotComparable">not comparable (API evidence unavailable or incomplete)</span></span>"#,
         );
     }
 

@@ -1065,7 +1065,7 @@ fn test_delta_section_shows_improvement() {
         checks_passed_before: 1,
         checks_failed_before: 2,
         findings_before: 3,
-        breaking_before: 0,
+        breaking_before: Some(0),
         quality_pass_before: false,
     });
     let checks = mock_checks(); // 1 passed, 0 failed
@@ -1089,7 +1089,7 @@ fn test_delta_section_shows_regression() {
         checks_passed_before: 5,
         checks_failed_before: 0,
         findings_before: 0,
-        breaking_before: 0,
+        breaking_before: Some(0),
         quality_pass_before: true,
     });
     let checks = vec![CheckResult {
@@ -1118,6 +1118,92 @@ fn test_delta_nav_conditional() {
         !html.contains(r##"href="#section-delta""##),
         "Nav should NOT have Delta link when no previous run"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn review80_api_delta_rejects_unavailable_previous_and_current_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let previous = temp.path().join("previous");
+    let current = temp.path().join("current");
+    fs::create_dir(&previous).unwrap();
+    fs::create_dir(&current).unwrap();
+    std::os::unix::fs::symlink("previous", temp.path().join("latest")).unwrap();
+    let measured = json!({
+        "status": "MEASURED", "analysis_complete": true,
+        "removed_public_symbols_count": 0, "signature_changes_count": 0,
+        "new_env_vars_count": 0, "relocated_count": 0, "visibility_changed_count": 0,
+    });
+    for (baseline, current_available) in [
+        (json!({"status":"NOT_RUN", "analysis_complete":false}), true),
+        (json!({"status":"UNKNOWN", "analysis_complete":false}), true),
+        (json!(null), true),
+        (measured.clone(), false),
+    ] {
+        fs::write(
+            previous.join("report.json"),
+            json!({
+                "gate":{"quality_pass":true}, "checks":[],
+                "quality":{"breaking_changes":baseline}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut ctx = mock_ctx();
+        ctx.has_api_comparison = current_available;
+        ctx.breaking.push(BreakingFinding {
+            file: "api.ts".into(),
+            kind: super::super::signal::BreakingKind::RemovedSymbol {
+                symbol_type: "function".into(),
+            },
+            line: "export function removed()".into(),
+            risk_level: super::super::signal::BreakingRisk::High,
+        });
+        ctx.previous_run = super::super::load_previous_run_delta(&current);
+        let html = build_delta_section(&ctx, &[]);
+        assert!(html.contains("not comparable"), "{html}");
+        assert!(!html.contains("0&#x2192;1"), "{html}");
+        assert!(html.contains("Passed"), "unrelated deltas remain: {html}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn review80_api_delta_compares_measured_zero_and_known_counts() {
+    let temp = tempfile::tempdir().unwrap();
+    let previous = temp.path().join("previous");
+    let current = temp.path().join("current");
+    fs::create_dir(&previous).unwrap();
+    fs::create_dir(&current).unwrap();
+    std::os::unix::fs::symlink("previous", temp.path().join("latest")).unwrap();
+    for (signatures, expected) in [(0, "0&#x2192;1 (+1)"), (2, "2&#x2192;1 (-1)")] {
+        fs::write(
+            previous.join("report.json"),
+            json!({
+                "gate":{"quality_pass":true}, "checks":[],
+                "quality":{"breaking_changes":{
+                    "status":"MEASURED", "analysis_complete":true,
+                    "removed_public_symbols_count":0, "signature_changes_count":signatures,
+                    "new_env_vars_count":0, "relocated_count":0, "visibility_changed_count":0,
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut ctx = mock_ctx();
+        ctx.breaking.push(BreakingFinding {
+            file: "api.ts".into(),
+            kind: super::super::signal::BreakingKind::RemovedSymbol {
+                symbol_type: "function".into(),
+            },
+            line: "export function removed()".into(),
+            risk_level: super::super::signal::BreakingRisk::High,
+        });
+        ctx.previous_run = super::super::load_previous_run_delta(&current);
+        let html = build_delta_section(&ctx, &[]);
+        assert!(html.contains(expected), "{html}");
+        assert!(!html.contains("not comparable"), "{html}");
+    }
 }
 
 // ---- PRV-105: View Mode Toggle ----

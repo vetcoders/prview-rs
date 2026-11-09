@@ -7,7 +7,8 @@ pub(crate) struct PreviousRunDelta {
     pub checks_passed_before: usize,
     pub checks_failed_before: usize,
     pub findings_before: usize,
-    pub breaking_before: usize,
+    /// A count is comparable only when the previous API analysis was complete.
+    pub breaking_before: Option<usize>,
     pub quality_pass_before: bool,
 }
 

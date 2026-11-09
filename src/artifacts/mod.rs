@@ -882,7 +882,13 @@ fn generate_guarded(
         || diffs
             .iter()
             .flat_map(|diff| diff.files.iter())
-            .any(|file| file.path.ends_with(".rs"));
+            // A removed manifest can leave the target profile generic while
+            // the base still contains a Rust API that must be compared.
+            .any(|file| {
+                file.path.ends_with(".rs")
+                    || file.path == "Cargo.toml"
+                    || file.path.ends_with("/Cargo.toml")
+            });
     let rust_api_delta = if has_rust_scope {
         let fast_preset = config.is_fast_remote_only_standard();
         let phase = if fast_preset {

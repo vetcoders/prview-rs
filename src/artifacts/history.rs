@@ -244,22 +244,26 @@ pub(crate) fn load_previous_run_delta(out_dir: &Path) -> Option<PreviousRunDelta
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
 
-    // PRV-P2-3: Breaking changes delta.
-    // report.json schema (v1) stores `quality.breaking_changes.removed_public_symbols_count`
-    // and `quality.breaking_changes.new_env_vars_count`. If these fields are missing
-    // (e.g. report.json from a version before these fields existed), we fall back to 0.
-    // This means the delta may show "+N new breaking changes" even if the previous run
-    // had the same count — known limitation for pre-v1 reports.
+    // Only complete, measured API evidence establishes a historical count.
+    // Legacy/missing/unresolved evidence is unavailable, not a measured zero.
     let breaking_section = json.get("quality").and_then(|q| q.get("breaking_changes"));
-    let removed = breaking_section
-        .and_then(|b| b.get("removed_public_symbols_count"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let env = breaking_section
-        .and_then(|b| b.get("new_env_vars_count"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let breaking_before = (removed + env) as usize;
+    let breaking_before = breaking_section
+        .filter(|section| {
+            section["status"].as_str() == Some("MEASURED")
+                && section["analysis_complete"].as_bool() == Some(true)
+        })
+        .and_then(|section| {
+            [
+                "removed_public_symbols_count",
+                "signature_changes_count",
+                "new_env_vars_count",
+                "relocated_count",
+                "visibility_changed_count",
+            ]
+            .into_iter()
+            .try_fold(0_u64, |sum, key| sum.checked_add(section[key].as_u64()?))
+        })
+        .and_then(|count| usize::try_from(count).ok());
 
     Some(PreviousRunDelta {
         checks_passed_before,

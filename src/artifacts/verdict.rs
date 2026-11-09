@@ -237,7 +237,7 @@ pub(crate) fn decision_readout_from_gate(gate: &serde_json::Value) -> Option<Dec
                 malformed = true;
             }
         }
-    } else if !quality_failures.is_empty() {
+    } else if decision.get("quality_failure_details").is_some() || !quality_failures.is_empty() {
         malformed = true;
     }
     // An invalid extra detail must not disappear and accidentally restore a
@@ -5709,6 +5709,48 @@ mod decision_readout_tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    fn review80_malformed_detail_container_preserves_permission_without_zero_counts() {
+        for allow_merge in [false, true] {
+            for malformed in [
+                serde_json::json!({}),
+                serde_json::json!("invalid"),
+                serde_json::json!(null),
+                serde_json::json!(false),
+            ] {
+                let gate = serde_json::json!({"decision": {
+                    "allow_merge": allow_merge,
+                    "quality_failures": [],
+                    "quality_failure_details": malformed,
+                }});
+                let readout = decision_readout_from_gate(&gate).unwrap();
+                assert_eq!(readout.automatic_merge, allow_merge);
+                assert!(!readout.details_complete, "malformed details: {gate}");
+                assert_eq!(readout.introduced_failures, None);
+                assert_eq!(readout.preexisting_failures, None);
+                assert_eq!(readout.mixed_failures, None);
+                assert_eq!(readout.unclassified_failures, None);
+            }
+        }
+        let legacy = serde_json::json!({"decision": {
+            "allow_merge": true, "quality_failures": []
+        }});
+        assert!(
+            decision_readout_from_gate(&legacy)
+                .unwrap()
+                .details_complete
+        );
+        let empty = serde_json::json!({"decision": {
+            "allow_merge": true, "quality_failures": [], "quality_failure_details": []
+        }});
+        assert_eq!(
+            decision_readout_from_gate(&empty)
+                .unwrap()
+                .introduced_failures,
+            Some(0)
+        );
     }
 
     #[test]
