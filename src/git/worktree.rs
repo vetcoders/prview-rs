@@ -3104,7 +3104,7 @@ mod tests {
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\ngit \"$@\"\nstatus=$?\nif [ \"$3\" = worktree ] && [ \"$4\" = add ] && [ \"$status\" -eq 0 ]; then\n  printf '%s\\n' \"$7\" > '{}'\n  sleep 30\nfi\nexit \"$status\"\n",
+                "#!/bin/sh\nprevious=''\npenultimate=''\nis_worktree_add=0\nfor arg in \"$@\"; do\n  if [ \"$previous\" = worktree ] && [ \"$arg\" = add ]; then\n    is_worktree_add=1\n  fi\n  penultimate=$previous\n  previous=$arg\ndone\ngit \"$@\"\nstatus=$?\nif [ \"$is_worktree_add\" -eq 1 ] && [ \"$status\" -eq 0 ]; then\n  printf '%s\\n' \"$penultimate\" > '{}'\n  sleep 30\nfi\nexit \"$status\"\n",
                 ready.display()
             ),
         )
