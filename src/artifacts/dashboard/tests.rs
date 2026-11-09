@@ -590,7 +590,10 @@ fn test_merge_decision_card_all_pass() {
 
     assert!(html.contains("Merge Decision"), "Should have title");
     assert!(html.contains("Policy: ALLOW"), "Policy should be ALLOW");
-    assert!(html.contains("Quality: PASS"), "Quality should be PASS");
+    assert!(
+        html.contains("Change quality: PASS"),
+        "Quality should be PASS"
+    );
     assert!(html.contains("Merge: GO"), "Merge should be GO");
     assert!(html.contains("alert-success"), "Should be success class");
     assert!(
@@ -668,7 +671,10 @@ fn test_merge_decision_card_quality_fail() {
     ctx.quality_failures = vec!["cargo_clippy".into(), "cargo_test".into()];
     let html = build_merge_decision_card(&ctx);
 
-    assert!(html.contains("Quality: FAIL"), "Quality should be FAIL");
+    assert!(
+        html.contains("Change quality: FAIL"),
+        "Quality should be FAIL"
+    );
     assert!(
         html.contains("Merge: HOLD"),
         "Merge should be HOLD when policy allows but quality fails"
@@ -1851,4 +1857,252 @@ fn api_missing_comparison_is_not_run_in_hero_details_navigation_and_actions() {
         .unwrap();
     assert!(navigation.contains("#section-breaking"));
     assert!(navigation.contains("NOT_RUN"));
+}
+
+#[test]
+fn automatic_merge_and_real_failures_reach_all_rendered_surfaces() {
+    use crate::artifacts::{
+        CleanComparison, DashboardContextInput, InlineFindingsSummary, MergeGateInput,
+        ProvenanceConsistency, ReviewRange, build_dashboard_context, generate_merge_gate,
+        generate_pr_review,
+    };
+    use crate::policy::PolicySeverity;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = mock_config();
+    config
+        .policy
+        .checks
+        .insert("semgrep_scan".into(), PolicySeverity::Warn);
+    let checks = vec![CheckResult {
+        name: "Semgrep scan".into(), status: CheckStatus::Failed,
+        duration: Duration::from_millis(1),
+        output: r#"{"results":[],"errors":[{"type":["PartialParsing",[]],"level":"warn","path":"src/old.rs"}]}"#.into(),
+        cached: false, provenance: None,
+    }, CheckResult {
+        name: "Cargo audit".into(), status: CheckStatus::Passed,
+        duration: Duration::from_millis(1), output: "{}".into(),
+        cached: false, provenance: None,
+    }];
+    let inline = InlineFindingsSummary {
+        cargo_audit: None,
+        status: "failed".into(),
+        findings_count: 1,
+        dashboard_findings: vec![crate::artifacts::DashboardFinding {
+            level: "error",
+            check_name: "Semgrep scan".into(),
+            check_id: "semgrep_scan".into(),
+            message: "pre-existing source finding".into(),
+            in_diff: Some(false),
+            file: Some("src/old.rs".into()),
+            line: Some(3),
+        }],
+    };
+    let target = crate::git::ResolvedRef {
+        name: "topic".into(),
+        commit_id: "b".repeat(40),
+        is_remote: false,
+    };
+    let bases = vec![crate::git::ResolvedRef {
+        name: "main".into(),
+        commit_id: "a".repeat(40),
+        is_remote: false,
+    }];
+    let provenance = ProvenanceConsistency::default();
+    let range = ReviewRange::default();
+    let coverage = || super::super::CoverageDelta {
+        pct: None,
+        total_source: 0,
+        covered_count: 0,
+        uncovered: vec![],
+        covered: vec![],
+        non_code_count: 0,
+        ghost_tests: vec![],
+    };
+    let clean = CleanComparison::for_test(true, true);
+    let summary_dir = dir.path().join("00_summary");
+    fs::create_dir_all(&summary_dir).unwrap();
+    generate_merge_gate(MergeGateInput {
+        dir: &summary_dir,
+        config: &config,
+        ledger: &crate::ledger::TaskLedger::new(),
+        scope: None,
+        checks: &checks,
+        heuristics: None,
+        inline: &inline,
+        breaking: &[],
+        rust_api_delta: None,
+        coverage: &coverage(),
+        diffs: &[],
+        skipped_checks: &[],
+        resolved_target: &target,
+        resolved_bases: &bases,
+        clean_comparison: clean.clone(),
+        snapshot_integrity: None,
+    })
+    .unwrap();
+    let ctx = build_dashboard_context(DashboardContextInput {
+        review_range: &range,
+        config: &config,
+        checks: &checks,
+        heuristics: None,
+        inline: &inline,
+        breaking: vec![],
+        rust_api_delta: None,
+        coverage: coverage(),
+        diff_dir: dir.path(),
+        skipped_checks: vec![],
+        out_dir: dir.path(),
+        diffs: &[],
+        ownership_map: vec![],
+        clean_comparison: clean,
+        snapshot_integrity: None,
+        provenance: &provenance,
+        scope: None,
+    });
+    // Preconditions are products of the actual CheckResults and policy path.
+    assert!(!ctx.allow_merge);
+    assert!(ctx.quality_pass);
+    assert_eq!(ctx.verdict, "CONDITIONAL");
+    super::super::report::generate(&super::super::report::ReportInput {
+        dir: dir.path(),
+        config: &config,
+        diffs: &[],
+        checks: &checks,
+        resolved_target: &target,
+        resolved_bases: &bases,
+        ctx: &ctx,
+        run_started_at: "2026-11-08T00:00:00Z",
+        heuristics: None,
+        regression: None,
+        coverage_history: None,
+        provenance: &provenance,
+        scope: None,
+    })
+    .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("report.json")).unwrap()).unwrap();
+    let gate: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(summary_dir.join("MERGE_GATE.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["decision_readout"], gate["decision_readout"]);
+    assert_eq!(report["decision_readout"]["automatic_merge"], false);
+    assert_eq!(report["decision_readout"]["introduced_failures"], 0);
+    assert_eq!(report["decision_readout"]["preexisting_failures"], 1);
+    assert!(
+        gate["decision"].get("decision_readout").is_none(),
+        "decision contract stays closed"
+    );
+    let statuses = report["checks"].as_array().unwrap();
+    assert!(
+        statuses
+            .iter()
+            .any(|check| check["id"] == "semgrep_scan" && check["status"] == "FAIL")
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|check| check["id"] == "cargo_audit" && check["status"] == "PASS")
+    );
+    generate_pr_review(dir.path(), &config, &[], &checks, &[], &coverage(), None).unwrap();
+    super::super::review_html::generate_review_summary(dir.path(), &[]).unwrap();
+    let hero = build_header(&config, None, &ctx, dir.path(), "");
+    let card = build_merge_decision_card(&ctx);
+    let html_tags = regex::Regex::new("<[^>]+>").unwrap();
+    for html in [hero, card] {
+        // i18n markup may sit between the label and value; text remains readable.
+        let text = html_tags.replace_all(&html, "");
+        assert!(
+            text.contains(
+                "Automatic merge: NO · Introduced failures: 0 · Pre-existing failures: 1"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Change quality: PASS"));
+        assert!(html.contains("data-automatic-merge=\"false\""));
+    }
+    for path in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+        let md = fs::read_to_string(dir.path().join(path)).unwrap();
+        assert!(
+            md.contains("Automatic merge: NO · Introduced failures: 0 · Pre-existing failures: 1"),
+            "{path}: {md}"
+        );
+        assert!(md.contains("all-check status is separate"));
+        assert!(md.contains("Cargo audit checks dependency advisories"));
+    }
+}
+
+#[test]
+fn hero_and_card_preserve_unknown_and_canonical_permission() {
+    use crate::artifacts::{QualityFailureClass, QualityFailureDetail, QualityFailureOrigin};
+    let config = mock_config();
+    let html_tags = regex::Regex::new("<[^>]+>").unwrap();
+    let mut ctx = mock_ctx();
+    // A review recommendation is deliberately independent of permission.
+    ctx.allow_merge = false;
+    ctx.recommended_merge = true;
+    ctx.quality_failures = vec!["legacy".into()];
+    for html in [
+        build_header(&config, None, &ctx, Path::new("."), ""),
+        build_merge_decision_card(&ctx),
+    ] {
+        let text = html_tags.replace_all(&html, "").into_owned();
+        assert!(text.contains("Automatic merge: NO · Introduced failures: UNKNOWN"));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("00_summary")).unwrap();
+    for allow_merge in [false, true] {
+        ctx.allow_merge = allow_merge;
+        let expected = if allow_merge {
+            "Automatic merge: YES · Introduced failures: UNKNOWN"
+        } else {
+            "Automatic merge: NO · Introduced failures: UNKNOWN"
+        };
+        for names in [
+            None,
+            Some(serde_json::json!("invalid")),
+            Some(serde_json::json!([null])),
+        ] {
+            let mut gate = serde_json::json!({"decision": {"allow_merge": allow_merge}});
+            if let Some(names) = names {
+                gate["decision"]["quality_failures"] = names;
+            }
+            fs::write(
+                dir.path().join("00_summary/MERGE_GATE.json"),
+                gate.to_string(),
+            )
+            .unwrap();
+            super::super::generate_pr_review(
+                dir.path(),
+                &config,
+                &[],
+                &[],
+                &[],
+                &ctx.coverage,
+                None,
+            )
+            .unwrap();
+            super::super::review_html::generate_review_summary(dir.path(), &[]).unwrap();
+            for path in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+                let md = fs::read_to_string(dir.path().join(path)).unwrap();
+                assert!(md.contains(expected));
+            }
+            for html in [
+                build_header(&config, None, &ctx, dir.path(), ""),
+                build_merge_decision_card(&ctx),
+            ] {
+                let text = html_tags.replace_all(&html, "").into_owned();
+                assert!(text.contains(expected));
+            }
+        }
+    }
+    ctx.allow_merge = true;
+    ctx.quality_failure_details = vec![QualityFailureDetail {
+        name: "legacy".into(),
+        classification: QualityFailureClass::Introduced,
+        origin: QualityFailureOrigin::Warning,
+    }];
+    let html = build_merge_decision_card(&ctx);
+    let text = html_tags.replace_all(&html, "");
+    assert!(text.contains("Automatic merge: YES · Introduced failures: 0"));
+    assert!(!text.contains("Advisory warnings"));
 }

@@ -2635,6 +2635,25 @@ const JS_SUFFIX: &str = r##"
     }
 
     // -- B5: Copy PR Comment --
+    function decisionReadoutComment(report) {
+        var gate = report.gate || {};
+        var readout = report.decision_readout || {};
+        var complete = readout.details_complete === true;
+        var unknown = t('readout.unknown');
+        function count(key) {
+            return complete && typeof readout[key] === 'number' && readout[key] >= 0
+                ? readout[key] : unknown;
+        }
+        var automatic = gate.allow_merge === true ? t('readout.yes')
+            : (gate.allow_merge === false ? t('readout.no') : unknown);
+        var parts = [t('readout.automaticMerge') + ': ' + automatic];
+        [['readout.introduced', 'introduced_failures'], ['readout.preexisting', 'preexisting_failures'],
+         ['readout.mixed', 'mixed_failures'], ['readout.unclassified', 'unclassified_failures']].forEach(function(pair) {
+            parts.push(t(pair[0]) + ': ' + count(pair[1]));
+        });
+        return parts.join(' · ') + '\n\n' + t('readout.scope') + '\n\n';
+    }
+
     var copyPrBtn = document.getElementById('copy-pr-comment');
     if (copyPrBtn) {
         copyPrBtn.addEventListener('click', function() {
@@ -2647,7 +2666,8 @@ const JS_SUFFIX: &str = r##"
 
             var comment = '## PR Review Summary\n\n';
             var mergeLabel = gate.recommended_label || (gate.recommended_merge ? 'MERGE' : (gate.allow_merge ? 'HOLD' : 'BLOCK'));
-            comment += '**Gate:** ' + (gate.status || 'N/A') + ' | **Quality:** ' + (gate.quality_pass ? 'PASS' : 'FAIL') + ' | **Merge:** ' + mergeLabel + '\n\n';
+            comment += decisionReadoutComment(report);
+            comment += '**Gate:** ' + (gate.status || 'N/A') + ' | **' + t('readout.changeQuality') + ':** ' + (gate.quality_pass ? 'PASS' : 'FAIL') + ' | **' + t('readout.reviewRecommendation') + ':** ' + mergeLabel + '\n\n';
             if (gate.summary) {
                 comment += '**Decision:** ' + gate.summary + '\n\n';
             }
@@ -2657,7 +2677,22 @@ const JS_SUFFIX: &str = r##"
 
             var passed = checks.filter(function(c) { return c.status === 'PASS'; }).length;
             var failed = checks.filter(function(c) { return c.status === 'FAIL' || c.status === 'ERROR'; }).length;
-            comment += '**Checks:** ' + passed + ' passed, ' + failed + ' failed\n\n';
+            var warned = checks.filter(function(c) { return c.status === 'WARN'; }).length;
+            comment += '**' + t('readout.allChecks') + ':** ' + passed + ' ' + t('readout.passed') + ', ' + failed + ' ' + t('readout.failed') + ', ' + warned + ' ' + t('readout.warningChecks') + '\n\n';
+            [['semgrep_scan', 'readout.sourceScan'], ['cargo_audit', 'readout.dependencyAudit']].forEach(function(scope) {
+                var statuses = checks.filter(function(c) { return c.id === scope[0]; }).map(function(c) {
+                    return typeof c.status === 'string' && c.status.trim() ? c.status : t('readout.unknown');
+                });
+                // A configured skip is known NOT_RUN, not missing execution data.
+                // Actual result rows take precedence, including all duplicates.
+                var recorded = report.security_scope;
+                if (!statuses.length && recorded && recorded.source === 'recorded_check_results' && Array.isArray(recorded.checks)) {
+                    statuses = recorded.checks.filter(function(c) { return c.id === scope[0]; }).map(function(c) {
+                        return c.execution === 'not_executed' ? 'NOT_RUN' : t('readout.unknown');
+                    });
+                }
+                comment += '**' + t(scope[1]) + ':** ' + (statuses.length ? statuses.join(', ') : t('readout.unknown')) + '\n\n';
+            });
 
             if (quality.breaking_changes) {
                 var api = quality.breaking_changes;

@@ -191,6 +191,8 @@ jobs:
           node-version: "20"
           cache: npm
           cache-dependency-path: tools/fixtures/bounded-runtime/package-lock.json
+      - name: Test copied PR-comment evidence contract
+        run: node tools/tests/test_clipboard_contract.js
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"

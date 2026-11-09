@@ -50,6 +50,18 @@ cargo test --lib
 cargo test --test json_contract
 ```
 
+The clipboard projection contract exercises the actual dashboard JavaScript
+handler with controlled report data, including EN/PL, canonical permission,
+unknown classification and independent security-check statuses:
+
+```bash
+node tools/tests/test_clipboard_contract.js
+```
+
+It uses Node built-ins; CI runs it with the existing Node 20 setup. Clipboard
+writes are captured by the harness, while browser interaction is a separate
+artifact acceptance check.
+
 For resource-constrained validation, run stages sequentially with explicit caps:
 
 ```bash

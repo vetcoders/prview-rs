@@ -320,6 +320,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Show canonical automatic-merge permission and classified failed-check counts
+  in the dashboard, narratives and copied PR comment. Change quality is distinct
+  from all-check status; incomplete classification remains UNKNOWN, warning
+  results are not failures, and source/dependency scan statuses stay separate.
 - Preserve incomplete API analysis through report, dashboard, narrative and
   copied comments, with explicit UNKNOWN state and known observations retained.
   Dependency regression now records current and baseline measurement evidence

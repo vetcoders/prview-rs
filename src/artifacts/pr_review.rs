@@ -371,8 +371,20 @@ pub(crate) fn generate_pr_review(
 
     let mut md = String::new();
 
+    // Copy canonical permission and classified failure counts from the gate.
+    // A missing/legacy/malformed gate never earns a fabricated zero.
+    let gate = read_to_string_within(dir, Path::new("00_summary/MERGE_GATE.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or(serde_json::Value::Null);
     // Header
     writeln!(md, "# PR Review")?;
+    writeln!(
+        md,
+        "\n{}\n\n{}\n",
+        gate_readout_summary(&gate),
+        CHANGE_QUALITY_SCOPE
+    )?;
     writeln!(md)?;
     writeln!(
         md,

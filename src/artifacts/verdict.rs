@@ -120,6 +120,149 @@ impl QualityFailureSummary {
     }
 }
 
+/// Advisory presentation only. Permission is copied from canonical allow_merge;
+/// no field here participates in policy, scores, or the verdict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DecisionReadout {
+    pub automatic_merge: bool,
+    pub details_complete: bool,
+    pub introduced_failures: Option<usize>,
+    pub preexisting_failures: Option<usize>,
+    pub mixed_failures: Option<usize>,
+    pub unclassified_failures: Option<usize>,
+}
+
+pub(crate) const CHANGE_QUALITY_SCOPE: &str = "Change quality excludes proven pre-existing failures; all-check status is separate. Semgrep scans source patterns; Cargo audit checks dependency advisories. Their recorded statuses are independent.";
+
+impl DecisionReadout {
+    pub(crate) fn count_label(count: Option<usize>) -> String {
+        count.map_or_else(|| "UNKNOWN".to_string(), |value| value.to_string())
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "Automatic merge: {} · Introduced failures: {} · Pre-existing failures: {} · Mixed failures: {} · Unclassified failures: {}",
+            if self.automatic_merge { "YES" } else { "NO" },
+            Self::count_label(self.introduced_failures),
+            Self::count_label(self.preexisting_failures),
+            Self::count_label(self.mixed_failures),
+            Self::count_label(self.unclassified_failures),
+        )
+    }
+}
+
+/// Count only failed checks. The legacy buckets include warnings, so their
+/// lengths cannot establish introduced or pre-existing failure counts.
+/// Require exact name coverage (including multiplicity) before publishing any
+/// trusted zero. Missing, extra, or blank legacy details mean UNKNOWN.
+pub(crate) fn build_decision_readout(
+    allow_merge: bool,
+    quality_failures: &[String],
+    details: &[QualityFailureDetail],
+) -> DecisionReadout {
+    let mut names = quality_failures
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut detail_names = details
+        .iter()
+        .map(|detail| detail.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    detail_names.sort_unstable();
+    let complete = names == detail_names && names.iter().all(|name| !name.trim().is_empty());
+    let count = |class| {
+        complete.then(|| {
+            details
+                .iter()
+                .filter(|detail| {
+                    detail.origin == QualityFailureOrigin::Failure && detail.classification == class
+                })
+                .count()
+        })
+    };
+    DecisionReadout {
+        automatic_merge: allow_merge,
+        details_complete: complete,
+        introduced_failures: count(QualityFailureClass::Introduced),
+        preexisting_failures: count(QualityFailureClass::Preexisting),
+        mixed_failures: count(QualityFailureClass::Mixed),
+        unclassified_failures: count(QualityFailureClass::Unclassified),
+    }
+}
+
+/// Narrative files consume the gate written for this run, never re-evaluate
+/// policy. Reconstruct through the same projection for legacy packs too.
+pub(crate) fn decision_readout_from_gate(gate: &serde_json::Value) -> Option<DecisionReadout> {
+    let decision = &gate["decision"];
+    let allow_merge = decision["allow_merge"].as_bool()?;
+    let names = decision["quality_failures"].as_array().and_then(|names| {
+        names
+            .iter()
+            .map(|name| name.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+    });
+    let mut malformed = names.is_none();
+    // Invalid count evidence cannot discard independently valid permission.
+    // A blank sentinel forces the shared coverage check to return UNKNOWN.
+    let quality_failures = names.unwrap_or_else(|| vec![String::new()]);
+    let mut details = Vec::new();
+    if let Some(rows) = decision["quality_failure_details"].as_array() {
+        for row in rows {
+            let classification = match row["classification"].as_str() {
+                Some("introduced") => QualityFailureClass::Introduced,
+                Some("pre-existing") => QualityFailureClass::Preexisting,
+                Some("mixed") => QualityFailureClass::Mixed,
+                Some("unclassified") => QualityFailureClass::Unclassified,
+                _ => {
+                    malformed = true;
+                    continue;
+                }
+            };
+            let origin = match row["origin"].as_str() {
+                Some("failure") => QualityFailureOrigin::Failure,
+                Some("warning") => QualityFailureOrigin::Warning,
+                _ => {
+                    malformed = true;
+                    continue;
+                }
+            };
+            if let Some(name) = row["name"].as_str() {
+                details.push(QualityFailureDetail {
+                    name: name.to_string(),
+                    classification,
+                    origin,
+                });
+            } else {
+                malformed = true;
+            }
+        }
+    } else if !quality_failures.is_empty() {
+        malformed = true;
+    }
+    // An invalid extra detail must not disappear and accidentally restore a
+    // complete readout. Force the shared coverage check to fail in that case.
+    if malformed {
+        details.push(QualityFailureDetail {
+            name: String::new(),
+            classification: QualityFailureClass::Unclassified,
+            origin: QualityFailureOrigin::Failure,
+        });
+    }
+    Some(build_decision_readout(
+        allow_merge,
+        &quality_failures,
+        &details,
+    ))
+}
+
+pub(crate) fn gate_readout_summary(gate: &serde_json::Value) -> String {
+    decision_readout_from_gate(gate).map_or_else(
+        || "Automatic merge: UNKNOWN · Introduced failures: UNKNOWN · Pre-existing failures: UNKNOWN · Mixed failures: UNKNOWN · Unclassified failures: UNKNOWN".to_string(),
+        |readout| readout.summary(),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MergeDecisionState {
     Allow,
@@ -5452,5 +5595,132 @@ mod tests {
                 "Rust API delta: 5 unknown findings [{expected_ids}]"
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod decision_readout_tests {
+    use super::*;
+
+    #[test]
+    fn real_warning_status_is_advisory_in_readout() {
+        let checks = [CheckResult {
+            name: "Rustfmt".into(),
+            status: crate::checks::CheckStatus::Warnings,
+            duration: std::time::Duration::ZERO,
+            output: String::new(),
+            cached: false,
+            provenance: None,
+        }];
+        let findings = [DashboardFinding {
+            level: "warning",
+            check_name: "Rustfmt".into(),
+            check_id: "rustfmt".into(),
+            message: "format".into(),
+            in_diff: Some(true),
+            file: None,
+            line: None,
+        }];
+        let summary = build_quality_failure_summary(
+            &checks,
+            &findings,
+            &CleanComparison::for_test(true, true),
+        );
+        assert_eq!(
+            summary.introduced_quality_failures.len(),
+            1,
+            "legacy bucket contains warnings"
+        );
+        let readout = build_decision_readout(true, &summary.quality_failures, &summary.details);
+        assert_eq!(readout.introduced_failures, Some(0));
+        assert!(
+            readout
+                .summary()
+                .starts_with("Automatic merge: YES · Introduced failures: 0")
+        );
+    }
+
+    #[test]
+    fn failure_classes_and_incomplete_legacy_details_never_claim_clean_zero() {
+        let names = ["introduced", "preexisting", "mixed", "unclassified"].map(str::to_string);
+        let classes = [
+            QualityFailureClass::Introduced,
+            QualityFailureClass::Preexisting,
+            QualityFailureClass::Mixed,
+            QualityFailureClass::Unclassified,
+        ];
+        let details = names
+            .iter()
+            .zip(classes)
+            .map(|(name, classification)| QualityFailureDetail {
+                name: name.clone(),
+                classification,
+                origin: QualityFailureOrigin::Failure,
+            })
+            .collect::<Vec<_>>();
+        let readout = build_decision_readout(false, &names, &details);
+        assert_eq!(
+            (
+                readout.introduced_failures,
+                readout.preexisting_failures,
+                readout.mixed_failures,
+                readout.unclassified_failures
+            ),
+            (Some(1), Some(1), Some(1), Some(1))
+        );
+        assert!(
+            readout
+                .summary()
+                .contains("Mixed failures: 1 · Unclassified failures: 1")
+        );
+        for incomplete in [&details[..0], &details[..3]] {
+            let readout = build_decision_readout(false, &names, incomplete);
+            assert!(!readout.details_complete);
+            assert!(readout.summary().contains("Introduced failures: UNKNOWN"));
+        }
+        assert!(
+            build_decision_readout(true, &[], &[])
+                .summary()
+                .starts_with("Automatic merge: YES · Introduced failures: 0")
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_failure_names_preserve_canonical_permission() {
+        for allow_merge in [false, true] {
+            for names in [
+                None,
+                Some(serde_json::json!("invalid")),
+                Some(serde_json::json!([null])),
+            ] {
+                let mut gate = serde_json::json!({"decision": {"allow_merge": allow_merge}});
+                if let Some(names) = names {
+                    gate["decision"]["quality_failures"] = names;
+                }
+                let readout = decision_readout_from_gate(&gate).expect("valid permission survives");
+                assert_eq!(readout.automatic_merge, allow_merge);
+                assert!(!readout.details_complete);
+                assert_eq!(readout.introduced_failures, None);
+                assert_eq!(readout.preexisting_failures, None);
+                assert!(readout.summary().starts_with(if allow_merge {
+                    "Automatic merge: YES · Introduced failures: UNKNOWN"
+                } else {
+                    "Automatic merge: NO · Introduced failures: UNKNOWN"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_origin_cannot_disappear_into_zero() {
+        let gate = serde_json::json!({"decision": {"allow_merge": false,
+        "quality_failures": ["Rustfmt"], "quality_failure_details": [
+            {"name":"Rustfmt", "classification":"introduced", "origin":"warning"},
+            {"name":"extra", "classification":"introduced", "origin":"unknown"}
+        ]}});
+        let summary = gate_readout_summary(&gate);
+        assert!(summary.starts_with("Automatic merge: NO · Introduced failures: UNKNOWN"));
+        let missing = serde_json::json!({"decision": {"allow_merge": false, "quality_failures": ["Rustfmt"]}});
+        assert!(gate_readout_summary(&missing).contains("Pre-existing failures: UNKNOWN"));
     }
 }

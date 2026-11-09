@@ -263,13 +263,20 @@ pub(super) fn build_header(
     } else if ctx.quality_pass {
         format!(
             r#"<span class="badge badge-success">{}</span>"#,
-            i18n_template("badge.qualityPass", "Quality: PASS", &[])
+            i18n_template("badge.qualityPass", "Change quality: PASS", &[])
         )
     } else {
         format!(
-            r#"<span class="badge badge-error" title="{} check(s) failed">{}</span>"#,
-            ctx.quality_failures.len(),
-            i18n_template("badge.qualityFail", "Quality: FAIL", &[])
+            r#"<span class="badge badge-error" title="{} introduced failed check(s); mixed and unclassified listed separately">{}</span>"#,
+            crate::artifacts::DecisionReadout::count_label(
+                crate::artifacts::build_decision_readout(
+                    ctx.allow_merge,
+                    &ctx.quality_failures,
+                    &ctx.quality_failure_details,
+                )
+                .introduced_failures,
+            ),
+            i18n_template("badge.qualityFail", "Change quality: FAIL", &[])
         )
     };
 
@@ -404,6 +411,7 @@ pub(super) fn build_header(
         <div class="merge-decision">
             <span class="merge-chip {mc}" data-merge-verdict="{mv}">{ml}</span>
             {qb}
+            {readout}
             {policy}
             {review_note}
             <a href="{api_anchor}">{api_evidence}</a>
@@ -430,6 +438,7 @@ pub(super) fn build_header(
         mv = escape_html(ctx.verdict),
         ml = merge_label,
         qb = quality_badge,
+        readout = decision_readout_html(ctx),
         policy = policy_html,
         review_note = review_note_html,
         api_evidence = breaking_evidence_html(ctx),
@@ -3351,6 +3360,59 @@ pub(super) fn build_artifacts_section(
 // PRV-101: Merge Decision Card (first card in Action Center)
 // ---------------------------------------------------------------------------
 
+fn decision_readout_html(ctx: &DashboardContext) -> String {
+    use crate::artifacts::build_decision_readout;
+    let readout = build_decision_readout(
+        ctx.allow_merge,
+        &ctx.quality_failures,
+        &ctx.quality_failure_details,
+    );
+    let counts = [
+        (
+            "readout.introduced",
+            "Introduced failures",
+            readout.introduced_failures,
+        ),
+        (
+            "readout.preexisting",
+            "Pre-existing failures",
+            readout.preexisting_failures,
+        ),
+        ("readout.mixed", "Mixed failures", readout.mixed_failures),
+        (
+            "readout.unclassified",
+            "Unclassified failures",
+            readout.unclassified_failures,
+        ),
+    ];
+    let mut parts = vec![format!(
+        "{}: {}",
+        i18n_template("readout.automaticMerge", "Automatic merge", &[]),
+        if ctx.allow_merge {
+            i18n_template("readout.yes", "YES", &[])
+        } else {
+            i18n_template("readout.no", "NO", &[])
+        },
+    )];
+    parts.extend(counts.into_iter().map(|(key, label, count)| {
+        format!(
+            "{}: {}",
+            i18n_template(key, label, &[]),
+            count.map_or_else(
+                || i18n_template("readout.unknown", "UNKNOWN", &[]),
+                |value| value.to_string()
+            ),
+        )
+    }));
+    format!(
+        r#"<div class="decision-readout" data-automatic-merge="{}" data-details-complete="{}">{}</div><p class="decision-scope-note">{}</p>"#,
+        ctx.allow_merge,
+        readout.details_complete,
+        parts.join(" · "),
+        i18n_template("readout.scope", crate::artifacts::CHANGE_QUALITY_SCOPE, &[]),
+    )
+}
+
 pub(super) fn build_merge_decision_card(ctx: &DashboardContext) -> String {
     let decision = merge_decision_view(ctx);
     let has_review_caveats = !decision.review_caveats.is_empty();
@@ -3372,12 +3434,12 @@ pub(super) fn build_merge_decision_card(ctx: &DashboardContext) -> String {
     let (quality_class, quality_label) = if ctx.quality_pass {
         (
             "mdb-pass",
-            i18n_template("badge.qualityPass", "Quality: PASS", &[]),
+            i18n_template("badge.qualityPass", "Change quality: PASS", &[]),
         )
     } else {
         (
             "mdb-fail",
-            i18n_template("badge.qualityFail", "Quality: FAIL", &[]),
+            i18n_template("badge.qualityFail", "Change quality: FAIL", &[]),
         )
     };
 
@@ -3434,6 +3496,7 @@ pub(super) fn build_merge_decision_card(ctx: &DashboardContext) -> String {
         <span class="merge-decision-badge {mc}">{ml}</span>
     </div>
     <div class="merge-decision-reason" data-decision-reason="{reason}">{reason}</div>
+    {readout}
     {caveat}
 </div>"#,
         card_class = card_class,
@@ -3445,6 +3508,7 @@ pub(super) fn build_merge_decision_card(ctx: &DashboardContext) -> String {
         ml = merge_label,
         reason = escape_html(&reason),
         caveat = caveat_html,
+        readout = decision_readout_html(ctx),
     )
 }
 

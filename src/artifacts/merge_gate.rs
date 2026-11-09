@@ -497,6 +497,9 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         // to see it.
         "review_range": review_range,
         "provenance_contradictions": provenance.contradictions,
+        "decision_readout": build_decision_readout(
+            allow_merge, &quality_failures.quality_failures, &quality_failures.details,
+        ),
         "decision": {
             "enforcement_disposition": enforcement_disposition,
             "analysis_status": worst_confidence,
@@ -1029,6 +1032,31 @@ mod tests {
             fs::read_to_string(tmp.path().join("AI_INDEX.md")).unwrap(),
             caveats,
         )
+    }
+
+    #[test]
+    fn decision_readout_tracks_clean_introduced_and_advisory_gate_results() {
+        let preexisting = run_gate_with_semgrep_finding(false, false);
+        assert_eq!(preexisting["decision_readout"]["introduced_failures"], 0);
+        assert_eq!(preexisting["decision_readout"]["preexisting_failures"], 1);
+        let introduced = run_gate_with_semgrep_finding(true, false);
+        assert_eq!(introduced["decision"]["verdict"], "CONDITIONAL");
+        assert_eq!(introduced["decision_readout"]["automatic_merge"], false);
+        assert_eq!(introduced["decision_readout"]["introduced_failures"], 1);
+        let advisory = run_gate_with_rustfmt_warning(true);
+        assert_eq!(advisory["decision_readout"]["introduced_failures"], 0);
+        assert!(
+            advisory["decision_readout"]
+                .get("advisory_warnings")
+                .is_none()
+        );
+        let advisory_pass = run_gate_with_rustfmt_warning(false);
+        assert_eq!(advisory_pass["decision"]["allow_merge"], true);
+        assert_eq!(advisory_pass["decision_readout"]["automatic_merge"], true);
+        assert_eq!(advisory_pass["decision_readout"]["preexisting_failures"], 0);
+        let (clean, _) = run_gate_over(&[]);
+        assert_eq!(clean["decision"]["allow_merge"], true);
+        assert_eq!(clean["decision_readout"]["automatic_merge"], true);
     }
 
     #[test]

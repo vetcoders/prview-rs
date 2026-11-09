@@ -984,6 +984,18 @@ are separate from the generator's package version.
 
 ### Read a pack in the browser
 
+The decision views state **Automatic merge: YES/NO** from the canonical
+`allow_merge` value, alongside introduced, pre-existing, mixed and unclassified
+failed-check counts. **Change quality: PASS** means the change's quality gate
+found no new/indeterminate failures; it does not mean every check passed or that
+analysis was complete. Read the separate overall check status and availability.
+A human review recommendation or policy allowance does not authorize automatic
+merge when the canonical value is false. Unknown classification displays
+UNKNOWN, not a clean zero. The copied PR comment carries the same distinctions
+and separate recorded Semgrep/Cargo audit results, including multiple statuses.
+Machine consumers can read additive root `decision_readout` in the report or
+merge gate; the canonical permission remains `decision.allow_merge` in the gate.
+
 Open `dashboard.html` from the extracted pack. Its reading path starts with
 what changed and what was checked, then leads to the failure summary,
 provenance and consolidated summary. Shortcuts provide the full diff, gate

@@ -103,6 +103,7 @@ struct Report {
     schema_version: &'static str,
     meta: Meta,
     gate: Gate,
+    decision_readout: super::DecisionReadout,
     checks: Vec<CheckEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     checks_skipped: Vec<SkippedCheckEntry>,
@@ -1283,6 +1284,11 @@ fn build_report_for_range(
         schema_version: "3.2",
         meta,
         gate,
+        decision_readout: super::build_decision_readout(
+            ctx.allow_merge,
+            &ctx.quality_failures,
+            &ctx.quality_failure_details,
+        ),
         checks: check_entries,
         checks_skipped,
         diff: diff_section,
@@ -1995,6 +2001,8 @@ test result: FAILED. 0 passed; 1 failed
             json["gate"]["quality_failure_details"]
         );
         assert_eq!(json["gate"]["quality_pass"].as_bool(), Some(true));
+        assert_eq!(json["decision_readout"]["introduced_failures"], 0);
+        assert!(json["decision_readout"].get("advisory_warnings").is_none());
     }
 
     #[test]

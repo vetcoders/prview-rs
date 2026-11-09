@@ -2961,6 +2961,25 @@ measured scope and all baseline counters exist. A zero-file baseline is
 on `DepsRegression` qualify its legacy counters. This metadata changes neither
 the delta algorithm nor scoring or merge policy.
 
+#### Decision presentation
+
+`build_decision_readout` is a pure advisory projection of canonical
+`allow_merge` and quality-summary details. The identical value is serialized
+as root `decision_readout` in the gate and report; it never enters the closed
+`decision` object or the policy calculation. It counts only Failure-origin
+records, classifies them separately, and requires exact multiset name coverage
+before publishing numeric counters. Incomplete legacy coverage yields nulls.
+Permission remains known independently of classification availability.
+
+Hero, merge card, both narratives and the clipboard handler expose that axis
+explicitly. Change-quality labels explain their scope instead of claiming that
+all checks passed. Overall warning totals use actual check results; no broad
+advisory-warning total is inferred from the selected baseline-warning details.
+The clipboard always uses the canonical report gate bool and lists all matching
+Semgrep/Cargo audit statuses, preserving failures and missing data rather than
+choosing the first result. Existing recommendation vocabulary and verdict rules
+remain unchanged.
+
 The dashboard has one evidence reader, including file-row patches. It does not
 fall back to a second fetch-based diff modal. Complete original text is stored
 as an escaped JSON string inside its template so HTML newline normalization

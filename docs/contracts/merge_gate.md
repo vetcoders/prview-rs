@@ -26,6 +26,7 @@ document disagree, the code is the contract and this document is the bug.
 | `stale_cache_caveats` | object[] | Advisory, additive: gate rows replayed from an old or age-unverifiable cache (see below) |
 | `provenance_contradictions` | object[] | Advisory, additive: substrate statements the run and a check make that cannot both be true (see below) |
 | `decision` | object | The merge decision (see below) |
+| `decision_readout` | object | Additive advisory projection of canonical permission and failed-check counts; does not rank the verdict |
 | `files` | object | Artifact-root-relative paths (see below) |
 | `rust_api_delta` | object \| null | Additive lossless Rust API delta; `null` on non-Rust runs (see below) |
 
@@ -719,6 +720,39 @@ just the row shapes:
   When rows exist, an absent or non-array `decision.review_caveats` is rejected
   for the same reason.
 
+## `decision_readout`
+
+This root-level advisory object is also emitted at the root of `report.json`.
+It is outside the closed `decision` object and changes no policy, verdict,
+enforcement or score. `decision.allow_merge` remains authoritative; the mirrored
+permission is never a reason to override that scalar or infer it from a human
+review recommendation.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `automatic_merge` | boolean | Projection of canonical `decision.allow_merge` |
+| `details_complete` | boolean | The quality-summary names and detail names have exact multiset coverage |
+| `introduced_failures` | integer \| null | Actual failing results classified introduced |
+| `preexisting_failures` | integer \| null | Actual failing results proven pre-existing |
+| `mixed_failures` | integer \| null | Actual failing results with mixed provenance |
+| `unclassified_failures` | integer \| null | Actual failing results without established provenance |
+
+Only `quality_failure_details.origin == "failure"` contributes to these counts.
+Legacy quality buckets can also contain warning-level signals, so their lengths
+are not failure counts. Missing, malformed, extra or incomplete detail coverage
+produces null counters, rendered as UNKNOWN rather than trusted zero. A known
+canonical YES/NO is retained even when classification counts are unknown.
+
+The dashboard hero/card, PR narrative, consolidated summary and copied comment
+display permission independently of change quality, policy allowance and human
+review recommendation. Overall PASS/FAIL/WARN counts come from actual check
+results. Semgrep source scanning and Cargo dependency auditing retain separate
+recorded statuses; when a scope has multiple results, the copied comment lists
+them instead of selecting an optimistic first record.
+When no execution row exists, an explicit `not_executed` entry in the recorded
+security inventory preserves `NOT_RUN`; a requested setting alone is not such
+evidence. Missing evidence remains UNKNOWN.
+
 ## `decision`
 
 The decision object is the merge verdict. Its scalar fields are derived from two
@@ -1379,6 +1413,10 @@ revision metadata stays null; a branch label is not promoted to a SHA. A prior
 though its ratio is null. Existing
 `base_coverage_ratio`, delta and regression flags are unchanged: this comparison
 is a previous-run trend, not a coverage scan of the current PR's base commit.
-Public Rust regression structs are unchanged. The CLI JSON summary keeps its
+Dependency-availability metadata adds explicit fields to the Rust regression
+and context records, plus optional baseline scan scope in heuristics metadata.
+Exhaustive Rust constructors must supply those fields or use their defaults;
+older serialized availability defaults to UNKNOWN, never a measured zero.
+The CLI JSON summary keeps its
 existing schema and public Rust shape; it carries the clarified review caveats
 and links to these canonical artifacts.
