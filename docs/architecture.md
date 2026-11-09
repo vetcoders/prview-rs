@@ -2967,7 +2967,10 @@ OS/architecture remain available.
 `unknown`. A process-wide identity value hashes the executable with streaming
 SHA256 once, yielding `binary_build_id: "sha256:<64 lowercase hex digits>"`.
 An unreadable executable produces a null build ID, status `unavailable`, and an
-explicit reason. The digest identifies executable bytes; it is not a signature
+explicit reason. On Linux, the file is opened through `/proc/self/exe`, so an
+upgrade that replaces or unlinks the installed path still hashes the running
+image. Other platforms retain their executable-path lookup.
+The digest identifies executable bytes; it is not a signature
 or build attestation. Neither the reviewed HEAD, the current directory nor
 runtime environment overrides supply generator identity.
 
@@ -3003,6 +3006,12 @@ collection. No comparison means `NOT_RUN` and incomplete analysis, even when
 the finding count is zero. A real comparison with an empty diff still provides
 structural input. This availability fact is independent of the global verdict
 and does not alter reference resolution or the canonical merge policy.
+Changes to `Cargo.toml`, including deletion, retain Rust API scope even when the
+target profile is generic; the existing analyzer determines exact base/target
+availability. The dashboard compares prior structural observation counts only
+when both runs are complete and `MEASURED`, and all five historical count fields
+are available. Missing legacy evidence, `NOT_RUN`, and `UNKNOWN` are not comparable;
+measured zero remains comparable. Relocation totals include both JS/TS and Rust.
 
 Dependency regression carries current and baseline evidence separately through
 `RegressionContext`. A current measurement requires enabled heuristics, an
@@ -3023,7 +3032,9 @@ as root `decision_readout` in the gate and report; it never enters the closed
 `decision` object or the policy calculation. It counts only Failure-origin
 records, classifies them separately, and requires exact multiset name coverage
 before publishing numeric counters. Incomplete legacy coverage yields nulls.
-Permission remains known independently of classification availability.
+Permission remains known independently of classification availability. A present
+non-array `quality_failure_details` value is malformed and yields unknown class
+counts; an absent legacy field remains compatible when no failures are recorded.
 
 Hero, merge card, both narratives and the clipboard handler expose that axis
 explicitly. Change-quality labels explain their scope instead of claiming that
@@ -4387,11 +4398,12 @@ comparable previous run: the previous `report.json` must carry the same
 `regression.tests.metric_fingerprint` (`COVERAGE_METRIC_FINGERPRINT`, the
 definition of the test-file classifier and the matching; bumped when either
 changes, independent of the generator SHA and of the review range). The current
-`source_test_change_match/xctest-v3` definition strips the CamelCase `Tests`
-suffix only for Swift matching, so `FooTests.swift` can pair with `Foo.swift`.
+`source_test_change_match/xctest-v4` definition strips the CamelCase `Tests`
+suffix only for Swift matching and accepts Swift extensions case-insensitively,
+so `FooTests.SWIFT` can pair with `Foo.swift`.
 It preserves the existing confidence rules: a stem match across different
-modules remains low confidence. Previous v2 metrics retain their provenance
-but are not compared to v3. Otherwise
+modules remains low confidence. Previous v2/v3 metrics retain their provenance
+but are not compared to v4. Otherwise
 `comparison_status` is `not_comparable` (fingerprint missing or different, the
 previous run recorded another or no `meta.repo.full_name`, or either side has
 no measured ratio: a count-only previous record or a current run without

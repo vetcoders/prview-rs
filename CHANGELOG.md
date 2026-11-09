@@ -332,6 +332,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve unavailable structural API baselines and malformed failure-detail
+  containers as unknown, retain base Rust scope after Cargo manifest deletion,
+  and count JS/TS relocations on the same axis as Rust observations.
+- Restore an actual DOM target for Breaking navigation, preserve existing context
+  preset deferrals, and match Swift extensions case-insensitively. The matching
+  fingerprint advances to `source_test_change_match/xctest-v4`.
+- Refuse authorized execution on exact-target snapshots with unsupported named
+  checkout filters, including pinned submodules; keep raw analytical snapshots
+  available with unconfirmed materialization. Reconcile state counts with native
+  Git when staged changes are restored in the worktree.
+- Hash the running Linux executable through `/proc/self/exe` even after its
+  installed pathname is replaced. Stabilize partial-clone test setup by disabling
+  asynchronous Git maintenance before byte-preservation assertions.
+
 - Optimize executable SHA-256 hashing in development and inherited test builds
   so generator identity does not exhaust short review deadlines on large debug
   binaries. The digest, release profile, and deadline limits remain unchanged.

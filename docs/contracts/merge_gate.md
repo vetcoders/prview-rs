@@ -769,7 +769,10 @@ Only `quality_failure_details.origin == "failure"` contributes to these counts.
 Legacy quality buckets can also contain warning-level signals, so their lengths
 are not failure counts. Missing, malformed, extra or incomplete detail coverage
 produces null counters, rendered as UNKNOWN rather than trusted zero. A known
-canonical YES/NO is retained even when classification counts are unknown.
+canonical YES/NO is retained even when classification counts are unknown. A
+present non-array `quality_failure_details` container is malformed even when
+`quality_failures` is empty. An absent legacy field remains compatible only
+when no failure names are recorded.
 
 The dashboard hero/card, PR narrative, consolidated summary and copied comment
 display permission independently of change quality, policy allowance and human
@@ -1444,7 +1447,7 @@ base commit.
 
 `regression.tests` additionally carries `metric_fingerprint` (the current
 definition of the test-file classifier and matching,
-`source_test_change_match/xctest-v3`), `comparison_status` (`comparable`,
+`source_test_change_match/xctest-v4`), `comparison_status` (`comparable`,
 `not_comparable`, `unavailable`), `comparison_reason` (present only when the
 status is not `comparable`) and `low_test_match_detected`. A comparison is
 `comparable` only when both runs record the same repository
@@ -1454,9 +1457,9 @@ repositories, and a repository without a GitHub `origin` is `not_comparable`
 because its identity is not recorded), both carry a
 measured ratio in `0..=1` (a count-only or 0/0 record of a run without changed
 source files is provenance, not a measurement) and the previous run carries
-the identical fingerprint. The v3 definition additionally pairs Swift
-`FooTests.swift` with `Foo.swift`; a v2 previous run retains its source and raw
-ratio but is not comparable to v3. A different review range alone does not break
+the identical fingerprint. The v4 definition pairs Swift `FooTests.swift` with
+`Foo.swift` using case-insensitive Swift extensions; v2/v3 previous runs retain
+their source and raw ratio but are not comparable to v4. A different review range alone does not break
 comparability. `coverage_comparison` repeats the current fingerprint as
 `current_metric_fingerprint`, the status as `comparison_status`, and the
 previous run's `source.metric_fingerprint` and `source.repo_identity` (null

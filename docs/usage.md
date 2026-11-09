@@ -58,7 +58,17 @@ tools, context-only tools and tool-version probes are suppressed. `doctor` also
 requires consent for toolchain probes. State/worktree analysis does not execute
 configured Git filters. Fix refuses without the flag. Skipped check evidence
 feeds the existing canonical merge decision as incomplete/review-required,
-including when project policy labels a check ignored.
+including when project policy labels a check ignored. Context artifacts already
+deferred by a preset keep that preset's reason; enabling consent does not override
+the preset.
+
+Exact-target snapshots do not run Git clean, smudge or process filters. Named
+filter attributes, including Git LFS and filters in pinned submodules, leave raw
+Git blobs available for analysis with materialized checkout integrity unconfirmed.
+An authorized run refuses such a snapshot before checks, presync or executing
+context, reports the path/filter and `NOT_RUN`, and produces no verdict. PrView
+neither downloads LFS data nor executes custom filter drivers. Unset (`-filter`)
+and unspecified (`!filter`) attributes retain ordinary planning.
 
 This is **not a sandbox**: with consent, project code can access the host as the
 running user. Process supervision, temporary snapshots and caller drift checks
@@ -81,7 +91,7 @@ Automatically:
 - uses the current branch as the target
 - diffs against the repo's default base
 - in standard mode, generates the full artifact pack
-- runs tests and lint by default, unless you pick a lighter mode (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*`
+- with execution consent, runs tests and lint by default, unless you pick a lighter mode (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*`
 
 The profile is detected from the tree being reviewed. An explicit target
 (`--pr`, `--target-sha`, `--remote`, or even `HEAD`) derives markers from regular
@@ -639,6 +649,10 @@ prview --update
 # 7) Fast machine-readable repo state (branch, HEAD, dirty, latest run)
 prview state --json --fast
 ```
+
+State statistics and hot files follow native `git diff HEAD`: staged edits
+restored to HEAD in the worktree disappear, while staged deletions preserve Git's
+index semantics even if an untracked replacement exists at the same path.
 
 ## zsh aliases (`prv`, `prvpr`, `prvjson`)
 
@@ -1570,10 +1584,11 @@ ratio over changed source files and the previous run carries the same
 `unavailable`, the `PR_REVIEW.md` notice says the previous run was not
 compared, and no coverage regression is reported. Low matching in the current
 change is a separate signal, `low_test_match_detected`, not a regression.
-Swift matching pairs a changed `FooTests.swift` with `Foo.swift`; unrelated test
-names do not cover a source file merely by sharing the test directory. This
-matching definition uses fingerprint `source_test_change_match/xctest-v3`, so a
-previous v2 metric remains provenance and is not compared to v3.
+Swift matching pairs a changed `FooTests.swift` with `Foo.swift`, accepting Swift
+extensions case-insensitively. Unrelated test names do not cover a source file
+merely by sharing the test directory. This definition uses fingerprint
+`source_test_change_match/xctest-v4`; previous v2/v3 metrics retain provenance
+and are not compared to v4.
 Slow-check messages
 name active checks without assuming that their delay is Cargo compilation.
 
