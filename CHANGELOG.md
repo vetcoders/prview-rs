@@ -332,6 +332,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The repository's Gate Shadow job explicitly acknowledges project execution
+  so its Cargo check continues to run with the new analytical default.
+- CI dependency auditing applies the maintainer-approved RUSTSEC-2026-0457/0462
+  exceptions only after locked metadata proves the exact reviewed rmcp 2.0.0
+  graph excludes OAuth/HTTP clients. Changed features, versions, sources or
+  incomplete metadata fail closed. The affected version remains required by Loctree;
+  no global advisory ignore is added, and raw `cargo audit` still reports them.
+
 - Preserve nested gitlink support in the built-in conversion probe by binding
   its private handle to an owned workdir without operator configuration writes.
 - Confirm Deep/CI baseline conversion before Loctree scans, cover clean
