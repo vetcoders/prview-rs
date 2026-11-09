@@ -1260,9 +1260,6 @@ impl WorktreeSnapshot {
             .context("worktree comparison requires a workdir")?;
         let mut issues = Vec::new();
         for entry in repo.index()?.iter() {
-            if !matches!(entry.mode, 0o100644 | 0o100755) {
-                continue;
-            }
             let path = git_tree_component(&entry.path)?;
             match std::fs::symlink_metadata(workdir.join(&path)) {
                 Ok(metadata) if metadata.file_type().is_file() => {}

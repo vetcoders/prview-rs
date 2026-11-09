@@ -348,6 +348,139 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn review80_round3_symlink_index_replaced_by_regular_requires_clean_conversion() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let (_dir, path) = make_temp_repo();
+        let marker = path.join("clean-marker");
+        let script = path.join("owned-round3-clean");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf 'canonical\\n'\nprintf x >> '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink("destination", path.join("asset.txt")).unwrap();
+        std::fs::write(
+            path.join(".gitattributes"),
+            "asset.txt filter=round3clean\n",
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("asset.txt")).unwrap();
+        index.add_path(Path::new(".gitattributes")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = repo.signature().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "tracked symlink",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("filter.round3clean.clean", script.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_file(path.join("asset.txt")).unwrap();
+        std::fs::write(path.join("asset.txt"), "display\nthree\nlines\n").unwrap();
+        let original_index = std::fs::read(repo.path().join("index")).unwrap();
+
+        // Native Git normalizes the new regular file despite the index mode
+        // still being a symlink. The owned driver is only run by this oracle.
+        let native = git_cmd()
+            .args(["diff", "--numstat", "HEAD", "--", "asset.txt"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert_eq!(native.stdout, b"1\t1\tasset.txt\n");
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+        let error = match get_diff_stats(&path) {
+            Ok(stats) => panic!(
+                "regular replacement requires unsupported clean normalization, got {} files/+{}/-{}",
+                stats.files_changed, stats.insertions, stats.deletions
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            crate::git::WorktreeSnapshot::is_materialization_error(&error),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("asset.txt (filter=round3clean)"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            original_index
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review80_round3_actual_symlinks_and_unfiltered_typechanges_remain_available() {
+        use std::os::unix::fs::symlink;
+        let (_dir, path) = make_temp_repo();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("destination"), "external bytes\n").unwrap();
+        symlink(outside.path().join("destination"), path.join("asset.txt")).unwrap();
+        std::fs::write(
+            path.join(".gitattributes"),
+            "asset.txt filter=round3clean\n",
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("asset.txt")).unwrap();
+        index.add_path(Path::new(".gitattributes")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = repo.signature().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "symlink control",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        // This command would fail if the guard followed the actual symlink.
+        repo.config()
+            .unwrap()
+            .set_str("filter.round3clean.clean", "unavailable-round3-driver")
+            .unwrap();
+        assert_eq!(get_diff_stats(&path).unwrap().files_changed, 0);
+        std::fs::remove_file(path.join("asset.txt")).unwrap();
+        std::fs::write(path.join("asset.txt"), "ordinary type change\n").unwrap();
+        std::fs::write(path.join(".gitattributes"), "asset.txt -filter\n").unwrap();
+        assert!(
+            get_diff_stats(&path).is_ok(),
+            "an unfiltered type change remains measurable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("destination")).unwrap(),
+            "external bytes\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn review80_round2_state_refuses_unsupported_clean_normalization_without_callbacks() {
         use std::os::unix::fs::PermissionsExt as _;
         let (_dir, path) = make_temp_repo();
