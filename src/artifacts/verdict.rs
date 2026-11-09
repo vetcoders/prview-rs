@@ -880,12 +880,12 @@ pub(crate) fn build_merge_decision_view(
     };
 
     let reason = match state {
-        MergeDecisionState::Allow => "All quality gates passed".to_string(),
+        MergeDecisionState::Allow => "Change quality gate passed".to_string(),
         MergeDecisionState::AllowWithReview => format!(
             "{}{} review signal{} need attention",
             quality_failure_reason_text(quality_failures, quality_failure_details)
                 .map(|reason| format!("{reason}; "))
-                .unwrap_or_else(|| "Quality gates passed, but ".to_string()),
+                .unwrap_or_else(|| "Change quality gate passed, but ".to_string()),
             review_caveats.len(),
             if review_caveats.len() == 1 { "" } else { "s" }
         ),

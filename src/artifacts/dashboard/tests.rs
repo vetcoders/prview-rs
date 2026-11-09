@@ -594,10 +594,13 @@ fn test_merge_decision_card_all_pass() {
         html.contains("Change quality: PASS"),
         "Quality should be PASS"
     );
-    assert!(html.contains("Merge: GO"), "Merge should be GO");
+    assert!(
+        html.contains("Review recommendation: GO"),
+        "Merge should be GO"
+    );
     assert!(html.contains("alert-success"), "Should be success class");
     assert!(
-        html.contains("All quality gates passed"),
+        html.contains("Change quality gate passed"),
         "Should show success reason"
     );
 }
@@ -633,11 +636,11 @@ fn test_merge_decision_card_review_caveats() {
     }];
     let html = build_merge_decision_card(&ctx);
 
-    assert!(html.contains("Merge: GO WITH REVIEW"));
+    assert!(html.contains("Review recommendation: GO WITH REVIEW"));
     assert!(html.contains("alert-warning"));
-    assert!(html.contains("Quality gates passed, but 3 review signals need attention"));
+    assert!(html.contains("Change quality gate passed, but 3 review signals need attention"));
     assert!(html.contains(
-        r#"data-decision-reason="Quality gates passed, but 3 review signals need attention""#
+        r#"data-decision-reason="Change quality gate passed, but 3 review signals need attention""#
     ));
     assert!(html.contains(r#"data-i18n="message.reviewSignalsPrefix""#));
     assert!(html.contains(
@@ -676,7 +679,7 @@ fn test_merge_decision_card_quality_fail() {
         "Quality should be FAIL"
     );
     assert!(
-        html.contains("Merge: HOLD"),
+        html.contains("Review recommendation: HOLD"),
         "Merge should be HOLD when policy allows but quality fails"
     );
     assert!(html.contains("alert-warning"), "Should be warning class");
@@ -696,7 +699,10 @@ fn test_merge_decision_card_policy_block() {
     let html = build_merge_decision_card(&ctx);
 
     assert!(html.contains("Policy: BLOCK"), "Policy should be BLOCK");
-    assert!(html.contains("Merge: BLOCK"), "Merge should be BLOCK");
+    assert!(
+        html.contains("Review recommendation: BLOCK"),
+        "Merge should be BLOCK"
+    );
     assert!(html.contains("alert-error"), "Should be error class");
     assert!(
         html.contains("1 blocking issue found"),

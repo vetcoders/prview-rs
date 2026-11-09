@@ -257,6 +257,12 @@ pub(super) fn build_header(
         )
     };
 
+    let merge_label = format!(
+        r#"<span style="font-size:11px;font-weight:500">{}:</span> {}"#,
+        i18n_template("readout.reviewRecommendation", "Review recommendation", &[]),
+        merge_label,
+    );
+
     // Quality badge next to merge chip
     let quality_badge = if ctx.check_gates.is_empty() {
         String::new()
@@ -3445,7 +3451,7 @@ pub(super) fn build_merge_decision_card(ctx: &DashboardContext) -> String {
 
     // Merge badge: GO / HOLD / BLOCK
     let merge_class = decision.state.card_badge_class();
-    let merge_fallback = format!("Merge: {}", decision.state.card_label());
+    let merge_fallback = format!("Review recommendation: {}", decision.state.card_label());
     let merge_label = match decision.state {
         crate::artifacts::MergeDecisionState::Allow => {
             i18n_template("badge.mergeGo", merge_fallback.as_str(), &[])

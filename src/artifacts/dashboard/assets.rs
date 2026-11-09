@@ -2103,11 +2103,11 @@ const JS_SUFFIX: &str = r##"
         var text = (reason || '').trim();
         var match;
         if (text.includes('; ')) return text.split('; ').map(translateDecisionReason).join('; ');
-        if (text === 'All quality gates passed') return 'Wszystkie wymagane kontrole zakończyły się powodzeniem';
-        match = text.match(/^Quality gates passed, but (\d+) review signal(?:s)? need attention$/);
+        if (text === 'All quality gates passed' || text === 'Change quality gate passed') return 'Kontrola jakości zmiany zakończyła się powodzeniem';
+        match = text.match(/^(?:Quality gates passed|Change quality gate passed), but (\d+) review signal(?:s)? need attention$/);
         if (match) {
             var reviewCount = Number(match[1]);
-            return 'Kontrole zakończyły się powodzeniem, ale ' + match[1] + ' ' + polishPlural(reviewCount, 'sygnał wymaga uwagi', 'sygnały wymagają uwagi', 'sygnałów wymaga uwagi');
+            return 'Kontrola jakości zmiany zakończyła się powodzeniem, ale ' + match[1] + ' ' + polishPlural(reviewCount, 'sygnał wymaga uwagi', 'sygnały wymagają uwagi', 'sygnałów wymaga uwagi');
         }
         match = text.match(/^(\d+) quality check(?:s)? failed([\s\S]*)$/);
         if (match) {
