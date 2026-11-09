@@ -228,6 +228,14 @@ Artifact diffs use `resolve_diff_bases()` before `generate_diffs()`, so the
 review pack matches GitHub's three-dot "Files changed" model: branch names stay
 displayable as bases, while each diff is anchored at the target/base merge-base.
 
+Every tree-to-tree diff that yields line counts or a patch — `diff_refs` (per-file
+additions/deletions and totals), `full_diff`, `file_diff` and `scoped_full_diff`
+— is built from one `canonical_diff_options()`: libgit2's default Myers algorithm
+with three context lines, the same hunks `git diff --numstat` and GitHub count.
+Only the pathspec of a single-file diff and rename/copy detection are added per
+call. `changed_paths` deliberately uses zero context because it reads deltas, not
+hunks.
+
 `Config::required_base_exact` is the single opt-out, set by `prview gate --base
 <REF> --exact-base`. It keeps the one requested base pinned at the commit it
 resolved to, so the review is `<REF>..target` literally — the range a push

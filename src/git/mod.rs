@@ -28,6 +28,25 @@ use std::path::{Path, PathBuf};
 /// Minimum similarity percentage for rename/copy detection (like `git diff -M50`).
 const RENAME_SIMILARITY_THRESHOLD: u16 = 50;
 
+/// Diff options shared by every tree-to-tree diff that produces line counts or
+/// a patch: [`Repository::diff_refs`], [`Repository::full_diff`],
+/// [`Repository::file_diff`] and [`Repository::scoped_full_diff`].
+///
+/// One algorithm (libgit2's default Myers, the one `git diff --numstat` and the
+/// GitHub PR statistics use) and one hunk context for all of them, so per-file
+/// additions/deletions, the totals and the shipped patches describe the same
+/// hunks. `diff_refs` alone used to ask for patience, which aligns repeated
+/// lines (braces, blank separators, key/value pairs) differently and reported
+/// line counts the pack's own `full.patch` did not contain.
+///
+/// Callers add only what is local to them (a pathspec); rename/copy detection
+/// stays in `DiffFindOptions` at each call site.
+fn canonical_diff_options() -> DiffOptions {
+    let mut opts = DiffOptions::new();
+    opts.context_lines(3);
+    opts
+}
+
 /// Maximum number of commits loaded by `commits_between()`.
 /// PRs with more commits are truncated: first and last commits are always preserved.
 /// Aligned with `MAX_COMMITS_FOR_PER_COMMIT_DIFFS` in artifacts (50 << 500).
@@ -576,9 +595,7 @@ impl Repository {
         let base_tree = base_commit.tree()?;
         let target_tree = target_commit.tree()?;
 
-        let mut opts = DiffOptions::new();
-        opts.patience(true);
-        opts.context_lines(3);
+        let mut opts = canonical_diff_options();
 
         let mut diff =
             self.inner
@@ -1511,8 +1528,8 @@ impl Repository {
         let base_tree = base_obj.peel_to_tree()?;
         let target_tree = target_obj.peel_to_tree()?;
 
-        // Create diff with path filter
-        let mut opts = git2::DiffOptions::new();
+        // Shared options plus the one path filter local to this call
+        let mut opts = canonical_diff_options();
         opts.pathspec(safe_path);
 
         let diff =
@@ -1530,9 +1547,10 @@ impl Repository {
         let base_tree = base_obj.peel_to_tree()?;
         let target_tree = target_obj.peel_to_tree()?;
 
-        let mut diff = self
-            .inner
-            .diff_tree_to_tree(Some(&base_tree), Some(&target_tree), None)?;
+        let mut opts = canonical_diff_options();
+        let mut diff =
+            self.inner
+                .diff_tree_to_tree(Some(&base_tree), Some(&target_tree), Some(&mut opts))?;
 
         // Enable rename/copy detection (like git diff -M -C)
         let mut find_opts = git2::DiffFindOptions::new();
@@ -1561,9 +1579,10 @@ impl Repository {
         // No pathspec here: rename detection needs both ends of the diff, and a
         // pathspec on the new path alone would hide the old-path delete before
         // find_similar can pair them. We filter by scope membership afterwards.
-        let mut diff = self
-            .inner
-            .diff_tree_to_tree(Some(&base_tree), Some(&target_tree), None)?;
+        let mut opts = canonical_diff_options();
+        let mut diff =
+            self.inner
+                .diff_tree_to_tree(Some(&base_tree), Some(&target_tree), Some(&mut opts))?;
         let mut find_opts = git2::DiffFindOptions::new();
         find_opts.renames(true);
         find_opts.copies(true);
@@ -1941,6 +1960,122 @@ mod tests {
         assert_eq!(repo.resolve_ref(&head).expect("commit sha"), head);
         // A tree is not a reviewable ref.
         assert!(repo.resolve_ref("HEAD^{tree}").is_err());
+    }
+
+    /// Minimal text pair on which patience and Myers disagree: Myers reports
+    /// +3/-2, patience +5/-4 (same +N/-N signature as the eleven Codescribe
+    /// PR225 files whose `report.json` counts did not match `full.patch`).
+    const NUMSTAT_FIXTURE_BEFORE: &str = "a {\n  x: 0;\n}\n\nb {\n  x: 0;\n}\n";
+    const NUMSTAT_FIXTURE_AFTER: &str = "b {\n  x: 0;\n}\n\na {\n  x: 0;\n  y: 1;\n}\n";
+
+    /// `git apply --numstat` over a unified patch, reduced to what these
+    /// tests need: added and removed content lines, file headers excluded.
+    fn numstat_of_patch(patch: &str) -> (usize, usize) {
+        let mut added = 0;
+        let mut removed = 0;
+        for line in patch.lines() {
+            if line.starts_with("+++ ") || line.starts_with("--- ") {
+                continue;
+            }
+            if line.starts_with('+') {
+                added += 1;
+            } else if line.starts_with('-') {
+                removed += 1;
+            }
+        }
+        (added, removed)
+    }
+
+    fn resolved(name: &str, commit_id: &str) -> ResolvedRef {
+        ResolvedRef {
+            name: name.to_string(),
+            commit_id: commit_id.to_string(),
+            is_remote: false,
+        }
+    }
+
+    fn init_numstat_fixture_repo() -> (tempfile::TempDir, String, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let base = write_commit(tmp.path(), "f.txt", NUMSTAT_FIXTURE_BEFORE);
+        let head = write_commit(tmp.path(), "f.txt", NUMSTAT_FIXTURE_AFTER);
+        (tmp, base, head)
+    }
+
+    /// Per-file counts and totals come from the same hunks as every patch the
+    /// pack ships: `full.patch`, the per-file patch and the scoped patch all
+    /// agree with `diff_refs` on a fixture where the algorithm choice matters.
+    #[test]
+    fn diff_refs_numstat_matches_the_patches_on_a_patience_divergent_fixture() {
+        let (tmp, base, head) = init_numstat_fixture_repo();
+        let repo = Repository::open(tmp.path()).expect("repo");
+
+        let diff = repo
+            .diff_refs(&resolved("main", &base), &resolved("head", &head))
+            .expect("diff refs");
+        assert_eq!(diff.files.len(), 1, "{:?}", diff.files);
+        let file = &diff.files[0];
+        assert_eq!(file.path, "f.txt");
+
+        let full = repo.full_diff(&base, &head).expect("full diff");
+        let expected = numstat_of_patch(&full);
+        assert_eq!((file.additions, file.deletions), expected, "{full}");
+        assert_eq!((diff.stats.additions, diff.stats.deletions), expected);
+        assert_eq!(diff.stats.files_changed, 1);
+
+        let single = repo.file_diff(&base, &head, "f.txt").expect("file diff");
+        assert_eq!(numstat_of_patch(&single), expected, "{single}");
+        let scoped = repo
+            .scoped_full_diff(&base, &head, &["f.txt"])
+            .expect("scoped diff");
+        assert_eq!(numstat_of_patch(&scoped), expected, "{scoped}");
+    }
+
+    /// The canonical algorithm is Myers, as `git diff --numstat` and GitHub
+    /// count it: this fixture is +3/-2 everywhere. Patience would say +5/-4.
+    #[test]
+    fn diff_refs_counts_lines_the_way_native_git_numstat_does() {
+        let (tmp, base, head) = init_numstat_fixture_repo();
+        let repo = Repository::open(tmp.path()).expect("repo");
+
+        let diff = repo
+            .diff_refs(&resolved("main", &base), &resolved("head", &head))
+            .expect("diff refs");
+        assert_eq!((diff.files[0].additions, diff.files[0].deletions), (3, 2));
+        assert_eq!((diff.stats.additions, diff.stats.deletions), (3, 2));
+
+        let full = repo.full_diff(&base, &head).expect("full diff");
+        assert_eq!(numstat_of_patch(&full), (3, 2), "{full}");
+    }
+
+    /// Unchanged content stays invisible on every path: a file the range does
+    /// not touch has no `diff_refs` entry, no line counts and an empty patch.
+    #[test]
+    fn unchanged_file_has_no_numstat_and_no_patch_on_any_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let base = write_commit(tmp.path(), "f.txt", NUMSTAT_FIXTURE_BEFORE);
+        let head = write_commit(tmp.path(), "other.txt", "other\n");
+        let repo = Repository::open(tmp.path()).expect("repo");
+
+        let diff = repo
+            .diff_refs(&resolved("main", &base), &resolved("head", &head))
+            .expect("diff refs");
+        assert!(
+            diff.files.iter().all(|file| file.path != "f.txt"),
+            "{:?}",
+            diff.files
+        );
+        assert_eq!((diff.stats.additions, diff.stats.deletions), (1, 0));
+        assert_eq!(
+            repo.file_diff(&base, &head, "f.txt").expect("file diff"),
+            ""
+        );
+        assert_eq!(
+            repo.scoped_full_diff(&base, &head, &["f.txt"])
+                .expect("scoped diff"),
+            ""
+        );
     }
 
     /// The API signals read a copy from its section header: a patch must

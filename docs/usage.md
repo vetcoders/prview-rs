@@ -926,7 +926,7 @@ $HOME/.prview/runs/my-repo/feature-x/20260225-185357/
 │   ├── file-status.txt      # A/M/D + file paths
 │   └── commit-list.txt      # hash date author message
 ├── 10_diff/
-│   ├── full.patch            # Full diff with diff-stat header (+N -N per file)
+│   ├── full.patch            # Full diff with diff-stat header (+N -N, same Myers diff as the hunks)
 │   ├── per-commit-diffs/     # Individual per-commit patches
 │   │   ├── 00-SUMMARY.md     # Commit stats + batch mapping + thematic labels
 │   │   ├── 01-abc1234-message.patch

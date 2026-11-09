@@ -335,6 +335,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixture (`tests/fixtures/review_file_paths/codescribe_pr225.paths`) pins the
   corrected classification. Matching ratio and score are recomputed from the
   corrected classification on the next run, not rescaled.
+- Per-file and total line counts in `report.json`, the dashboard and the
+  `full.patch` header now come from the same diff as the shipped patches.
+  `diff_refs` used the patience algorithm while `full.patch`, per-file and
+  scoped patches used Myers, so on files with repeated lines the counts could
+  differ from `git diff --numstat` and from GitHub by the same +N/-N on both
+  sides (11 files in one 184-file review). All four paths now share one set of
+  diff options (Myers, 3 context lines); rename/copy detection is unchanged.
+  Existing regression snapshots may show a one-time numstat delta.
 - Preserve incomplete API analysis through report, dashboard, narrative and
   copied comments, with explicit UNKNOWN state and known observations retained.
   Dependency regression now records current and baseline measurement evidence
