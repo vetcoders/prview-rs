@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Explicit per-invocation project execution consent: CLI
+  `--allow-project-execution` and MCP `allow_project_execution` (default false).
+  Default reviews suppress project tools, presync, scope metadata and context
+  commands with truthful NOT_RUN evidence and incomplete/review-required policy.
+  Git state/watch and snapshot checkout avoid configured filter callbacks.
+  `fix` requires acknowledgement; cache/update cannot inherit consent. This is
+  not a sandbox and host-write confinement remains false. Public Rust `Cli` and
+  `Config` exhaustive constructors must supply the new boolean; RUN.json adds
+  `project_execution` metadata without changing the schema version.
+
 - Export generator identity in `report.json`, `RUN.json` and human metadata:
   embedded source SHA, executable SHA256 build ID, and an optional build-provided
   release tag. Unknown or unreadable identity stays explicit, and copied ZIPs

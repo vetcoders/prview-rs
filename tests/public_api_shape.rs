@@ -3,6 +3,7 @@
 pub fn roundtrip_config(value: prview::Config) -> prview::Config {
     let prview::Config {
         repo_root,
+        allow_project_execution,
         target,
         pinned_target,
         pinned_diff_bases,
@@ -62,6 +63,7 @@ pub fn roundtrip_config(value: prview::Config) -> prview::Config {
     } = value;
     prview::Config {
         repo_root,
+        allow_project_execution,
         target,
         pinned_target,
         pinned_diff_bases,
@@ -123,6 +125,7 @@ pub fn roundtrip_config(value: prview::Config) -> prview::Config {
 pub fn roundtrip_cli(value: prview::cli::Cli) -> prview::cli::Cli {
     let prview::cli::Cli {
         command,
+        allow_project_execution,
         target,
         bases,
         quick,
@@ -174,6 +177,7 @@ pub fn roundtrip_cli(value: prview::cli::Cli) -> prview::cli::Cli {
     } = value;
     prview::cli::Cli {
         command,
+        allow_project_execution,
         target,
         bases,
         quick,
@@ -262,6 +266,8 @@ fn library_selection_child() {
             "--quiet",
         ]
     };
+    let mut args = args;
+    args.push("--allow-project-execution");
     let cli = prview::Cli::parse_from(args);
     let mut config = prview::Config::from_cli(&cli).unwrap();
     if case == "pr-auto-override" {

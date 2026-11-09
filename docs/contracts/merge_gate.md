@@ -9,6 +9,21 @@ document disagree, the code is the contract and this document is the bug.
 
 ## Top-level object
 
+Project execution requires the invocation's explicit acknowledgement. Without
+CLI `--allow-project-execution` or MCP `allow_project_execution: true`, project
+checks have `execution_state: skipped`, no executed result/command/exit code,
+and reason `project execution not authorized; use --allow-project-execution (NOT_RUN)`.
+PolicyEngine maps this loss of evidence to `incomplete` and `review_required`,
+including severity `ignore`; it cannot produce unconditional `allow_merge: true`.
+This is a confidence ratchet within the existing canonical decision pipeline,
+not a second permission policy. Existing failures can still make the result BLOCK.
+
+RUN.json adds `project_execution: {"allowed": false, "authority": "invocation",
+"host_write_confinement": false}` (with `allowed: true` after acknowledgement).
+The field is evidence about this invocation, never authority for a future one.
+It is additive; absence in an older pack cannot authorize execution or update
+reuse. Consent does not provide a sandbox or change finding severity/score weights.
+
 | Field | Type | Notes |
 |---|---|---|
 | `schema_version` | string | `"3.2"` |

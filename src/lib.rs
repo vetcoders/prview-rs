@@ -807,37 +807,24 @@ impl App {
     }
 
     fn get_repo_state_hash(&self) -> Result<String> {
-        use crate::git::git_cmd;
-
-        let mut head_cmd = git_cmd();
-        head_cmd
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&self.config.repo_root);
-        let head = crate::proc::output_governed(head_cmd, "git watch rev-parse")?;
-
-        let mut status_cmd = git_cmd();
-        status_cmd
-            .args(["status", "--porcelain"])
-            .current_dir(&self.config.repo_root);
-        let status = crate::proc::output_governed(status_cmd, "git watch status")?;
-
-        let mut diff_cmd = git_cmd();
-        diff_cmd
-            .args(["diff", "--no-ext-diff", "--stat"])
-            .current_dir(&self.config.repo_root);
-        let diff = crate::proc::output_governed(diff_cmd, "git watch diff")?;
-
-        let head_str = String::from_utf8_lossy(&head.stdout);
-        let status_str = String::from_utf8_lossy(&status.stdout);
-        let diff_str = String::from_utf8_lossy(&diff.stdout);
-
         use sha2::{Digest, Sha256};
+        let repo = git2::Repository::discover(&self.config.repo_root)?;
+        let head = repo.head()?.peel_to_commit()?.id().to_string();
+        let mut options = git2::StatusOptions::new();
+        options.include_untracked(true).recurse_untracked_dirs(true);
+        let statuses = repo.statuses(Some(&mut options))?;
         let mut hasher = Sha256::new();
-        hasher.update(status_str.as_bytes());
-        hasher.update(diff_str.as_bytes());
-        let status_hash = format!("{:x}", hasher.finalize());
-
-        Ok(format!("{}:{}", head_str.trim(), &status_hash[..16]))
+        for entry in statuses.iter() {
+            hasher.update(entry.path_bytes());
+            hasher.update(entry.status().bits().to_le_bytes());
+        }
+        let tree = repo.head()?.peel_to_tree()?;
+        let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None)?;
+        diff.print(git2::DiffFormat::Patch, |_, _, line| {
+            hasher.update(line.content());
+            true
+        })?;
+        Ok(format!("{}:{:x}", head, hasher.finalize()))
     }
 
     async fn run_watch_iteration(
@@ -1007,6 +994,12 @@ impl App {
     ) -> Result<Option<output::Report>> {
         use colored::Colorize;
 
+        // A previous execution never supplies this invocation's consent or
+        // substitutes its successful results for today's NOT_RUN evidence.
+        if !self.config.allow_project_execution {
+            return Ok(None);
+        }
+
         self.ensure_not_cancelled()?;
         // New packs record comparison coverage. Reuse may not carry an
         // explicit self-diff assessment into an automatic/current-only run, or
@@ -1022,6 +1015,14 @@ impl App {
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         };
         let previous_report = read_json("report.json");
+        if read_json("00_summary/RUN.json")
+            .and_then(|run| run["project_execution"]["allowed"].as_bool())
+            != Some(true)
+        {
+            // Opting in after an inert run must actually run the requested
+            // checks. Legacy packs have no consent evidence either.
+            return Ok(None);
+        }
         let previous_range = previous_report
             .as_ref()
             .and_then(|report| report.get("review_range"));
@@ -2005,41 +2006,19 @@ mod tests {
         );
     }
 
-    /// The watch hash used raw `Command::output` calls. Wrapping the containing
-    /// closure in `blocking_stage` kept the Ctrl-C task pollable, but the actual
-    /// git process was neither registered nor cancellable, so the closure still
-    /// waited for git. Exercise the production hash path with a blocking git
-    /// executable, not a synthetic sleep probe.
+    /// Watch state is an in-process read: even a configured Git executable
+    /// override is never started to discover a worktree edit.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn watch_state_hash_cancels_its_real_git_child() {
+    #[test]
+    fn project_execution_watch_hash_does_not_spawn_git() {
         let repo = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         let app = crate::App::from_config(reviewable_repo(repo.path(), out.path())).unwrap();
-        let governor = app.governor();
         let pidfile = repo.path().join("watch-git.pid");
         let shim = blocking_script(repo.path(), "blocking-git", &pidfile);
-        let run_governor = std::sync::Arc::clone(&governor);
-        let started = std::time::Instant::now();
-
-        let work = async move {
-            super::run_headless_sync_stage(&run_governor, || {
-                let _override = crate::git::override_test_git_program(shim);
-                app.get_repo_state_hash()
-            })
-        };
-        let error = crate::governor::with_cancellation(
-            work,
-            &governor,
-            InterruptWhenFileExists::new(pidfile.clone()),
-        )
-        .await
-        .expect_err("interrupt must cancel the git-backed state hash");
-
-        assert!(crate::governor::is_cancellation(&error), "{error:#}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        assert_eq!(governor.inflight_count(), 0);
-        assert_recorded_process_gone(&pidfile).await;
+        let _override = crate::git::override_test_git_program(shim);
+        assert!(!app.get_repo_state_hash().unwrap().is_empty());
+        assert!(!pidfile.exists());
     }
 
     /// Snapshot creation is a synchronous `git archive | tar` pipeline. On a
@@ -2158,6 +2137,42 @@ mod tests {
     }
 
     #[test]
+    fn project_execution_update_requires_current_and_previous_consent() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = reviewable_repo(repo.path(), out.path());
+        let head = rev_parse(repo.path(), "HEAD");
+        let previous = tempfile::tempdir().unwrap();
+        std::fs::create_dir(previous.path().join("00_summary")).unwrap();
+        std::fs::write(
+            previous.path().join("00_summary/pr-metadata.txt"),
+            format!("HEAD: feature ({head})\n"),
+        )
+        .unwrap();
+        let target = resolved(&head);
+        for allowed_now in [false, true] {
+            for allowed_before in [None, Some(false), Some(true)] {
+                let mut current = config.clone();
+                current.allow_project_execution = allowed_now;
+                let app = crate::App::from_config(current).unwrap();
+                let run = match allowed_before {
+                    Some(allowed) => serde_json::json!({"project_execution":{"allowed":allowed}}),
+                    None => serde_json::json!({}),
+                };
+                std::fs::write(previous.path().join("00_summary/RUN.json"), run.to_string())
+                    .unwrap();
+                let reused = app
+                    .reuse_unchanged_run(&target, &[], &[], previous.path().to_owned(), false)
+                    .unwrap();
+                assert_eq!(
+                    reused.is_some(),
+                    allowed_now && allowed_before == Some(true)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn explicit_self_reuse_requires_a_matching_modern_non_pass_assessment() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
@@ -2173,6 +2188,11 @@ mod tests {
         let effective = app.repo.resolve_diff_bases(&app.config, &target, &bases);
         let prev = tempfile::tempdir().unwrap();
         std::fs::create_dir(prev.path().join("00_summary")).unwrap();
+        std::fs::write(
+            prev.path().join("00_summary/RUN.json"),
+            r#"{"project_execution":{"allowed":true}}"#,
+        )
+        .unwrap();
         std::fs::write(
             prev.path().join("00_summary/pr-metadata.txt"),
             format!("HEAD: feature ({head})\n"),
@@ -2267,6 +2287,11 @@ mod tests {
         config.required_base = Some(requested);
         let prev = tempfile::tempdir().unwrap();
         std::fs::create_dir(prev.path().join("00_summary")).unwrap();
+        std::fs::write(
+            prev.path().join("00_summary/RUN.json"),
+            r#"{"project_execution":{"allowed":true}}"#,
+        )
+        .unwrap();
 
         for exact in [false, true] {
             config.required_base_exact = exact;
@@ -2334,6 +2359,11 @@ mod tests {
         // `--update` short-circuit.
         let prev = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(prev.path().join("00_summary")).unwrap();
+        std::fs::write(
+            prev.path().join("00_summary/RUN.json"),
+            r#"{"project_execution":{"allowed":true}}"#,
+        )
+        .unwrap();
         std::fs::write(
             prev.path().join("00_summary/pr-metadata.txt"),
             format!("HEAD: feature ({head})\n"),

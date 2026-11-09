@@ -897,7 +897,7 @@ fn run_review_distinguishes_automatic_and_explicit_same_origin_base() {
     for explicit in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
-        let mut args = serde_json::json!({"repo":repo.path(), "profile":"quick"});
+        let mut args = serde_json::json!({"repo":repo.path(), "profile":"quick", "allow_project_execution":true});
         if explicit {
             args["base"] = "origin/main".into();
         }

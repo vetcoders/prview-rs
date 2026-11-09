@@ -152,6 +152,7 @@ fn path_without_semgrep(repo: &Path) -> OsString {
 
 fn prview_gate_command(repo: &Path, home: &Path) -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("prview"));
+    command.arg("--allow-project-execution");
     command
         .current_dir(repo)
         .env("PATH", path_without_semgrep(repo))
@@ -209,6 +210,7 @@ fn operator_policy_real_gate_warning_lane() {
     let path = path_without_semgrep(temp.path());
 
     let strict = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--allow-project-execution")
         .current_dir(temp.path())
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
@@ -227,6 +229,7 @@ fn operator_policy_real_gate_warning_lane() {
     assert_eq!(strict_json["exit_code"], 0);
 
     let hardened = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--allow-project-execution")
         .current_dir(temp.path())
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
@@ -277,6 +280,7 @@ fn ci_run_exits_three_when_pack_has_no_merge_gate() {
 
     // 1. A real run, so the pack on disk is a genuine one (metadata included).
     let assert = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--allow-project-execution")
         .current_dir(repo)
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
@@ -302,6 +306,7 @@ fn ci_run_exits_three_when_pack_has_no_merge_gate() {
     // 3. `--update` re-reads that pack (HEAD is unchanged). No verdict is
     //    readable, so the process must report an execution error, not a guess.
     Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--allow-project-execution")
         .current_dir(repo)
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
@@ -340,6 +345,7 @@ fn gate_exits_three_when_it_cannot_execute() {
     let temp = tempfile::tempdir().expect("tempdir");
 
     Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--allow-project-execution")
         .current_dir(temp.path())
         .env("GIT_CEILING_DIRECTORIES", temp.path())
         .env("PRVIEW_HOME", home.path())
@@ -387,6 +393,7 @@ fn create_pushed_main_fixture() -> (TempDir, String) {
 /// The pack lives under `home`, which must outlive the caller's assertions.
 fn run_gate_json(repo: &Path, path: &OsString, home: &Path, extra: &[&str]) -> serde_json::Value {
     let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--allow-project-execution")
         .current_dir(repo)
         .env("PATH", path)
         .env("PRVIEW_HOME", home)
@@ -884,6 +891,7 @@ fn gate_exits_three_for_unresolvable_explicit_base() {
     for base in ["does-not-exist", "remote-fetch-git"] {
         let home = tempfile::tempdir().expect("prview home");
         let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+            .arg("--allow-project-execution")
             .current_dir(temp.path())
             .env("PATH", &path)
             .env("PRVIEW_HOME", home.path())
@@ -932,6 +940,7 @@ fn gate_base_cannot_be_combined_with_pr() {
         &["gate", "--base", "main", "--pr", "42", "--json"][..],
     ] {
         let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+            .arg("--allow-project-execution")
             .current_dir(temp.path())
             .env("PRVIEW_HOME", home.path())
             .env("PATH", &path)

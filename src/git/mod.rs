@@ -304,7 +304,18 @@ impl Repository {
 
         let mut fetch_origin = git_cmd();
         configure(&mut fetch_origin);
-        fetch_origin.args(["fetch", "--quiet", "--prune"]);
+        fetch_origin.args([
+            "-c",
+            "core.hooksPath=",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "fetch",
+            "--no-recurse-submodules",
+            "--quiet",
+            "--prune",
+        ]);
         if refetch {
             fetch_origin.arg("--refetch");
         }
@@ -324,7 +335,17 @@ impl Repository {
             let pr_ref = format!("pull/{pr_number}/head:refs/remotes/origin/pr/{pr_number}");
             let mut fetch_pr = git_cmd();
             configure(&mut fetch_pr);
-            fetch_pr.args(["fetch", "--quiet"]);
+            fetch_pr.args([
+                "-c",
+                "core.hooksPath=",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "fetch",
+                "--no-recurse-submodules",
+                "--quiet",
+            ]);
             if refetch {
                 fetch_pr.arg("--refetch");
             }

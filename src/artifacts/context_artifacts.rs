@@ -205,6 +205,12 @@ pub(super) fn plan_context_artifacts(
         decisions.push(plan_tauri_info_artifact(config, scan_root, diffs, ledger));
     }
 
+    if !config.allow_project_execution {
+        for decision in &mut decisions {
+            decision.generated = false;
+            decision.reason = crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned();
+        }
+    }
     decisions
 }
 
@@ -800,6 +806,17 @@ fn plan_context_cmds(
     decisions: &[ContextArtifactDecision],
 ) -> Vec<ContextCmd> {
     let ctx = context_dir.to_path_buf();
+    if !config.allow_project_execution {
+        record_context_decision(
+            ledger,
+            "project context tools",
+            &context_substrate("project context tools", scan_root, &config.repo_root),
+            TaskState::Skipped {
+                reason: crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned(),
+            },
+        );
+        return Vec::new();
+    }
     let scan_root = scan_root.to_path_buf();
     let has_pnpm = which::which("pnpm").is_ok();
 
@@ -2091,6 +2108,28 @@ pub(super) fn truncate_on_char_boundary(input: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_execution_context_cannot_compensate_for_missing_consent() {
+        let repo = tempfile::tempdir().unwrap();
+        let ctx = tempfile::tempdir().unwrap();
+        let mut config = crate::config::test_config();
+        config.repo_root = repo.path().to_owned();
+        config.profile = crate::config::test_rust_profile(true);
+        config.profile.cargo_root = Some(repo.path().to_owned());
+        let ledger = crate::ledger::TaskLedger::new();
+        // Authorized planning demonstrably contains project commands.
+        assert!(
+            !super::plan_context_cmds(&config, repo.path(), &ledger, ctx.path(), false, &[])
+                .is_empty()
+        );
+        config.allow_project_execution = false;
+        let ledger = crate::ledger::TaskLedger::new();
+        assert!(
+            super::plan_context_cmds(&config, repo.path(), &ledger, ctx.path(), false, &[])
+                .is_empty()
+        );
+        assert!(ledger.entries().iter().all(|entry| matches!(&entry.state, crate::ledger::TaskState::Skipped { reason } if reason == crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED)));
+    }
     use super::{
         ContextCmd, context_artifact_wire_path, context_substrate, js_exec_cmd, plan_context_cmds,
         plan_tsc_trace_artifact, reconcile_context_artifacts, tauri_info_cmd,

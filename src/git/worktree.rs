@@ -1502,7 +1502,8 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     command
         .arg("-c")
         .arg(hooks_config)
-        .args(["worktree", "add", "--detach", "--force"])
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["worktree", "add", "--detach", "--force", "--no-checkout"])
         .arg(&worktree_path)
         .arg(&original_target_sha)
         .current_dir(repo_root);
@@ -1516,6 +1517,11 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("git worktree add failed: {}", stderr.trim());
     }
+
+    // libgit2 does not execute configured external clean/smudge/process drivers.
+    // Native Git only registered the worktree; it never checked out project bytes.
+    let snapshot_repo = git2::Repository::open(&worktree_path)?;
+    snapshot_repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
 
     let source_repo = git2::Repository::discover(repo_root)?;
     materialize_pinned_gitlinks(

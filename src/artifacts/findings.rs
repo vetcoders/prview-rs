@@ -587,7 +587,20 @@ pub(super) fn build_heuristics_gate_check(
     (check, blocking_issue, disposition)
 }
 
+// Existing parser fixtures explicitly exercise the authorized baseline lane.
+#[cfg(test)]
 pub(super) fn generate_inline_findings(
+    dir: &Path,
+    checks: &[CheckResult],
+    diffs: &[crate::git::Diff],
+    repo: Option<&crate::git::Repository>,
+    cargo_root: Option<&Path>,
+) -> Result<InlineFindingsSummary> {
+    generate_inline_findings_with_execution(true, dir, checks, diffs, repo, cargo_root)
+}
+
+pub(super) fn generate_inline_findings_with_execution(
+    allow_project_execution: bool,
     dir: &Path,
     checks: &[CheckResult],
     diffs: &[crate::git::Diff],
@@ -651,11 +664,12 @@ pub(super) fn generate_inline_findings(
             let audit_findings = parse_cargo_audit_findings(&check.output);
             let current_advisories = cargo_audit_report_advisory_keys(&check.output);
             let cargo_lock_changed = cargo_audit_lock_changed(repo, diffs, cargo_root);
-            let base_audit_cache = if cargo_lock_changed && current_advisories.is_some() {
-                get_base_cargo_audit_findings(repo, diffs, cargo_root)?
-            } else {
-                None
-            };
+            let base_audit_cache =
+                if allow_project_execution && cargo_lock_changed && current_advisories.is_some() {
+                    get_base_cargo_audit_findings(repo, diffs, cargo_root)?
+                } else {
+                    None
+                };
             let baseline = cargo_audit_baseline_counts(
                 current_advisories.as_ref(),
                 cargo_lock_changed,

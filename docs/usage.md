@@ -24,6 +24,45 @@ prview --help
 
 Full installation details, including release binaries and checksums, are in `docs/INSTALL.md`.
 
+## Execution consent
+
+The default invocation generates an analytical pack without running project
+tools. All project tool checks are recorded as **NOT_RUN** (`skipped`, with the
+reason `project execution not authorized`). No successful result, command or
+exit code is fabricated. Source parsing, Git object analysis and PrView's owned
+static analyzer workers remain available. Git/GitHub transport uses the
+operator's trusted installed tools and authentication configuration.
+
+```bash
+prview --deep                              # analysis; project checks NOT_RUN
+prview --deep --allow-project-execution    # acknowledge project code execution
+prview fix --allow-project-execution       # acknowledge mutating fixers
+prview gate --allow-project-execution      # permit tools within the gate preset
+prview --ci --allow-project-execution      # explicit CI execution consent
+```
+
+The acknowledgement applies only to this invocation. It does not enable checks
+disabled by the selected preset. It is independent of `--full-tests`, `--with-tests`,
+`--with-lint`, `--security-full`, the chosen target and project policy files.
+There is no persistent trust store. TUI and watch retain the invocation's setting.
+An unchanged `--update` cannot reuse an authorized pack without new consent, or
+reuse an inert/legacy pack as execution after consent is granted.
+
+Without consent, dependency setup (`uv sync`), Cargo scope metadata, language
+tools, context-only tools and tool-version probes are suppressed. `doctor` also
+requires consent for toolchain probes. State/worktree analysis does not execute
+configured Git filters. Fix refuses without the flag. Skipped check evidence
+feeds the existing canonical merge decision as incomplete/review-required,
+including when project policy labels a check ignored.
+
+This is **not a sandbox**: with consent, project code can access the host as the
+running user. Process supervision, temporary snapshots and caller drift checks
+do not provide host-write confinement. Review only code you are willing to run,
+or run authorized checks in an isolation environment you manage.
+
+Examples elsewhere in this guide describe the selected check budget. Add
+`--allow-project-execution` whenever you intend those project checks to execute.
+
 ## Basic usage
 
 ### Auto mode (default)
@@ -441,7 +480,7 @@ contains, `--full-tests` is the answer.
 records `full test run requested (--full-tests)` as the reason. Nothing else
 changes: the same commands, the same caps.
 
-**`--ci` runs everything; `--deep` narrows.** Narrowing exists to keep a
+**With execution consent, `--ci` runs everything; `--deep` narrows.** Narrowing exists to keep a
 reviewer's laptop usable, and a runner is not a laptop — so the automation
 preset pins both suites to the full run and the pack records
 `full test run requested (--ci)`, naming the preset rather than an operator.
@@ -581,7 +620,7 @@ prview --quick
 prview --pr 23 --quick
 
 # 3) Deeper PR analysis (tests + lint + full gate)
-prview --pr 23 --deep
+prview --pr 23 --deep --allow-project-execution
 
 # 4) Compact JSON for automation (stdout = JSON only)
 prview --pr 23 --quick --json --quiet
@@ -623,7 +662,8 @@ prview --help
 | Flag | Effect |
 |------|--------|
 | `--quick` | Skip tests/lint/bundle/heuristics |
-| `--deep` | Enable all checks (including security and heuristics) |
+| `--allow-project-execution` | Explicit per-invocation acknowledgement for project commands; false by default, not a sandbox |
+| `--deep` | Enable all checks (including security and heuristics); project tools still require execution consent |
 | `--ci` | CI mode: all checks, no colors; Block/quality failure exit |
 | `--ai-only` | Minimal checks, AI context pack only |
 

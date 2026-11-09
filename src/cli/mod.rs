@@ -43,9 +43,9 @@ Generates Artifact Pack v1 with structured, verifiable PR review artifacts:\n\n\
   Supported profiles: Rust, JavaScript/TypeScript, Python, Mixed, Generic (with Loctree heuristics)"
 )]
 #[command(after_help = "Examples:
-  prview                              Standard review (tests + lint, current branch vs develop/main)
+  prview                              Analytical review (project checks NOT_RUN without consent)
   prview --quick                      Quick review (skip tests/lint/heuristics)
-  prview --deep feature/x dev         Full review with all checks
+  prview --deep --allow-project-execution feature/x dev  Execute full review checks
   prview --skip-tests feature/x dev   Review without tests
   prview --no-dashboard               Generate static review.html instead of dashboard.html
   prview --pr 42                      Analyze GitHub PR #42
@@ -62,6 +62,11 @@ Generates Artifact Pack v1 with structured, verifiable PR review artifacts:\n\n\
   prview open <run-id> --dir          Print the artifact directory path for a run
   prview completions zsh              Generate shell completions for zsh")]
 pub struct Cli {
+    /// Allow this invocation to run project tools, build scripts, plugins and tests.
+    /// This is an acknowledgement of code execution, not a sandbox.
+    #[arg(long, global = true)]
+    pub allow_project_execution: bool,
+
     #[command(subcommand)]
     pub command: Option<CliCommand>,
 
@@ -665,6 +670,7 @@ mod tests {
 
     fn default_cli() -> Cli {
         Cli {
+            allow_project_execution: false,
             command: None,
             target: None,
             bases: vec![],

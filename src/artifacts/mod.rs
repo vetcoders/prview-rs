@@ -590,6 +590,10 @@ fn publication_failure_after_rollback(
 
 /// Generate all artifacts
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
+    anyhow::ensure!(
+        input.config.allow_project_execution || input.checks.is_empty(),
+        "cannot publish executed or cached check results without invocation consent"
+    );
     let ledger = input.ledger;
     // Quick reviews did not pass through the quality dispatcher. Preserve any
     // existing baseline rather than recertifying a caller after it changed.
@@ -720,6 +724,40 @@ fn generate_guarded(
 
     // Build extended checks list including synthetic heuristics check
     let heuristics_check = build_heuristics_check(heuristics, config);
+    let mut skipped_checks = skipped_checks;
+    if !config.allow_project_execution {
+        for check in crate::checks::get_checks_for_profile(config) {
+            if !ledger.entries().iter().any(|entry| {
+                entry.kind == crate::ledger::TaskKind::Check
+                    && entry.key.tool == crate::check_id::check_id_from_name(check.name())
+            }) {
+                ledger.record(crate::ledger::TaskEntry {
+                    key: crate::ledger::TaskKey::new(
+                        check.name(),
+                        ledger.resolved_substrate().unwrap_or_default(),
+                    ),
+                    kind: crate::ledger::TaskKind::Check,
+                    state: crate::ledger::TaskState::Skipped {
+                        reason: crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned(),
+                    },
+                    queued_at: None,
+                    started_at: None,
+                });
+            }
+            if let Some(row) = skipped_checks
+                .iter_mut()
+                .find(|row| row.name == check.name())
+            {
+                row.reason = crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned();
+            } else {
+                skipped_checks.push(crate::checks::SkippedCheck {
+                    id: crate::check_id::check_id_from_name(check.name()),
+                    name: check.name().to_owned(),
+                    reason: crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned(),
+                });
+            }
+        }
+    }
     let mut all_checks: Vec<CheckResult> = checks.to_vec();
     all_checks.push(heuristics_check);
     // The reviewed tree, not the local one: in a `--pr` run the checks judged a
@@ -902,7 +940,7 @@ fn generate_guarded(
     generate_metadata(&summary_dir, config, diffs, &all_checks, resolved_target)?;
     generate_commit_list(&summary_dir, diffs)?;
     generate_file_status(&summary_dir, diffs)?;
-    generate_system_meta(&summary_dir)?;
+    generate_system_meta(&summary_dir, config.allow_project_execution)?;
     if let Some((caller_root, execution_repo)) = ledger.execution_roots() {
         fs::write(
             summary_dir.join("EXECUTION_ROOTS.json"),
@@ -985,7 +1023,8 @@ fn generate_guarded(
         .cargo_root
         .as_deref()
         .unwrap_or(config.repo_root.as_path());
-    let inline_summary = generate_inline_findings(
+    let inline_summary = generate_inline_findings_with_execution(
+        config.allow_project_execution,
         &context_dir,
         &all_checks,
         diffs,
@@ -2452,6 +2491,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
     runner["arch"] = json!(std::env::consts::ARCH);
 
     let run = json!({
+        "project_execution": {"allowed": config.allow_project_execution, "authority": "invocation", "host_write_confinement": false},
         "schema_version": "1.0",
         "run_started_at": run_started_at,
         "run_finished_at": &generated_at,
@@ -2565,7 +2605,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
 }
 
 /// system_meta.txt (Artifact Pack v1)
-fn generate_system_meta(dir: &Path) -> Result<()> {
+fn generate_system_meta(dir: &Path, allow_project_execution: bool) -> Result<()> {
     let mut content = String::new();
 
     content.push_str(&format!(
@@ -2577,7 +2617,7 @@ fn generate_system_meta(dir: &Path) -> Result<()> {
     let mut hostname = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
         .ok();
-    if hostname.is_none() {
+    if hostname.is_none() && allow_project_execution {
         hostname = governed_optional_output(Command::new("hostname"), "system metadata hostname")?
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
@@ -2596,6 +2636,14 @@ fn generate_system_meta(dir: &Path) -> Result<()> {
         generator.release_tag.unwrap_or("unknown"),
     ));
 
+    if !allow_project_execution {
+        content.push_str(&format!(
+            "tool_versions: {}\n",
+            crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED
+        ));
+        fs::write(dir.join("system_meta.txt"), content)?;
+        return Ok(());
+    }
     let mut command = Command::new("rustc");
     command.arg("--version");
     if let Some(output) = governed_optional_output(command, "system metadata rustc version")? {

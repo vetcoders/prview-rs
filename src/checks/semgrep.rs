@@ -43,6 +43,9 @@ impl Check for SemgrepCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 

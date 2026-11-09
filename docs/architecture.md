@@ -13,6 +13,38 @@ main properties:
 - typed code (easier maintenance)
 - parallel checks (rayon/tokio)
 
+## Project execution authority
+
+`Cli::allow_project_execution` and `Config::allow_project_execution` carry one
+per-invocation acknowledgement, default false. Project manifests and merge policy
+cannot set it. MCP `allow_project_execution` is an optional boolean, defaults
+false, and explicitly forwards the flag to both quick and detached deep children.
+The public Rust structs gained this field; exhaustive constructors/destructures
+must add it. This is a source compatibility change, with no artifact schema
+version bump: RUN.json's `project_execution` object is additive.
+
+Both check dispatchers gate before cache replay, scope discovery and Python
+presync. Each concrete `Check::run` also refuses independently. The artifact
+context planner, audit baseline and version probes use the same authority.
+Watch/direct artifact generation supplies NOT_RUN check rows even when no
+dispatcher ran. Update reuse requires current consent and an authorized prior
+RUN.json; consent is never recovered from an old result. PolicyEngine projects
+suppression to incomplete/review-required through the existing decision pipeline.
+
+Snapshot preparation precedes check dispatch. Native worktree registration uses
+`--no-checkout`, disabled hooks and disabled fsmonitor; libgit2 materializes the
+checkout/index without executing external Git filters. State and watch diff
+reads also use libgit2. PrView's fetches disable hooks, automatic maintenance and
+submodule recursion. Operator-supplied Git/gh/tar executables and transport helpers
+remain trusted infrastructure; Rust API source parsing and owned Loctree workers
+are static analysis, not project builds.
+
+The acknowledgement does not claim isolation. `host_write_confinement` stays
+false. Low-level explicit command utilities are execution APIs, not a review
+authorization boundary; Config-driven review and concrete check entrypoints
+enforce the default. Existing internal test fixture builders explicitly opt in
+to retain coverage of the authorized lane.
+
 ## Directory structure
 
 ```

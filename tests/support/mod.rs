@@ -35,6 +35,9 @@ impl ContractEnvironment {
 
     pub fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_prview"));
+        // Legacy contract fixtures exercise actual tool execution. Default
+        // denial is covered independently by project_execution.rs.
+        command.arg("--allow-project-execution");
         self.configure(&mut command);
         command
     }

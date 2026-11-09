@@ -1,7 +1,6 @@
 //! Diff summary and file status (working tree vs HEAD)
 
-use crate::git::git_cmd;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 
 pub struct WorkingTreeStats {
@@ -10,55 +9,26 @@ pub struct WorkingTreeStats {
     pub deletions: usize,
 }
 
+/// libgit2 reads worktree bytes without executing configured Git callbacks.
+pub(super) fn with_worktree_diff<T>(
+    root: &Path,
+    read: impl FnOnce(&git2::Diff<'_>) -> Result<T>,
+) -> Result<T> {
+    let repo = git2::Repository::discover(root)?;
+    let tree = repo.head()?.peel_to_tree()?;
+    let mut diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None)?;
+    diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)))?;
+    read(&diff)
+}
+
 pub fn get_diff_stats(root: &Path) -> Result<WorkingTreeStats> {
-    let output = git_cmd()
-        .args(["diff", "HEAD", "--stat", "--stat-width=120"])
-        .current_dir(root)
-        .output()
-        .context("git diff --stat")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git diff --stat failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Parse last line: " N files changed, X insertions(+), Y deletions(-)"
-    let mut files_changed = 0;
-    let mut insertions = 0;
-    let mut deletions = 0;
-
-    if let Some(summary) = stdout.lines().last() {
-        for part in summary.split(',') {
-            let part = part.trim();
-            if part.contains("file") {
-                files_changed = part
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-            } else if part.contains("insertion") {
-                insertions = part
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-            } else if part.contains("deletion") {
-                deletions = part
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-            }
-        }
-    }
-
-    Ok(WorkingTreeStats {
-        files_changed,
-        insertions,
-        deletions,
+    with_worktree_diff(root, |diff| {
+        let stats = diff.stats()?;
+        Ok(WorkingTreeStats {
+            files_changed: stats.files_changed(),
+            insertions: stats.insertions(),
+            deletions: stats.deletions(),
+        })
     })
 }
 
@@ -68,19 +38,14 @@ pub fn get_diff_stats(root: &Path) -> Result<WorkingTreeStats> {
 /// an untracked file reports zero diff stats. Callers that decide "is the
 /// worktree dirty?" need this signal too (PR #12 review).
 pub fn count_untracked(root: &Path) -> Result<usize> {
-    let output = git_cmd()
-        .args(["status", "--porcelain", "--untracked-files=all"])
-        .current_dir(root)
-        .output()
-        .context("git status --porcelain")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git status --porcelain failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().filter(|l| l.starts_with("??")).count())
+    let repo = git2::Repository::discover(root)?;
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    Ok(repo
+        .statuses(Some(&mut options))?
+        .iter()
+        .filter(|entry| entry.status().contains(git2::Status::WT_NEW))
+        .count())
 }
 
 pub fn print_diff_summary(root: &Path) -> Result<()> {
@@ -111,20 +76,26 @@ pub fn print_diff_summary(root: &Path) -> Result<()> {
 pub fn print_file_status(root: &Path) -> Result<()> {
     use colored::Colorize;
 
-    let output = git_cmd()
-        .args(["diff", "HEAD", "--name-status"])
-        .current_dir(root)
-        .output()
-        .context("git diff --name-status")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git diff --name-status failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
+    let lines: Vec<String> = with_worktree_diff(root, |diff| {
+        Ok(diff
+            .deltas()
+            .map(|delta| {
+                let status = match delta.status() {
+                    git2::Delta::Added => "A",
+                    git2::Delta::Deleted => "D",
+                    git2::Delta::Renamed => "R",
+                    _ => "M",
+                };
+                let path = delta.new_file().path().or_else(|| delta.old_file().path());
+                format!(
+                    "{}\t{}",
+                    status,
+                    path.map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                )
+            })
+            .collect())
+    })?;
 
     if lines.is_empty() {
         return Ok(());

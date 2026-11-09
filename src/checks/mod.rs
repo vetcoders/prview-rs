@@ -24,6 +24,30 @@ pub const CHECK_TIMEOUT_SECS: u64 = 300;
 /// Timeout for test commands (15 minutes - ML projects with model loading need this)
 pub const TEST_TIMEOUT_SECS: u64 = 900;
 
+/// Stable reason shared by check, context and policy projections.
+pub const PROJECT_EXECUTION_NOT_AUTHORIZED: &str =
+    "project execution not authorized; use --allow-project-execution (NOT_RUN)";
+
+/// Direct check callers obey the same consent boundary as the dispatchers.
+pub(crate) fn project_execution_denied(config: &Config, name: &str) -> Option<CheckResult> {
+    (!config.allow_project_execution).then(|| CheckResult {
+        name: name.to_owned(),
+        status: CheckStatus::Skipped,
+        duration: Duration::ZERO,
+        output: PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned(),
+        cached: false,
+        provenance: None,
+    })
+}
+
+fn authorized_eligibility(check: &dyn Check, config: &Config) -> CheckEligibility {
+    if !config.allow_project_execution {
+        CheckEligibility::Skip(PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned())
+    } else {
+        check.check_eligibility(config)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod caller_guard_tests;
 pub(crate) mod caller_integrity;
@@ -794,7 +818,7 @@ async fn run_all_checks_inner(
     let mut runnable_checks = Vec::new();
 
     for check in checks {
-        match check.check_eligibility(config) {
+        match authorized_eligibility(check.as_ref(), config) {
             CheckEligibility::Skip(reason) => {
                 ledger.record(TaskEntry {
                     key: TaskKey::new(check.name(), ledger_substrate(None, ledger)),
@@ -1090,6 +1114,9 @@ async fn presync_python_venv_guarded(
             .verify_caller("presync-admitted", Some("Python pre-sync"))
             .await?;
     }
+    if !config.allow_project_execution {
+        return Ok(());
+    }
     let plan = match plan_python_presync(config) {
         Ok(plan) => plan,
         Err(error) => {
@@ -1316,7 +1343,7 @@ where
 
     // First pass: resolve skipped/cached checks and collect runnable ones.
     for check in checks {
-        match check.check_eligibility(config) {
+        match authorized_eligibility(check.as_ref(), config) {
             CheckEligibility::Skip(reason) => {
                 ledger.record(TaskEntry {
                     key: TaskKey::new(check.name(), ledger_substrate(None, ledger)),
@@ -2143,6 +2170,9 @@ async fn install_run_scope(
     runnable_checks: &[Box<dyn Check>],
     ledger: &TaskLedger,
 ) {
+    if !config.allow_project_execution {
+        return;
+    }
     if !runnable_checks
         .iter()
         .any(|check| scope::owns_test_scope(check.name()))
@@ -2596,6 +2626,73 @@ impl CheckResult {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn project_execution_denial_precedes_a_real_cache_hit() {
+        use super::*;
+        struct Cached;
+        #[async_trait::async_trait]
+        impl Check for Cached {
+            fn name(&self) -> &str {
+                "permission-fixture"
+            }
+            fn check_eligibility(&self, _: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn cache_key(&self, _: &Config) -> Option<String> {
+                Some("key".into())
+            }
+            async fn run(&self, _: &Config) -> anyhow::Result<CheckResult> {
+                panic!("unapproved check executed")
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(root.path()).unwrap();
+        let tree = repo.treebuilder(None).unwrap().write().unwrap();
+        let sig = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "fixture",
+            &repo.find_tree(tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+        let mut config = crate::config::test_config_builder()
+            .repo_root(root.path())
+            .build();
+        config.allow_project_execution = false;
+        config.quiet = true;
+        for events in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let cache = crate::cache::Cache::with_dir(home.path().to_owned(), true);
+            cache
+                .set(
+                    "permission-fixture",
+                    "key",
+                    "passed",
+                    Some("old green"),
+                    None,
+                )
+                .unwrap();
+            assert!(cache.get("permission-fixture", "key").is_some());
+            let ledger = TaskLedger::new();
+            let governor = Arc::new(ResourceGovernor::with_budget(1, 1));
+            let checks: Vec<Box<dyn Check>> = vec![Box::new(Cached)];
+            let (results, skipped) = if events {
+                run_all_checks_with_events(checks, cache, &config, &ledger, &governor, |_| {})
+                    .await
+                    .unwrap()
+            } else {
+                run_all_checks(checks, cache, &config, &ledger, &governor)
+                    .await
+                    .unwrap()
+            };
+            assert!(results.is_empty());
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0].reason, PROJECT_EXECUTION_NOT_AUTHORIZED);
+        }
+    }
     use super::*;
     use crate::cli::ExecutionMode;
     use crate::config::{Config, test_config, test_rust_profile};

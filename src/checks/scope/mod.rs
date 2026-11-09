@@ -1473,6 +1473,12 @@ pub async fn resolve_run_scope(
     reviewed_tree: &ReviewedTree,
 ) -> ScopeDecisions {
     let change_set = config.changed_paths.as_ref();
+    if !config.allow_project_execution {
+        return both(ScopeDecision::full(
+            crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED,
+            change_set.map(|set| set.paths().len()),
+        ));
+    }
     if let Some(request) = config.full_tests {
         // Contract §9: everything was asked for, so there is nothing to decide
         // and nothing to pay a subprocess for. Stated as an ordinary escalation
