@@ -741,6 +741,8 @@ mod tests {
                     "-c",
                     "core.hooksPath=",
                     "fetch",
+                    // Freeze fixture object bytes only after synchronous setup.
+                    "--no-auto-maintenance",
                     "--quiet",
                     "--filter=blob:none",
                     "origin",
