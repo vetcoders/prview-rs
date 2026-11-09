@@ -1427,11 +1427,26 @@ quality, policy, and permission axes beside that explanation.
   the statuses (a rendering regression, or an artifact edited or damaged after the run), not a check filed
   under the wrong category: that mapping is shared by both sides and pinned by tests.
 - `00_summary/FAILURES_SUMMARY.md` summarizes blocking failures and advisories without copying whole JSON files.
-- When `30_context/INLINE_FINDINGS.sarif` exists, it emits findings per location/advisory and is suitable for annotation integrations.
+- When `30_context/INLINE_FINDINGS.sarif` exists, it emits source diagnostics,
+  dependency advisories and general check evidence. `properties.finding_class`
+  identifies that kind independently of the existing diff-origin
+  `classification`; use real source locations for source annotations, lockfile
+  locations for Cargo audit advisories, and the combined check log for general
+  evidence. Structured test failures without a real file/positive line also
+  remain general log evidence, with unknown origin and no fabricated source
+  line. `AI_INDEX.md` reports counts from the emitted rows.
 - In Rust runs, `PR_REVIEW.md` and `FAILURES_SUMMARY.md` can surface dependency paths to vulnerable crates based on `30_context/cargo-tree.txt`.
 - `10_diff/per-commit-diffs/00-SUMMARY.md` carries both the batching and thematic batch labels.
 - `20_quality/coverage-delta.txt` is a heuristic; for Rust it drops DELETED files in favor of disk searches for orphaned tests (raising an `ORPHANED_TEST_DETECTED` flag). Inline `#[cfg(test)]` modules are handled silently, without false alarms.
 - In fast `remote-only` runs, heavier diagnostics such as `30_context/tsc-trace.log` or `30_context/tauri-info.log` may be intentionally skipped. Check `RUN.json` for `recommended`/`reason` notes on whether they are worth generating.
+
+Commit categorization in `PR_REVIEW.md` accepts one optional agent prefix of
+1–64 ASCII letters, digits, `/`, `.`, `_` or `-`, followed by a space, for
+example `[codex/triage] docs: explain usage`. The Conventional Commit header
+must include a recognized type, optional nonempty scope and optional `!`, a
+colon and a nonempty description. Original titles are preserved in the commit
+table. Malformed or repeated prefixes remain `other`; existing type aliases
+such as `bugfix` and `doc` remain recognized.
 
 #### Commit batching
 
@@ -1441,7 +1456,7 @@ For large PRs, per-commit diffs are grouped automatically:
 |--------------|----------|
 | <=10 | Individual `.patch` per commit |
 | 11–50 | Batches of 5 commits in `batch-NN.patch` |
-| >50 | Per-commit diffs skipped (only `full.patch`) |
+| >50 | Summary-only `00-SUMMARY.md` with top-10 churn; no per-commit patch files; full range in `10_diff/full.patch` |
 
 #### MERGE_GATE
 

@@ -320,6 +320,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep SARIF observation kind (`source`, `dependency`, `general`) separate from
+  the existing diff-origin classification. The AI index counts emitted rows by
+  kind, so dependency advisories and unlocated check failures are not presented
+  as errors in changed source. Structured failures without a real source
+  location (including Cargo test's placeholder/line-0 results) remain general
+  log evidence with unclassified origin and no fabricated source region.
+- Recognize one bounded agent prefix such as `[codex/triage]` before a valid
+  Conventional Commit header in PR narratives and commit tables. Original
+  titles remain visible; malformed headers and repeated prefixes stay `other`.
+- Describe ranges above 50 commits as summary-only in the AI index and
+  per-commit summary, pointing to `10_diff/full.patch` for the full range.
+  The 50-commit limit and existing batching remain unchanged.
+
 - Show canonical automatic-merge permission and classified failed-check counts
   in the dashboard, narratives and copied PR comment. Change quality is distinct
   from all-check status; incomplete classification remains UNKNOWN, warning

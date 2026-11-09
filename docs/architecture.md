@@ -2898,10 +2898,19 @@ The core artifact generator. Builds the numbered directory layout
 
 - Root: `AI_INDEX.md`, `REVIEW_SUMMARY.md`, `PR_REVIEW.md`, `report.json`, `dashboard.html` (or `review.html` with `--no-dashboard`), `artifacts.zip`
 - `00_summary/`: `RUN.json`, `PROVENANCE.json`, `FAILURES_SUMMARY.md`, `MANIFEST.json`, `SANITY.json`, `MERGE_GATE.json/md`, metadata
-- `10_diff/`: `full.patch`, `per-commit-diffs/` (batching + thematic labels), `per-file-diffs/` (hotspots)
+- `10_diff/`: `full.patch`, `per-commit-diffs/` (individual patches through 10 commits, batches through 50, summary-only top-10 churn above 50), `per-file-diffs/` (hotspots)
 - `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `PUBLIC_API_DIFF.json/md`, `BREAKING_CHANGES.json/md`
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)
 - `latest` symlink in the parent dir (completed runs only)
+
+SARIF producers assign `properties.finding_class` from structured evidence:
+Cargo audit advisories are dependency observations, parsed/extracted source
+locations with a nonempty, non-placeholder path and a positive line are source
+observations. Unlocated generic or structured results are general observations
+pointing at the check log, with unknown origin and no fabricated source region. That axis is independent of diff-origin `classification`;
+the AI index counts emitted result rows rather than inferring kind from origin
+or title text. PR narrative categorization uses the shared commit classifier,
+which accepts one bounded optional agent prefix and retains original titles.
 
 The default run generates one HTML entry point, `dashboard.html`.
 `--no-dashboard` selects the static `review.html` export instead. `AI_INDEX.md`

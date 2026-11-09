@@ -9796,3 +9796,476 @@ fn execution_roots_metadata_retains_utf8_paths_and_absent_target() {
     assert!(metadata["target_root"].is_null());
     assert_eq!(metadata["host_write_confinement"], false);
 }
+
+// PRV-08/09/10 regression controls: synthetic, local and network-independent.
+fn reporting_empty_coverage() -> CoverageDelta {
+    CoverageDelta {
+        total_source: 0,
+        covered_count: 0,
+        pct: None,
+        uncovered: vec![],
+        covered: vec![],
+        non_code_count: 0,
+        ghost_tests: vec![],
+    }
+}
+
+fn reporting_diff(commits: Vec<crate::git::CommitInfo>) -> Diff {
+    Diff {
+        base: "main".into(),
+        target: "reporting-fixture".into(),
+        base_commit_id: "baseline".into(),
+        target_commit_id: "target".into(),
+        files: vec![FileChange {
+            path: "src/changed.rs".into(),
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+        }],
+        stats: DiffStats {
+            files_changed: 1,
+            additions: 1,
+            deletions: 0,
+            copied: 0,
+        },
+        commits,
+    }
+}
+
+fn reporting_commit(message: &str) -> crate::git::CommitInfo {
+    crate::git::CommitInfo {
+        id: "abcdef0123456789".into(),
+        short_id: "abcdef0".into(),
+        author: "Reporting fixture".into(),
+        email: "fixture@example.test".into(),
+        date: "2026-11-09".into(),
+        message: message.into(),
+    }
+}
+
+fn reporting_check(name: &str, output: &str) -> CheckResult {
+    CheckResult {
+        name: name.into(),
+        status: CheckStatus::Failed,
+        duration: Duration::from_secs(1),
+        output: output.into(),
+        cached: false,
+        provenance: None,
+    }
+}
+
+fn reporting_sarif(dir: &Path) -> serde_json::Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(dir.join("30_context/INLINE_FINDINGS.sarif"))
+            .expect("SARIF exists"),
+    )
+    .expect("SARIF parses")
+}
+
+#[test]
+fn reporting_prv08_dependency_and_general_rows_are_not_source_diagnostics() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let context = tmp.path().join("30_context");
+    std::fs::create_dir_all(&context).expect("context dir");
+    let advisories: Vec<_> = (0..15)
+        .map(|i| {
+            serde_json::json!({
+                "advisory": {
+                    "id": format!("RUSTSEC-2026-{:04}", 9000 + i),
+                    "title": format!("Controlled dependency advisory {i}"),
+                    "cvss": {"score": 7.5}
+                },
+                "package": {"name": format!("fixture-{i}"), "version": "1.0.0"},
+                "versions": {"patched": [">=1.0.1"]}
+            })
+        })
+        .collect();
+    let audit = serde_json::json!({
+        "vulnerabilities": {"found": true, "count": 15, "list": advisories},
+        "warnings": {}
+    });
+    let mut audit_check = reporting_check("Cargo audit", &audit.to_string());
+    let mut provenance = snapshot_provenance("target");
+    provenance.command = "cargo audit --json".into();
+    provenance.cwd = "/external/checked-project".into();
+    provenance.exit_code = Some(1);
+    audit_check.provenance = Some(provenance);
+    let checks = [
+        audit_check,
+        reporting_check("API compatibility", "API comparison unavailable"),
+    ];
+    let diffs = [reporting_diff(vec![])];
+    let summary =
+        generate_inline_findings(&context, &checks, &diffs, None, None).expect("inline findings");
+    assert_eq!(
+        summary.findings_count, 16,
+        "severity/count semantics remain intact"
+    );
+    let sarif = reporting_sarif(tmp.path());
+    let rows = sarif["runs"][0]["results"].as_array().expect("result rows");
+    assert_eq!(rows.len(), 16);
+    let class_count = |kind: &str| {
+        rows.iter()
+            .filter(|row| row["properties"]["finding_class"] == kind)
+            .count()
+    };
+    assert_eq!(class_count("dependency"), 15);
+    assert_eq!(class_count("general"), 1);
+    assert_eq!(class_count("source"), 0);
+    for row in rows {
+        let uri = &row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"];
+        match row["properties"]["finding_class"].as_str() {
+            Some("dependency") => {
+                assert_eq!(uri, "/external/checked-project/Cargo.lock");
+                assert!(row["properties"]["classification"].is_string());
+            }
+            Some("general") => {
+                assert_eq!(uri, "20_quality/full-checks.log");
+                assert!(row["locations"][0]["physicalLocation"]["region"].is_null());
+                assert!(row["properties"]["in_diff"].is_null());
+                assert_eq!(row["properties"]["classification"], "unclassified");
+            }
+            other => panic!("unexpected class {other:?}"),
+        }
+        assert_ne!(uri, "src/changed.rs");
+    }
+    let config = create_test_config(PolicyConfig::default());
+    generate_ai_index(
+        tmp.path(),
+        &config,
+        &diffs,
+        &checks,
+        &reporting_empty_coverage(),
+    )
+    .expect("AI index");
+    let index = std::fs::read_to_string(tmp.path().join("AI_INDEX.md")).expect("index");
+    assert!(index.contains("0 source, 15 dependency, 1 general, 0 unknown"));
+    assert!(index.contains("Origin is reported separately"));
+    assert!(!index.contains("structured inline findings"));
+}
+
+#[test]
+fn reporting_prv08_source_class_preserves_locations_and_origin_tri_state() {
+    for (output, expected_uri, expected_origin, expected_in_diff) in [
+        (
+            "Diff in src/changed.rs:3:\n-old\n+new\n",
+            "src/changed.rs",
+            "introduced",
+            serde_json::json!(true),
+        ),
+        (
+            "Diff in /outside/project/external.rs:3:\n-old\n+new\n",
+            "/outside/project/external.rs",
+            "preexisting",
+            serde_json::json!(false),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let context = tmp.path().join("30_context");
+        std::fs::create_dir_all(&context).expect("context dir");
+        generate_inline_findings(
+            &context,
+            &[reporting_check("Rustfmt", output)],
+            &[reporting_diff(vec![])],
+            None,
+            None,
+        )
+        .expect("inline findings");
+        let sarif = reporting_sarif(tmp.path());
+        let row = &sarif["runs"][0]["results"][0];
+        assert_eq!(row["properties"]["finding_class"], "source");
+        assert_eq!(row["properties"]["classification"], expected_origin);
+        assert_eq!(row["properties"]["in_diff"], expected_in_diff);
+        assert_eq!(
+            row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            expected_uri
+        );
+        assert_eq!(
+            row["locations"][0]["physicalLocation"]["region"]["startLine"],
+            3
+        );
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let context = tmp.path().join("30_context");
+    std::fs::create_dir_all(&context).expect("context dir");
+    generate_inline_findings(
+        &context,
+        &[reporting_check(
+            "Pytest",
+            "================ FAILURES ================\n___ test_case ___\nE AssertionError: controlled\ntests/test_fixture.py:7: AssertionError\n",
+        )],
+        &[reporting_diff(vec![])],
+        None,
+        None,
+    )
+    .expect("pytest findings");
+    let sarif = reporting_sarif(tmp.path());
+    let rows = sarif["runs"][0]["results"].as_array().expect("pytest rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["properties"]["finding_class"], "source");
+    assert_eq!(rows[0]["properties"]["classification"], "unclassified");
+    assert!(rows[0]["properties"]["in_diff"].is_null());
+}
+
+#[test]
+fn reporting_prv08_index_preserves_unknown_class_for_legacy_rows() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("30_context")).expect("context");
+    std::fs::write(
+        tmp.path().join("30_context/INLINE_FINDINGS.sarif"),
+        r#"{"runs":[{"results":[{"properties":{"classification":"introduced"}},{"properties":{"finding_class":"future-kind"}}]}]}"#,
+    )
+    .expect("legacy SARIF");
+    let config = create_test_config(PolicyConfig::default());
+    generate_ai_index(tmp.path(), &config, &[], &[], &reporting_empty_coverage()).expect("index");
+    let index = std::fs::read_to_string(tmp.path().join("AI_INDEX.md")).expect("index");
+    assert!(index.contains("0 source, 0 dependency, 0 general, 2 unknown"));
+}
+
+#[test]
+fn reporting_prv09_single_agent_prefix_uses_shared_commit_classifier() {
+    for (title, expected) in [
+        ("docs: plain control", "docs"),
+        ("[codex/triage] docs: explain evidence", "docs"),
+        ("[claude/review] fix(parser): parse scope", "fix"),
+        ("[agent-1] feat(api)!: change contract", "feat"),
+        ("[agent] refactor!: simplify flow", "refactor"),
+        ("[agent] bugfix: retain alias", "fix"),
+        ("[agent] tests(scope): retain test alias", "test"),
+        ("[agent] ci: maintain check", "chore"),
+        ("[agent] perf: improve latency", "perf"),
+        ("[agent] style: align output", "style"),
+        ("Update release notes", "other"),
+        ("[codex/triage] Update release notes", "other"),
+        ("[agent][second] docs: nested prefix", "other"),
+        ("[agent] [second] docs: nested prefix", "other"),
+        ("[agent]docs: missing delimiter", "other"),
+        ("[] docs: empty agent", "other"),
+        ("[agent name] docs: invalid agent", "other"),
+        ("[agent\n] docs: multiline agent", "other"),
+        ("[agent] docs", "other"),
+        ("[agent] docs:", "other"),
+        ("[agent] docs(): empty scope", "other"),
+        ("[agent] docs(scope: unclosed scope", "other"),
+        ("[agent] docs(scope)junk: malformed header", "other"),
+    ] {
+        assert_eq!(classify_commit_type(title), expected, "title: {title}");
+    }
+    let max_prefix = format!("[{}] docs: bounded control", "a".repeat(64));
+    let too_long = format!("[{}] docs: overlong prefix", "a".repeat(65));
+    assert_eq!(classify_commit_type(&max_prefix), "docs");
+    assert_eq!(classify_commit_type(&too_long), "other");
+}
+
+#[test]
+fn reporting_prv09_narrative_and_table_preserve_all_original_titles() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Controlled 100-title population: 51 prefixed, 48 plain, one negative.
+    // These are synthetic controls, not the historical project's frozen titles.
+    let mut commits: Vec<_> = (0..51)
+        .map(|i| reporting_commit(&format!("[codex/triage] docs: explain item {i}")))
+        .chain((0..48).map(|i| reporting_commit(&format!("docs: plain item {i}"))))
+        .collect();
+    commits.push(reporting_commit("Update unrelated release notes"));
+    let diffs = [reporting_diff(commits)];
+    let config = create_test_config(PolicyConfig::default());
+    generate_pr_review(
+        tmp.path(),
+        &config,
+        &diffs,
+        &[],
+        &[],
+        &reporting_empty_coverage(),
+        None,
+    )
+    .expect("review");
+    let review = std::fs::read_to_string(tmp.path().join("PR_REVIEW.md")).expect("review");
+    assert!(
+        review.contains("This PR contains 100 commits: 99 documentation updates, 1 other changes.")
+    );
+    for commit in &diffs[0].commits {
+        let expected_type = if commit.message.starts_with("Update") {
+            "other"
+        } else {
+            "docs"
+        };
+        assert!(review.contains(&format!(
+            "| `{expected_type}` | `{}` | {} |",
+            commit.short_id, commit.message
+        )));
+    }
+}
+
+#[test]
+fn reporting_prv10_commit_limit_matches_generated_files_and_index() {
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let raw = git2::Repository::init(repo_dir.path()).expect("init local fixture");
+    let sig = git2::Signature::now("Fixture", "fixture@example.test").expect("signature");
+    let mut parent_id = None;
+    let mut commits = Vec::new();
+    for i in 0..51 {
+        let blob = raw.blob(format!("fixture {i}\n").as_bytes()).expect("blob");
+        let mut builder = raw.treebuilder(None).expect("tree builder");
+        builder
+            .insert("fixture.txt", blob, 0o100644)
+            .expect("insert");
+        let tree = raw
+            .find_tree(builder.write().expect("write tree"))
+            .expect("tree");
+        let parent = parent_id.map(|id| raw.find_commit(id).expect("parent"));
+        let parents: Vec<_> = parent.iter().collect();
+        let title = format!("docs: fixture {i}");
+        let oid = raw
+            .commit(None, &sig, &sig, &title, &tree, &parents)
+            .expect("commit");
+        parent_id = Some(oid);
+        let mut commit = reporting_commit(&title);
+        commit.id = oid.to_string();
+        commit.short_id = commit.id[..7].to_string();
+        commits.push(commit);
+    }
+    let repo = Repository::open(repo_dir.path()).expect("fixture repository");
+    for count in [50, 51] {
+        let out = tempfile::tempdir().expect("output");
+        let diff_dir = out.path().join("10_diff");
+        let per_commit = diff_dir.join("per-commit-diffs");
+        std::fs::create_dir_all(&per_commit).expect("per-commit dir");
+        let mut diff = reporting_diff(commits[..count].to_vec());
+        diff.base_commit_id = commits[0].id.clone();
+        diff.target_commit_id = commits[count - 1].id.clone();
+        let diffs = [diff];
+        generate_full_patch(&diff_dir, &repo, &diffs).expect("full patch");
+        generate_per_commit_diffs(&repo, &per_commit, &diffs, false).expect("per-commit");
+        let config = create_test_config(PolicyConfig::default());
+        generate_ai_index(
+            out.path(),
+            &config,
+            &diffs,
+            &[],
+            &reporting_empty_coverage(),
+        )
+        .expect("index");
+        let index = std::fs::read_to_string(out.path().join("AI_INDEX.md")).expect("index");
+        let summary =
+            std::fs::read_to_string(per_commit.join("00-SUMMARY.md")).expect("commit summary");
+        let patches: Vec<_> = std::fs::read_dir(&per_commit)
+            .expect("patch dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+            .collect();
+        let full_patch = std::fs::read_to_string(diff_dir.join("full.patch")).expect("full patch");
+        assert!(full_patch.contains(&format!("+fixture {}", count - 1)));
+        assert!(!full_patch.contains("# Error generating diff"));
+        assert!(index.contains("10_diff/full.patch"));
+        assert!(index.contains("10_diff/per-commit-diffs/00-SUMMARY.md"));
+        if count == 50 {
+            assert_eq!(patches.len(), 10, "50 commits retain ten batches of five");
+            assert!(!index.contains("summary-only"));
+            assert!(index.contains("index of generated individual or batched commit patches"));
+            for batch in 1..=10 {
+                let name = format!("batch-{batch:02}.patch");
+                assert!(per_commit.join(&name).is_file());
+                assert!(
+                    summary.contains(&name),
+                    "summary must link existing batch {name}"
+                );
+            }
+        } else {
+            assert!(
+                patches.is_empty(),
+                "51 commits emit no per-commit patch files"
+            );
+            assert!(index.contains("summary-only: 51 commits exceed the limit of 50"));
+            assert!(!index.contains("commit-by-commit patches"));
+            assert!(summary.contains("51 > 50"));
+            assert!(summary.contains("Top 10 commits by churn"));
+            assert!(summary.contains("Summary-only: no per-commit patch files were emitted"));
+            assert!(summary.contains("10_diff/full.patch"));
+        }
+    }
+}
+
+#[test]
+fn reporting_prv08_unlocated_cargo_test_failure_remains_general_log_evidence() {
+    let unlocated = "running 1 test\ntest tests::fails ... FAILED\n\nfailures:\n\n---- tests::fails stdout ----\nassertion failed without a panic frame\n\nfailures:\n    tests::fails\n\ntest result: FAILED. 0 passed; 1 failed\n";
+    let located = format!("thread 'tests::fails' panicked at src/changed.rs:7:3:\n{unlocated}");
+    for (name, output, source_location) in [
+        ("Cargo test", unlocated, false),
+        ("Cargo test", located.as_str(), true),
+        ("Rustfmt", "Diff in src/changed.rs:0:\n-old\n+new\n", false),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let context = tmp.path().join("30_context");
+        std::fs::create_dir_all(&context).expect("context dir");
+        let checks = [reporting_check(name, output)];
+        let diffs = [reporting_diff(vec![])];
+        let summary = generate_inline_findings(&context, &checks, &diffs, None, None)
+            .expect("inline findings");
+        assert_eq!(summary.status, "failed");
+        assert_eq!(
+            summary.findings_count, 1,
+            "one failed observation is retained"
+        );
+        let dashboard = &summary.dashboard_findings[0];
+        let sarif = reporting_sarif(tmp.path());
+        let rows = sarif["runs"][0]["results"].as_array().expect("results");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["level"], "error");
+        let location = &row["locations"][0]["physicalLocation"];
+        if source_location {
+            assert_eq!(row["properties"]["finding_class"], "source");
+            assert_eq!(row["properties"]["in_diff"], true);
+            assert_eq!(row["properties"]["classification"], "introduced");
+            assert_eq!(location["artifactLocation"]["uri"], "src/changed.rs");
+            assert_eq!(location["region"]["startLine"], 7);
+            assert_eq!(location["region"]["startColumn"], 3);
+            assert_eq!(dashboard.file.as_deref(), Some("src/changed.rs"));
+            assert_eq!(dashboard.line, Some(7));
+        } else {
+            assert_eq!(row["properties"]["finding_class"], "general");
+            assert!(row["properties"]["in_diff"].is_null());
+            assert_eq!(row["properties"]["classification"], "unclassified");
+            assert_eq!(
+                location["artifactLocation"]["uri"],
+                "20_quality/full-checks.log"
+            );
+            assert!(
+                location["region"].is_null(),
+                "no line 0 or fabricated source region"
+            );
+            assert!(dashboard.file.is_none());
+            assert!(dashboard.line.is_none());
+            assert!(dashboard.in_diff.is_none());
+            if name == "Cargo test" {
+                assert!(
+                    row["message"]["text"]
+                        .as_str()
+                        .expect("message")
+                        .contains("tests::fails")
+                );
+                let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+                    .as_array()
+                    .expect("rules");
+                let totals = &rules
+                    .iter()
+                    .find(|rule| rule["id"] == "prview.summary.cargo_test")
+                    .expect("cargo test summary")["properties"];
+                assert_eq!(totals["unclassified_count"], 1);
+                assert_eq!(totals["preexisting_count"], 0);
+                assert_eq!(totals["introduced_count"], 0);
+            }
+            let config = create_test_config(PolicyConfig::default());
+            generate_ai_index(
+                tmp.path(),
+                &config,
+                &diffs,
+                &checks,
+                &reporting_empty_coverage(),
+            )
+            .expect("index");
+            let index = std::fs::read_to_string(tmp.path().join("AI_INDEX.md")).expect("index");
+            assert!(index.contains("0 source, 0 dependency, 1 general, 0 unknown"));
+        }
+    }
+}

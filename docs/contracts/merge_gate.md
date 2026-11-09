@@ -235,6 +235,19 @@ startup/progress output.
 |---|---|---|
 | `properties.in_diff` | boolean \| null | `true` when the reported location is in a file this diff touches, `false` when it is outside, `null` when the origin was not established |
 | `properties.classification` | string | `introduced` (`in_diff == true`), `preexisting` (`in_diff == false`), `unclassified` (`in_diff == null`) |
+| `properties.finding_class` | string | `dependency` for structured Cargo audit advisories, `source` for a parsed/extracted source diagnostic with a nonempty, non-placeholder path and a positive line, `general` for an unlocated check result |
+
+Observation kind and diff origin are independent. A dependency advisory remains
+`dependency` whether its origin is introduced, preexisting or unclassified;
+its location points at the checked lockfile. A general check result points at
+`20_quality/full-checks.log`, without inventing a source line. A structured
+parser's placeholder (for example Cargo test's `(test)` with line 0), empty
+path or nonpositive line is likewise general evidence: no SARIF region,
+`in_diff: null`, `classification: unclassified` and no dashboard file/line.
+Positive source locations outside the diff remain `source`. Pytest rows are `source` with
+`classification: unclassified`. The new property is additive; consumers must
+retain an unknown-kind fallback for legacy or future producers. These classes
+are not changes to the gate's severity, count or merge policy.
 
 Outside Pytest, `introduced` is derived from the diff intersection alone: the
 tool reported the finding in a file this diff touches. That is a location
