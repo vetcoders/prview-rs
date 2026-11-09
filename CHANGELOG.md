@@ -332,6 +332,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Optimize executable SHA-256 hashing in development and inherited test builds
+  so generator identity does not exhaust short review deadlines on large debug
+  binaries. The digest, release profile, and deadline limits remain unchanged.
+
 - State the limited scope of artifact self-checks in the AI index and reading
   guide. Their successful integrity/consistency result does not independently
   validate classifier or matching results, security-scan completeness, or code.

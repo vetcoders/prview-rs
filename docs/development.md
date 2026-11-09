@@ -36,6 +36,14 @@ cargo build --release
 ./target/release/prview --quick
 ```
 
+Generator identity hashes the actual executable with SHA-256 once per process.
+Debug executables can be large, so the development profile optimizes the direct
+`sha2@0.10.9` dependency at level 3; the test profile inherits that override.
+Other development code keeps its normal debug settings. This avoids spending
+review deadlines in unoptimized digest code while preserving the exact binary
+digest. Release profile settings and review deadlines are unchanged. Keep the
+package-specific override aligned when updating the direct SHA-256 dependency.
+
 ### Rebuild on change
 
 ```bash
