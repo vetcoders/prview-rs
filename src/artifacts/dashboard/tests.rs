@@ -1780,7 +1780,7 @@ fn api_unknown_is_visible_in_hero_details_navigation_and_action_center() {
         let header = build_header(&config, None, &ctx, dir.path(), "{}");
         assert!(header.contains(status));
         assert!(html.contains(&format!("{removed} known; {unknown} unresolved")));
-        assert_eq!(html.matches("id=\"section-breaking\"").count(), 1);
+        assert_eq!(html.matches(" id=\"section-breaking\"").count(), 1);
         let actions = build_action_center(&ctx, &[], None);
         if unknown > 0 {
             assert!(actions.contains("UNKNOWN"));
@@ -1850,7 +1850,7 @@ fn api_missing_comparison_is_not_run_in_hero_details_navigation_and_actions() {
     let header = build_header(&config, None, &ctx, dir.path(), "{}");
     assert!(header.contains("analysis: NOT_RUN; Rust: NOT_RUN"));
     assert!(build_breaking_section(&ctx).contains("NOT_RUN"));
-    assert_eq!(html.matches("id=\"section-breaking\"").count(), 1);
+    assert_eq!(html.matches(" id=\"section-breaking\"").count(), 1);
     let actions = build_action_center(&ctx, &[], None);
     assert!(actions.contains("NOT_RUN"));
     assert!(!actions.contains("chip.publicApiStructuralChangesClear"));
@@ -2111,4 +2111,22 @@ fn hero_and_card_preserve_unknown_and_canonical_permission() {
     let text = html_tags.replace_all(&html, "");
     assert!(text.contains("Automatic merge: YES · Introduced failures: 0"));
     assert!(!text.contains("Advisory warnings"));
+}
+
+#[test]
+fn review80_breaking_navigation_has_actual_dom_target() {
+    for compared in [false, true] {
+        let mut ctx = mock_ctx();
+        ctx.has_api_comparison = compared;
+        let config = mock_config();
+        let dir = tempfile::tempdir().unwrap();
+        let html = build_html_test!(&config, &[], &[], None, &ctx, "{}", dir.path(), "", None);
+        // A substring of data-section-id is not a DOM id attribute.
+        assert_eq!(html.matches(" id=\"section-breaking\"").count(), 1);
+        assert_eq!(
+            html.matches("data-section-id=\"section-breaking\"").count(),
+            1
+        );
+        assert!(html.contains("href=\"#section-breaking\""));
+    }
 }

@@ -2087,7 +2087,7 @@ pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
     }
 
     format!(
-        r#"<div class="section breaking-evidence-details">
+        r#"<div id="section-breaking" class="section breaking-evidence-details">
     <div class="section-header">
         <span class="section-title" data-i18n="section.breaking">Breaking</span>
         <span class="section-count">{count_label}</span>
