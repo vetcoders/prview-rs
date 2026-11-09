@@ -2969,7 +2969,11 @@ SHA256 once, yielding `binary_build_id: "sha256:<64 lowercase hex digits>"`.
 An unreadable executable produces a null build ID, status `unavailable`, and an
 explicit reason. On Linux, the file is opened through `/proc/self/exe`, so an
 upgrade that replaces or unlinks the installed path still hashes the running
-image. Other platforms retain their executable-path lookup.
+image. On macOS, an opened file is hashed only after its device/inode match the
+native vnode backing the loaded main Mach-O image. The same file handle is
+verified and read. Null/short/unavailable native evidence or a replaced pathname
+yields explicit unavailable; a normal verifiable image retains its digest.
+Other platforms retain their executable-path lookup.
 The digest identifies executable bytes; it is not a signature
 or build attestation. Neither the reviewed HEAD, the current directory nor
 runtime environment overrides supply generator identity.
@@ -2987,6 +2991,25 @@ authoritative. `PROVENANCE.json.target_sha` and `base_sha` still identify the
 reviewed input. Normal manifest hashing and ZIP export carry the generator
 record unchanged, so a copied pack remains attributable without the original
 host or executable path.
+
+#### Checkout conversion completeness
+
+`create_worktree_snapshot` can retain raw Git objects for raw Git operations.
+Source consumers require a confirmed materialized checkout instead. The planner,
+artifact generator, and Semgrep's independently owned Ambient baseline enforce
+`ensure_checkout_complete` before consuming source; the process-owned evidence
+registry covers canonical roots and descendant overrides, including pinned
+submodules. Attribute lookup uses a private bare handle with an in-memory pinned
+index, so dirty operator workdir symlinks cannot hide target attributes.
+
+Effective required/process/smudge settings determine whether checkout conversion
+is needed. Optional undefined and clean-only checkout drivers do not block an
+identity checkout; an explicitly empty process suppresses the one-shot side as
+in native Git. Unsupported encodings and non-string encoding declarations remain
+unconfirmed. Actual missing transformations refuse source analysis even without
+execution consent, rather than publishing empty structural scans from pointers.
+Live state probes separately require the clean side of conversion; unsupported
+normalization produces a typed unavailable error without executing callbacks.
 
 #### Availability of structural evidence
 
@@ -3012,6 +3035,10 @@ availability. The dashboard compares prior structural observation counts only
 when both runs are complete and `MEASURED`, and all five historical count fields
 are available. Missing legacy evidence, `NOT_RUN`, and `UNKNOWN` are not comparable;
 measured zero remains comparable. Relocation totals include both JS/TS and Rust.
+The previous-run badge is labelled API observations and is neutral in both count
+directions: these structural observations include legacy non-breaking JS/TS
+relocations, so a total alone does not prove regression or improvement. Typed
+breaking facts, risk, and merge policy retain their independent classification.
 
 Dependency regression carries current and baseline evidence separately through
 `RegressionContext`. A current measurement requires enabled heuristics, an
@@ -4398,12 +4425,12 @@ comparable previous run: the previous `report.json` must carry the same
 `regression.tests.metric_fingerprint` (`COVERAGE_METRIC_FINGERPRINT`, the
 definition of the test-file classifier and the matching; bumped when either
 changes, independent of the generator SHA and of the review range). The current
-`source_test_change_match/xctest-v4` definition strips the CamelCase `Tests`
-suffix only for Swift matching and accepts Swift extensions case-insensitively,
-so `FooTests.SWIFT` can pair with `Foo.swift`.
+`source_test_change_match/xctest-v5` definition classifies Swift source extensions
+case-insensitively and strips the CamelCase `Tests` suffix only for Swift
+matching, so `FooTests.SWIFT` can pair with `Foo.SwIfT`.
 It preserves the existing confidence rules: a stem match across different
-modules remains low confidence. Previous v2/v3 metrics retain their provenance
-but are not compared to v4. Otherwise
+modules remains low confidence. Previous v2/v3/v4 metrics retain their provenance
+but are not compared to v5. Otherwise
 `comparison_status` is `not_comparable` (fingerprint missing or different, the
 previous run recorded another or no `meta.repo.full_name`, or either side has
 no measured ratio: a count-only previous record or a current run without

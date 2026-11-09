@@ -576,6 +576,7 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 |---------------|------|
 | `repo_not_found` | The `repo` path does not exist. |
 | `not_a_git_repo` | The path exists but is not a readable git repository. |
+| `state_unavailable` | The repository is valid, but unsupported Git clean/process conversion or encoding prevents a trustworthy state/implicit-head lookup without executing project callbacks. No guessed counts are returned. |
 | `run_failed` | The review process failed to produce a completed pack (or an unknown `profile` was requested). |
 | `run_timeout` | A `quick` review exceeded the 120s budget. Carries `run_id`, `containment_confirmed`, and `retry_hint.profile: "deep"`. |
 | `run_not_found` | No run matches the given `run_id` / HEAD; call `run_review`. |

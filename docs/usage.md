@@ -62,13 +62,17 @@ including when project policy labels a check ignored. Context artifacts already
 deferred by a preset keep that preset's reason; enabling consent does not override
 the preset.
 
-Exact-target snapshots do not run Git clean, smudge or process filters. Named
-filter attributes, including Git LFS and filters in pinned submodules, leave raw
-Git blobs available for analysis with materialized checkout integrity unconfirmed.
-An authorized run refuses such a snapshot before checks, presync or executing
-context, reports the path/filter and `NOT_RUN`, and produces no verdict. PrView
-neither downloads LFS data nor executes custom filter drivers. Unset (`-filter`)
-and unspecified (`!filter`) attributes retain ordinary planning.
+Exact-target snapshots never run Git clean, smudge or process filters. PrView
+checks the effective checkout configuration, including pinned submodules. An
+optional undefined driver, a clean-only driver, or a configured checkout no-op
+can retain normal source analysis. A required unavailable driver, a configured
+smudge/process transformation, an invalid encoding attribute, or an unsupported
+`working-tree-encoding` (such as UTF-16LE) prevents source stages from using raw
+Git blobs as materialized source. PrView refuses before static analysis, checks,
+presync or context, reports the affected path and `NOT_RUN`, and produces no
+verdict. This refusal applies without execution consent as well. UTF-8/UTF8 and
+unset/unspecified encoding controls remain supported. PrView neither downloads
+LFS data nor runs custom drivers to repair that input.
 
 This is **not a sandbox**: with consent, project code can access the host as the
 running user. Process supervision, temporary snapshots and caller drift checks
@@ -653,6 +657,10 @@ prview state --json --fast
 State statistics and hot files follow native `git diff HEAD`: staged edits
 restored to HEAD in the worktree disappear, while staged deletions preserve Git's
 index semantics even if an untracked replacement exists at the same path.
+When Git would need an unsupported clean/process conversion or encoding to
+establish those counts, the state probe reports unavailable instead of running
+the driver or publishing guessed dirty/churn values. MCP reports this case as
+`state_unavailable`; it does not mean the path stopped being a Git repository.
 
 ## zsh aliases (`prv`, `prvpr`, `prvjson`)
 
@@ -1584,11 +1592,12 @@ ratio over changed source files and the previous run carries the same
 `unavailable`, the `PR_REVIEW.md` notice says the previous run was not
 compared, and no coverage regression is reported. Low matching in the current
 change is a separate signal, `low_test_match_detected`, not a regression.
-Swift matching pairs a changed `FooTests.swift` with `Foo.swift`, accepting Swift
-extensions case-insensitively. Unrelated test names do not cover a source file
+Swift source classification and XCTest matching accept Swift extensions
+case-insensitively, so `FooTests.SWIFT` can pair with `Foo.SwIfT`. Other language
+classification remains unchanged. Unrelated test names do not cover a source file
 merely by sharing the test directory. This definition uses fingerprint
-`source_test_change_match/xctest-v4`; previous v2/v3 metrics retain provenance
-and are not compared to v4.
+`source_test_change_match/xctest-v5`; previous v2/v3/v4 metrics retain provenance
+and are not compared to v5.
 Slow-check messages
 name active checks without assuming that their delay is Cargo compilation.
 

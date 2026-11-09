@@ -337,11 +337,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and count JS/TS relocations on the same axis as Rust observations.
 - Restore an actual DOM target for Breaking navigation, preserve existing context
   preset deferrals, and match Swift extensions case-insensitively. The matching
-  fingerprint advances to `source_test_change_match/xctest-v4`.
-- Refuse authorized execution on exact-target snapshots with unsupported named
-  checkout filters, including pinned submodules; keep raw analytical snapshots
-  available with unconfirmed materialization. Reconcile state counts with native
-  Git when staged changes are restored in the worktree.
+  fingerprint advances to `source_test_change_match/xctest-v5`, including
+  case-insensitive classification of Swift source files.
+- Reconcile state counts with native Git when staged changes are restored in
+  the worktree, preserving staged deletion semantics and real binary changes.
+- Verify macOS executable device/inode against the loaded main Mach-O image
+  before hashing the same handle; pathname replacement yields explicit unavailable.
+- Keep previous-run API observation deltas neutral, retaining their structural
+  count axis without treating non-breaking relocations as quality regressions.
+- Validate effective checkout filters, encodings, descendant snapshot overrides
+  and Ambient Semgrep baselines before source consumption, including inert static
+  analysis. Preserve identity/no-op checkout configurations. State refuses
+  unsupported clean normalization and MCP reports `state_unavailable`.
 - Hash the running Linux executable through `/proc/self/exe` even after its
   installed pathname is replaced. Stabilize partial-clone test setup by disabling
   asynchronous Git maintenance before byte-preservation assertions.
