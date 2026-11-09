@@ -1206,6 +1206,50 @@ fn review80_api_delta_compares_measured_zero_and_known_counts() {
     }
 }
 
+#[test]
+fn review80_round2_api_observation_delta_is_neutral_for_legacy_relocations() {
+    use super::super::PreviousRunDelta;
+    for (before, relocated, expected) in
+        [(0, true, "0&#x2192;1 (+1)"), (1, false, "1&#x2192;0 (-1)")]
+    {
+        let mut ctx = mock_ctx();
+        ctx.previous_run = Some(PreviousRunDelta {
+            checks_passed_before: 0,
+            checks_failed_before: 0,
+            findings_before: 0,
+            breaking_before: Some(before),
+            quality_pass_before: true,
+        });
+        if relocated {
+            ctx.breaking.push(BreakingFinding {
+                file: "moved.ts".into(),
+                kind: super::super::signal::BreakingKind::RelocatedSymbol {
+                    symbol_type: "function".into(),
+                },
+                line: "export function moved()".into(),
+                risk_level: super::super::signal::BreakingRisk::High,
+            });
+        }
+        let evidence = breaking_evidence(&ctx.breaking, None, ctx.has_api_comparison);
+        assert_eq!(evidence.known_count, usize::from(relocated));
+        let html = build_delta_section(&ctx, &[]);
+        assert!(
+            html.contains("data-i18n=\"label.apiObservations\""),
+            "{html}"
+        );
+        assert!(html.contains("API observations"), "{html}");
+        assert!(html.contains(expected), "{html}");
+        assert!(
+            !html.contains("delta-worse"),
+            "observations alone do not establish regression: {html}"
+        );
+        assert!(
+            !html.contains("delta-better"),
+            "observation count alone does not establish improvement: {html}"
+        );
+    }
+}
+
 // ---- PRV-105: View Mode Toggle ----
 
 #[test]

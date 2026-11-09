@@ -100,6 +100,7 @@
   "label.hideRenames": "Hide renames",
   "label.high": "high",
   "label.lintIncomplete": "ANALYSIS INCOMPLETE",
+  "label.apiObservations": "API observations",
   "label.apiDeltaNotComparable": "not comparable (API evidence unavailable or incomplete)",
   "label.message": "Message",
   "label.low": "low",

@@ -561,24 +561,17 @@ pub(super) fn build_delta_section(ctx: &DashboardContext, checks: &[CheckResult]
         );
     }
 
-    // Breaking changes delta
+    // Structural observations have no inherent regression/improvement direction.
     if let Some(before) = prev
         .breaking_before
         .filter(|_| api_evidence.analysis_complete)
     {
         if before > 0 || breaking_now > 0 {
             let diff_val = breaking_now as isize - before as isize;
-            let (class, arrow) = if diff_val < 0 {
-                ("delta-better", "")
-            } else if diff_val > 0 {
-                ("delta-worse", "+")
-            } else {
-                ("delta-same", "")
-            };
+            let arrow = if diff_val > 0 { "+" } else { "" };
             let _ = write!(
                 badges,
-                r#"<span class="delta-badge {cls}"><span class="delta-label" data-i18n="section.breaking">Breaking</span> {before}&#x2192;{now} ({arrow}{diff})</span>"#,
-                cls = class,
+                r#"<span class="delta-badge delta-same"><span class="delta-label" data-i18n="label.apiObservations">API observations</span> {before}&#x2192;{now} ({arrow}{diff})</span>"#,
                 before = before,
                 now = breaking_now,
                 arrow = arrow,
@@ -587,7 +580,7 @@ pub(super) fn build_delta_section(ctx: &DashboardContext, checks: &[CheckResult]
         }
     } else {
         badges.push_str(
-            r#"<span class="delta-badge delta-same"><span class="delta-label" data-i18n="section.breaking">Breaking</span> <span data-i18n="label.apiDeltaNotComparable">not comparable (API evidence unavailable or incomplete)</span></span>"#,
+            r#"<span class="delta-badge delta-same"><span class="delta-label" data-i18n="label.apiObservations">API observations</span> <span data-i18n="label.apiDeltaNotComparable">not comparable (API evidence unavailable or incomplete)</span></span>"#,
         );
     }
 
