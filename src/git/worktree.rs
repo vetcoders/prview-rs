@@ -1751,7 +1751,14 @@ fn collect_checkout_filters(
             .target_dir(scratch.path())
             .update_index(false)
             .refresh(false);
-        match attributes_repo.checkout_tree(tree.as_object(), Some(&mut checkout)) {
+        // libgit2 inspects nested gitlinks during checkout and requires a
+        // workdir even with an explicit target directory. Bind only this
+        // private handle to the owned scratch; false keeps Git links and
+        // core.worktree/core.bare out of the caller's persistent configuration.
+        let proof = attributes_repo
+            .set_workdir(scratch.path(), false)
+            .and_then(|()| attributes_repo.checkout_tree(tree.as_object(), Some(&mut checkout)));
+        match proof {
             Ok(()) => Some(scratch),
             Err(error) => {
                 filters.push(format!(
@@ -3192,6 +3199,15 @@ mod tests {
     }
 
     fn round3_gitlink_builtin_case(attributes: &str, raw: &[u8], expected_complete: bool) {
+        round3_gitlink_builtin_fixture_case(attributes, raw, expected_complete, false);
+    }
+
+    fn round3_gitlink_builtin_fixture_case(
+        attributes: &str,
+        raw: &[u8],
+        expected_complete: bool,
+        nested_gitlink: bool,
+    ) {
         let (tmp, repo) = repo_with_commit();
         let module = tmp.path().join("module");
         std::fs::create_dir(&module).unwrap();
@@ -3220,6 +3236,39 @@ mod tests {
             .insert(".gitattributes", attributes_oid, 0o100644)
             .unwrap();
         builder.insert("asset.txt", raw_oid, 0o100644).unwrap();
+        let nested_repo = if nested_gitlink {
+            let nested_path = module.join("engine");
+            std::fs::create_dir(&nested_path).unwrap();
+            let nested = git2::Repository::init(&nested_path).unwrap();
+            std::fs::write(nested_path.join("payload.txt"), "pinned nested bytes\n").unwrap();
+            let blob = nested.blob(b"pinned nested bytes\n").unwrap();
+            let mut nested_builder = nested.treebuilder(None).unwrap();
+            nested_builder
+                .insert("payload.txt", blob, 0o100644)
+                .unwrap();
+            let tree_id = nested_builder.write().unwrap();
+            let nested_tree = nested.find_tree(tree_id).unwrap();
+            let signature = repo.signature().unwrap();
+            let pinned = nested
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "pinned engine",
+                    &nested_tree,
+                    &[],
+                )
+                .unwrap();
+            let mut nested_index = nested.index().unwrap();
+            nested_index.read_tree(&nested_tree).unwrap();
+            nested_index.write().unwrap();
+            builder.insert("engine", pinned, 0o160000).unwrap();
+            drop(nested_tree);
+            drop(nested_builder);
+            Some(nested)
+        } else {
+            None
+        };
         let tree_oid = builder.write().unwrap();
         let tree = sub_repo.find_tree(tree_oid).unwrap();
         let signature = repo.signature().unwrap();
@@ -3297,6 +3346,15 @@ mod tests {
             )
             .unwrap()
             .to_string();
+        let original_config = std::fs::read(sub_repo.path().join("config")).unwrap();
+        let original_root_config = std::fs::read(repo.path().join("config")).unwrap();
+        let original_root_index = std::fs::read(repo.path().join("index")).ok();
+        let original_nested = nested_repo.as_ref().map(|nested| {
+            (
+                std::fs::read(nested.path().join("config")).unwrap(),
+                std::fs::read(nested.path().join("index")).unwrap(),
+            )
+        });
         let snapshot = create_worktree_snapshot(tmp.path(), &target).unwrap();
         assert_eq!(
             std::fs::read(snapshot.worktree_path.join("module/asset.txt")).unwrap(),
@@ -3306,6 +3364,36 @@ mod tests {
             std::fs::read(sub_repo.path().join("index")).unwrap(),
             original_index
         );
+        assert_eq!(
+            std::fs::read(sub_repo.path().join("config")).unwrap(),
+            original_config
+        );
+        assert_eq!(
+            std::fs::read(repo.path().join("config")).unwrap(),
+            original_root_config
+        );
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).ok(),
+            original_root_index
+        );
+        assert!(
+            !snapshot.worktree_path.join("module/.git").exists(),
+            "the probe must not add a Git link inside materialized modules"
+        );
+        if let Some(nested) = &nested_repo {
+            assert_eq!(
+                std::fs::read(snapshot.worktree_path.join("module/engine/payload.txt")).unwrap(),
+                b"pinned nested bytes\n"
+            );
+            assert!(!snapshot.worktree_path.join("module/engine/.git").exists());
+            assert_eq!(
+                Some((
+                    std::fs::read(nested.path().join("config")).unwrap(),
+                    std::fs::read(nested.path().join("index")).unwrap(),
+                )),
+                original_nested
+            );
+        }
         let completeness = WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path);
         assert_eq!(
             completeness.is_ok(),
@@ -3313,6 +3401,14 @@ mod tests {
             "{attributes}: {completeness:?}"
         );
         if !expected_complete {
+            assert!(
+                completeness
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("built-in checkout conversion changes raw gitlink bytes"),
+                "{completeness:?}"
+            );
             assert!(WorktreeSnapshot::is_materialization_error(
                 &completeness.unwrap_err()
             ));
@@ -3326,6 +3422,28 @@ mod tests {
                 crate::checks::snapshot_integrity::SnapshotIntegrityStatus::Unknown
             );
         }
+    }
+
+    #[test]
+    fn review80_round3_nested_gitlink_builtin_probe_preserves_pinned_bytes_and_caller_state() {
+        round3_gitlink_builtin_fixture_case(
+            "asset.txt ident filter=round3clean\n",
+            b"no ident placeholder\n",
+            true,
+            true,
+        );
+        round3_gitlink_builtin_fixture_case(
+            "asset.txt text eol=crlf filter=round3clean\n",
+            b"hello\n",
+            false,
+            true,
+        );
+        round3_gitlink_builtin_fixture_case(
+            "asset.txt ident filter=round3clean\n",
+            b"$Id$\n",
+            false,
+            true,
+        );
     }
 
     #[test]

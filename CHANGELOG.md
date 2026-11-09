@@ -332,6 +332,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve nested gitlink support in the built-in conversion probe by binding
+  its private handle to an owned workdir without operator configuration writes.
 - Confirm Deep/CI baseline conversion before Loctree scans, cover clean
   normalization after tracked symlinks become regular files, and reject raw
   pinned-module bytes when built-in checkout conversions would change them.

@@ -3010,7 +3010,9 @@ unconfirmed. Actual missing transformations refuse source analysis even without
 execution consent, rather than publishing empty structural scans from pointers.
 Pinned modules retain raw blobs. A separate libgit2 checkout at the pinned
 attribute tree, without external drivers, checks built-in conversions such as
-CRLF and ident expansion. Changed bytes or an unavailable comparison leave module
+CRLF and ident expansion. Its private repository handle is bound to the owned
+scratch workdir for nested-gitlink inspection, without persisting Git links,
+configuration or index changes in the operator repository. Changed bytes or an unavailable comparison leave module
 materialization unconfirmed; byte-identical conversions remain available.
 Live state probes separately require the clean side of conversion. Actual regular
 files are checked even when their index entries are symlinks or gitlinks, while
