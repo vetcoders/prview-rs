@@ -427,10 +427,12 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     }
 
     let decision = build_merge_decision_view(
-        policy_allow_merge,
-        quality_pass,
-        legacy_recommended_merge,
-        worst_confidence,
+        crate::artifacts::verdict::DecisionAxes {
+            policy_allow_merge,
+            quality_pass,
+            recommended_merge: legacy_recommended_merge,
+            analysis_status: worst_confidence,
+        },
         &quality_failures.quality_failures,
         &quality_failures.details,
         &blocking_issues,
