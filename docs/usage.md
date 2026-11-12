@@ -1549,6 +1549,21 @@ The policy-aware merge decision. Details: `docs/contracts/merge_gate.md`.
 
 Run from a directory inside a git repo.
 
+### "object not found" in a partial clone
+
+A clone made with `--filter=blob:none` (or another filter) stores only some
+objects and lets Git download the rest on demand. prview reads the repository
+directly and never downloads on demand, so an ordinary review stops with
+`object not found - cannot read header for (<sha>)` and a hint naming the
+partial clone. The repository is not damaged. Either fetch the missing objects:
+
+```bash
+git fetch --refetch --no-filter origin
+```
+
+or review refs that exist on `origin` with `--remote-only` or `--pr <N>`: those
+modes fetch what they need into prview's own copy and leave your clone unchanged.
+
 ### "Could not resolve ref: &lt;branch&gt;"
 
 The named base branch does not exist. Pass an existing branch explicitly:

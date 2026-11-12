@@ -286,7 +286,7 @@ fn anchored_origin_url(url: &str, caller: &Path) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("relative origin resolves to a non-UTF-8 path"))
 }
 
-fn is_partial_clone(source: &git2::Repository) -> Result<bool> {
+pub(crate) fn is_partial_clone(source: &git2::Repository) -> Result<bool> {
     let config = source.config()?;
     if config.get_string("extensions.partialclone").is_ok() {
         return Ok(true);

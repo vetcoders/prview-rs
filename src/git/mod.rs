@@ -120,6 +120,20 @@ impl std::fmt::Display for MissingRequiredBase {
 
 impl std::error::Error for MissingRequiredBase {}
 
+/// Whether the repository containing `path` is a partial clone, i.e. may lack
+/// objects that only its promisor remote holds.
+///
+/// libgit2 never fetches on demand, so reading such an object fails with a bare
+/// "object not found". The CLI uses this to explain that failure instead of
+/// leaving the caller to suspect a damaged repository. Any inspection error
+/// answers `false`: this only selects a hint, it never gates a review.
+pub fn is_partial_clone_checkout(path: &Path) -> bool {
+    git2::Repository::discover(path)
+        .ok()
+        .and_then(|repo| crate::review_workspace::is_partial_clone(&repo).ok())
+        .unwrap_or(false)
+}
+
 /// Diff between two refs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diff {

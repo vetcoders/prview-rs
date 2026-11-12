@@ -97,37 +97,58 @@ fn display_error(err: &anyhow::Error) {
         eprintln!("  {} {cause}", "caused by:".yellow());
     }
 
-    // Contextual hints based on error message content. An error that embeds a
-    // user-supplied ref would match on the ref's name, not on the failure.
-    let msg = format!("{err:?}").to_lowercase();
-    let hint = if err.downcast_ref::<UnresolvableGateBase>().is_some()
+    let partial_clone =
+        || std::env::current_dir().is_ok_and(|cwd| prview::git::is_partial_clone_checkout(&cwd));
+    if let Some(hint) = error_hint(err, partial_clone) {
+        eprintln!("  {} {hint}", "hint:".cyan().bold());
+    }
+}
+
+const PARTIAL_CLONE_HINT: &str = "this repository is a partial clone and the review needs an object      that is not stored locally; prview does not download objects on demand. Fetch them with      `git fetch --refetch --no-filter origin`, or review pushed refs with `--remote-only` or      `--pr <N>`, which fetch into prview's own copy";
+
+/// Whether any cause is libgit2 failing to find the object or repository it
+/// was asked for, as opposed to text that merely mentions one.
+fn git_not_found(err: &anyhow::Error, class: git2::ErrorClass) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<git2::Error>()
+            .is_some_and(|git| git.code() == git2::ErrorCode::NotFound && git.class() == class)
+    })
+}
+
+/// Contextual hint for a failed run. `partial_clone` is consulted only for a
+/// missing object, so ordinary failures never inspect the repository again.
+fn error_hint(err: &anyhow::Error, partial_clone: impl FnOnce() -> bool) -> Option<String> {
+    // An error that embeds a user-supplied ref would match on the ref's name,
+    // not on the failure.
+    if err.downcast_ref::<UnresolvableGateBase>().is_some()
         || err
             .downcast_ref::<prview::git::MissingRequiredBase>()
             .is_some()
     {
-        None
-    } else if msg.contains("repository") || msg.contains("git") {
-        Some("make sure you're running prview from inside a git repository")
+        return None;
+    }
+    if git_not_found(err, git2::ErrorClass::Odb) && partial_clone() {
+        return Some(PARTIAL_CLONE_HINT.to_string());
+    }
+    let msg = format!("{err:?}").to_lowercase();
+    // Only a missing repository earns this hint. Git transport and object
+    // errors mention "git" and "repository" too, from inside a healthy one.
+    if git_not_found(err, git2::ErrorClass::Repository)
+        || msg.contains("not inside a git repository")
+    {
+        Some("make sure you're running prview from inside a git repository".to_string())
+    } else if msg.contains("remote") || msg.contains("fetch") {
+        Some("check your network connection and remote repository access".to_string())
     } else if msg.contains("permission") || msg.contains("denied") {
-        Some("check file permissions on ~/.prview/")
+        Some("check file permissions on ~/.prview/".to_string())
     } else if msg.contains("not found") {
         ["cargo", "npm", "python", "node"]
             .iter()
             .find(|tool| msg.contains(**tool))
-            .map(|tool| {
-                // Leak is fine: we exit right after this
-                Box::leak(
-                    format!("make sure {tool} is installed and in your PATH").into_boxed_str(),
-                ) as &str
-            })
-    } else if msg.contains("remote") || msg.contains("fetch") {
-        Some("check your network connection and remote repository access")
+            .map(|tool| format!("make sure {tool} is installed and in your PATH"))
     } else {
         None
-    };
-
-    if let Some(hint) = hint {
-        eprintln!("  {} {hint}", "hint:".cyan().bold());
     }
 }
 
@@ -985,6 +1006,75 @@ async fn run_mcp_command(args: &McpArgs) -> Result<()> {
         prview::mcp::probe(args.json).await
     } else {
         prview::mcp::serve().await
+    }
+}
+
+#[cfg(test)]
+mod error_hint_tests {
+    use super::*;
+
+    fn git_error(class: git2::ErrorClass, message: &str) -> anyhow::Error {
+        git2::Error::new(git2::ErrorCode::NotFound, class, message).into()
+    }
+
+    #[test]
+    fn missing_object_in_partial_clone_names_the_partial_clone() {
+        let err = git_error(
+            git2::ErrorClass::Odb,
+            "object not found - cannot read header",
+        );
+        let hint = error_hint(&err, || true).expect("partial clone hint");
+        assert!(hint.contains("partial clone"), "{hint}");
+        assert!(
+            hint.contains("git fetch --refetch --no-filter origin"),
+            "{hint}"
+        );
+        assert!(!hint.contains("inside a git repository"), "{hint}");
+
+        let wrapped = git_error(git2::ErrorClass::Odb, "object not found").context("diff failed");
+        assert_eq!(
+            error_hint(&wrapped, || true).as_deref(),
+            Some(PARTIAL_CLONE_HINT)
+        );
+    }
+
+    #[test]
+    fn missing_object_in_complete_clone_gets_no_partial_clone_hint() {
+        let err = git_error(
+            git2::ErrorClass::Odb,
+            "object not found - cannot read header",
+        );
+        assert_eq!(error_hint(&err, || false), None);
+    }
+
+    #[test]
+    fn git_transport_failure_is_not_blamed_on_the_working_directory() {
+        let err = anyhow::anyhow!(
+            "cannot copy remote review objects: fatal: git upload-pack: aborting due to \
+             possible repository corruption on the remote side."
+        );
+        let hint = error_hint(&err, || panic!("only a missing object inspects the clone"))
+            .expect("transport hint");
+        assert!(!hint.contains("inside a git repository"), "{hint}");
+        assert!(hint.contains("remote repository access"), "{hint}");
+
+        let denied = anyhow::anyhow!("git fetch failed: Permission denied (publickey)");
+        assert_eq!(
+            error_hint(&denied, || false).as_deref(),
+            Some("check your network connection and remote repository access")
+        );
+    }
+
+    #[test]
+    fn missing_repository_keeps_the_repository_hint() {
+        let expected = Some("make sure you're running prview from inside a git repository");
+        let libgit = git_error(
+            git2::ErrorClass::Repository,
+            "could not find repository at '/x'",
+        );
+        assert_eq!(error_hint(&libgit, || false).as_deref(), expected);
+        let worded = anyhow::anyhow!("Not inside a git repository");
+        assert_eq!(error_hint(&worded, || false).as_deref(), expected);
     }
 }
 
