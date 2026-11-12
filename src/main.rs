@@ -104,7 +104,10 @@ fn display_error(err: &anyhow::Error) {
     }
 }
 
-const PARTIAL_CLONE_HINT: &str = "this repository is a partial clone and the review needs an object      that is not stored locally; prview does not download objects on demand. Fetch them with      `git fetch --refetch --no-filter origin`, or review pushed refs with `--remote-only` or      `--pr <N>`, which fetch into prview's own copy";
+const PARTIAL_CLONE_HINT: &str = "this repository is a partial clone and the review needs an \
+    object that is not stored locally; prview does not download objects on demand. Fetch them \
+    with `git fetch --refetch --no-filter origin`, or review pushed refs with `--remote-only` or \
+    `--pr <N>`, which fetch into prview's own copy";
 
 /// Whether any cause is libgit2 failing to find the object or repository it
 /// was asked for, as opposed to text that merely mentions one.
@@ -1030,6 +1033,7 @@ mod error_hint_tests {
             "{hint}"
         );
         assert!(!hint.contains("inside a git repository"), "{hint}");
+        assert!(!hint.contains("  "), "one sentence, single-spaced: {hint}");
 
         let wrapped = git_error(git2::ErrorClass::Odb, "object not found").context("diff failed");
         assert_eq!(
