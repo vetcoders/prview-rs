@@ -7863,7 +7863,7 @@ fn cargo_authority_manifest_paths(
 
     let is_workspace =
         |manifest: &toml::Value| manifest.get("workspace").is_some_and(toml::Value::is_table);
-    let workspace_authorities = if parsed.get("Cargo.toml").is_some_and(&is_workspace) {
+    let workspace_authorities = if parsed.get("Cargo.toml").is_some_and(is_workspace) {
         vec!["Cargo.toml".to_owned()]
     } else {
         let declared = allowed
@@ -7880,7 +7880,7 @@ fn cargo_authority_manifest_paths(
                 let workspace_manifest = safe_join_repo_path(&workspace_dir, "Cargo.toml").ok()?;
                 parsed
                     .get(&workspace_manifest)
-                    .is_some_and(&is_workspace)
+                    .is_some_and(is_workspace)
                     .then_some(workspace_manifest)
             })
             .collect::<BTreeSet<_>>();
@@ -9823,7 +9823,7 @@ impl ProcMacroSubstrate {
         };
         let mut closure: BTreeSet<String> = reachable
             .iter()
-            .filter(|path| parsed.get(*path).is_some_and(&is_proc_macro))
+            .filter(|path| parsed.get(*path).is_some_and(is_proc_macro))
             .cloned()
             .collect();
         let mut closure_queue = closure.iter().cloned().collect::<Vec<_>>();
