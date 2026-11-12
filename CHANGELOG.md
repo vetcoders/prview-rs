@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Explicit per-invocation project execution consent: CLI
+  `--allow-project-execution` and MCP `allow_project_execution` (default false).
+  Default reviews suppress project tools, presync, scope metadata and context
+  commands with truthful NOT_RUN evidence and incomplete/review-required policy.
+  Git state/watch and snapshot checkout avoid configured filter callbacks.
+  `fix` requires acknowledgement; cache/update cannot inherit consent. This is
+  not a sandbox and host-write confinement remains false. Public Rust `Cli` and
+  `Config` exhaustive constructors must supply the new boolean; RUN.json adds
+  `project_execution` metadata without changing the schema version.
+  The command-backed Cargo workspace reader is private; library scope discovery
+  goes through the Config-authorized `resolve_run_scope` entrypoint.
+
+- Export generator identity in `report.json`, `RUN.json` and human metadata:
+  embedded source SHA, executable SHA256 build ID, and an optional build-provided
+  release tag. Unknown or unreadable identity stays explicit, and copied ZIPs
+  preserve the same fields independently of the reviewed repository.
 - Release preparation is now an operator-selected, expected-SHA-pinned draft PR
   workflow. A separate fail-closed merge validator creates the immutable tag
   only for a machine-marked release PR, while the existing signed publish
@@ -316,6 +332,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The repository's Gate Shadow job explicitly acknowledges project execution
+  so its Cargo check continues to run with the new analytical default.
+- CI dependency auditing applies the maintainer-approved RUSTSEC-2026-0457/0462
+  exceptions only after locked metadata proves the exact reviewed rmcp 2.0.0
+  graph excludes OAuth/HTTP clients. Changed features, versions, sources or
+  incomplete metadata fail closed. The affected version remains required by Loctree;
+  no global advisory ignore is added, and raw `cargo audit` still reports them.
+
+- Preserve caller filter-conversion requirements as non-executable evidence
+  across independent remote root/module stores, and release successful baseline
+  proof checkouts before archive extraction. Add depth-two conversion and
+  explicit baseline-refusal controls.
+
+- Preserve nested gitlink support in the built-in conversion probe by binding
+  its private handle to an owned workdir without operator configuration writes.
+- Confirm Deep/CI baseline conversion before Loctree scans, cover clean
+  normalization after tracked symlinks become regular files, and reject raw
+  pinned-module bytes when built-in checkout conversions would change them.
+- Preserve unavailable structural API baselines and malformed failure-detail
+  containers as unknown, retain base Rust scope after Cargo manifest deletion,
+  and count JS/TS relocations on the same axis as Rust observations.
+- Restore an actual DOM target for Breaking navigation, preserve existing context
+  preset deferrals, and match Swift extensions case-insensitively. The matching
+  fingerprint advances to `source_test_change_match/xctest-v5`, including
+  case-insensitive classification of Swift source files.
+- Reconcile state counts with native Git when staged changes are restored in
+  the worktree, preserving staged deletion semantics and real binary changes.
+- Verify macOS executable device/inode against the loaded main Mach-O image
+  before hashing the same handle; pathname replacement yields explicit unavailable.
+- Keep previous-run API observation deltas neutral, retaining their structural
+  count axis without treating non-breaking relocations as quality regressions.
+- Validate effective checkout filters, encodings, descendant snapshot overrides
+  and Ambient Semgrep baselines before source consumption, including inert static
+  analysis. Preserve identity/no-op checkout configurations. State refuses
+  unsupported clean normalization and MCP reports `state_unavailable`.
+- Hash the running Linux executable through `/proc/self/exe` even after its
+  installed pathname is replaced. Stabilize partial-clone test setup by disabling
+  asynchronous Git maintenance before byte-preservation assertions.
+
+- Optimize executable SHA-256 hashing in development and inherited test builds
+  so generator identity does not exhaust short review deadlines on large debug
+  binaries. The digest, release profile, and deadline limits remain unchanged.
+
+- State the limited scope of artifact self-checks in the AI index and reading
+  guide. Their successful integrity/consistency result does not independently
+  validate classifier or matching results, security-scan completeness, or code.
+
+- Keep SARIF observation kind (`source`, `dependency`, `general`) separate from
+  the existing diff-origin classification. The AI index counts emitted rows by
+  kind, so dependency advisories and unlocated check failures are not presented
+  as errors in changed source. Structured failures without a real source
+  location (including Cargo test's placeholder/line-0 results) remain general
+  log evidence with unclassified origin and no fabricated source region.
+- Recognize one bounded agent prefix such as `[codex/triage]` before a valid
+  Conventional Commit header in PR narratives and commit tables. Original
+  titles remain visible; malformed headers and repeated prefixes stay `other`.
+- Describe ranges above 50 commits as summary-only in the AI index and
+  per-commit summary, pointing to `10_diff/full.patch` for the full range.
+  The 50-commit limit and existing batching remain unchanged.
+
+- Show canonical automatic-merge permission and classified failed-check counts
+  in the dashboard, narratives and copied PR comment. Change quality is distinct
+  from all-check status; incomplete classification remains UNKNOWN, warning
+  results are not failures, and source/dependency scan statuses stay separate.
+- The shared test-file classifier now recognises the Swift XCTest convention:
+  `.swift` files inside a `<Target>Tests/` (or `<Target>UITests/`) directory and
+  files named `SomethingTests.swift` are tests. They used to count as production
+  code, which inflated code-file counts, the untested denominator, hotspots and
+  the review score (63 of 184 files in one macOS review). The rule is Swift-only
+  and matches `Tests` as a CamelCase word boundary, so a README or fixture inside
+  the test target, `Protests.swift`, `Latest.swift` or `FooTests.rs` are
+  unaffected; Rust, JS/TS and Python markers are unchanged. Any Swift stem or
+  directory segment ending in `Tests` qualifies, so a domain name such as
+  `BloodTests.swift` would also be classified as a test; Objective-C XCTest
+  files (`.m`/`.mm`) are out of scope. A 184-path reference
+  fixture (`tests/fixtures/review_file_paths/codescribe_pr225.paths`) pins the
+  corrected classification. Matching ratio and score are recomputed from the
+  corrected classification on the next run, not rescaled.
+- Swift source/test-change matching now pairs `Foo.swift` with `FooTests.swift`,
+  including the XCTest target convention. The suffix is stripped only for Swift;
+  unrelated test files, README files and other languages keep the existing rules.
+  The metric fingerprint is now `source_test_change_match/xctest-v3`; v2 history
+  remains provenance and does not produce a trend against v3. Existing confidence
+  levels and score weights are unchanged.
+- Per-file and total line counts in `report.json`, the dashboard and the
+  `full.patch` header now come from the same diff as the shipped patches.
+  `diff_refs` used the patience algorithm while `full.patch`, per-file and
+  scoped patches used Myers, so on files with repeated lines the counts could
+  differ from `git diff --numstat` and from GitHub by the same +N/-N on both
+  sides (11 files in one 184-file review). All four paths now share one set of
+  diff options (Myers, 3 context lines); rename/copy detection is unchanged.
+  Because the options are now explicit, a `diff.context` setting in git config
+  no longer changes `full.patch`, per-file or scoped patches. Existing
+  regression snapshots may show a one-time numstat delta.
+- Low source/test-change matching in the current change is no longer reported
+  as a coverage regression. `regression.tests.coverage_regression_detected` now
+  means a historical decline against a *comparable* previous run only; the
+  current-change signal is the new `low_test_match_detected`. A previous run is
+  comparable only when both runs name the same repository
+  (`meta.repo.full_name`, today inferred from a GitHub `origin` only, compared
+  case-insensitively), both carry a measured ratio in `0..=1` (a count-only or
+  0/0 record is provenance, not a measurement) and the previous run carries the
+  same `metric_fingerprint` (`source_test_change_match/xctest-v3`, the
+  definition of the classifier and the matching, not the generator SHA);
+  `comparison_status` is `comparable`, `not_comparable` or `unavailable` with a
+  `comparison_reason`, and the `PR_REVIEW.md` notice now says whether the
+  previous run was compared. Repositories without a GitHub `origin` currently
+  get `not_comparable` (identity not established) instead of a trend; a
+  host-independent repository identity is a tracked follow-up. Without a
+  comparable baseline `coverage_delta` is null and the score's "coverage
+  dropped" points are not awarded, because they were never supported; the
+  untested-code-file points are unchanged. `base_coverage_ratio` keeps the raw
+  previous-run value as provenance, and `coverage_comparison` names the current
+  and previous fingerprints.
+- Preserve incomplete API analysis through report, dashboard, narrative and
+  copied comments, with explicit UNKNOWN state and known observations retained.
+  Dependency regression now records current and baseline measurement evidence
+  instead of presenting an unavailable comparison as a measured zero.
 - Remote reviews use an independently owned Git repository before ref refresh,
   check planning and TUI preflight. Existing agent worktrees and concurrent
   caller edits stay outside execution, while caller provenance and concrete

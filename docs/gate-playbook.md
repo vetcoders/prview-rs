@@ -5,6 +5,30 @@ measured fast gate profile, reads the generated `MERGE_GATE.json`, and returns a
 stable process exit code. Hook recipes must decide from that exit code only;
 they must not parse stdout.
 
+Project tools require explicit per-invocation consent. A hook or CI job that is
+intended to execute the selected checks must use
+`prview gate --allow-project-execution` (plus its existing policy/base flags).
+Without the acknowledgement, project checks are NOT_RUN and the canonical
+decision requires review; `--strict` therefore rejects it. Advisory mode can
+still exit zero for CONDITIONAL by its existing exit contract—zero alone is not
+evidence that checks ran. `--allow-project-execution` does not enable tests/lint
+disabled by the fast gate preset and does not provide host isolation. Apply
+this acknowledgement to the execution recipes below only in trusted environments.
+
+The repository's `Gate Shadow` workflow is an explicit CI opt-in: its gate
+invocation passes `--allow-project-execution` because the job is intended to run
+the gate's Cargo check against the reviewed tree. The workflow uses the ordinary
+`pull_request` event, a GitHub-hosted runner, `contents: read`, and checkout with
+credentials disabled; it does not reference repository secrets. Treat pull
+request source as code that this CI job executes, including fork contributions
+when GitHub permits the run. This workflow choice does not change the default
+for local CLI or MCP invocations.
+
+For the composite GitHub Action, pass the acknowledgement through its existing
+`args` input. The action appends those arguments after `prview gate`; for example
+`args: --allow-project-execution`. Without it, the action retains the analytical
+default rather than granting execution on behalf of its caller.
+
 ## Exit-code contract
 
 | Exit code | Meaning | Default hook effect |
@@ -91,7 +115,7 @@ branch is the right base:
   with:
     strict: "true"
     version: "X.Y.Z"
-    args: ${{ github.event_name == 'push' && format('--base {0} --exact-base', github.event.before) || '' }}
+    args: ${{ github.event_name == 'push' && format('--allow-project-execution --base {0} --exact-base', github.event.before) || '--allow-project-execution' }}
 ```
 
 `--exact-base` makes the review the literal `before..HEAD` range instead of

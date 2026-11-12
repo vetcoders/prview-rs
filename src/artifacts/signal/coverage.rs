@@ -535,6 +535,14 @@ fn find_matching_test<'a>(
             .or_else(|| test_stem.strip_suffix(".test"))
             .or_else(|| test_stem.strip_suffix(".spec"))
             .or_else(|| test_stem.strip_prefix("test_"))
+            .or_else(|| {
+                test_stem.strip_suffix("Tests").filter(|_| {
+                    Path::new(&test.path)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("swift"))
+                })
+            })
             .unwrap_or(test_stem);
 
         if test_base == src_stem {
@@ -623,6 +631,7 @@ fn find_matching_test<'a>(
 fn compatible_test_language(source: &str, test: &str) -> bool {
     let source_ext = Path::new(source).extension().and_then(|ext| ext.to_str());
     let test_ext = Path::new(test).extension().and_then(|ext| ext.to_str());
+    let is_swift = |ext: Option<&str>| ext.is_some_and(|ext| ext.eq_ignore_ascii_case("swift"));
     let is_js_ts = |ext| {
         matches!(
             ext,
@@ -638,6 +647,7 @@ fn compatible_test_language(source: &str, test: &str) -> bool {
     let is_jvm = |ext| matches!(ext, Some("java" | "kt" | "kts"));
     source_ext.is_some()
         && (source_ext == test_ext
+            || is_swift(source_ext) && is_swift(test_ext)
             || is_js_ts(source_ext) && is_js_ts(test_ext)
             || is_c_cpp(source_ext) && is_c_cpp(test_ext)
             || is_jvm(source_ext) && is_jvm(test_ext))
@@ -857,6 +867,128 @@ mod tests {
         assert_eq!(signal.total_source_files, 1);
         assert_eq!(signal.covered_count, 1);
         assert_eq!(signal.covered_files[0].2, CoverageMatchTier::High);
+    }
+
+    #[test]
+    fn coverage_xctest_suffix_pairs_changed_source_and_test() {
+        for (source, test) in [
+            (
+                "Sources/App/Parser.swift",
+                "Tests/AppTests/ParserTests.swift",
+            ),
+            ("src/Parser.swift", "src/ParserTests.swift"),
+            (
+                "Sources/App/ParserUI.swift",
+                "Tests/AppUITests/ParserUITests.swift",
+            ),
+        ] {
+            let diff = mock_diff(vec![
+                mock_file_change(source, FileStatus::Modified, 2, 1),
+                mock_file_change(test, FileStatus::Modified, 2, 1),
+                mock_file_change("macos/AppTests/README.md", FileStatus::Modified, 2, 1),
+            ]);
+            let signal = compute_coverage_signal(&[diff], None, None);
+            assert_eq!(signal.total_source_files, 1, "{test}");
+            assert_eq!(signal.covered_count, 1, "{test}");
+            assert_eq!(signal.coverage_pct, Some(100), "{test}");
+            assert_eq!(signal.covered_files[0].0, source);
+            assert_eq!(signal.covered_files[0].1, test);
+            assert!(signal.uncovered_files.is_empty());
+            assert_eq!(signal.non_code_count, 1);
+            let expected_tier = if source.starts_with("src/") {
+                CoverageMatchTier::High
+            } else {
+                CoverageMatchTier::Low
+            };
+            assert_eq!(signal.covered_files[0].2, expected_tier);
+        }
+    }
+
+    #[test]
+    fn review80_round2_swift_source_and_test_extension_case_matrix() {
+        for source_extension in ["swift", "SWIFT", "SwIfT"] {
+            for test_extension in ["swift", "SWIFT", "SwIfT"] {
+                let source = format!("Sources/App/Parser.{source_extension}");
+                let test = format!("Tests/AppTests/ParserTests.{test_extension}");
+                let diff = mock_diff(vec![
+                    mock_file_change(&source, FileStatus::Modified, 2, 1),
+                    mock_file_change(&test, FileStatus::Modified, 2, 1),
+                ]);
+                let signal = compute_coverage_signal(&[diff], None, None);
+                assert_eq!(signal.total_source_files, 1, "{source} / {test}");
+                assert_eq!(signal.covered_count, 1, "{source} / {test}");
+                assert_eq!(signal.non_code_count, 0, "{source} / {test}");
+                assert_eq!(signal.covered_files[0].0, source);
+                assert_eq!(signal.covered_files[0].1, test);
+            }
+        }
+        for test in [
+            "Tests/AppTests/OtherTests.SWIFT",
+            "tests/ParserTests.rs",
+            "tests/ParserTests.js",
+        ] {
+            let diff = mock_diff(vec![
+                mock_file_change("Sources/App/Parser.SWIFT", FileStatus::Modified, 2, 1),
+                mock_file_change(test, FileStatus::Modified, 2, 1),
+            ]);
+            let signal = compute_coverage_signal(&[diff], None, None);
+            assert_eq!(signal.total_source_files, 1, "{test}");
+            assert_eq!(signal.covered_count, 0, "{test}");
+            assert_eq!(
+                signal.uncovered_files,
+                vec!["Sources/App/Parser.SWIFT"],
+                "{test}"
+            );
+        }
+    }
+
+    #[test]
+    fn review80_xctest_match_accepts_case_insensitive_swift_extension() {
+        let diff = mock_diff(vec![
+            mock_file_change("Sources/App/Parser.swift", FileStatus::Modified, 2, 1),
+            mock_file_change(
+                "Tests/AppTests/ParserTests.SWIFT",
+                FileStatus::Modified,
+                2,
+                1,
+            ),
+        ]);
+
+        let signal = compute_coverage_signal(&[diff], None, None);
+
+        assert_eq!(signal.total_source_files, 1);
+        assert_eq!(signal.covered_count, 1);
+        assert_eq!(signal.covered_files[0].0, "Sources/App/Parser.swift");
+        assert_eq!(
+            signal.covered_files[0].1,
+            "Tests/AppTests/ParserTests.SWIFT"
+        );
+    }
+
+    #[test]
+    fn coverage_xctest_suffix_does_not_pair_unrelated_files_or_other_languages() {
+        for (source, test) in [
+            (
+                "Sources/App/Parser.swift",
+                "Tests/AppTests/OtherTests.swift",
+            ),
+            (
+                "Sources/App/Parser.swift",
+                "Tests/AppTests/ParserHelpers.swift",
+            ),
+            ("Sources/App/Parser.swift", "Tests/AppTests/README.md"),
+            ("src/Parser.rs", "tests/ParserTests.rs"),
+            ("src/Parser.js", "tests/ParserTests.js"),
+            ("src/Parser.swift", "tests/ParserTests.rs"),
+        ] {
+            let source = mock_file_change(source, FileStatus::Modified, 2, 1);
+            let test = mock_file_change(test, FileStatus::Modified, 2, 1);
+            assert!(
+                find_matching_test(&source, &[&test]).is_none(),
+                "{}",
+                test.path
+            );
+        }
     }
 
     #[test]

@@ -1703,6 +1703,9 @@ impl Check for CargoCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -1790,6 +1793,9 @@ impl Check for ClippyCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -1910,6 +1916,9 @@ impl Check for CargoTestCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -2035,6 +2044,9 @@ impl Check for RustfmtCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -2180,6 +2192,9 @@ impl Check for CargoAuditCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -2356,6 +2371,9 @@ impl Check for CargoGeigerCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 

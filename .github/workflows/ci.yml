@@ -191,6 +191,8 @@ jobs:
           node-version: "20"
           cache: npm
           cache-dependency-path: tools/fixtures/bounded-runtime/package-lock.json
+      - name: Test copied PR-comment evidence contract
+        run: node tools/tests/test_clipboard_contract.js
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -284,7 +286,10 @@ jobs:
       # its published lockfile exact.
       - name: Install pinned cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
-      # WHY: quick-xml 0.39 sits in Cargo.lock only through comrak's target-gated (wasm) syntect variant; it is NOT part of the build graph on any release target (proof: cargo tree -i quick-xml empty on x86_64-unknown-linux-gnu and aarch64-apple-darwin) and prview parses no external XML.
-      # WHEN TO REMOVE: when plist releases quick-xml >=0.41 support (RUSTSEC-2026-0194/0195 patched there) — bump the chain and drop this ignore.
+      - name: Test the dependency audit exception guard
+        run: python3 -m unittest discover -s tools/tests -p 'test_audit_dependencies.py'
+      # Existing quick-xml exceptions remain in .cargo/audit.toml. The runner
+      # adds RUSTSEC-2026-0457/0462 only after proving the exact reviewed rmcp
+      # graph excludes OAuth/HTTP clients. See CONTRIBUTING.md for removal.
       - name: Audit dependencies
-        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+        run: python3 tools/audit_dependencies.py

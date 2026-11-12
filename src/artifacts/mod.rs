@@ -11,6 +11,7 @@ pub use signal::{api_delta, api_surface, revision_source};
 mod context_artifacts;
 mod evidence_scope;
 mod findings;
+mod generator_identity;
 pub(crate) mod git_artifacts;
 mod merge_gate;
 mod review_range;
@@ -589,6 +590,10 @@ fn publication_failure_after_rollback(
 
 /// Generate all artifacts
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
+    anyhow::ensure!(
+        input.config.allow_project_execution || input.checks.is_empty(),
+        "cannot publish executed or cached check results without invocation consent"
+    );
     let ledger = input.ledger;
     // Quick reviews did not pass through the quality dispatcher. Preserve any
     // existing baseline rather than recertifying a caller after it changed.
@@ -719,6 +724,40 @@ fn generate_guarded(
 
     // Build extended checks list including synthetic heuristics check
     let heuristics_check = build_heuristics_check(heuristics, config);
+    let mut skipped_checks = skipped_checks;
+    if !config.allow_project_execution {
+        for check in crate::checks::get_checks_for_profile(config) {
+            if !ledger.entries().iter().any(|entry| {
+                entry.kind == crate::ledger::TaskKind::Check
+                    && entry.key.tool == crate::check_id::check_id_from_name(check.name())
+            }) {
+                ledger.record(crate::ledger::TaskEntry {
+                    key: crate::ledger::TaskKey::new(
+                        check.name(),
+                        ledger.resolved_substrate().unwrap_or_default(),
+                    ),
+                    kind: crate::ledger::TaskKind::Check,
+                    state: crate::ledger::TaskState::Skipped {
+                        reason: crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned(),
+                    },
+                    queued_at: None,
+                    started_at: None,
+                });
+            }
+            if let Some(row) = skipped_checks
+                .iter_mut()
+                .find(|row| row.name == check.name())
+            {
+                row.reason = crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned();
+            } else {
+                skipped_checks.push(crate::checks::SkippedCheck {
+                    id: crate::check_id::check_id_from_name(check.name()),
+                    name: check.name().to_owned(),
+                    reason: crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned(),
+                });
+            }
+        }
+    }
     let mut all_checks: Vec<CheckResult> = checks.to_vec();
     all_checks.push(heuristics_check);
     // The reviewed tree, not the local one: in a `--pr` run the checks judged a
@@ -733,6 +772,9 @@ fn generate_guarded(
     let context_scan_root = ledger
         .scan_dir()
         .unwrap_or_else(|| config.repo_root.clone());
+    // Every source consumer needs materialized bytes, including inert static
+    // analysis. Raw Git snapshots remain usable for raw Git operations only.
+    crate::git::WorktreeSnapshot::ensure_checkout_complete(&context_scan_root)?;
     // Freeze this run-wide observation before context commands can write more files.
     let snapshot_integrity = match ledger.current_snapshot_observation() {
         Some(observation) => {
@@ -843,7 +885,13 @@ fn generate_guarded(
         || diffs
             .iter()
             .flat_map(|diff| diff.files.iter())
-            .any(|file| file.path.ends_with(".rs"));
+            // A removed manifest can leave the target profile generic while
+            // the base still contains a Rust API that must be compared.
+            .any(|file| {
+                file.path.ends_with(".rs")
+                    || file.path == "Cargo.toml"
+                    || file.path.ends_with("/Cargo.toml")
+            });
     let rust_api_delta = if has_rust_scope {
         let fast_preset = config.is_fast_remote_only_standard();
         let phase = if fast_preset {
@@ -901,7 +949,7 @@ fn generate_guarded(
     generate_metadata(&summary_dir, config, diffs, &all_checks, resolved_target)?;
     generate_commit_list(&summary_dir, diffs)?;
     generate_file_status(&summary_dir, diffs)?;
-    generate_system_meta(&summary_dir)?;
+    generate_system_meta(&summary_dir, config.allow_project_execution)?;
     if let Some((caller_root, execution_repo)) = ledger.execution_roots() {
         fs::write(
             summary_dir.join("EXECUTION_ROOTS.json"),
@@ -984,7 +1032,8 @@ fn generate_guarded(
         .cargo_root
         .as_deref()
         .unwrap_or(config.repo_root.as_path());
-    let inline_summary = generate_inline_findings(
+    let inline_summary = generate_inline_findings_with_execution(
+        config.allow_project_execution,
         &context_dir,
         &all_checks,
         diffs,
@@ -1120,14 +1169,14 @@ fn generate_guarded(
         &coverage_delta,
         heuristics,
     )?;
-    let mut range_notices = review_range.review_caveats();
-    range_notices.push(prev_coverage.description());
-    if !range_notices.is_empty() {
-        let path = out_dir.join("PR_REVIEW.md");
-        let narrative = fs::read_to_string(&path)?;
-        let notice = format!("# PR Review\n\n{}\n", range_notices.join("\n\n"));
-        fs::write(path, narrative.replacen("# PR Review\n", &notice, 1))?;
-    }
+    pr_review::append_api_evidence(
+        &out_dir,
+        &breaking_evidence(
+            &breaking_findings,
+            rust_breaking_view.as_ref(),
+            !diffs.is_empty(),
+        ),
+    )?;
     stage_timings.push(finish_timing(emit_human_stdout, "PR_REVIEW", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PrReview)?;
 
@@ -1209,9 +1258,19 @@ fn generate_guarded(
                 .map(|f| f.path.clone())
                 .collect(),
             base_untested_critical_count: prev_coverage.untested_count,
+            base_metric_fingerprint: prev_coverage.metric_fingerprint.clone(),
+            repo_identity: config.gh_repo.clone(),
+            base_repo_identity: prev_coverage.repo_identity.clone(),
             cycles,
             dead_exports,
             unused_symbols,
+            deps_availability: regression::deps::current_evidence(
+                config.run_heuristics,
+                heuristics,
+            ),
+            deps_base_availability: regression::deps::baseline_evidence(
+                heuristics.and_then(|h| h.regression.as_ref()),
+            ),
             base_cycles,
             base_dead_exports,
             base_unused_symbols,
@@ -1222,6 +1281,19 @@ fn generate_guarded(
 
         regression::compute_regression(&reg_ctx)
     };
+
+    // The previous-run notice needs the computed comparison status, so the
+    // review-range caveats and that notice are written once the regression
+    // report exists. The header replacement does not depend on what the
+    // narrative generators appended before it.
+    let mut range_notices = review_range.review_caveats();
+    range_notices.push(prev_coverage.description(&regression_report.tests));
+    if !range_notices.is_empty() {
+        let path = out_dir.join("PR_REVIEW.md");
+        let narrative = fs::read_to_string(&path)?;
+        let notice = format!("# PR Review\n\n{}\n", range_notices.join("\n\n"));
+        fs::write(path, narrative.replacen("# PR Review\n", &notice, 1))?;
+    }
 
     let file_paths: Vec<String> = diffs
         .iter()
@@ -2421,7 +2493,14 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
 
     let generated_at = chrono::Local::now().to_rfc3339();
 
+    let mut runner = serde_json::to_value(generator_identity::current())?;
+    runner["tool"] = json!(env!("CARGO_PKG_NAME"));
+    runner["version"] = json!(env!("CARGO_PKG_VERSION"));
+    runner["os"] = json!(std::env::consts::OS);
+    runner["arch"] = json!(std::env::consts::ARCH);
+
     let run = json!({
+        "project_execution": {"allowed": config.allow_project_execution, "authority": "invocation", "host_write_confinement": false},
         "schema_version": "1.0",
         "run_started_at": run_started_at,
         "run_finished_at": &generated_at,
@@ -2475,12 +2554,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             "backpressured": config.resource_plan.backpressured,
             "schedule": "cheap orientation/checks -> capped pools -> serialized uncapped tools -> artifacts",
         },
-        "runner": {
-            "tool": env!("CARGO_PKG_NAME"),
-            "version": env!("CARGO_PKG_VERSION"),
-            "os": std::env::consts::OS,
-            "arch": std::env::consts::ARCH,
-        },
+        "runner": runner,
         "checks": check_results,
         "analysis": {
             "mode": if !config.run_heuristics {
@@ -2540,7 +2614,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
 }
 
 /// system_meta.txt (Artifact Pack v1)
-fn generate_system_meta(dir: &Path) -> Result<()> {
+fn generate_system_meta(dir: &Path, allow_project_execution: bool) -> Result<()> {
     let mut content = String::new();
 
     content.push_str(&format!(
@@ -2552,7 +2626,7 @@ fn generate_system_meta(dir: &Path) -> Result<()> {
     let mut hostname = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
         .ok();
-    if hostname.is_none() {
+    if hostname.is_none() && allow_project_execution {
         hostname = governed_optional_output(Command::new("hostname"), "system metadata hostname")?
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
@@ -2561,7 +2635,24 @@ fn generate_system_meta(dir: &Path) -> Result<()> {
     }
 
     content.push_str(&format!("prview_version: {}\n", env!("CARGO_PKG_VERSION")));
+    let generator = generator_identity::current();
+    content.push_str(&format!(
+        "generator_git_sha: {}\ngenerator_binary_build_id: {}\ngenerator_binary_build_id_status: {}\ngenerator_binary_build_id_reason: {}\ngenerator_release_tag: {}\n",
+        generator.git_sha,
+        generator.binary_build_id.as_deref().unwrap_or("unavailable"),
+        generator.binary_build_id_status,
+        generator.binary_build_id_reason.as_deref().unwrap_or("none"),
+        generator.release_tag.unwrap_or("unknown"),
+    ));
 
+    if !allow_project_execution {
+        content.push_str(&format!(
+            "tool_versions: {}\n",
+            crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED
+        ));
+        fs::write(dir.join("system_meta.txt"), content)?;
+        return Ok(());
+    }
     let mut command = Command::new("rustc");
     command.arg("--version");
     if let Some(output) = governed_optional_output(command, "system metadata rustc version")? {

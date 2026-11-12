@@ -65,6 +65,7 @@ fn command(caller: &Path, parent: &Path) -> Command {
 
 fn command_mode(caller: &Path, parent: &Path, quick: bool) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("prview"));
+    cmd.arg("--allow-project-execution");
     cmd.current_dir(caller)
         .env("PRVIEW_HOME", parent.join("home"))
         .args([

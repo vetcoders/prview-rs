@@ -1343,6 +1343,7 @@ def run_case(args: argparse.Namespace, case_name: str) -> dict[str, Any]:
             command = [
                 str(binary),
                 "--deep",
+                "--allow-project-execution",
                 "--no-cache",
                 "--no-fetch",
                 "--local-only",

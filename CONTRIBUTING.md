@@ -87,6 +87,31 @@ configuration does not enable auto-merge. Dependabot reads its configuration
 from the default branch, so adding this file on a feature branch does not yet
 activate scheduled updates.
 
+The CI Security Audit uses `python3 tools/audit_dependencies.py`. It applies a
+maintainer-approved exceptions for
+[RUSTSEC-2026-0457](https://rustsec.org/advisories/RUSTSEC-2026-0457.html) and
+[RUSTSEC-2026-0462](https://rustsec.org/advisories/RUSTSEC-2026-0462.html).
+Their OAuth and Streamable HTTP client implementations are not compiled by the
+current default Cargo feature graph. Loctree 0.15.1 still requires rmcp 2.x,
+so updating PrView's direct SDK dependency alone would retain the affected
+transitive version.
+These exceptions do not remediate that version.
+
+Before applying the exception, the runner requires complete locked Cargo
+metadata, exactly one crates.io rmcp 2.0.0 node with the reviewed feature set,
+and no OAuth/HTTP dependencies. Any changed source, version, feature set,
+missing or inconsistent metadata, or failed metadata command stops before
+the exceptions can be used. The metadata covers all resolved platforms and
+matches the default feature selection used by this repository's build/test
+jobs. A workflow that changes feature selection must update this proof.
+
+The exceptions are passed only to that guarded audit invocation; there is no
+new global ignore in `.cargo/audit.toml`. Raw `cargo audit`, including PrView's
+ordinary Cargo audit check, still reports both advisories. Existing quick-xml
+exceptions are unchanged. Remove the rmcp exceptions and their guard once a
+published, validated Loctree dependency chain supports patched rmcp >=3.9.0;
+the guard already refuses any rmcp version or feature change pending review.
+
 ## Release maintenance
 
 Maintainers should use the repo-level helpers instead of ad-hoc commands:

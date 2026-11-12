@@ -24,6 +24,74 @@ prview --help
 
 Full installation details, including release binaries and checksums, are in `docs/INSTALL.md`.
 
+## Execution consent
+
+The default invocation generates an analytical pack without running project
+tools. All project tool checks are recorded as **NOT_RUN** (`skipped`, with the
+reason `project execution not authorized`). No successful result, command or
+exit code is fabricated. Source parsing, Git object analysis and PrView's owned
+static analyzer workers remain available. Git/GitHub transport uses the
+operator's trusted installed tools and authentication configuration.
+
+```bash
+prview --deep                              # analysis; project checks NOT_RUN
+prview --deep --allow-project-execution    # acknowledge project code execution
+prview fix --allow-project-execution       # acknowledge mutating fixers
+prview gate --allow-project-execution      # permit tools within the gate preset
+prview --ci --allow-project-execution      # explicit CI execution consent
+```
+
+For subcommands, put the command name before the consent flag, for example
+`prview gate --allow-project-execution` or `prview fix --allow-project-execution`.
+The existing CLI grammar treats root-level review options before a command as
+an ordinary branch review, so the command-first form preserves its meaning.
+
+The acknowledgement applies only to this invocation. It does not enable checks
+disabled by the selected preset. It is independent of `--full-tests`, `--with-tests`,
+`--with-lint`, `--security-full`, the chosen target and project policy files.
+There is no persistent trust store. TUI and watch retain the invocation's setting.
+An unchanged `--update` cannot reuse an authorized pack without new consent, or
+reuse an inert/legacy pack as execution after consent is granted.
+
+Without consent, dependency setup (`uv sync`), Cargo scope metadata, language
+tools, context-only tools and tool-version probes are suppressed. `doctor` also
+requires consent for toolchain probes. State/worktree analysis does not execute
+configured Git filters. Fix refuses without the flag. Skipped check evidence
+feeds the existing canonical merge decision as incomplete/review-required,
+including when project policy labels a check ignored. Context artifacts already
+deferred by a preset keep that preset's reason; enabling consent does not override
+the preset.
+
+Exact-target snapshots never run Git clean, smudge or process filters. PrView
+checks the effective checkout configuration, including pinned submodules. An
+independent remote review retains the caller's effective filter requirements
+for the root and module stores as process-owned evidence. It does not copy
+driver commands into the review repository or execute them to classify input.
+An optional undefined driver, a clean-only driver, or a configured checkout no-op
+can retain normal source analysis. A required unavailable driver, a configured
+smudge/process transformation, an invalid encoding attribute, or an unsupported
+`working-tree-encoding` (such as UTF-16LE) prevents source stages from using raw
+Git blobs as materialized source. PrView refuses before static analysis, checks,
+presync or context, reports the affected path and `NOT_RUN`, and produces no
+verdict. This refusal applies without execution consent as well. UTF-8/UTF8 and
+unset/unspecified encoding controls remain supported. PrView neither downloads
+LFS data nor runs custom drivers to repair that input.
+For pinned submodules, built-in conversions that would change the retained raw
+bytes (for example CRLF or ident expansion) also leave source materialization
+unconfirmed. Byte-identical cases remain supported. Deep/CI baseline comparisons
+are unavailable when baseline conversion cannot be confirmed, even if a Git
+archive could be extracted. A confirmed baseline proof checkout is released
+before archive extraction, so both full temporary copies do not remain resident
+through baseline analysis.
+
+This is **not a sandbox**: with consent, project code can access the host as the
+running user. Process supervision, temporary snapshots and caller drift checks
+do not provide host-write confinement. Review only code you are willing to run,
+or run authorized checks in an isolation environment you manage.
+
+Examples elsewhere in this guide describe the selected check budget. Add
+`--allow-project-execution` whenever you intend those project checks to execute.
+
 ## Basic usage
 
 ### Auto mode (default)
@@ -37,7 +105,7 @@ Automatically:
 - uses the current branch as the target
 - diffs against the repo's default base
 - in standard mode, generates the full artifact pack
-- runs tests and lint by default, unless you pick a lighter mode (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*`
+- with execution consent, runs tests and lint by default, unless you pick a lighter mode (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*`
 
 The profile is detected from the tree being reviewed. An explicit target
 (`--pr`, `--target-sha`, `--remote`, or even `HEAD`) derives markers from regular
@@ -441,7 +509,7 @@ contains, `--full-tests` is the answer.
 records `full test run requested (--full-tests)` as the reason. Nothing else
 changes: the same commands, the same caps.
 
-**`--ci` runs everything; `--deep` narrows.** Narrowing exists to keep a
+**With execution consent, `--ci` runs everything; `--deep` narrows.** Narrowing exists to keep a
 reviewer's laptop usable, and a runner is not a laptop — so the automation
 preset pins both suites to the full run and the pack records
 `full test run requested (--ci)`, naming the preset rather than an operator.
@@ -581,7 +649,7 @@ prview --quick
 prview --pr 23 --quick
 
 # 3) Deeper PR analysis (tests + lint + full gate)
-prview --pr 23 --deep
+prview --pr 23 --deep --allow-project-execution
 
 # 4) Compact JSON for automation (stdout = JSON only)
 prview --pr 23 --quick --json --quiet
@@ -595,6 +663,14 @@ prview --update
 # 7) Fast machine-readable repo state (branch, HEAD, dirty, latest run)
 prview state --json --fast
 ```
+
+State statistics and hot files follow native `git diff HEAD`: staged edits
+restored to HEAD in the worktree disappear, while staged deletions preserve Git's
+index semantics even if an untracked replacement exists at the same path.
+When Git would need an unsupported clean/process conversion or encoding to
+establish those counts, the state probe reports unavailable instead of running
+the driver or publishing guessed dirty/churn values. MCP reports this case as
+`state_unavailable`; it does not mean the path stopped being a Git repository.
 
 ## zsh aliases (`prv`, `prvpr`, `prvjson`)
 
@@ -623,7 +699,8 @@ prview --help
 | Flag | Effect |
 |------|--------|
 | `--quick` | Skip tests/lint/bundle/heuristics |
-| `--deep` | Enable all checks (including security and heuristics) |
+| `--allow-project-execution` | Explicit per-invocation acknowledgement for project commands; false by default, not a sandbox |
+| `--deep` | Enable all checks (including security and heuristics); project tools still require execution consent |
 | `--ci` | CI mode: all checks, no colors; Block/quality failure exit |
 | `--ai-only` | Minimal checks, AI context pack only |
 
@@ -848,6 +925,10 @@ On Unix, a `latest` symlink points at the most recent **completed** run in
 An unexpected invalid `00_summary/SANITY.json` is a fatal generation result:
 the diagnostic directory and SANITY evidence remain on disk, but no ZIP,
 `latest` update, index row, or successful completion message is produced.
+SANITY and CONSISTENCY_CHECK cover selected pack invariants, counters,
+provenance and checklist consistency; manifest verification samples at most
+five files. A valid/consistent pack is not independent proof that its
+classifier, matching, security analysis, or the reviewed code is correct.
 A cancellation observed before the durable publication commit writes
 `00_summary/INCOMPLETE.json` and does not update `latest` or the run index. The
 marker names its cause: `reason: "cancelled"` for the operator's Ctrl-C, and
@@ -926,7 +1007,7 @@ $HOME/.prview/runs/my-repo/feature-x/20260225-185357/
 │   ├── file-status.txt      # A/M/D + file paths
 │   └── commit-list.txt      # hash date author message
 ├── 10_diff/
-│   ├── full.patch            # Full diff with diff-stat header (+N -N per file)
+│   ├── full.patch            # Full diff with diff-stat header (+N -N, same Myers diff as the hunks)
 │   ├── per-commit-diffs/     # Individual per-commit patches
 │   │   ├── 00-SUMMARY.md     # Commit stats + batch mapping + thematic labels
 │   │   ├── 01-abc1234-message.patch
@@ -965,7 +1046,36 @@ default dashboard. `MERGE_GATE.json` follows the selection: its
 `files.dashboard` names `review.html` for such a run, so the canonical decision
 never points at an HTML file the pack does not contain.
 
+### Identify the generator of a copied pack
+
+Read `report.json.meta.tool` or `00_summary/RUN.json.runner`. Both include the
+embedded `git_sha`, `binary_build_id` (SHA256 of the generator executable),
+`binary_build_id_status`, `binary_build_id_reason`, and optional `release_tag`.
+`00_summary/system_meta.txt` repeats these as `generator_*` fields for human
+inspection. They survive ordinary ZIP export and are independent of the
+reviewed repository's base and target SHAs.
+
+An unstamped source build reports `git_sha: "unknown"`; an untagged build has
+`release_tag: null`. If the executable cannot be read, the build ID is null and
+its status/reason explicitly say why. A package version alone does not prove a
+published release. The tag is build-provided metadata; the release workflow
+verifies its source binding. The executable digest is an identity check, not a
+signature or attestation. Report, RUN, PROVENANCE and layout schema versions
+are separate from the generator's package version.
+
 ### Read a pack in the browser
+
+The decision views state **Automatic merge: YES/NO** from the canonical
+`allow_merge` value, alongside introduced, pre-existing, mixed and unclassified
+failed-check counts. **Change quality: PASS** means the change's quality gate
+found no new/indeterminate failures; it does not mean every check passed or that
+analysis was complete. Read the separate overall check status and availability.
+A human review recommendation or policy allowance does not authorize automatic
+merge when the canonical value is false. Unknown classification displays
+UNKNOWN, not a clean zero. The copied PR comment carries the same distinctions
+and separate recorded Semgrep/Cargo audit results, including multiple statuses.
+Machine consumers can read additive root `decision_readout` in the report or
+merge gate; the canonical permission remains `decision.allow_merge` in the gate.
 
 Open `dashboard.html` from the extracted pack. Its reading path starts with
 what changed and what was checked, then leads to the failure summary,
@@ -1063,6 +1173,31 @@ decoded Git header identity; incoherent, truncated, or markerless hunk sections
 are discarded fail-closed, while coherent mode-only add/delete metadata remains
 valid. Confirmed removed, changed, relocated, and
 visibility-changed Rust facts are breaking; added-only facts are informational.
+
+The aggregate `quality.breaking_changes` in `report.json` states `status`
+(`MEASURED`, `UNKNOWN` or `NOT_RUN`), `analysis_complete`, and the separate `rust_status`.
+These describe the bounded structural observations, not semantic compatibility.
+`has_breaking: false` means no known compatibility-impact observation was found;
+when `analysis_complete` is false it does not establish absence of changes.
+Unknown observations remain visible alongside known counts in the dashboard,
+`PR_REVIEW.md`, `REVIEW_SUMMARY.md`, and the copied PR comment. Rust additions
+remain in the typed API view without becoming breaking observations. Outside
+Rust scope, `rust_status: NOT_APPLICABLE` does not invalidate the JS/TS structural
+scan. The details anchor is available even for a measured zero.
+
+If no review comparison was resolved, structural analysis is `NOT_RUN`, with
+`analysis_complete: false`; an empty list of observations is not a measurement.
+This differs from a valid base/target comparison whose diff contains no files.
+Known observations are retained even when their comparison is unavailable.
+
+`regression.deps` separately records `current_status`/`current_reason` and
+`comparison_status`/`comparison_reason`. Read the legacy numeric counts only
+with the relevant `MEASURED` state. Disabled analysis, unavailable Loctree and a
+zero-file scan cannot establish a measured zero. A measured target without a
+baseline retains its current counts, while comparison is `NOT_RUN`. Baseline
+counts alone are insufficient: comparison also requires a positive measured
+baseline scan. Older metadata without that proof remains `UNKNOWN`. The
+existing delta and score calculations are unchanged.
 
 A JS/TS export removed and added again in the same file under the same name
 (and, for `interface`/`type`, in the same type namespace) is paired rather than
@@ -1373,11 +1508,26 @@ quality, policy, and permission axes beside that explanation.
   the statuses (a rendering regression, or an artifact edited or damaged after the run), not a check filed
   under the wrong category: that mapping is shared by both sides and pinned by tests.
 - `00_summary/FAILURES_SUMMARY.md` summarizes blocking failures and advisories without copying whole JSON files.
-- When `30_context/INLINE_FINDINGS.sarif` exists, it emits findings per location/advisory and is suitable for annotation integrations.
+- When `30_context/INLINE_FINDINGS.sarif` exists, it emits source diagnostics,
+  dependency advisories and general check evidence. `properties.finding_class`
+  identifies that kind independently of the existing diff-origin
+  `classification`; use real source locations for source annotations, lockfile
+  locations for Cargo audit advisories, and the combined check log for general
+  evidence. Structured test failures without a real file/positive line also
+  remain general log evidence, with unknown origin and no fabricated source
+  line. `AI_INDEX.md` reports counts from the emitted rows.
 - In Rust runs, `PR_REVIEW.md` and `FAILURES_SUMMARY.md` can surface dependency paths to vulnerable crates based on `30_context/cargo-tree.txt`.
 - `10_diff/per-commit-diffs/00-SUMMARY.md` carries both the batching and thematic batch labels.
 - `20_quality/coverage-delta.txt` is a heuristic; for Rust it drops DELETED files in favor of disk searches for orphaned tests (raising an `ORPHANED_TEST_DETECTED` flag). Inline `#[cfg(test)]` modules are handled silently, without false alarms.
 - In fast `remote-only` runs, heavier diagnostics such as `30_context/tsc-trace.log` or `30_context/tauri-info.log` may be intentionally skipped. Check `RUN.json` for `recommended`/`reason` notes on whether they are worth generating.
+
+Commit categorization in `PR_REVIEW.md` accepts one optional agent prefix of
+1–64 ASCII letters, digits, `/`, `.`, `_` or `-`, followed by a space, for
+example `[codex/triage] docs: explain usage`. The Conventional Commit header
+must include a recognized type, optional nonempty scope and optional `!`, a
+colon and a nonempty description. Original titles are preserved in the commit
+table. Malformed or repeated prefixes remain `other`; existing type aliases
+such as `bugfix` and `doc` remain recognized.
 
 #### Commit batching
 
@@ -1387,7 +1537,7 @@ For large PRs, per-commit diffs are grouped automatically:
 |--------------|----------|
 | <=10 | Individual `.patch` per commit |
 | 11–50 | Batches of 5 commits in `batch-NN.patch` |
-| >50 | Per-commit diffs skipped (only `full.patch`) |
+| >50 | Summary-only `00-SUMMARY.md` with top-10 churn; no per-commit patch files; full range in `10_diff/full.patch` |
 
 #### MERGE_GATE
 
@@ -1445,7 +1595,20 @@ Loctree warnings describe the whole analyzed repository. Zero net count deltas
 do not establish identical finding sets and do not automatically produce PASS.
 Coverage trends use a previous run, which can have a different pair of revisions;
 `regression.tests.coverage_comparison` identifies that source explicitly and
-never labels it as a measurement of the current PR base. Slow-check messages
+never labels it as a measurement of the current PR base. A trend is only derived
+when both runs name the same repository (a GitHub `origin`), both measured a
+ratio over changed source files and the previous run carries the same
+`metric_fingerprint`; otherwise `comparison_status` says `not_comparable` or
+`unavailable`, the `PR_REVIEW.md` notice says the previous run was not
+compared, and no coverage regression is reported. Low matching in the current
+change is a separate signal, `low_test_match_detected`, not a regression.
+Swift source classification and XCTest matching accept Swift extensions
+case-insensitively, so `FooTests.SWIFT` can pair with `Foo.SwIfT`. Other language
+classification remains unchanged. Unrelated test names do not cover a source file
+merely by sharing the test directory. This definition uses fingerprint
+`source_test_change_match/xctest-v5`; previous v2/v3/v4 metrics retain provenance
+and are not compared to v5.
+Slow-check messages
 name active checks without assuming that their delay is Cargo compilation.
 
 Remote reviews (`--pr`, `--remote`, `--remote-only`) use a private Git repository

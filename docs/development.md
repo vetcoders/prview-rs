@@ -36,6 +36,14 @@ cargo build --release
 ./target/release/prview --quick
 ```
 
+Generator identity hashes the actual executable with SHA-256 once per process.
+Debug executables can be large, so the development profile optimizes the direct
+`sha2@0.10.9` dependency at level 3; the test profile inherits that override.
+Other development code keeps its normal debug settings. This avoids spending
+review deadlines in unoptimized digest code while preserving the exact binary
+digest. Release profile settings and review deadlines are unchanged. Keep the
+package-specific override aligned when updating the direct SHA-256 dependency.
+
 ### Rebuild on change
 
 ```bash
@@ -49,6 +57,18 @@ cargo watch -x build
 cargo test --lib
 cargo test --test json_contract
 ```
+
+The clipboard projection contract exercises the actual dashboard JavaScript
+handler with controlled report data, including EN/PL, canonical permission,
+unknown classification and independent security-check statuses:
+
+```bash
+node tools/tests/test_clipboard_contract.js
+```
+
+It uses Node built-ins; CI runs it with the existing Node 20 setup. Clipboard
+writes are captured by the harness, while browser interaction is a separate
+artifact acceptance check.
 
 For resource-constrained validation, run stages sequentially with explicit caps:
 

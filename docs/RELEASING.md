@@ -128,6 +128,28 @@ For a validated tag on `main`, `.github/workflows/release.yml`:
 
 Release concurrency never cancels an in-flight release.
 
+### Generator metadata in exported packs
+
+`build.rs` embeds `PRVIEW_SOURCE_SHA` and, when supplied with that exact source
+stamp, nonempty `PRVIEW_GENERATOR_RELEASE_TAG`. The tag must match
+`v<CARGO_PKG_VERSION>`. These are
+build inputs: the release workflow's tag-to-commit validation above is the
+authority for their binding, not the build script's syntax checks. Ordinary
+untagged builds keep a null release tag; builds without a source stamp report
+`unknown` and do not substitute the reviewed checkout's SHA. The workflow's
+general `PRVIEW_RELEASE_TAG` is not a build stamp: branch dry runs and
+`cargo package` can inherit that variable without claiming a release identity.
+Only the validated publication build passes `PRVIEW_GENERATOR_RELEASE_TAG`;
+dry-run builds pass an empty value.
+
+Every generated pack records the embedded identity and a SHA256 build ID of
+the executable in `report.json.meta.tool`, `RUN.json.runner`, and human system
+metadata. That runtime digest includes the bytes of the executable used after
+stripping/signing, so it may differ between target platforms or differently
+signed builds from the same source commit. It is separate from release archive
+checksums and GitHub attestations. Copying the pack or changing its reviewed
+repository does not change the identity already recorded in its ZIP.
+
 ## Required secrets and permissions
 
 Only the trusted Release continuation and its manual dry run receive signing

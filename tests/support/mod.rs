@@ -34,6 +34,15 @@ impl ContractEnvironment {
     }
 
     pub fn command(&self) -> Command {
+        let mut command = self.bare_command();
+        // Legacy contract fixtures exercise actual tool execution. Default
+        // denial is covered independently by project_execution.rs. This is a
+        // review invocation; subcommands must select their name before flags.
+        command.arg("--allow-project-execution");
+        command
+    }
+
+    pub fn bare_command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_prview"));
         self.configure(&mut command);
         command

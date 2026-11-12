@@ -104,6 +104,7 @@ fn mock_checks() -> Vec<CheckResult> {
 
 pub(super) fn mock_ctx() -> DashboardContext {
     DashboardContext {
+        has_api_comparison: true,
         verdict: "PASS",
         analysis_status: crate::policy::engine::AnalysisStatus::Complete,
         merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -589,11 +590,17 @@ fn test_merge_decision_card_all_pass() {
 
     assert!(html.contains("Merge Decision"), "Should have title");
     assert!(html.contains("Policy: ALLOW"), "Policy should be ALLOW");
-    assert!(html.contains("Quality: PASS"), "Quality should be PASS");
-    assert!(html.contains("Merge: GO"), "Merge should be GO");
+    assert!(
+        html.contains("Change quality: PASS"),
+        "Quality should be PASS"
+    );
+    assert!(
+        html.contains("Review recommendation: GO"),
+        "Merge should be GO"
+    );
     assert!(html.contains("alert-success"), "Should be success class");
     assert!(
-        html.contains("All quality gates passed"),
+        html.contains("Change quality gate passed"),
         "Should show success reason"
     );
 }
@@ -629,11 +636,11 @@ fn test_merge_decision_card_review_caveats() {
     }];
     let html = build_merge_decision_card(&ctx);
 
-    assert!(html.contains("Merge: GO WITH REVIEW"));
+    assert!(html.contains("Review recommendation: GO WITH REVIEW"));
     assert!(html.contains("alert-warning"));
-    assert!(html.contains("Quality gates passed, but 3 review signals need attention"));
+    assert!(html.contains("Change quality gate passed, but 3 review signals need attention"));
     assert!(html.contains(
-        r#"data-decision-reason="Quality gates passed, but 3 review signals need attention""#
+        r#"data-decision-reason="Change quality gate passed, but 3 review signals need attention""#
     ));
     assert!(html.contains(r#"data-i18n="message.reviewSignalsPrefix""#));
     assert!(html.contains(
@@ -667,9 +674,12 @@ fn test_merge_decision_card_quality_fail() {
     ctx.quality_failures = vec!["cargo_clippy".into(), "cargo_test".into()];
     let html = build_merge_decision_card(&ctx);
 
-    assert!(html.contains("Quality: FAIL"), "Quality should be FAIL");
     assert!(
-        html.contains("Merge: HOLD"),
+        html.contains("Change quality: FAIL"),
+        "Quality should be FAIL"
+    );
+    assert!(
+        html.contains("Review recommendation: HOLD"),
         "Merge should be HOLD when policy allows but quality fails"
     );
     assert!(html.contains("alert-warning"), "Should be warning class");
@@ -689,7 +699,10 @@ fn test_merge_decision_card_policy_block() {
     let html = build_merge_decision_card(&ctx);
 
     assert!(html.contains("Policy: BLOCK"), "Policy should be BLOCK");
-    assert!(html.contains("Merge: BLOCK"), "Merge should be BLOCK");
+    assert!(
+        html.contains("Review recommendation: BLOCK"),
+        "Merge should be BLOCK"
+    );
     assert!(html.contains("alert-error"), "Should be error class");
     assert!(
         html.contains("1 blocking issue found"),
@@ -1052,7 +1065,7 @@ fn test_delta_section_shows_improvement() {
         checks_passed_before: 1,
         checks_failed_before: 2,
         findings_before: 3,
-        breaking_before: 0,
+        breaking_before: Some(0),
         quality_pass_before: false,
     });
     let checks = mock_checks(); // 1 passed, 0 failed
@@ -1076,7 +1089,7 @@ fn test_delta_section_shows_regression() {
         checks_passed_before: 5,
         checks_failed_before: 0,
         findings_before: 0,
-        breaking_before: 0,
+        breaking_before: Some(0),
         quality_pass_before: true,
     });
     let checks = vec![CheckResult {
@@ -1105,6 +1118,136 @@ fn test_delta_nav_conditional() {
         !html.contains(r##"href="#section-delta""##),
         "Nav should NOT have Delta link when no previous run"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn review80_api_delta_rejects_unavailable_previous_and_current_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let previous = temp.path().join("previous");
+    let current = temp.path().join("current");
+    fs::create_dir(&previous).unwrap();
+    fs::create_dir(&current).unwrap();
+    std::os::unix::fs::symlink("previous", temp.path().join("latest")).unwrap();
+    let measured = json!({
+        "status": "MEASURED", "analysis_complete": true,
+        "removed_public_symbols_count": 0, "signature_changes_count": 0,
+        "new_env_vars_count": 0, "relocated_count": 0, "visibility_changed_count": 0,
+    });
+    for (baseline, current_available) in [
+        (json!({"status":"NOT_RUN", "analysis_complete":false}), true),
+        (json!({"status":"UNKNOWN", "analysis_complete":false}), true),
+        (json!(null), true),
+        (measured.clone(), false),
+    ] {
+        fs::write(
+            previous.join("report.json"),
+            json!({
+                "gate":{"quality_pass":true}, "checks":[],
+                "quality":{"breaking_changes":baseline}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut ctx = mock_ctx();
+        ctx.has_api_comparison = current_available;
+        ctx.breaking.push(BreakingFinding {
+            file: "api.ts".into(),
+            kind: super::super::signal::BreakingKind::RemovedSymbol {
+                symbol_type: "function".into(),
+            },
+            line: "export function removed()".into(),
+            risk_level: super::super::signal::BreakingRisk::High,
+        });
+        ctx.previous_run = super::super::load_previous_run_delta(&current);
+        let html = build_delta_section(&ctx, &[]);
+        assert!(html.contains("not comparable"), "{html}");
+        assert!(!html.contains("0&#x2192;1"), "{html}");
+        assert!(html.contains("Passed"), "unrelated deltas remain: {html}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn review80_api_delta_compares_measured_zero_and_known_counts() {
+    let temp = tempfile::tempdir().unwrap();
+    let previous = temp.path().join("previous");
+    let current = temp.path().join("current");
+    fs::create_dir(&previous).unwrap();
+    fs::create_dir(&current).unwrap();
+    std::os::unix::fs::symlink("previous", temp.path().join("latest")).unwrap();
+    for (signatures, expected) in [(0, "0&#x2192;1 (+1)"), (2, "2&#x2192;1 (-1)")] {
+        fs::write(
+            previous.join("report.json"),
+            json!({
+                "gate":{"quality_pass":true}, "checks":[],
+                "quality":{"breaking_changes":{
+                    "status":"MEASURED", "analysis_complete":true,
+                    "removed_public_symbols_count":0, "signature_changes_count":signatures,
+                    "new_env_vars_count":0, "relocated_count":0, "visibility_changed_count":0,
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut ctx = mock_ctx();
+        ctx.breaking.push(BreakingFinding {
+            file: "api.ts".into(),
+            kind: super::super::signal::BreakingKind::RemovedSymbol {
+                symbol_type: "function".into(),
+            },
+            line: "export function removed()".into(),
+            risk_level: super::super::signal::BreakingRisk::High,
+        });
+        ctx.previous_run = super::super::load_previous_run_delta(&current);
+        let html = build_delta_section(&ctx, &[]);
+        assert!(html.contains(expected), "{html}");
+        assert!(!html.contains("not comparable"), "{html}");
+    }
+}
+
+#[test]
+fn review80_round2_api_observation_delta_is_neutral_for_legacy_relocations() {
+    use super::super::PreviousRunDelta;
+    for (before, relocated, expected) in
+        [(0, true, "0&#x2192;1 (+1)"), (1, false, "1&#x2192;0 (-1)")]
+    {
+        let mut ctx = mock_ctx();
+        ctx.previous_run = Some(PreviousRunDelta {
+            checks_passed_before: 0,
+            checks_failed_before: 0,
+            findings_before: 0,
+            breaking_before: Some(before),
+            quality_pass_before: true,
+        });
+        if relocated {
+            ctx.breaking.push(BreakingFinding {
+                file: "moved.ts".into(),
+                kind: super::super::signal::BreakingKind::RelocatedSymbol {
+                    symbol_type: "function".into(),
+                },
+                line: "export function moved()".into(),
+                risk_level: super::super::signal::BreakingRisk::High,
+            });
+        }
+        let evidence = breaking_evidence(&ctx.breaking, None, ctx.has_api_comparison);
+        assert_eq!(evidence.known_count, usize::from(relocated));
+        let html = build_delta_section(&ctx, &[]);
+        assert!(
+            html.contains("data-i18n=\"label.apiObservations\""),
+            "{html}"
+        );
+        assert!(html.contains("API observations"), "{html}");
+        assert!(html.contains(expected), "{html}");
+        assert!(
+            !html.contains("delta-worse"),
+            "observations alone do not establish regression: {html}"
+        );
+        assert!(
+            !html.contains("delta-better"),
+            "observation count alone does not establish improvement: {html}"
+        );
+    }
 }
 
 // ---- PRV-105: View Mode Toggle ----
@@ -1738,5 +1881,382 @@ fn security_cards_never_report_a_metric_for_a_check_that_did_not_run() {
                 status
             );
         }
+    }
+}
+
+#[test]
+fn api_unknown_is_visible_in_hero_details_navigation_and_action_center() {
+    for (removed, unknown) in [(0, 1), (1, 1), (0, 0)] {
+        let mut ctx = mock_ctx();
+        ctx.rust_api_delta = Some(super::super::api_delta::ApiArtifactView {
+            view: super::super::api_delta::ApiArtifactViewKind::BreakingChanges,
+            analysis_source: "fixture",
+            base_revision: "base".into(),
+            target_revision: "target".into(),
+            counts: super::super::api_delta::ApiDeltaCounts {
+                added: 0,
+                removed,
+                changed: 0,
+                relocated: 0,
+                visibility_changed: 0,
+                unknown,
+            },
+            findings: vec![],
+        });
+        let config = mock_config();
+        let dir = tempfile::tempdir().unwrap();
+        let html = build_html_test!(&config, &[], &[], None, &ctx, "{}", dir.path(), "", None);
+        let status = if unknown == 0 { "MEASURED" } else { "UNKNOWN" };
+        let header = build_header(&config, None, &ctx, dir.path(), "{}");
+        assert!(header.contains(status));
+        assert!(html.contains(&format!("{removed} known; {unknown} unresolved")));
+        assert_eq!(html.matches(" id=\"section-breaking\"").count(), 1);
+        let actions = build_action_center(&ctx, &[], None);
+        if unknown > 0 {
+            assert!(actions.contains("UNKNOWN"));
+            assert!(!actions.contains("chip.publicApiStructuralChangesClear"));
+        } else {
+            assert!(actions.contains("chip.publicApiStructuralChangesClear"));
+        }
+        let navigation = html
+            .split("<nav")
+            .nth(1)
+            .unwrap()
+            .split("</nav>")
+            .next()
+            .unwrap();
+        assert!(navigation.contains("#section-breaking"));
+        assert!(navigation.contains(status));
+    }
+}
+
+#[test]
+fn js_ts_structural_zero_does_not_require_rust_evidence() {
+    let ctx = mock_ctx();
+    let evidence = breaking_evidence(&ctx.breaking, None, ctx.has_api_comparison);
+    assert_eq!(evidence.status, "MEASURED");
+    assert_eq!(evidence.rust_status, "NOT_APPLICABLE");
+    assert!(build_action_center(&ctx, &[], None).contains("chip.publicApiStructuralChangesClear"));
+    assert!(!build_breaking_section(&ctx).is_empty());
+}
+
+#[test]
+fn added_only_rust_api_keeps_additions_without_claiming_zero_all_changes() {
+    let mut ctx = mock_ctx();
+    ctx.rust_api_delta = Some(super::super::api_delta::ApiArtifactView {
+        view: super::super::api_delta::ApiArtifactViewKind::BreakingChanges,
+        analysis_source: "fixture",
+        base_revision: "base".into(),
+        target_revision: "target".into(),
+        counts: super::super::api_delta::ApiDeltaCounts {
+            added: 1,
+            removed: 0,
+            changed: 0,
+            relocated: 0,
+            visibility_changed: 0,
+            unknown: 0,
+        },
+        findings: vec![],
+    });
+    let evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
+    assert_eq!(evidence.known_count, 0);
+    assert_eq!(ctx.rust_api_delta.as_ref().unwrap().counts.added, 1);
+    let html = build_action_center(&ctx, &[], None);
+    assert!(html.contains("Structural compatibility-impact observations: 0"));
+    assert!(!html.contains("Public API structural changes: 0"));
+}
+
+#[test]
+fn api_missing_comparison_is_not_run_in_hero_details_navigation_and_actions() {
+    let mut ctx = mock_ctx();
+    ctx.has_api_comparison = false;
+    let config = mock_config();
+    let dir = tempfile::tempdir().unwrap();
+    let html = build_html_test!(&config, &[], &[], None, &ctx, "{}", dir.path(), "", None);
+    let header = build_header(&config, None, &ctx, dir.path(), "{}");
+    assert!(header.contains("analysis: NOT_RUN; Rust: NOT_RUN"));
+    assert!(build_breaking_section(&ctx).contains("NOT_RUN"));
+    assert_eq!(html.matches(" id=\"section-breaking\"").count(), 1);
+    let actions = build_action_center(&ctx, &[], None);
+    assert!(actions.contains("NOT_RUN"));
+    assert!(!actions.contains("chip.publicApiStructuralChangesClear"));
+    let navigation = html
+        .split("<nav")
+        .nth(1)
+        .unwrap()
+        .split("</nav>")
+        .next()
+        .unwrap();
+    assert!(navigation.contains("#section-breaking"));
+    assert!(navigation.contains("NOT_RUN"));
+}
+
+#[test]
+fn automatic_merge_and_real_failures_reach_all_rendered_surfaces() {
+    use crate::artifacts::{
+        CleanComparison, DashboardContextInput, InlineFindingsSummary, MergeGateInput,
+        ProvenanceConsistency, ReviewRange, build_dashboard_context, generate_merge_gate,
+        generate_pr_review,
+    };
+    use crate::policy::PolicySeverity;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = mock_config();
+    config
+        .policy
+        .checks
+        .insert("semgrep_scan".into(), PolicySeverity::Warn);
+    let checks = vec![CheckResult {
+        name: "Semgrep scan".into(), status: CheckStatus::Failed,
+        duration: Duration::from_millis(1),
+        output: r#"{"results":[],"errors":[{"type":["PartialParsing",[]],"level":"warn","path":"src/old.rs"}]}"#.into(),
+        cached: false, provenance: None,
+    }, CheckResult {
+        name: "Cargo audit".into(), status: CheckStatus::Passed,
+        duration: Duration::from_millis(1), output: "{}".into(),
+        cached: false, provenance: None,
+    }];
+    let inline = InlineFindingsSummary {
+        cargo_audit: None,
+        status: "failed".into(),
+        findings_count: 1,
+        dashboard_findings: vec![crate::artifacts::DashboardFinding {
+            level: "error",
+            check_name: "Semgrep scan".into(),
+            check_id: "semgrep_scan".into(),
+            message: "pre-existing source finding".into(),
+            in_diff: Some(false),
+            file: Some("src/old.rs".into()),
+            line: Some(3),
+        }],
+    };
+    let target = crate::git::ResolvedRef {
+        name: "topic".into(),
+        commit_id: "b".repeat(40),
+        is_remote: false,
+    };
+    let bases = vec![crate::git::ResolvedRef {
+        name: "main".into(),
+        commit_id: "a".repeat(40),
+        is_remote: false,
+    }];
+    let provenance = ProvenanceConsistency::default();
+    let range = ReviewRange::default();
+    let coverage = || super::super::CoverageDelta {
+        pct: None,
+        total_source: 0,
+        covered_count: 0,
+        uncovered: vec![],
+        covered: vec![],
+        non_code_count: 0,
+        ghost_tests: vec![],
+    };
+    let clean = CleanComparison::for_test(true, true);
+    let summary_dir = dir.path().join("00_summary");
+    fs::create_dir_all(&summary_dir).unwrap();
+    generate_merge_gate(MergeGateInput {
+        dir: &summary_dir,
+        config: &config,
+        ledger: &crate::ledger::TaskLedger::new(),
+        scope: None,
+        checks: &checks,
+        heuristics: None,
+        inline: &inline,
+        breaking: &[],
+        rust_api_delta: None,
+        coverage: &coverage(),
+        diffs: &[],
+        skipped_checks: &[],
+        resolved_target: &target,
+        resolved_bases: &bases,
+        clean_comparison: clean.clone(),
+        snapshot_integrity: None,
+    })
+    .unwrap();
+    let ctx = build_dashboard_context(DashboardContextInput {
+        review_range: &range,
+        config: &config,
+        checks: &checks,
+        heuristics: None,
+        inline: &inline,
+        breaking: vec![],
+        rust_api_delta: None,
+        coverage: coverage(),
+        diff_dir: dir.path(),
+        skipped_checks: vec![],
+        out_dir: dir.path(),
+        diffs: &[],
+        ownership_map: vec![],
+        clean_comparison: clean,
+        snapshot_integrity: None,
+        provenance: &provenance,
+        scope: None,
+    });
+    // Preconditions are products of the actual CheckResults and policy path.
+    assert!(!ctx.allow_merge);
+    assert!(ctx.quality_pass);
+    assert_eq!(ctx.verdict, "CONDITIONAL");
+    super::super::report::generate(&super::super::report::ReportInput {
+        dir: dir.path(),
+        config: &config,
+        diffs: &[],
+        checks: &checks,
+        resolved_target: &target,
+        resolved_bases: &bases,
+        ctx: &ctx,
+        run_started_at: "2026-11-08T00:00:00Z",
+        heuristics: None,
+        regression: None,
+        coverage_history: None,
+        provenance: &provenance,
+        scope: None,
+    })
+    .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("report.json")).unwrap()).unwrap();
+    let gate: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(summary_dir.join("MERGE_GATE.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["decision_readout"], gate["decision_readout"]);
+    assert_eq!(report["decision_readout"]["automatic_merge"], false);
+    assert_eq!(report["decision_readout"]["introduced_failures"], 0);
+    assert_eq!(report["decision_readout"]["preexisting_failures"], 1);
+    assert!(
+        gate["decision"].get("decision_readout").is_none(),
+        "decision contract stays closed"
+    );
+    let statuses = report["checks"].as_array().unwrap();
+    assert!(
+        statuses
+            .iter()
+            .any(|check| check["id"] == "semgrep_scan" && check["status"] == "FAIL")
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|check| check["id"] == "cargo_audit" && check["status"] == "PASS")
+    );
+    generate_pr_review(dir.path(), &config, &[], &checks, &[], &coverage(), None).unwrap();
+    super::super::review_html::generate_review_summary(dir.path(), &[]).unwrap();
+    let hero = build_header(&config, None, &ctx, dir.path(), "");
+    let card = build_merge_decision_card(&ctx);
+    let html_tags = regex::Regex::new("<[^>]+>").unwrap();
+    for html in [hero, card] {
+        // i18n markup may sit between the label and value; text remains readable.
+        let text = html_tags.replace_all(&html, "");
+        assert!(
+            text.contains(
+                "Automatic merge: NO · Introduced failures: 0 · Pre-existing failures: 1"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Change quality: PASS"));
+        assert!(html.contains("data-automatic-merge=\"false\""));
+    }
+    for path in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+        let md = fs::read_to_string(dir.path().join(path)).unwrap();
+        assert!(
+            md.contains("Automatic merge: NO · Introduced failures: 0 · Pre-existing failures: 1"),
+            "{path}: {md}"
+        );
+        assert!(md.contains("all-check status is separate"));
+        assert!(md.contains("Cargo audit checks dependency advisories"));
+    }
+}
+
+#[test]
+fn hero_and_card_preserve_unknown_and_canonical_permission() {
+    use crate::artifacts::{QualityFailureClass, QualityFailureDetail, QualityFailureOrigin};
+    let config = mock_config();
+    let html_tags = regex::Regex::new("<[^>]+>").unwrap();
+    let mut ctx = mock_ctx();
+    // A review recommendation is deliberately independent of permission.
+    ctx.allow_merge = false;
+    ctx.recommended_merge = true;
+    ctx.quality_failures = vec!["legacy".into()];
+    for html in [
+        build_header(&config, None, &ctx, Path::new("."), ""),
+        build_merge_decision_card(&ctx),
+    ] {
+        let text = html_tags.replace_all(&html, "").into_owned();
+        assert!(text.contains("Automatic merge: NO · Introduced failures: UNKNOWN"));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("00_summary")).unwrap();
+    for allow_merge in [false, true] {
+        ctx.allow_merge = allow_merge;
+        let expected = if allow_merge {
+            "Automatic merge: YES · Introduced failures: UNKNOWN"
+        } else {
+            "Automatic merge: NO · Introduced failures: UNKNOWN"
+        };
+        for names in [
+            None,
+            Some(serde_json::json!("invalid")),
+            Some(serde_json::json!([null])),
+        ] {
+            let mut gate = serde_json::json!({"decision": {"allow_merge": allow_merge}});
+            if let Some(names) = names {
+                gate["decision"]["quality_failures"] = names;
+            }
+            fs::write(
+                dir.path().join("00_summary/MERGE_GATE.json"),
+                gate.to_string(),
+            )
+            .unwrap();
+            super::super::generate_pr_review(
+                dir.path(),
+                &config,
+                &[],
+                &[],
+                &[],
+                &ctx.coverage,
+                None,
+            )
+            .unwrap();
+            super::super::review_html::generate_review_summary(dir.path(), &[]).unwrap();
+            for path in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+                let md = fs::read_to_string(dir.path().join(path)).unwrap();
+                assert!(md.contains(expected));
+            }
+            for html in [
+                build_header(&config, None, &ctx, dir.path(), ""),
+                build_merge_decision_card(&ctx),
+            ] {
+                let text = html_tags.replace_all(&html, "").into_owned();
+                assert!(text.contains(expected));
+            }
+        }
+    }
+    ctx.allow_merge = true;
+    ctx.quality_failure_details = vec![QualityFailureDetail {
+        name: "legacy".into(),
+        classification: QualityFailureClass::Introduced,
+        origin: QualityFailureOrigin::Warning,
+    }];
+    let html = build_merge_decision_card(&ctx);
+    let text = html_tags.replace_all(&html, "");
+    assert!(text.contains("Automatic merge: YES · Introduced failures: 0"));
+    assert!(!text.contains("Advisory warnings"));
+}
+
+#[test]
+fn review80_breaking_navigation_has_actual_dom_target() {
+    for compared in [false, true] {
+        let mut ctx = mock_ctx();
+        ctx.has_api_comparison = compared;
+        let config = mock_config();
+        let dir = tempfile::tempdir().unwrap();
+        let html = build_html_test!(&config, &[], &[], None, &ctx, "{}", dir.path(), "", None);
+        // A substring of data-section-id is not a DOM id attribute.
+        assert_eq!(html.matches(" id=\"section-breaking\"").count(), 1);
+        assert_eq!(
+            html.matches("data-section-id=\"section-breaking\"").count(),
+            1
+        );
+        assert!(html.contains("href=\"#section-breaking\""));
     }
 }

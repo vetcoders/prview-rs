@@ -257,19 +257,32 @@ pub(super) fn build_header(
         )
     };
 
+    let merge_label = format!(
+        r#"<span style="font-size:11px;font-weight:500">{}:</span> {}"#,
+        i18n_template("readout.reviewRecommendation", "Review recommendation", &[]),
+        merge_label,
+    );
+
     // Quality badge next to merge chip
     let quality_badge = if ctx.check_gates.is_empty() {
         String::new()
     } else if ctx.quality_pass {
         format!(
             r#"<span class="badge badge-success">{}</span>"#,
-            i18n_template("badge.qualityPass", "Quality: PASS", &[])
+            i18n_template("badge.qualityPass", "Change quality: PASS", &[])
         )
     } else {
         format!(
-            r#"<span class="badge badge-error" title="{} check(s) failed">{}</span>"#,
-            ctx.quality_failures.len(),
-            i18n_template("badge.qualityFail", "Quality: FAIL", &[])
+            r#"<span class="badge badge-error" title="{} introduced failed check(s); mixed and unclassified listed separately">{}</span>"#,
+            crate::artifacts::DecisionReadout::count_label(
+                crate::artifacts::build_decision_readout(
+                    ctx.allow_merge,
+                    &ctx.quality_failures,
+                    &ctx.quality_failure_details,
+                )
+                .introduced_failures,
+            ),
+            i18n_template("badge.qualityFail", "Change quality: FAIL", &[])
         )
     };
 
@@ -404,8 +417,10 @@ pub(super) fn build_header(
         <div class="merge-decision">
             <span class="merge-chip {mc}" data-merge-verdict="{mv}">{ml}</span>
             {qb}
+            {readout}
             {policy}
             {review_note}
+            <a href="{api_anchor}">{api_evidence}</a>
         </div>
     </div>
 </header>"#,
@@ -429,8 +444,11 @@ pub(super) fn build_header(
         mv = escape_html(ctx.verdict),
         ml = merge_label,
         qb = quality_badge,
+        readout = decision_readout_html(ctx),
         policy = policy_html,
         review_note = review_note_html,
+        api_evidence = breaking_evidence_html(ctx),
+        api_anchor = "#section-breaking",
     )
 }
 
@@ -468,7 +486,12 @@ pub(super) fn build_delta_section(ctx: &DashboardContext, checks: &[CheckResult]
         .filter(|c| matches!(c.status, CheckStatus::Failed | CheckStatus::Error))
         .count();
     let findings_now = ctx.findings.len();
-    let breaking_now = ctx.breaking.len();
+    let api_evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
+    let breaking_now = api_evidence.known_count;
 
     let mut badges = String::new();
 
@@ -538,25 +561,26 @@ pub(super) fn build_delta_section(ctx: &DashboardContext, checks: &[CheckResult]
         );
     }
 
-    // Breaking changes delta
-    if prev.breaking_before > 0 || breaking_now > 0 {
-        let before = prev.breaking_before;
-        let diff_val = breaking_now as isize - before as isize;
-        let (class, arrow) = if diff_val < 0 {
-            ("delta-better", "")
-        } else if diff_val > 0 {
-            ("delta-worse", "+")
-        } else {
-            ("delta-same", "")
-        };
-        let _ = write!(
-            badges,
-            r#"<span class="delta-badge {cls}"><span class="delta-label" data-i18n="section.breaking">Breaking</span> {before}&#x2192;{now} ({arrow}{diff})</span>"#,
-            cls = class,
-            before = before,
-            now = breaking_now,
-            arrow = arrow,
-            diff = diff_val,
+    // Structural observations have no inherent regression/improvement direction.
+    if let Some(before) = prev
+        .breaking_before
+        .filter(|_| api_evidence.analysis_complete)
+    {
+        if before > 0 || breaking_now > 0 {
+            let diff_val = breaking_now as isize - before as isize;
+            let arrow = if diff_val > 0 { "+" } else { "" };
+            let _ = write!(
+                badges,
+                r#"<span class="delta-badge delta-same"><span class="delta-label" data-i18n="label.apiObservations">API observations</span> {before}&#x2192;{now} ({arrow}{diff})</span>"#,
+                before = before,
+                now = breaking_now,
+                arrow = arrow,
+                diff = diff_val,
+            );
+        }
+    } else {
+        badges.push_str(
+            r#"<span class="delta-badge delta-same"><span class="delta-label" data-i18n="label.apiObservations">API observations</span> <span data-i18n="label.apiDeltaNotComparable">not comparable (API evidence unavailable or incomplete)</span></span>"#,
         );
     }
 
@@ -906,6 +930,27 @@ pub(super) fn heuristic_confidence(kind: &str, count: usize) -> &'static str {
     }
 }
 
+pub(super) fn breaking_evidence_html(ctx: &DashboardContext) -> String {
+    let evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
+    i18n_template(
+        "summary.apiEvidence",
+        &format!(
+            "Structural compatibility-impact observations: {} known; {} unresolved; analysis: {}; Rust: {} (structural scan; semantic compatibility not assessed)",
+            evidence.known_count, evidence.unknown_count, evidence.status, evidence.rust_status
+        ),
+        &[
+            ("known", evidence.known_count.to_string()),
+            ("unknown", evidence.unknown_count.to_string()),
+            ("status", evidence.status.to_string()),
+            ("rust", evidence.rust_status.to_string()),
+        ],
+    )
+}
+
 pub(super) fn build_action_center(
     ctx: &DashboardContext,
     checks: &[CheckResult],
@@ -1020,43 +1065,33 @@ pub(super) fn build_action_center(
         }
     }
 
-    if !ctx.breaking.is_empty() {
+    let evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
+    if !evidence.analysis_complete || evidence.known_count > 0 {
         let high_risk = ctx
             .breaking
             .iter()
-            .filter(|f| f.risk_level == BreakingRisk::High)
-            .count();
+            .any(|f| f.risk_level == BreakingRisk::High);
         push_card(
             &mut cards,
             "#section-breaking",
-            if high_risk > 0 {
+            if high_risk {
                 "alert-error"
             } else {
                 "alert-warning"
             },
             r#"<span data-i18n="section.breaking">Breaking</span>"#.to_string(),
+            breaking_evidence_html(ctx),
             i18n_template(
-                "count.changes",
-                &format!("{} changes", ctx.breaking.len(),),
-                &[("count", ctx.breaking.len().to_string())],
+                "message.structuralScanScope",
+                "structural scan; semantic compatibility not assessed",
+                &[],
             ),
-            if high_risk > 0 {
-                i18n_template(
-                    "message.publicApiImpactDetected",
-                    "Public API / env impact detected",
-                    &[],
-                )
-            } else {
-                i18n_template(
-                    "message.verifyCompatibilityBeforeMerge",
-                    "Verify compatibility before merge",
-                    &[],
-                )
-            },
         );
     } else {
-        // A structural scanner can only speak about structure: the chip says
-        // what was counted, and the note says what was not assessed.
         push_chip(
             &mut chips,
             "#section-breaking",
@@ -1065,8 +1100,8 @@ pub(super) fn build_action_center(
                 r#"<span class="chip-ok-check">&#x2713;</span> {} <span class="chip-note" data-i18n="message.structuralScanScope">structural scan; semantic compatibility not assessed</span>"#,
                 i18n_template(
                     "chip.publicApiStructuralChangesClear",
-                    "Public API structural changes: 0",
-                    &[],
+                    "Structural compatibility-impact observations: 0",
+                    &[]
                 )
             ),
         );
@@ -1973,9 +2008,11 @@ pub(super) fn build_ownership_section(ctx: &DashboardContext) -> String {
 }
 
 pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
-    if ctx.breaking.is_empty() {
-        return String::new();
-    }
+    let evidence = breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
 
     let removed: Vec<_> = ctx
         .breaking
@@ -1993,7 +2030,10 @@ pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
         .filter(|f| matches!(&f.kind, BreakingKind::NewEnvRequirement { .. }))
         .collect();
 
-    let mut content = String::new();
+    let mut content = format!("<p>{}</p>", breaking_evidence_html(ctx));
+    if ctx.rust_api_delta.is_some() {
+        content.push_str(r#"<p><a href="20_quality/BREAKING_CHANGES.md" data-i18n="message.rustApiDetails">Rust API evidence and unresolved observations</a></p>"#);
+    }
     content.push_str(r#"<p style="color:var(--muted);font-size:12px;margin-bottom:12px" data-i18n="message.heuristicScanNote">Heuristic scan — may contain false positives. Verify manually.</p>"#);
 
     if !removed.is_empty() {
@@ -2053,7 +2093,7 @@ pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
     }
 
     format!(
-        r#"<div class="section" id="section-breaking">
+        r#"<div id="section-breaking" class="section breaking-evidence-details">
     <div class="section-header">
         <span class="section-title" data-i18n="section.breaking">Breaking</span>
         <span class="section-count">{count_label}</span>
@@ -2062,8 +2102,8 @@ pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
 </div>"#,
         count_label = i18n_template(
             "count.detected",
-            &format!("{} detected", ctx.breaking.len()),
-            &[("count", ctx.breaking.len().to_string())],
+            &format!("{} detected", evidence.known_count),
+            &[("count", evidence.known_count.to_string())],
         ),
         content = content,
     )
@@ -3332,6 +3372,59 @@ pub(super) fn build_artifacts_section(
 // PRV-101: Merge Decision Card (first card in Action Center)
 // ---------------------------------------------------------------------------
 
+fn decision_readout_html(ctx: &DashboardContext) -> String {
+    use crate::artifacts::build_decision_readout;
+    let readout = build_decision_readout(
+        ctx.allow_merge,
+        &ctx.quality_failures,
+        &ctx.quality_failure_details,
+    );
+    let counts = [
+        (
+            "readout.introduced",
+            "Introduced failures",
+            readout.introduced_failures,
+        ),
+        (
+            "readout.preexisting",
+            "Pre-existing failures",
+            readout.preexisting_failures,
+        ),
+        ("readout.mixed", "Mixed failures", readout.mixed_failures),
+        (
+            "readout.unclassified",
+            "Unclassified failures",
+            readout.unclassified_failures,
+        ),
+    ];
+    let mut parts = vec![format!(
+        "{}: {}",
+        i18n_template("readout.automaticMerge", "Automatic merge", &[]),
+        if ctx.allow_merge {
+            i18n_template("readout.yes", "YES", &[])
+        } else {
+            i18n_template("readout.no", "NO", &[])
+        },
+    )];
+    parts.extend(counts.into_iter().map(|(key, label, count)| {
+        format!(
+            "{}: {}",
+            i18n_template(key, label, &[]),
+            count.map_or_else(
+                || i18n_template("readout.unknown", "UNKNOWN", &[]),
+                |value| value.to_string()
+            ),
+        )
+    }));
+    format!(
+        r#"<div class="decision-readout" data-automatic-merge="{}" data-details-complete="{}">{}</div><p class="decision-scope-note">{}</p>"#,
+        ctx.allow_merge,
+        readout.details_complete,
+        parts.join(" · "),
+        i18n_template("readout.scope", crate::artifacts::CHANGE_QUALITY_SCOPE, &[]),
+    )
+}
+
 pub(super) fn build_merge_decision_card(ctx: &DashboardContext) -> String {
     let decision = merge_decision_view(ctx);
     let has_review_caveats = !decision.review_caveats.is_empty();
@@ -3353,18 +3446,18 @@ pub(super) fn build_merge_decision_card(ctx: &DashboardContext) -> String {
     let (quality_class, quality_label) = if ctx.quality_pass {
         (
             "mdb-pass",
-            i18n_template("badge.qualityPass", "Quality: PASS", &[]),
+            i18n_template("badge.qualityPass", "Change quality: PASS", &[]),
         )
     } else {
         (
             "mdb-fail",
-            i18n_template("badge.qualityFail", "Quality: FAIL", &[]),
+            i18n_template("badge.qualityFail", "Change quality: FAIL", &[]),
         )
     };
 
     // Merge badge: GO / HOLD / BLOCK
     let merge_class = decision.state.card_badge_class();
-    let merge_fallback = format!("Merge: {}", decision.state.card_label());
+    let merge_fallback = format!("Review recommendation: {}", decision.state.card_label());
     let merge_label = match decision.state {
         crate::artifacts::MergeDecisionState::Allow => {
             i18n_template("badge.mergeGo", merge_fallback.as_str(), &[])
@@ -3415,6 +3508,7 @@ pub(super) fn build_merge_decision_card(ctx: &DashboardContext) -> String {
         <span class="merge-decision-badge {mc}">{ml}</span>
     </div>
     <div class="merge-decision-reason" data-decision-reason="{reason}">{reason}</div>
+    {readout}
     {caveat}
 </div>"#,
         card_class = card_class,
@@ -3426,6 +3520,7 @@ pub(super) fn build_merge_decision_card(ctx: &DashboardContext) -> String {
         ml = merge_label,
         reason = escape_html(&reason),
         caveat = caveat_html,
+        readout = decision_readout_html(ctx),
     )
 }
 

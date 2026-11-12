@@ -37,6 +37,9 @@ pub struct StateArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunReviewArgs {
+    /// Explicitly allow project tools, build scripts, plugins and tests. Not a sandbox.
+    #[serde(default)]
+    pub allow_project_execution: bool,
     /// Absolute path to the git repository to review.
     pub repo: String,
     /// Base ref to diff against. Default: merge-base with the repo default branch.
@@ -179,7 +182,7 @@ impl PrviewMcp {
             Ok(s) => s,
             Err(e) => {
                 return types::tool_error(
-                    error_class::NOT_A_GIT_REPO,
+                    types::state_read_error_class(&e),
                     &format!("failed to read repo state: {e}"),
                     json!({}),
                 );
@@ -224,7 +227,7 @@ impl PrviewMcp {
 
     #[tool(
         name = "run_review",
-        description = "Generate a review pack. profile=quick is synchronous (120s budget). profile=deep returns immediately with run_id; poll verdict(run_id) for completion. Test suites are narrowed to the change; pass full_tests=true to run everything."
+        description = "Generate a review pack. Project commands are NOT_RUN unless allow_project_execution=true explicitly acknowledges host code execution (not a sandbox). profile=quick is synchronous (120s budget). profile=deep returns immediately with run_id; poll verdict(run_id) for completion. Authorized test suites are narrowed to the change; pass full_tests=true to run everything."
     )]
     async fn run_review(&self, Parameters(args): Parameters<RunReviewArgs>) -> CallToolResult {
         let root = match read::resolve_repo_root(&args.repo) {
@@ -235,7 +238,15 @@ impl PrviewMcp {
             Ok(p) => p,
             Err(e) => return e.into_result(),
         };
-        match run::start(&root, args.base, profile, args.full_tests).await {
+        match run::start(
+            &root,
+            args.base,
+            profile,
+            args.full_tests,
+            args.allow_project_execution,
+        )
+        .await
+        {
             Ok(body) => types::tool_success(body),
             Err(e) => e.into_result(),
         }
@@ -895,6 +906,31 @@ pub async fn probe(json_output: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_execution_mcp_consent_defaults_false_and_rejects_non_booleans() {
+        let absent: super::RunReviewArgs =
+            serde_json::from_value(serde_json::json!({"repo":"/fixture"})).unwrap();
+        assert!(!absent.allow_project_execution);
+        for value in [serde_json::json!(false), serde_json::json!(true)] {
+            let args: super::RunReviewArgs = serde_json::from_value(
+                serde_json::json!({"repo":"/fixture", "allow_project_execution":value}),
+            )
+            .unwrap();
+            assert_eq!(args.allow_project_execution, value.as_bool().unwrap());
+        }
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                serde_json::from_value::<super::RunReviewArgs>(
+                    serde_json::json!({"repo":"/fixture", "allow_project_execution":value})
+                )
+                .is_err()
+            );
+        }
+    }
     use super::*;
 
     #[tokio::test]

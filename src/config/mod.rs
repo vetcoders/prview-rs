@@ -132,6 +132,9 @@ fn resolve_deadline(cli: &Cli, automation: bool) -> Option<std::time::Duration> 
 /// Runtime configuration derived from CLI and environment
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Explicit per-invocation consent. Never loaded from reviewed project files.
+    /// False keeps project commands NOT_RUN; true does not provide isolation.
+    pub allow_project_execution: bool,
     pub repo_root: PathBuf,
     pub target: Option<String>,
     /// Target captured for this run's diff. Internal runtime state, never a CLI
@@ -595,7 +598,7 @@ pub(crate) fn test_js_profile(has_tsconfig: bool) -> DetectedProfile {
 
 #[cfg(test)]
 pub fn test_config() -> Config {
-    Config::base(
+    let mut config = Config::base(
         PathBuf::from("."),
         test_generic_profile(),
         PathBuf::from(".prview-policy.yml"),
@@ -603,7 +606,11 @@ pub fn test_config() -> Config {
         None,
     )
     .with_fetch_config(FetchConfig::default_enabled())
-    .with_output_config(OutputConfig::standard())
+    .with_output_config(OutputConfig::standard());
+    // These unit fixtures predate the consent boundary and exercise the
+    // authorized execution lane. Production constructors always default false.
+    config.allow_project_execution = true;
+    config
 }
 
 #[cfg(test)]
@@ -1069,6 +1076,7 @@ impl Config {
 
         Self {
             repo_root,
+            allow_project_execution: false,
             target: None,
             pinned_target: None,
             pinned_diff_bases: None,
@@ -1258,6 +1266,7 @@ impl Config {
         config.bases = bases;
         config.security_full = cli.security_full;
         config.execution_mode = cli.execution_mode();
+        config.allow_project_execution = cli.allow_project_execution;
         config.enforcement_mode = EnforcementMode::from_ci_flags(cli.ci, cli.fail_on_warnings);
         config.update_mode = cli.update;
         config.remote_mode = remote_mode;

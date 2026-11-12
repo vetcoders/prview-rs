@@ -43,6 +43,9 @@ impl Check for SemgrepCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -515,6 +518,8 @@ fn plan_semgrep_scan(config: &Config) -> std::result::Result<SemgrepScanPlan, St
                     short_oid(&target.commit_id),
                 )
             })?;
+        WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path)
+            .map_err(|error| format!("semgrep: {error:#}; skipping incomplete source"))?;
         return Ok(SemgrepScanPlan {
             baseline_commit: Some(baseline),
             scan_dir: snapshot.worktree_path.clone(),
@@ -528,6 +533,8 @@ fn plan_semgrep_scan(config: &Config) -> std::result::Result<SemgrepScanPlan, St
         )
     })?;
     if let Some(scan_dir) = &config.scan_dir_override {
+        WorktreeSnapshot::ensure_checkout_complete(scan_dir)
+            .map_err(|error| format!("semgrep: {error:#}; skipping incomplete source"))?;
         return Ok(SemgrepScanPlan {
             scan_dir: scan_dir.clone(),
             baseline_commit: snapshot_baseline_commit(&repo, config, &target)?,
@@ -542,6 +549,8 @@ fn plan_semgrep_scan(config: &Config) -> std::result::Result<SemgrepScanPlan, St
             short_oid(&target.commit_id),
         )
     })?;
+    WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path)
+        .map_err(|error| format!("semgrep: {error:#}; skipping incomplete source"))?;
     let baseline = snapshot_baseline_commit(&repo, config, &target)?;
 
     Ok(SemgrepScanPlan {
@@ -1932,5 +1941,34 @@ mod tests {
         );
         // The snapshot is checked out at the target commit: b.txt is present.
         assert!(plan.scan_dir.join("b.txt").exists());
+    }
+
+    #[test]
+    fn review80_round2_ambient_baseline_rejects_unmaterialized_source() {
+        let (tmp, mut config, _, _) = issue69_ambient_fixture();
+        let target = write_commit(
+            tmp.path(),
+            ".gitattributes",
+            "source.js filter=review80baseline\n",
+        );
+        let repo = git2::Repository::open(tmp.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str(
+                "filter.review80baseline.smudge",
+                "review80-owned-unavailable-smudge",
+            )
+            .unwrap();
+        config.allow_project_execution = true;
+        config.pinned_target.as_mut().unwrap().commit_id = target;
+        let before = issue69_caller_identity(tmp.path());
+        let reason = match plan_semgrep_scan(&config) {
+            Ok(_) => panic!("Ambient baseline must not scan raw filtered source as a clean PASS"),
+            Err(reason) => reason,
+        };
+        assert!(reason.contains("conversion incomplete"), "{reason}");
+        assert!(reason.contains("source.js"), "{reason}");
+        assert!(reason.contains("NOT_RUN"), "{reason}");
+        assert_eq!(issue69_caller_identity(tmp.path()), before);
     }
 }

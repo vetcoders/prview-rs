@@ -1,7 +1,6 @@
 //! Diff summary and file status (working tree vs HEAD)
 
-use crate::git::git_cmd;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 
 pub struct WorkingTreeStats {
@@ -10,55 +9,87 @@ pub struct WorkingTreeStats {
     pub deletions: usize,
 }
 
-pub fn get_diff_stats(root: &Path) -> Result<WorkingTreeStats> {
-    let output = git_cmd()
-        .args(["diff", "HEAD", "--stat", "--stat-width=120"])
-        .current_dir(root)
-        .output()
-        .context("git diff --stat")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git diff --stat failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Parse last line: " N files changed, X insertions(+), Y deletions(-)"
-    let mut files_changed = 0;
-    let mut insertions = 0;
-    let mut deletions = 0;
-
-    if let Some(summary) = stdout.lines().last() {
-        for part in summary.split(',') {
-            let part = part.trim();
-            if part.contains("file") {
-                files_changed = part
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-            } else if part.contains("insertion") {
-                insertions = part
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-            } else if part.contains("deletion") {
-                deletions = part
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-            }
+/// libgit2 reads worktree bytes without executing configured Git callbacks.
+pub(super) fn with_worktree_diff<T>(
+    root: &Path,
+    read: impl FnOnce(&git2::Diff<'_>) -> Result<T>,
+) -> Result<T> {
+    let repo = git2::Repository::discover(root)?;
+    crate::git::WorktreeSnapshot::ensure_worktree_comparison_complete(&repo)?;
+    let tree = repo.head()?.peel_to_tree()?;
+    let mut diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None)?;
+    // libgit2 merges HEAD→index and index→workdir without cancelling a
+    // Modified delta whose final workdir bytes equal HEAD. Reconcile those
+    // candidates against the actual tree→workdir diff. Keep the merged diff
+    // for every other path: a staged deletion must remain a deletion even if
+    // an untracked replacement exists at that path, as in native git diff HEAD.
+    let modified: std::collections::BTreeSet<Vec<u8>> = diff
+        .deltas()
+        .filter(|delta| delta.status() == git2::Delta::Modified)
+        .filter_map(|delta| delta.new_file().path_bytes().map(<[u8]>::to_vec))
+        .collect();
+    if !modified.is_empty() {
+        let mut options = git2::DiffOptions::new();
+        options
+            .disable_pathspec_match(true)
+            .include_typechange(true);
+        for path in &modified {
+            options.pathspec(path.as_slice());
+        }
+        let actual = repo.diff_tree_to_workdir(Some(&tree), Some(&mut options))?;
+        let changed: std::collections::BTreeSet<Vec<u8>> = actual
+            .deltas()
+            .flat_map(|delta| {
+                [delta.old_file().path_bytes(), delta.new_file().path_bytes()]
+                    .into_iter()
+                    .flatten()
+                    .map(<[u8]>::to_vec)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let cancelled: std::collections::BTreeSet<Vec<u8>> =
+            modified.difference(&changed).cloned().collect();
+        if !cancelled.is_empty() {
+            let retained: std::collections::BTreeSet<Vec<u8>> = diff
+                .deltas()
+                .filter(|delta| {
+                    !delta
+                        .new_file()
+                        .path_bytes()
+                        .is_some_and(|path| cancelled.contains(path))
+                })
+                .flat_map(|delta| {
+                    [delta.old_file().path_bytes(), delta.new_file().path_bytes()]
+                        .into_iter()
+                        .flatten()
+                        .map(<[u8]>::to_vec)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            diff = if retained.is_empty() {
+                repo.diff_tree_to_tree(Some(&tree), Some(&tree), None)?
+            } else {
+                let mut options = git2::DiffOptions::new();
+                options.disable_pathspec_match(true);
+                for path in retained {
+                    options.pathspec(path);
+                }
+                repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))?
+            };
         }
     }
+    diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)))?;
+    read(&diff)
+}
 
-    Ok(WorkingTreeStats {
-        files_changed,
-        insertions,
-        deletions,
+pub fn get_diff_stats(root: &Path) -> Result<WorkingTreeStats> {
+    with_worktree_diff(root, |diff| {
+        let stats = diff.stats()?;
+        Ok(WorkingTreeStats {
+            files_changed: stats.files_changed(),
+            insertions: stats.insertions(),
+            deletions: stats.deletions(),
+        })
     })
 }
 
@@ -68,19 +99,14 @@ pub fn get_diff_stats(root: &Path) -> Result<WorkingTreeStats> {
 /// an untracked file reports zero diff stats. Callers that decide "is the
 /// worktree dirty?" need this signal too (PR #12 review).
 pub fn count_untracked(root: &Path) -> Result<usize> {
-    let output = git_cmd()
-        .args(["status", "--porcelain", "--untracked-files=all"])
-        .current_dir(root)
-        .output()
-        .context("git status --porcelain")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git status --porcelain failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().filter(|l| l.starts_with("??")).count())
+    let repo = git2::Repository::discover(root)?;
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    Ok(repo
+        .statuses(Some(&mut options))?
+        .iter()
+        .filter(|entry| entry.status().contains(git2::Status::WT_NEW))
+        .count())
 }
 
 pub fn print_diff_summary(root: &Path) -> Result<()> {
@@ -111,20 +137,26 @@ pub fn print_diff_summary(root: &Path) -> Result<()> {
 pub fn print_file_status(root: &Path) -> Result<()> {
     use colored::Colorize;
 
-    let output = git_cmd()
-        .args(["diff", "HEAD", "--name-status"])
-        .current_dir(root)
-        .output()
-        .context("git diff --name-status")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git diff --name-status failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
+    let lines: Vec<String> = with_worktree_diff(root, |diff| {
+        Ok(diff
+            .deltas()
+            .map(|delta| {
+                let status = match delta.status() {
+                    git2::Delta::Added => "A",
+                    git2::Delta::Deleted => "D",
+                    git2::Delta::Renamed => "R",
+                    _ => "M",
+                };
+                let path = delta.new_file().path().or_else(|| delta.old_file().path());
+                format!(
+                    "{}\t{}",
+                    status,
+                    path.map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                )
+            })
+            .collect())
+    })?;
 
     if lines.is_empty() {
         return Ok(());
@@ -312,5 +344,305 @@ mod tests {
 
         let stats = get_diff_stats(&path).unwrap();
         assert_eq!(stats.files_changed, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review80_round3_symlink_index_replaced_by_regular_requires_clean_conversion() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let (_dir, path) = make_temp_repo();
+        let marker = path.join("clean-marker");
+        let script = path.join("owned-round3-clean");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf 'canonical\\n'\nprintf x >> '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink("destination", path.join("asset.txt")).unwrap();
+        std::fs::write(
+            path.join(".gitattributes"),
+            "asset.txt filter=round3clean\n",
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("asset.txt")).unwrap();
+        index.add_path(Path::new(".gitattributes")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = repo.signature().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "tracked symlink",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("filter.round3clean.clean", script.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_file(path.join("asset.txt")).unwrap();
+        std::fs::write(path.join("asset.txt"), "display\nthree\nlines\n").unwrap();
+        let original_index = std::fs::read(repo.path().join("index")).unwrap();
+
+        // Native Git normalizes the new regular file despite the index mode
+        // still being a symlink. The owned driver is only run by this oracle.
+        let native = git_cmd()
+            .args(["diff", "--numstat", "HEAD", "--", "asset.txt"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert_eq!(native.stdout, b"1\t1\tasset.txt\n");
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+        let error = match get_diff_stats(&path) {
+            Ok(stats) => panic!(
+                "regular replacement requires unsupported clean normalization, got {} files/+{}/-{}",
+                stats.files_changed, stats.insertions, stats.deletions
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            crate::git::WorktreeSnapshot::is_materialization_error(&error),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("asset.txt (filter=round3clean)"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            original_index
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review80_round3_actual_symlinks_and_unfiltered_typechanges_remain_available() {
+        use std::os::unix::fs::symlink;
+        let (_dir, path) = make_temp_repo();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("destination"), "external bytes\n").unwrap();
+        symlink(outside.path().join("destination"), path.join("asset.txt")).unwrap();
+        std::fs::write(
+            path.join(".gitattributes"),
+            "asset.txt filter=round3clean\n",
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("asset.txt")).unwrap();
+        index.add_path(Path::new(".gitattributes")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = repo.signature().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "symlink control",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        // This command would fail if the guard followed the actual symlink.
+        repo.config()
+            .unwrap()
+            .set_str("filter.round3clean.clean", "unavailable-round3-driver")
+            .unwrap();
+        assert_eq!(get_diff_stats(&path).unwrap().files_changed, 0);
+        std::fs::remove_file(path.join("asset.txt")).unwrap();
+        std::fs::write(path.join("asset.txt"), "ordinary type change\n").unwrap();
+        std::fs::write(path.join(".gitattributes"), "asset.txt -filter\n").unwrap();
+        assert!(
+            get_diff_stats(&path).is_ok(),
+            "an unfiltered type change remains measurable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("destination")).unwrap(),
+            "external bytes\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review80_round2_state_refuses_unsupported_clean_normalization_without_callbacks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, path) = make_temp_repo();
+        let marker = path.join("clean-marker");
+        let script = path.join("owned-clean");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf 'init\n'\nprintf x >> '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(path.join(".gitattributes"), "init.txt filter=round2\n").unwrap();
+        let repo = git2::Repository::open(&path).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("filter.round2.clean", script.to_str().unwrap())
+            .unwrap();
+        std::fs::write(
+            path.join("init.txt"),
+            "DISPLAY CONTENT WITH DIFFERENT SIZE\n",
+        )
+        .unwrap();
+        let error = match get_diff_stats(&path) {
+            Ok(stats) => panic!(
+                "unsupported clean normalization cannot certify {} changed files",
+                stats.files_changed
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("init.txt (filter=round2)"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+        assert!(
+            super::super::collect_state(
+                &path,
+                &super::super::StateOpts {
+                    fast: true,
+                    json: true,
+                    hot: true
+                }
+            )
+            .is_err()
+        );
+        assert!(!marker.exists());
+        // Remove the untracked attribute file from native output by asking
+        // only about the tracked path; Git's owned clean driver proves identity.
+        let native = git_cmd()
+            .args(["diff", "--numstat", "HEAD", "--", "init.txt"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert!(native.stdout.is_empty());
+        assert!(!std::fs::read_to_string(&marker).unwrap().is_empty());
+    }
+
+    #[test]
+    fn review80_staged_change_restored_to_head_matches_native_git() {
+        let (_dir, path) = make_temp_repo();
+        std::fs::write(path.join("init.txt"), "staged content\n").unwrap();
+        let staged = git_cmd()
+            .args(["add", "init.txt"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        std::fs::write(path.join("init.txt"), "init\n").unwrap();
+
+        let native = git_cmd()
+            .args(["-c", "core.fsmonitor=false", "diff", "--numstat", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert!(
+            native.stdout.is_empty(),
+            "native Git sees the restored bytes"
+        );
+
+        let stats = get_diff_stats(&path).unwrap();
+        assert_eq!(stats.files_changed, 0, "match native git diff HEAD");
+        assert_eq!((stats.insertions, stats.deletions), (0, 0));
+        assert!(super::super::hot::get_hot_files(&path).unwrap().is_empty());
+
+        // Cancellation of one path must not hide another path's staged edit.
+        std::fs::write(path.join("other.txt"), "staged addition\n").unwrap();
+        let staged = git_cmd()
+            .args(["add", "other.txt"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        let stats = get_diff_stats(&path).unwrap();
+        assert_eq!(stats.files_changed, 1);
+        assert_eq!((stats.insertions, stats.deletions), (1, 0));
+        let hot = super::super::hot::get_hot_files(&path).unwrap();
+        assert_eq!(hot.len(), 1);
+        assert_eq!(hot[0].path, "other.txt");
+    }
+
+    #[test]
+    fn review80_staged_deletion_retains_native_git_index_semantics() {
+        let (_dir, path) = make_temp_repo();
+        let removed = git_cmd()
+            .args(["rm", "init.txt"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(removed.status.success());
+        std::fs::write(path.join("init.txt"), "init\nrestored as untracked\n").unwrap();
+        let native = git_cmd()
+            .args(["-c", "core.fsmonitor=false", "diff", "--numstat", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert_eq!(native.stdout, b"0\t1\tinit.txt\n");
+        let stats = get_diff_stats(&path).unwrap();
+        assert_eq!(stats.files_changed, 1);
+        assert_eq!((stats.insertions, stats.deletions), (0, 1));
+    }
+
+    #[test]
+    fn review80_binary_cancellation_does_not_hide_a_real_binary_change() {
+        let (_dir, path) = make_temp_repo();
+        let original = b"original\0binary\n";
+        std::fs::write(path.join("binary.bin"), original).unwrap();
+        let repo = git2::Repository::open(&path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("binary.bin")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = repo.signature().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "binary fixture",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        std::fs::write(path.join("binary.bin"), b"staged\0binary\n").unwrap();
+        index.add_path(Path::new("binary.bin")).unwrap();
+        index.write().unwrap();
+        std::fs::write(path.join("binary.bin"), original).unwrap();
+        assert_eq!(get_diff_stats(&path).unwrap().files_changed, 0);
+        std::fs::write(path.join("binary.bin"), b"real\0binary\n").unwrap();
+        let stats = get_diff_stats(&path).unwrap();
+        assert_eq!(
+            stats.files_changed, 1,
+            "zero text churn is still a binary change"
+        );
+        assert_eq!((stats.insertions, stats.deletions), (0, 0));
     }
 }

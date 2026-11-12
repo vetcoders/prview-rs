@@ -536,6 +536,15 @@ impl App {
         {
             match run_headless_sync_stage(&self.governor, || {
                 self.ensure_not_cancelled()?;
+                // Archive extraction can succeed with bytes that require an
+                // unsupported checkout conversion. Prove availability before
+                // the archive can run filters or Loctree can count a subset.
+                let checkout = git::create_worktree_snapshot(self.repo.path(), &base.commit_id)?;
+                git::WorktreeSnapshot::ensure_checkout_complete(&checkout.worktree_path)?;
+                // The proof names an immutable commit. Retaining its checkout
+                // cannot strengthen that proof while the same commit is archived.
+                drop(checkout);
+                self.ensure_not_cancelled()?;
                 self.repo.create_snapshot(&base.commit_id)
             }) {
                 Ok(base_snap) => {
@@ -807,37 +816,24 @@ impl App {
     }
 
     fn get_repo_state_hash(&self) -> Result<String> {
-        use crate::git::git_cmd;
-
-        let mut head_cmd = git_cmd();
-        head_cmd
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&self.config.repo_root);
-        let head = crate::proc::output_governed(head_cmd, "git watch rev-parse")?;
-
-        let mut status_cmd = git_cmd();
-        status_cmd
-            .args(["status", "--porcelain"])
-            .current_dir(&self.config.repo_root);
-        let status = crate::proc::output_governed(status_cmd, "git watch status")?;
-
-        let mut diff_cmd = git_cmd();
-        diff_cmd
-            .args(["diff", "--no-ext-diff", "--stat"])
-            .current_dir(&self.config.repo_root);
-        let diff = crate::proc::output_governed(diff_cmd, "git watch diff")?;
-
-        let head_str = String::from_utf8_lossy(&head.stdout);
-        let status_str = String::from_utf8_lossy(&status.stdout);
-        let diff_str = String::from_utf8_lossy(&diff.stdout);
-
         use sha2::{Digest, Sha256};
+        let repo = git2::Repository::discover(&self.config.repo_root)?;
+        let head = repo.head()?.peel_to_commit()?.id().to_string();
+        let mut options = git2::StatusOptions::new();
+        options.include_untracked(true).recurse_untracked_dirs(true);
+        let statuses = repo.statuses(Some(&mut options))?;
         let mut hasher = Sha256::new();
-        hasher.update(status_str.as_bytes());
-        hasher.update(diff_str.as_bytes());
-        let status_hash = format!("{:x}", hasher.finalize());
-
-        Ok(format!("{}:{}", head_str.trim(), &status_hash[..16]))
+        for entry in statuses.iter() {
+            hasher.update(entry.path_bytes());
+            hasher.update(entry.status().bits().to_le_bytes());
+        }
+        let tree = repo.head()?.peel_to_tree()?;
+        let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None)?;
+        diff.print(git2::DiffFormat::Patch, |_, _, line| {
+            hasher.update(line.content());
+            true
+        })?;
+        Ok(format!("{}:{:x}", head, hasher.finalize()))
     }
 
     async fn run_watch_iteration(
@@ -1007,6 +1003,12 @@ impl App {
     ) -> Result<Option<output::Report>> {
         use colored::Colorize;
 
+        // A previous execution never supplies this invocation's consent or
+        // substitutes its successful results for today's NOT_RUN evidence.
+        if !self.config.allow_project_execution {
+            return Ok(None);
+        }
+
         self.ensure_not_cancelled()?;
         // New packs record comparison coverage. Reuse may not carry an
         // explicit self-diff assessment into an automatic/current-only run, or
@@ -1022,6 +1024,14 @@ impl App {
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         };
         let previous_report = read_json("report.json");
+        if read_json("00_summary/RUN.json")
+            .and_then(|run| run["project_execution"]["allowed"].as_bool())
+            != Some(true)
+        {
+            // Opting in after an inert run must actually run the requested
+            // checks. Legacy packs have no consent evidence either.
+            return Ok(None);
+        }
         let previous_range = previous_report
             .as_ref()
             .and_then(|report| report.get("review_range"));
@@ -2005,41 +2015,19 @@ mod tests {
         );
     }
 
-    /// The watch hash used raw `Command::output` calls. Wrapping the containing
-    /// closure in `blocking_stage` kept the Ctrl-C task pollable, but the actual
-    /// git process was neither registered nor cancellable, so the closure still
-    /// waited for git. Exercise the production hash path with a blocking git
-    /// executable, not a synthetic sleep probe.
+    /// Watch state is an in-process read: even a configured Git executable
+    /// override is never started to discover a worktree edit.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn watch_state_hash_cancels_its_real_git_child() {
+    #[test]
+    fn project_execution_watch_hash_does_not_spawn_git() {
         let repo = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         let app = crate::App::from_config(reviewable_repo(repo.path(), out.path())).unwrap();
-        let governor = app.governor();
         let pidfile = repo.path().join("watch-git.pid");
         let shim = blocking_script(repo.path(), "blocking-git", &pidfile);
-        let run_governor = std::sync::Arc::clone(&governor);
-        let started = std::time::Instant::now();
-
-        let work = async move {
-            super::run_headless_sync_stage(&run_governor, || {
-                let _override = crate::git::override_test_git_program(shim);
-                app.get_repo_state_hash()
-            })
-        };
-        let error = crate::governor::with_cancellation(
-            work,
-            &governor,
-            InterruptWhenFileExists::new(pidfile.clone()),
-        )
-        .await
-        .expect_err("interrupt must cancel the git-backed state hash");
-
-        assert!(crate::governor::is_cancellation(&error), "{error:#}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        assert_eq!(governor.inflight_count(), 0);
-        assert_recorded_process_gone(&pidfile).await;
+        let _override = crate::git::override_test_git_program(shim);
+        assert!(!app.get_repo_state_hash().unwrap().is_empty());
+        assert!(!pidfile.exists());
     }
 
     /// Snapshot creation is a synchronous `git archive | tar` pipeline. On a
@@ -2158,6 +2146,42 @@ mod tests {
     }
 
     #[test]
+    fn project_execution_update_requires_current_and_previous_consent() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = reviewable_repo(repo.path(), out.path());
+        let head = rev_parse(repo.path(), "HEAD");
+        let previous = tempfile::tempdir().unwrap();
+        std::fs::create_dir(previous.path().join("00_summary")).unwrap();
+        std::fs::write(
+            previous.path().join("00_summary/pr-metadata.txt"),
+            format!("HEAD: feature ({head})\n"),
+        )
+        .unwrap();
+        let target = resolved(&head);
+        for allowed_now in [false, true] {
+            for allowed_before in [None, Some(false), Some(true)] {
+                let mut current = config.clone();
+                current.allow_project_execution = allowed_now;
+                let app = crate::App::from_config(current).unwrap();
+                let run = match allowed_before {
+                    Some(allowed) => serde_json::json!({"project_execution":{"allowed":allowed}}),
+                    None => serde_json::json!({}),
+                };
+                std::fs::write(previous.path().join("00_summary/RUN.json"), run.to_string())
+                    .unwrap();
+                let reused = app
+                    .reuse_unchanged_run(&target, &[], &[], previous.path().to_owned(), false)
+                    .unwrap();
+                assert_eq!(
+                    reused.is_some(),
+                    allowed_now && allowed_before == Some(true)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn explicit_self_reuse_requires_a_matching_modern_non_pass_assessment() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
@@ -2173,6 +2197,11 @@ mod tests {
         let effective = app.repo.resolve_diff_bases(&app.config, &target, &bases);
         let prev = tempfile::tempdir().unwrap();
         std::fs::create_dir(prev.path().join("00_summary")).unwrap();
+        std::fs::write(
+            prev.path().join("00_summary/RUN.json"),
+            r#"{"project_execution":{"allowed":true}}"#,
+        )
+        .unwrap();
         std::fs::write(
             prev.path().join("00_summary/pr-metadata.txt"),
             format!("HEAD: feature ({head})\n"),
@@ -2267,6 +2296,11 @@ mod tests {
         config.required_base = Some(requested);
         let prev = tempfile::tempdir().unwrap();
         std::fs::create_dir(prev.path().join("00_summary")).unwrap();
+        std::fs::write(
+            prev.path().join("00_summary/RUN.json"),
+            r#"{"project_execution":{"allowed":true}}"#,
+        )
+        .unwrap();
 
         for exact in [false, true] {
             config.required_base_exact = exact;
@@ -2334,6 +2368,11 @@ mod tests {
         // `--update` short-circuit.
         let prev = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(prev.path().join("00_summary")).unwrap();
+        std::fs::write(
+            prev.path().join("00_summary/RUN.json"),
+            r#"{"project_execution":{"allowed":true}}"#,
+        )
+        .unwrap();
         std::fs::write(
             prev.path().join("00_summary/pr-metadata.txt"),
             format!("HEAD: feature ({head})\n"),
@@ -2436,6 +2475,154 @@ mod tests {
         assert_ne!(
             reg_mb.base_sha, reg_tip.base_sha,
             "the chosen base ref changes which tree the regression is computed against"
+        );
+    }
+
+    #[tokio::test]
+    async fn review80_round3_baseline_conversion_must_be_available_before_loctree() {
+        if std::env::var_os("PRVIEW_ROUND4_BASELINE_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::review80_round3_baseline_conversion_must_be_available_before_loctree",
+                    "--nocapture",
+                ])
+                .env("PRVIEW_ROUND4_BASELINE_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                diagnostic.matches("Snapshot failed for base").count(),
+                2,
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("working-tree-encoding=UTF-16LE"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("filter=review80base"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("source analysis NOT_RUN"),
+                "{diagnostic}"
+            );
+            return;
+        }
+        for conversion in ["working-tree-encoding=UTF-16LE", "filter=review80base"] {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let out = tempfile::tempdir().unwrap();
+            let mut config = reviewable_repo(repo_dir.path(), out.path());
+            let repo = git2::Repository::open(repo_dir.path()).unwrap();
+            std::fs::write(
+                repo_dir.path().join(".gitattributes"),
+                format!("src/lib.rs {conversion}\n"),
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index
+                .add_path(std::path::Path::new(".gitattributes"))
+                .unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let sig = repo.signature().unwrap();
+            let base = repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    "base conversion",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            index
+                .remove_path(std::path::Path::new(".gitattributes"))
+                .unwrap();
+            index.write().unwrap();
+            std::fs::remove_file(repo_dir.path().join(".gitattributes")).unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.find_commit(base).unwrap();
+            let target = repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    "target identity checkout",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            repo.config()
+                .unwrap()
+                .set_str("filter.review80base.smudge", "review80-unavailable-driver")
+                .unwrap();
+            config.run_heuristics = true;
+            config.execution_mode = ExecutionMode::Deep;
+            config.allow_project_execution = false;
+            config.quiet = false;
+            config.json = false;
+            let app = crate::App::from_config(config).unwrap();
+            let result = app
+                .run_heuristics_with_snapshots(
+                    &app.config,
+                    &resolved(&target.to_string()),
+                    &[resolved(&base.to_string())],
+                )
+                .await
+                .unwrap();
+            assert!(
+                result.loctree.is_some() && result.summary.total_files > 0,
+                "the target identity checkout remains measured"
+            );
+            assert!(
+                result.regression.is_none(),
+                "baseline conversion {conversion} must not become a measured archive comparison"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review80_round4_base_checkout_is_released_before_archive_extraction() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(root.path(), out.path());
+        let repo = git2::Repository::open(root.path()).unwrap();
+        let base = repo.head().unwrap().peel_to_commit().unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn target_only() {}\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        let target = repo
+            .commit(Some("HEAD"), &sig, &sig, "target", &tree, &[&base])
+            .unwrap();
+        let marker = out.path().join("archive-worktree-counts");
+        let tar = out.path().join("owned-tar");
+        std::fs::write(&tar, format!("#!/bin/sh\nGIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 /usr/bin/git -c core.fsmonitor=false -C '{}' worktree list --porcelain | /usr/bin/awk '/^worktree / {{ count++ }} END {{ print count }}' >> '{}'\nexec /usr/bin/tar \"$@\"\n", root.path().display(), marker.display())).unwrap();
+        std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _tar = crate::git::override_test_tar_program(tar.into_os_string());
+        config.run_heuristics = true;
+        config.execution_mode = ExecutionMode::Deep;
+        let app = crate::App::from_config(config).unwrap();
+        app.run_heuristics_with_snapshots(
+            &app.config,
+            &resolved(&target.to_string()),
+            &[resolved(&base.id().to_string())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "1\n1\n",
+            "neither target nor base archive extraction may retain the proof checkout"
         );
     }
 }

@@ -6,6 +6,12 @@
 1. `prview.toml`
 2. `.prview-policy.yml`
 
+Neither file can authorize execution of project code. The separate CLI
+`--allow-project-execution` acknowledgement (or MCP `allow_project_execution:
+true`) is required per invocation; otherwise project commands are NOT_RUN.
+Preset/configuration choices describe which checks would run after consent.
+There is no persistent trust setting and consent does not provide a sandbox.
+
 The tool is designed to be **zero-config**: in most cases auto-detection works
 without either file, falling back to heuristics. For complex projects (monorepos
 or unusual directory layouts) these files give you full control.

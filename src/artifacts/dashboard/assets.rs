@@ -2103,11 +2103,11 @@ const JS_SUFFIX: &str = r##"
         var text = (reason || '').trim();
         var match;
         if (text.includes('; ')) return text.split('; ').map(translateDecisionReason).join('; ');
-        if (text === 'All quality gates passed') return 'Wszystkie wymagane kontrole zakończyły się powodzeniem';
-        match = text.match(/^Quality gates passed, but (\d+) review signal(?:s)? need attention$/);
+        if (text === 'All quality gates passed' || text === 'Change quality gate passed') return 'Kontrola jakości zmiany zakończyła się powodzeniem';
+        match = text.match(/^(?:Quality gates passed|Change quality gate passed), but (\d+) review signal(?:s)? need attention$/);
         if (match) {
             var reviewCount = Number(match[1]);
-            return 'Kontrole zakończyły się powodzeniem, ale ' + match[1] + ' ' + polishPlural(reviewCount, 'sygnał wymaga uwagi', 'sygnały wymagają uwagi', 'sygnałów wymaga uwagi');
+            return 'Kontrola jakości zmiany zakończyła się powodzeniem, ale ' + match[1] + ' ' + polishPlural(reviewCount, 'sygnał wymaga uwagi', 'sygnały wymagają uwagi', 'sygnałów wymaga uwagi');
         }
         match = text.match(/^(\d+) quality check(?:s)? failed([\s\S]*)$/);
         if (match) {
@@ -2635,6 +2635,25 @@ const JS_SUFFIX: &str = r##"
     }
 
     // -- B5: Copy PR Comment --
+    function decisionReadoutComment(report) {
+        var gate = report.gate || {};
+        var readout = report.decision_readout || {};
+        var complete = readout.details_complete === true;
+        var unknown = t('readout.unknown');
+        function count(key) {
+            return complete && typeof readout[key] === 'number' && readout[key] >= 0
+                ? readout[key] : unknown;
+        }
+        var automatic = gate.allow_merge === true ? t('readout.yes')
+            : (gate.allow_merge === false ? t('readout.no') : unknown);
+        var parts = [t('readout.automaticMerge') + ': ' + automatic];
+        [['readout.introduced', 'introduced_failures'], ['readout.preexisting', 'preexisting_failures'],
+         ['readout.mixed', 'mixed_failures'], ['readout.unclassified', 'unclassified_failures']].forEach(function(pair) {
+            parts.push(t(pair[0]) + ': ' + count(pair[1]));
+        });
+        return parts.join(' · ') + '\n\n' + t('readout.scope') + '\n\n';
+    }
+
     var copyPrBtn = document.getElementById('copy-pr-comment');
     if (copyPrBtn) {
         copyPrBtn.addEventListener('click', function() {
@@ -2647,7 +2666,8 @@ const JS_SUFFIX: &str = r##"
 
             var comment = '## PR Review Summary\n\n';
             var mergeLabel = gate.recommended_label || (gate.recommended_merge ? 'MERGE' : (gate.allow_merge ? 'HOLD' : 'BLOCK'));
-            comment += '**Gate:** ' + (gate.status || 'N/A') + ' | **Quality:** ' + (gate.quality_pass ? 'PASS' : 'FAIL') + ' | **Merge:** ' + mergeLabel + '\n\n';
+            comment += decisionReadoutComment(report);
+            comment += '**Gate:** ' + (gate.status || 'N/A') + ' | **' + t('readout.changeQuality') + ':** ' + (gate.quality_pass ? 'PASS' : 'FAIL') + ' | **' + t('readout.reviewRecommendation') + ':** ' + mergeLabel + '\n\n';
             if (gate.summary) {
                 comment += '**Decision:** ' + gate.summary + '\n\n';
             }
@@ -2657,10 +2677,27 @@ const JS_SUFFIX: &str = r##"
 
             var passed = checks.filter(function(c) { return c.status === 'PASS'; }).length;
             var failed = checks.filter(function(c) { return c.status === 'FAIL' || c.status === 'ERROR'; }).length;
-            comment += '**Checks:** ' + passed + ' passed, ' + failed + ' failed\n\n';
+            var warned = checks.filter(function(c) { return c.status === 'WARN'; }).length;
+            comment += '**' + t('readout.allChecks') + ':** ' + passed + ' ' + t('readout.passed') + ', ' + failed + ' ' + t('readout.failed') + ', ' + warned + ' ' + t('readout.warningChecks') + '\n\n';
+            [['semgrep_scan', 'readout.sourceScan'], ['cargo_audit', 'readout.dependencyAudit']].forEach(function(scope) {
+                var statuses = checks.filter(function(c) { return c.id === scope[0]; }).map(function(c) {
+                    return typeof c.status === 'string' && c.status.trim() ? c.status : t('readout.unknown');
+                });
+                // A configured skip is known NOT_RUN, not missing execution data.
+                // Actual result rows take precedence, including all duplicates.
+                var recorded = report.security_scope;
+                if (!statuses.length && recorded && recorded.source === 'recorded_check_results' && Array.isArray(recorded.checks)) {
+                    statuses = recorded.checks.filter(function(c) { return c.id === scope[0]; }).map(function(c) {
+                        return c.execution === 'not_executed' ? 'NOT_RUN' : t('readout.unknown');
+                    });
+                }
+                comment += '**' + t(scope[1]) + ':** ' + (statuses.length ? statuses.join(', ') : t('readout.unknown')) + '\n\n';
+            });
 
-            if (quality.breaking_changes && quality.breaking_changes.has_breaking) {
-                comment += '**Public API structural changes:** ' + (quality.breaking_changes.summary || 'Yes') + ' (structural scan; semantic compatibility not assessed)\n\n';
+            if (quality.breaking_changes) {
+                var api = quality.breaking_changes;
+                var apiStatus = api.status || 'UNKNOWN';
+                comment += '**Public API evidence:** ' + apiStatus + ' — ' + (api.summary || 'analysis completeness not recorded') + '\n\n';
             }
 
             if (quality.coverage) {

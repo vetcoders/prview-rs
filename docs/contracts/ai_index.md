@@ -66,11 +66,24 @@ scanned, and any `PROVENANCE_CONTRADICTION` between those statements) next to th
 mandatory for every pack, so the reference is unconditional rather than
 existence-guarded.
 
+The index states the limited self-check scope: SANITY/CONSISTENCY_CHECK test
+selected artifact invariants, counters, provenance and checklist consistency;
+manifest verification samples at most five files. Their success does not
+independently validate classifier or matching results, scan completeness, or
+the reviewed code.
+
 The deeper-context section must always include references to:
 
 - `20_quality/full-checks.log`
 - `10_diff/full.patch`
-- `10_diff/per-commit-diffs/`
+- `10_diff/per-commit-diffs/00-SUMMARY.md` when emitted, otherwise a compact
+  note that no per-commit context was emitted, naming the directory and full patch
+
+At most 50 commits receive individual or batched patch files. Above that limit,
+the index describes the per-commit directory as **summary-only**, states the
+50-commit limit, and points to `10_diff/full.patch` for the full reviewed range.
+The summary still lists the top ten commits by churn. The directory reference
+must not promise commit patch files when they were skipped.
 
 The packs section must describe one of:
 
@@ -88,6 +101,13 @@ given run:
 - `10_diff/per-commit-diffs/00-SUMMARY.md`
 - `00_summary/file-status.txt`
 - `30_context/changed-tests.txt`
+
+When SARIF is readable, the index counts its emitted result rows by
+`properties.finding_class`: source, dependency, general, and unknown for absent
+or unrecognized values. It describes these as tool observations, keeping
+`properties.classification` (diff origin) separate. A dependency or general row
+must not be described as a diagnostic in changed source. Raw SARIF remains
+canonical for per-row location, severity and origin.
 
 An optional `## Deferred diagnostics` section may appear when the run
 intentionally skips heavy context artifacts but wants to explain whether they

@@ -46,6 +46,10 @@ pub struct HeuristicsResult {
 /// Delta between base and target heuristics runs
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HeuristicsRegression {
+    /// Recorded only when the baseline Loctree scan was available. None is
+    /// unknown scope, including regressions read from older packs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_scanned_files: Option<usize>,
     pub base_sha: String,
     pub target_sha: String,
     pub dead_exports_delta: i64,
@@ -186,6 +190,7 @@ pub fn compute_delta(
     let parrots_delta = target.summary.dead_parrots as i64 - base.summary.dead_parrots as i64;
 
     HeuristicsRegression {
+        base_scanned_files: loctree_available(base).then_some(base.summary.total_files),
         base_sha: base_sha.to_string(),
         target_sha: target_sha.to_string(),
         dead_exports_delta: dead_delta,
@@ -500,6 +505,7 @@ mod tests {
     #[test]
     fn test_regression_serialization() {
         let reg = HeuristicsRegression {
+            base_scanned_files: None,
             base_sha: "abc".to_string(),
             target_sha: "def".to_string(),
             dead_exports_delta: 2,

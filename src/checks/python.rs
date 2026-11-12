@@ -1450,6 +1450,9 @@ impl Check for RuffCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -1550,6 +1553,9 @@ impl Check for MypyCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -1627,6 +1633,9 @@ impl Check for PytestCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 

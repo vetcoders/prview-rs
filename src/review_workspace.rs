@@ -1,9 +1,10 @@
 //! An owned Git repository for remote reviews, not a host filesystem sandbox.
 //!
-//! Only Git objects/refs cross this boundary. Caller source, dependencies,
-//! worktree registrations are never copied or borrowed for writes. Only the
+//! Reviewed source crosses as Git objects/refs. Caller source, dependencies,
+//! worktree registrations are never copied or borrowed for writes. The
 //! origin URL/fetch mapping and an allowlisted fetch-only transport snapshot are
-//! admitted; arbitrary caller configuration is not copied.
+//! admitted; conversion requirements cross only as process-owned boolean/unknown
+//! evidence. Arbitrary caller configuration and driver commands are not copied.
 use crate::{Config, git::git_cmd};
 use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
@@ -37,7 +38,28 @@ pub(crate) struct IndependentReview {
     pub(crate) repo_root: PathBuf,
     pub(crate) transport: Option<crate::git::transport::Transport>,
     pub(crate) origin_present: bool,
+    _conversion_contexts: ConversionContexts,
     _directory: tempfile::TempDir,
+}
+
+#[derive(Default)]
+struct ConversionContexts(Vec<PathBuf>);
+
+impl ConversionContexts {
+    fn capture(&mut self, source: &git2::Repository, destination: &git2::Repository) -> Result<()> {
+        self.0.push(
+            crate::git::WorktreeSnapshot::retain_caller_filter_requirements(source, destination)?,
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ConversionContexts {
+    fn drop(&mut self) {
+        for key in &self.0 {
+            crate::git::WorktreeSnapshot::release_caller_filter_requirements(key);
+        }
+    }
 }
 
 impl IndependentReview {
@@ -126,7 +148,8 @@ impl IndependentReview {
         } else {
             copy_objects(&source, &destination)?;
         }
-        copy_modules(&source, &destination, 0).context(
+        let mut conversion_contexts = ConversionContexts::default();
+        copy_modules(&source, &destination, 0, &mut conversion_contexts).context(
             "remote review module metadata copy failed; a partial clone may lack required objects, especially with fetch disabled",
         )?;
         if let Ok(head) = source.head() {
@@ -152,6 +175,7 @@ impl IndependentReview {
             repo_root,
             transport,
             origin_present,
+            _conversion_contexts: conversion_contexts,
             _directory: directory,
         })
     }
@@ -385,7 +409,9 @@ fn copy_modules(
     source: &git2::Repository,
     destination: &git2::Repository,
     depth: usize,
+    conversion_contexts: &mut ConversionContexts,
 ) -> Result<()> {
+    conversion_contexts.capture(source, destination)?;
     ensure!(
         depth < 16,
         "remote review submodule object nesting limit exceeded"
@@ -410,12 +436,17 @@ fn copy_modules(
                 destination.commondir().join("modules").join(relative),
             )?;
             copy_module_objects(&store, &copied)?;
-            copy_modules(&store, &copied, depth + 1)?;
+            copy_modules(&store, &copied, depth + 1, conversion_contexts)?;
         }
     }
     let modules = source.commondir().join("modules");
     if modules.exists() {
-        copy_module_namespace(&modules, &destination.commondir().join("modules"), depth)?;
+        copy_module_namespace(
+            &modules,
+            &destination.commondir().join("modules"),
+            depth,
+            conversion_contexts,
+        )?;
     }
     Ok(())
 }
@@ -476,7 +507,12 @@ fn committed_module_paths(
     Ok(paths)
 }
 
-fn copy_module_namespace(source: &Path, destination: &Path, depth: usize) -> Result<()> {
+fn copy_module_namespace(
+    source: &Path,
+    destination: &Path,
+    depth: usize,
+    conversion_contexts: &mut ConversionContexts,
+) -> Result<()> {
     // A historical pin may outlive .gitmodules, its index entry and checkout.
     // The Git administrative stores, rather than the current module list, are
     // the object source. Multi-component module names form directory groups.
@@ -495,13 +531,13 @@ fn copy_module_namespace(source: &Path, destination: &Path, depth: usize) -> Res
             )?;
             let copied = git2::Repository::init_bare(&target)?;
             copy_module_objects(&module, &copied)?;
-            copy_modules(&module, &copied, depth + 1)?;
+            copy_modules(&module, &copied, depth + 1, conversion_contexts)?;
         } else {
             ensure!(
                 !entry.file_type()?.is_symlink(),
                 "unresolved submodule namespace link"
             );
-            copy_module_namespace(&path, &target, depth)?;
+            copy_module_namespace(&path, &target, depth, conversion_contexts)?;
         }
     }
     Ok(())
@@ -555,6 +591,241 @@ fn copy_module_objects(source: &git2::Repository, destination: &git2::Repository
 mod tests {
     use super::*;
     use crate::checks::caller_integrity::CallerGuard;
+
+    #[cfg(unix)]
+    #[test]
+    fn review80_round4_remote_snapshot_retains_caller_filter_requirements() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for setting in ["smudge", "process", "required"] {
+            let (caller, _home, mut config) = crate::checks::caller_guard_tests::fixture();
+            config.do_fetch = false;
+            config.remote_mode = true;
+            let source = git2::Repository::open(caller.path()).unwrap();
+            std::fs::write(
+                caller.path().join(".gitattributes"),
+                "source.txt filter=round4owned\n",
+            )
+            .unwrap();
+            let mut index = source.index().unwrap();
+            index.add_path(Path::new(".gitattributes")).unwrap();
+            index.write().unwrap();
+            let tree = source.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = source.head().unwrap().peel_to_commit().unwrap();
+            let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+            let target = source
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "filter target",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            let marker = caller.path().join("owned-driver-marker");
+            let script = caller.path().join("owned-smudge");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\ncat >/dev/null\nprintf 'hydrated\\n'\nprintf x >> '{}'\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            source
+                .config()
+                .unwrap()
+                .set_str(
+                    &format!("filter.round4owned.{setting}"),
+                    if setting == "smudge" {
+                        script.to_str().unwrap()
+                    } else if setting == "required" {
+                        "true"
+                    } else {
+                        "owned-process-must-never-run"
+                    },
+                )
+                .unwrap();
+            if setting == "smudge" {
+                let native = git_cmd()
+                    .args(["cat-file", "--filters", "HEAD:source.txt"])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .current_dir(caller.path())
+                    .output()
+                    .unwrap();
+                assert!(native.status.success());
+                assert_eq!(native.stdout, b"hydrated\n");
+                assert!(marker.exists());
+                std::fs::remove_file(&marker).unwrap();
+            }
+            let before = (
+                std::fs::read(source.path().join("config")).unwrap(),
+                std::fs::read(source.path().join("index")).unwrap(),
+                source.head().unwrap().target(),
+            );
+            let workspace = IndependentReview::create(&config).unwrap();
+            let snapshot =
+                crate::git::create_worktree_snapshot(&workspace.repo_root, &target.to_string())
+                    .unwrap();
+            assert_eq!(
+                std::fs::read(snapshot.worktree_path.join("source.txt")).unwrap(),
+                b"original\n"
+            );
+            let completeness =
+                crate::git::WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path);
+            assert!(
+                completeness.is_err(),
+                "caller-only {setting} must not become an undefined identity filter in the independent repository"
+            );
+            assert!(crate::git::WorktreeSnapshot::is_materialization_error(
+                &completeness.unwrap_err()
+            ));
+            assert!(!marker.exists());
+            let copied = git2::Repository::open(&workspace.repo_root).unwrap();
+            assert!(
+                copied
+                    .config()
+                    .unwrap()
+                    .get_string(&format!("filter.round4owned.{setting}"))
+                    .is_err(),
+                "driver commands/configuration must not be copied"
+            );
+            assert_eq!(
+                (
+                    std::fs::read(source.path().join("config")).unwrap(),
+                    std::fs::read(source.path().join("index")).unwrap(),
+                    source.head().unwrap().target()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn review80_round4_remote_snapshot_preserves_caller_identity_filter_controls() {
+        for settings in [
+            vec![],
+            vec![("clean", "owned-clean-must-never-run")],
+            vec![("smudge", "owned-smudge-must-never-run"), ("process", "")],
+        ] {
+            let (caller, _home, mut config) = crate::checks::caller_guard_tests::fixture();
+            config.do_fetch = false;
+            config.remote_mode = true;
+            let source = git2::Repository::open(caller.path()).unwrap();
+            std::fs::write(
+                caller.path().join(".gitattributes"),
+                "source.txt filter=round4identity\n",
+            )
+            .unwrap();
+            let mut index = source.index().unwrap();
+            index.add_path(Path::new(".gitattributes")).unwrap();
+            index.write().unwrap();
+            let tree = source.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = source.head().unwrap().peel_to_commit().unwrap();
+            let sig = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+            let target = source
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    "identity filter",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            for (key, value) in settings {
+                source
+                    .config()
+                    .unwrap()
+                    .set_str(&format!("filter.round4identity.{key}"), value)
+                    .unwrap();
+            }
+            let workspace = IndependentReview::create(&config).unwrap();
+            let snapshot =
+                crate::git::create_worktree_snapshot(&workspace.repo_root, &target.to_string())
+                    .unwrap();
+            crate::git::WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn review80_round4_remote_module_retains_its_own_local_filter_requirement() {
+        let (caller, _home, mut config) = crate::checks::caller_guard_tests::fixture();
+        config.do_fetch = false;
+        config.remote_mode = true;
+        let source = git2::Repository::open(caller.path()).unwrap();
+        let module =
+            git2::Repository::init_bare(source.commondir().join("modules/backend")).unwrap();
+        let mut builder = module.treebuilder(None).unwrap();
+        builder
+            .insert(
+                ".gitattributes",
+                module.blob(b"asset.txt filter=round4module\n").unwrap(),
+                0o100644,
+            )
+            .unwrap();
+        builder
+            .insert(
+                "asset.txt",
+                module.blob(b"module pointer\n").unwrap(),
+                0o100644,
+            )
+            .unwrap();
+        let tree = module.find_tree(builder.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+        let pin = module
+            .commit(Some("HEAD"), &signature, &signature, "module", &tree, &[])
+            .unwrap();
+        module
+            .config()
+            .unwrap()
+            .set_bool("filter.round4module.required", true)
+            .unwrap();
+        let module_before = std::fs::read(module.path().join("config")).unwrap();
+        let parent = source.head().unwrap().peel_to_commit().unwrap();
+        let mut builder = source.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        builder.insert("backend", pin, 0o160000).unwrap();
+        let tree = source.find_tree(builder.write().unwrap()).unwrap();
+        let target = source
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "historical module",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let before = (
+            std::fs::read(source.path().join("config")).unwrap(),
+            std::fs::read(source.path().join("index")).unwrap(),
+            source.head().unwrap().target(),
+        );
+        let workspace = IndependentReview::create(&config).unwrap();
+        let snapshot =
+            crate::git::create_worktree_snapshot(&workspace.repo_root, &target.to_string())
+                .unwrap();
+        let error = crate::git::WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path)
+            .expect_err(
+                "required module driver cannot become optional undefined in the owned store",
+            );
+        assert!(error.to_string().contains("filter=round4module"), "{error}");
+        assert_eq!(
+            std::fs::read(module.path().join("config")).unwrap(),
+            module_before
+        );
+        assert_eq!(
+            (
+                std::fs::read(source.path().join("config")).unwrap(),
+                std::fs::read(source.path().join("index")).unwrap(),
+                source.head().unwrap().target()
+            ),
+            before
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -741,6 +1012,8 @@ mod tests {
                     "-c",
                     "core.hooksPath=",
                     "fetch",
+                    // Freeze fixture object bytes only after synchronous setup.
+                    "--no-auto-maintenance",
                     "--quiet",
                     "--filter=blob:none",
                     "origin",

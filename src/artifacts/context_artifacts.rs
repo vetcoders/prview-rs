@@ -205,6 +205,14 @@ pub(super) fn plan_context_artifacts(
         decisions.push(plan_tauri_info_artifact(config, scan_root, diffs, ledger));
     }
 
+    if !config.allow_project_execution {
+        for decision in &mut decisions {
+            if decision.generated {
+                decision.generated = false;
+                decision.reason = crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned();
+            }
+        }
+    }
     decisions
 }
 
@@ -800,6 +808,17 @@ fn plan_context_cmds(
     decisions: &[ContextArtifactDecision],
 ) -> Vec<ContextCmd> {
     let ctx = context_dir.to_path_buf();
+    if !config.allow_project_execution {
+        record_context_decision(
+            ledger,
+            "project context tools",
+            &context_substrate("project context tools", scan_root, &config.repo_root),
+            TaskState::Skipped {
+                reason: crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned(),
+            },
+        );
+        return Vec::new();
+    }
     let scan_root = scan_root.to_path_buf();
     let has_pnpm = which::which("pnpm").is_ok();
 
@@ -2091,6 +2110,28 @@ pub(super) fn truncate_on_char_boundary(input: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_execution_context_cannot_compensate_for_missing_consent() {
+        let repo = tempfile::tempdir().unwrap();
+        let ctx = tempfile::tempdir().unwrap();
+        let mut config = crate::config::test_config();
+        config.repo_root = repo.path().to_owned();
+        config.profile = crate::config::test_rust_profile(true);
+        config.profile.cargo_root = Some(repo.path().to_owned());
+        let ledger = crate::ledger::TaskLedger::new();
+        // Authorized planning demonstrably contains project commands.
+        assert!(
+            !super::plan_context_cmds(&config, repo.path(), &ledger, ctx.path(), false, &[])
+                .is_empty()
+        );
+        config.allow_project_execution = false;
+        let ledger = crate::ledger::TaskLedger::new();
+        assert!(
+            super::plan_context_cmds(&config, repo.path(), &ledger, ctx.path(), false, &[])
+                .is_empty()
+        );
+        assert!(ledger.entries().iter().all(|entry| matches!(&entry.state, crate::ledger::TaskState::Skipped { reason } if reason == crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED)));
+    }
     use super::{
         ContextCmd, context_artifact_wire_path, context_substrate, js_exec_cmd, plan_context_cmds,
         plan_tsc_trace_artifact, reconcile_context_artifacts, tauri_info_cmd,
@@ -2105,6 +2146,48 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use std::time::Instant;
+
+    #[test]
+    fn review80_no_consent_preserves_fast_preset_context_deferral_reason() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.repo_root = repo.path().to_owned();
+        config.profile = test_js_profile(true);
+        config.remote_only = true;
+        config.allow_project_execution = false;
+
+        let decisions =
+            super::plan_context_artifacts(&config, repo.path(), &[], &[], &TaskLedger::new());
+
+        assert_eq!(decisions.len(), 1);
+        assert!(!decisions[0].generated);
+        assert!(
+            decisions[0]
+                .reason
+                .contains("skipped by default in fast remote-only runs"),
+            "no-consent handling must retain the preset deferral reason, got {:?}",
+            decisions[0].reason,
+        );
+    }
+
+    #[test]
+    fn review80_no_consent_denies_context_artifacts_that_would_be_generated() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.repo_root = repo.path().to_owned();
+        config.profile = test_js_profile(true);
+        config.allow_project_execution = false;
+
+        let decisions =
+            super::plan_context_artifacts(&config, repo.path(), &[], &[], &TaskLedger::new());
+
+        assert_eq!(decisions.len(), 1);
+        assert!(!decisions[0].generated);
+        assert_eq!(
+            decisions[0].reason,
+            crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED,
+        );
+    }
 
     fn collected_context(stdout: &str, stderr: &str, name: &str) -> String {
         let dir = tempfile::tempdir().expect("context fixture");

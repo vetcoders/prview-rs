@@ -887,7 +887,9 @@ impl CargoWorkspace {
 /// `--frozen` guarantees no network and no lockfile write; `--no-deps` keeps it
 /// to the members' own manifests. Any failure at all is the caller's signal to
 /// run the full workspace.
-pub async fn read_cargo_workspace(cargo_root: &Path) -> Result<CargoWorkspace, WorkspaceError> {
+// Keep command-backed discovery behind the Config-authorized scope resolver.
+// A public read-only-looking helper must not bypass review execution consent.
+async fn read_cargo_workspace(cargo_root: &Path) -> Result<CargoWorkspace, WorkspaceError> {
     let output = crate::checks::run_command_with_timeout_and_env(
         "cargo",
         &["metadata", "--format-version", "1", "--no-deps", "--frozen"],
@@ -1473,6 +1475,12 @@ pub async fn resolve_run_scope(
     reviewed_tree: &ReviewedTree,
 ) -> ScopeDecisions {
     let change_set = config.changed_paths.as_ref();
+    if !config.allow_project_execution {
+        return both(ScopeDecision::full(
+            crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED,
+            change_set.map(|set| set.paths().len()),
+        ));
+    }
     if let Some(request) = config.full_tests {
         // Contract §9: everything was asked for, so there is nothing to decide
         // and nothing to pay a subprocess for. Stated as an ordinary escalation

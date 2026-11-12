@@ -604,6 +604,9 @@ impl Check for TypeScriptCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -689,6 +692,9 @@ impl Check for ESLintCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -823,6 +829,9 @@ impl Check for VitestCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
@@ -949,6 +958,9 @@ impl Check for StylelintCheck {
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
+        if let Some(skipped) = super::project_execution_denied(config, self.name()) {
+            return Ok(skipped);
+        }
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 

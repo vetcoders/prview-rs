@@ -18,7 +18,14 @@
 
 ---
 
-**prview** reads a pull request the way a good reviewer does: it separates signal from noise. It compares a branch against one or more bases, runs language-aware checks, computes structural heuristics, and emits both human- and machine-readable review packs — so you see the risk before you merge, not after.
+**prview** reads a pull request the way a good reviewer does: it separates signal from noise. It compares a branch against one or more bases, computes structural heuristics, and emits human- and machine-readable review packs. Language-aware tool checks require explicit execution consent.
+
+By default, project commands are **NOT_RUN**. Use `prview --deep --allow-project-execution`
+to acknowledge that build scripts, plugins, dependency setup and tests may run on
+your machine. `--quick`, `--deep`, `--ci` and project configuration never grant
+that permission themselves. The flag is per invocation and **does not provide a
+sandbox**. An analytical pack with suppressed checks is not an all-green check
+run or unconditional permission to merge. See [execution consent](docs/usage.md#execution-consent).
 
 No dashboards to babysit. No "powerful insights." Just the things that would block the merge, surfaced early.
 
@@ -71,10 +78,10 @@ Full instructions — release binaries, checksums, and PATH setup — live in [`
 prview --quick
 
 # Review a GitHub PR with stricter presets (tests narrowed to the change)
-prview --pr 23 --deep
+prview --pr 23 --deep --allow-project-execution
 
 # The same review on a runner, with every test executed
-prview --ci
+prview --ci --allow-project-execution
 
 # Run the automation gate with contractual exit codes
 prview gate

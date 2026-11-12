@@ -167,7 +167,7 @@ fn gate_exits_zero_for_non_strict_conditional() {
     // Default policy: the skipped Semgrep check is advisory → CONDITIONAL,
     // which is accepted (exit 0) without --strict.
     prview_gate_command(temp.path(), home.path())
-        .arg("gate")
+        .args(["gate", "--allow-project-execution"])
         .assert()
         .code(0);
 }
@@ -181,7 +181,7 @@ fn gate_exits_two_for_strict_conditional() {
     // exact code clap also uses for usage errors, which is why the action must
     // distinguish the two (see action.yml) — here we pin the contract value.
     prview_gate_command(temp.path(), home.path())
-        .args(["gate", "--strict"])
+        .args(["gate", "--allow-project-execution", "--strict"])
         .assert()
         .code(2);
 }
@@ -197,7 +197,7 @@ fn gate_exits_two_for_strict_conditional_with_breaking_change() {
     // (The skipped Semgrep check is also advisory here; either way the process
     // must exit 2 with a real breaking finding present in the pack.)
     prview_gate_command(temp.path(), home.path())
-        .args(["gate", "--strict"])
+        .args(["gate", "--allow-project-execution", "--strict"])
         .assert()
         .code(2);
 }
@@ -212,7 +212,7 @@ fn operator_policy_real_gate_warning_lane() {
         .current_dir(temp.path())
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
-        .args(["gate", "--strict", "--json"])
+        .args(["gate", "--allow-project-execution", "--strict", "--json"])
         .output()
         .expect("run strict warning gate");
     assert_eq!(
@@ -230,7 +230,13 @@ fn operator_policy_real_gate_warning_lane() {
         .current_dir(temp.path())
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
-        .args(["gate", "--strict", "--fail-on-warnings", "--json"])
+        .args([
+            "gate",
+            "--allow-project-execution",
+            "--strict",
+            "--fail-on-warnings",
+            "--json",
+        ])
         .output()
         .expect("run warnings-clean gate");
     assert_eq!(hardened.status.code(), Some(2));
@@ -256,7 +262,7 @@ fn gate_exits_one_for_block_verdict() {
     run_git(repo, &["commit", "-m", "block policy"]);
 
     prview_gate_command(repo, home.path())
-        .arg("gate")
+        .args(["gate", "--allow-project-execution"])
         .assert()
         .code(1);
 }
@@ -277,6 +283,7 @@ fn ci_run_exits_three_when_pack_has_no_merge_gate() {
 
     // 1. A real run, so the pack on disk is a genuine one (metadata included).
     let assert = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--allow-project-execution")
         .current_dir(repo)
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
@@ -302,6 +309,7 @@ fn ci_run_exits_three_when_pack_has_no_merge_gate() {
     // 3. `--update` re-reads that pack (HEAD is unchanged). No verdict is
     //    readable, so the process must report an execution error, not a guess.
     Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--allow-project-execution")
         .current_dir(repo)
         .env("PATH", &path)
         .env("PRVIEW_HOME", home.path())
@@ -343,7 +351,7 @@ fn gate_exits_three_when_it_cannot_execute() {
         .current_dir(temp.path())
         .env("GIT_CEILING_DIRECTORIES", temp.path())
         .env("PRVIEW_HOME", home.path())
-        .arg("gate")
+        .args(["gate", "--allow-project-execution"])
         .assert()
         .code(3);
 }
@@ -390,7 +398,7 @@ fn run_gate_json(repo: &Path, path: &OsString, home: &Path, extra: &[&str]) -> s
         .current_dir(repo)
         .env("PATH", path)
         .env("PRVIEW_HOME", home)
-        .arg("gate")
+        .args(["gate", "--allow-project-execution"])
         .args(extra)
         .arg("--json")
         .output()
@@ -887,7 +895,13 @@ fn gate_exits_three_for_unresolvable_explicit_base() {
             .current_dir(temp.path())
             .env("PATH", &path)
             .env("PRVIEW_HOME", home.path())
-            .args(["gate", "--base", base, "--json"])
+            .args([
+                "gate",
+                "--allow-project-execution",
+                "--base",
+                base,
+                "--json",
+            ])
             .output()
             .expect("run gate");
         let stdout = String::from_utf8_lossy(&output.stdout);

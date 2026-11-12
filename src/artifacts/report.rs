@@ -8,8 +8,7 @@ use super::api_delta;
 use super::parsers::cargo_test::extract_failed_test_names;
 use super::signal::BreakingKind;
 use super::{
-    DashboardContext, breaking_change_breakdown, build_merge_decision_view, build_review_caveats,
-    cargo_audit_review_caveats,
+    DashboardContext, build_merge_decision_view, build_review_caveats, cargo_audit_review_caveats,
 };
 use crate::checks::{CheckResult, CheckStatus};
 use crate::config::Config;
@@ -104,6 +103,7 @@ struct Report {
     schema_version: &'static str,
     meta: Meta,
     gate: Gate,
+    decision_readout: super::DecisionReadout,
     checks: Vec<CheckEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     checks_skipped: Vec<SkippedCheckEntry>,
@@ -148,6 +148,8 @@ struct Meta {
 struct ToolMeta {
     name: &'static str,
     version: String,
+    #[serde(flatten)]
+    generator: &'static super::generator_identity::GeneratorIdentity,
 }
 
 #[derive(Serialize)]
@@ -565,7 +567,11 @@ struct HeuristicsSection {
 
 #[derive(Serialize)]
 struct BreakingSection {
+    /// Whether known changes were detected; false does not establish completeness.
     has_breaking: bool,
+    status: &'static str,
+    analysis_complete: bool,
+    rust_status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
     md_path: Option<&'static str>,
@@ -730,6 +736,7 @@ fn build_report_for_range(
         tool: ToolMeta {
             name: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            generator: super::generator_identity::current(),
         },
         repo: config.gh_repo.as_ref().map(|r| RepoMeta {
             full_name: r.clone(),
@@ -1044,28 +1051,20 @@ fn build_report_for_range(
         },
     };
 
-    let breaking_breakdown = breaking_change_breakdown(&ctx.breaking);
+    let evidence = super::breaking_evidence(
+        &ctx.breaking,
+        ctx.rust_api_delta.as_ref(),
+        ctx.has_api_comparison,
+    );
     let rust_counts = ctx.rust_api_delta.as_ref().map(|view| &view.counts);
-    let rust_breaking_count = rust_counts.map_or(0, |counts| {
-        counts.removed + counts.changed + counts.relocated + counts.visibility_changed
-    });
 
     let quality = Quality {
         breaking_changes: BreakingSection {
-            has_breaking: !ctx.breaking.is_empty() || rust_breaking_count > 0,
-            summary: breaking_breakdown.summary().or_else(|| {
-                (rust_breaking_count > 0)
-                    .then(|| {
-                        format!(
-                            "{} confirmed Rust API breaking findings",
-                            rust_breaking_count
-                        )
-                    })
-                    .or_else(|| {
-                        (!ctx.breaking.is_empty())
-                            .then(|| format!("{} breaking findings", ctx.breaking.len()))
-                    })
-            }),
+            has_breaking: evidence.known_count > 0,
+            status: evidence.status,
+            analysis_complete: evidence.analysis_complete,
+            rust_status: evidence.rust_status,
+            summary: Some(evidence.summary),
             // A Rust API report can exist without a breaking finding. Link the
             // emitted artifact, rather than inferring its presence from severity.
             md_path: input
@@ -1078,7 +1077,12 @@ fn build_report_for_range(
             signature_changes_count: signature_changes
                 + rust_counts.map_or(0, |counts| counts.changed),
             new_env_vars_count: new_env_vars,
-            relocated_count: rust_counts.map_or(0, |counts| counts.relocated),
+            relocated_count: ctx
+                .breaking
+                .iter()
+                .filter(|finding| matches!(finding.kind, BreakingKind::RelocatedSymbol { .. }))
+                .count()
+                + rust_counts.map_or(0, |counts| counts.relocated),
             visibility_changed_count: rust_counts.map_or(0, |counts| counts.visibility_changed),
             unknown_count: rust_counts.map_or(0, |counts| counts.unknown),
             rust_api_delta: ctx.rust_api_delta.clone(),
@@ -1285,6 +1289,11 @@ fn build_report_for_range(
         schema_version: "3.2",
         meta,
         gate,
+        decision_readout: super::build_decision_readout(
+            ctx.allow_merge,
+            &ctx.quality_failures,
+            &ctx.quality_failure_details,
+        ),
         checks: check_entries,
         checks_skipped,
         diff: diff_section,
@@ -1491,6 +1500,7 @@ test result: FAILED. 0 passed; 1 failed
         }];
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "BLOCK",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Block,
@@ -1653,6 +1663,7 @@ test result: FAILED. 0 passed; 1 failed
             provenance: None,
         });
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -1780,6 +1791,7 @@ test result: FAILED. 0 passed; 1 failed
 
         // Pre-existing-only failures: quality_pass=true because no new issues
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -1902,6 +1914,7 @@ test result: FAILED. 0 passed; 1 failed
         config.execution_mode = ExecutionMode::Standard;
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "CONDITIONAL",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::ReviewRequired,
@@ -1993,6 +2006,8 @@ test result: FAILED. 0 passed; 1 failed
             json["gate"]["quality_failure_details"]
         );
         assert_eq!(json["gate"]["quality_pass"].as_bool(), Some(true));
+        assert_eq!(json["decision_readout"]["introduced_failures"], 0);
+        assert!(json["decision_readout"].get("advisory_warnings").is_none());
     }
 
     #[test]
@@ -2007,6 +2022,7 @@ test result: FAILED. 0 passed; 1 failed
         config.execution_mode = ExecutionMode::Standard;
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "BLOCK",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Block,
@@ -2113,10 +2129,11 @@ test result: FAILED. 0 passed; 1 failed
         assert_eq!(breaking["removed_public_symbols_count"].as_u64(), Some(1));
         assert_eq!(breaking["signature_changes_count"].as_u64(), Some(1));
         assert_eq!(breaking["new_env_vars_count"].as_u64(), Some(1));
-        assert_eq!(
-            breaking["summary"].as_str(),
-            Some("1 removed public symbol, 1 signature change, 1 new env requirement")
+        let summary = breaking["summary"].as_str().expect("breaking summary");
+        assert!(
+            summary.contains("1 removed public symbol, 1 signature change, 1 new env requirement")
         );
+        assert!(summary.contains("analysis: MEASURED"));
     }
 
     #[test]
@@ -2136,6 +2153,7 @@ test result: FAILED. 0 passed; 1 failed
         config.run_heuristics = true;
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -2266,6 +2284,7 @@ test result: FAILED. 0 passed; 1 failed
         coverage: crate::artifacts::signal::CoverageDelta,
     ) -> crate::artifacts::DashboardContext {
         crate::artifacts::DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -2705,6 +2724,7 @@ test result: FAILED. 0 passed; 1 failed
         }];
 
         let ctx = DashboardContext {
+            has_api_comparison: true,
             verdict: "PASS",
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
@@ -2919,5 +2939,123 @@ test result: FAILED. 0 passed; 1 failed
             0
         );
         assert_eq!(consistency["provenance_comparisons"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn review80_report_relocation_count_matches_known_evidence_axis() {
+        for rust_relocated in [0, 2] {
+            let mut ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+            ctx.breaking.push(super::super::signal::BreakingFinding {
+                file: "api.ts".into(),
+                kind: BreakingKind::RelocatedSymbol {
+                    symbol_type: "function".into(),
+                },
+                line: "export function moved()".into(),
+                risk_level: super::super::signal::BreakingRisk::High,
+            });
+            ctx.rust_api_delta = Some(api_delta::ApiArtifactView {
+                view: api_delta::ApiArtifactViewKind::BreakingChanges,
+                analysis_source: "fixture",
+                base_revision: "base".into(),
+                target_revision: "target".into(),
+                counts: api_delta::ApiDeltaCounts {
+                    added: 0,
+                    removed: 0,
+                    changed: 0,
+                    relocated: rust_relocated,
+                    visibility_changed: 0,
+                    unknown: 0,
+                },
+                findings: vec![],
+            });
+            let report = skip_as_zero_report(&ctx, None, false);
+            let api = &report["quality"]["breaking_changes"];
+            assert_eq!(api["relocated_count"], 1 + rust_relocated);
+            let total: u64 = [
+                "removed_public_symbols_count",
+                "signature_changes_count",
+                "new_env_vars_count",
+                "relocated_count",
+                "visibility_changed_count",
+            ]
+            .into_iter()
+            .map(|key| api[key].as_u64().unwrap())
+            .sum();
+            let evidence = super::super::breaking_evidence(
+                &ctx.breaking,
+                ctx.rust_api_delta.as_ref(),
+                ctx.has_api_comparison,
+            );
+            assert_eq!(total as usize, evidence.known_count);
+        }
+    }
+
+    #[test]
+    fn report_api_unknown_preserves_known_counts_and_completeness() {
+        for (added, removed, unknown) in [(0, 0, 1), (0, 1, 1), (0, 0, 0), (1, 0, 0)] {
+            let mut ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+            ctx.rust_api_delta = Some(api_delta::ApiArtifactView {
+                view: api_delta::ApiArtifactViewKind::BreakingChanges,
+                analysis_source: "fixture",
+                base_revision: "base".into(),
+                target_revision: "target".into(),
+                counts: api_delta::ApiDeltaCounts {
+                    added,
+                    removed,
+                    changed: 0,
+                    relocated: 0,
+                    visibility_changed: 0,
+                    unknown,
+                },
+                findings: vec![],
+            });
+            let report = skip_as_zero_report(&ctx, None, false);
+            let evidence = &report["quality"]["breaking_changes"];
+            assert_eq!(evidence["removed_public_symbols_count"], removed);
+            assert_eq!(evidence["unknown_count"], unknown);
+            assert_eq!(evidence["has_breaking"], removed > 0);
+            assert_eq!(evidence["analysis_complete"], unknown == 0);
+            assert_eq!(
+                evidence["status"],
+                if unknown == 0 { "MEASURED" } else { "UNKNOWN" }
+            );
+            let summary = evidence["summary"].as_str().unwrap();
+            assert!(summary.contains("Structural compatibility-impact observations:"));
+            assert!(!summary.contains("Public API structural changes: 0"));
+            assert!(summary.contains("unresolved"));
+            assert_eq!(evidence["rust_api_delta"]["counts"]["added"], added);
+        }
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let report = skip_as_zero_report(&ctx, None, false);
+        assert_eq!(
+            report["quality"]["breaking_changes"]["rust_status"],
+            "NOT_APPLICABLE"
+        );
+        assert_eq!(report["quality"]["breaking_changes"]["status"], "MEASURED");
+    }
+
+    #[test]
+    fn report_api_without_comparison_is_not_run_and_preserves_known_counts() {
+        let mut ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        ctx.has_api_comparison = false;
+        let report = skip_as_zero_report(&ctx, None, false);
+        let api = &report["quality"]["breaking_changes"];
+        assert_eq!(api["status"], "NOT_RUN");
+        assert_eq!(api["analysis_complete"], false);
+        assert_eq!(api["rust_status"], "NOT_RUN");
+        assert_eq!(api["has_breaking"], false);
+        ctx.breaking.push(super::super::signal::BreakingFinding {
+            file: "src/api.ts".into(),
+            kind: BreakingKind::RemovedSymbol {
+                symbol_type: "function".into(),
+            },
+            line: "export function removed()".into(),
+            risk_level: super::super::signal::BreakingRisk::High,
+        });
+        let report = skip_as_zero_report(&ctx, None, false);
+        let api = &report["quality"]["breaking_changes"];
+        assert_eq!(api["status"], "NOT_RUN");
+        assert_eq!(api["removed_public_symbols_count"], 1);
+        assert_eq!(api["has_breaking"], true);
     }
 }

@@ -48,7 +48,17 @@ fn run(
     args: &[&str],
     code: i32,
 ) -> (Value, Value, Value) {
-    let output = env.command().current_dir(repo).args(args).output().unwrap();
+    let is_gate = args.first() == Some(&"gate");
+    let mut command = if is_gate {
+        env.bare_command()
+    } else {
+        env.command()
+    };
+    command.current_dir(repo).args(args);
+    if is_gate {
+        command.arg("--allow-project-execution");
+    }
+    let output = command.output().unwrap();
     assert_eq!(
         output.status.code(),
         Some(code),

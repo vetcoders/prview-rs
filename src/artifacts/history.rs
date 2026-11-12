@@ -7,6 +7,12 @@ use super::*;
 pub(crate) struct PreviousCoverage {
     pub ratio: Option<f64>,
     pub untested_count: Option<usize>,
+    /// `regression.tests.metric_fingerprint` of the previous run; `None` for
+    /// runs recorded before fingerprints existed (not comparable).
+    pub metric_fingerprint: Option<String>,
+    /// `meta.repo.full_name` of the previous run; `None` when that run did not
+    /// record a repository identity (not comparable).
+    pub repo_identity: Option<String>,
     source: Option<CoverageHistorySource>,
 }
 
@@ -16,15 +22,37 @@ struct CoverageHistorySource {
     run_id: Option<String>,
     metric_path: Option<&'static str>,
     untested_count_path: Option<&'static str>,
+    metric_fingerprint: Option<String>,
+    repo_identity: Option<String>,
     review_range: Option<serde_json::Value>,
     run_freshness: Option<serde_json::Value>,
 }
 
 impl PreviousCoverage {
-    pub(crate) fn description(&self) -> String {
-        match self.source.as_ref() {
-            Some(source) => format!("Coverage trend compares source/test-change matching with previous run `{}` (`{}`), not with the PR base commit. Historical revision metadata is in report.json regression.tests.coverage_comparison.", source.run_id.as_deref().unwrap_or("unknown"), source.report_path),
-            None => "Coverage trend: no previous-run metric available; this is not a PR-base coverage comparison.".into(),
+    /// Narrative for `PR_REVIEW.md`. Takes the computed regression so the
+    /// sentence states whether the previous run was actually compared; a
+    /// found-but-not-comparable run must not read as a trend.
+    pub(crate) fn description(&self, tests: &regression::tests::TestRegression) -> String {
+        use regression::tests::CoverageComparisonStatus;
+        let Some(source) = self.source.as_ref() else {
+            return "Coverage trend: no previous-run metric available; this is not a PR-base coverage comparison.".into();
+        };
+        let run = source.run_id.as_deref().unwrap_or("unknown");
+        match tests.comparison_status {
+            CoverageComparisonStatus::Comparable => format!(
+                "Coverage trend compares source/test-change matching with previous run `{run}` (`{}`), not with the PR base commit. Historical revision metadata is in report.json regression.tests.coverage_comparison.",
+                source.report_path
+            ),
+            CoverageComparisonStatus::NotComparable | CoverageComparisonStatus::Unavailable => {
+                format!(
+                    "Coverage trend: previous run `{run}` (`{}`) was found but is not comparable ({}); no trend or historical regression is derived. Coverage trends compare source/test-change matching with a previous run, not with the PR base commit. Details: report.json regression.tests.coverage_comparison.",
+                    source.report_path,
+                    tests
+                        .comparison_reason
+                        .as_deref()
+                        .unwrap_or("no reason recorded")
+                )
+            }
         }
     }
 }
@@ -58,6 +86,16 @@ pub(crate) fn load_previous_coverage(out_dir: &Path) -> PreviousCoverage {
     if metric.is_none() && count.is_none() {
         return PreviousCoverage::default();
     }
+    let metric_fingerprint = json
+        .pointer("/regression/tests/metric_fingerprint")
+        .and_then(|v| v.as_str())
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .map(str::to_owned);
+    let repo_identity = json
+        .pointer("/meta/repo/full_name")
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
     // Preserve the actual record, including unknown/missing revision metadata.
     // A branch label must never be promoted into an inferred commit SHA.
     let run = fs::read_to_string(path.parent().unwrap().join("00_summary/RUN.json"))
@@ -66,6 +104,8 @@ pub(crate) fn load_previous_coverage(out_dir: &Path) -> PreviousCoverage {
     PreviousCoverage {
         ratio: metric.map(|(_, ratio)| ratio),
         untested_count: count.map(|(_, count)| count),
+        metric_fingerprint: metric_fingerprint.clone(),
+        repo_identity: repo_identity.clone(),
         source: Some(CoverageHistorySource {
             report_path: path.display().to_string(),
             run_id: path
@@ -74,6 +114,8 @@ pub(crate) fn load_previous_coverage(out_dir: &Path) -> PreviousCoverage {
                 .map(|name| name.to_string_lossy().into_owned()),
             metric_path: metric.map(|(path, _)| path),
             untested_count_path: count.map(|(path, _)| path),
+            metric_fingerprint,
+            repo_identity,
             review_range: json.get("review_range").cloned(),
             run_freshness: run.and_then(|run| run.get("freshness").cloned()),
         }),
@@ -91,6 +133,8 @@ pub(crate) fn regression_with_coverage_history(
         "kind": "previous_run",
         "metric_kind": "source_test_change_match",
         "pr_base_comparison": false,
+        "current_metric_fingerprint": regression::tests::COVERAGE_METRIC_FINGERPRINT,
+        "comparison_status": report.tests.comparison_status,
         "source_status": match history { Some(h) if h.source.is_some() => "recorded", Some(_) => "unavailable", None => "not_recorded" },
         "source": history.and_then(|h| h.source.as_ref()),
     });
@@ -200,22 +244,26 @@ pub(crate) fn load_previous_run_delta(out_dir: &Path) -> Option<PreviousRunDelta
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
 
-    // PRV-P2-3: Breaking changes delta.
-    // report.json schema (v1) stores `quality.breaking_changes.removed_public_symbols_count`
-    // and `quality.breaking_changes.new_env_vars_count`. If these fields are missing
-    // (e.g. report.json from a version before these fields existed), we fall back to 0.
-    // This means the delta may show "+N new breaking changes" even if the previous run
-    // had the same count — known limitation for pre-v1 reports.
+    // Only complete, measured API evidence establishes a historical count.
+    // Legacy/missing/unresolved evidence is unavailable, not a measured zero.
     let breaking_section = json.get("quality").and_then(|q| q.get("breaking_changes"));
-    let removed = breaking_section
-        .and_then(|b| b.get("removed_public_symbols_count"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let env = breaking_section
-        .and_then(|b| b.get("new_env_vars_count"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let breaking_before = (removed + env) as usize;
+    let breaking_before = breaking_section
+        .filter(|section| {
+            section["status"].as_str() == Some("MEASURED")
+                && section["analysis_complete"].as_bool() == Some(true)
+        })
+        .and_then(|section| {
+            [
+                "removed_public_symbols_count",
+                "signature_changes_count",
+                "new_env_vars_count",
+                "relocated_count",
+                "visibility_changed_count",
+            ]
+            .into_iter()
+            .try_fold(0_u64, |sum, key| sum.checked_add(section[key].as_u64()?))
+        })
+        .and_then(|count| usize::try_from(count).ok());
 
     Some(PreviousRunDelta {
         checks_passed_before,
@@ -473,7 +521,7 @@ mod dogfood_tests {
         fs::create_dir_all(&current).unwrap();
         let range =
             json!({"comparisons":[{"target_sha":"old-target", "effective_base_sha":"old-base"}]});
-        fs::write(previous.join("report.json"), json!({"review_range":range,"regression":{"tests":{"coverage_ratio":0.25,"untested_code_count":null,"untested_critical_count":3}}}).to_string()).unwrap();
+        fs::write(previous.join("report.json"), json!({"meta":{"repo":{"full_name":"acme/widgets"}},"review_range":range,"regression":{"tests":{"coverage_ratio":0.25,"untested_code_count":null,"untested_critical_count":3,"metric_fingerprint":regression::tests::COVERAGE_METRIC_FINGERPRINT}}}).to_string()).unwrap();
         fs::write(
             previous.join("00_summary/RUN.json"),
             json!({"freshness":{"target_sha":"old-target","base_sha":"old-base"}}).to_string(),
@@ -482,10 +530,30 @@ mod dogfood_tests {
         let history = load_previous_coverage(&current);
         assert_eq!(history.ratio, Some(0.25));
         assert_eq!(history.untested_count, Some(3));
+        assert_eq!(
+            history.metric_fingerprint.as_deref(),
+            Some(regression::tests::COVERAGE_METRIC_FINGERPRINT)
+        );
+        assert_eq!(history.repo_identity.as_deref(), Some("acme/widgets"));
+        let not_compared = history.description(&regression::tests::TestRegression::default());
+        assert!(not_compared.contains("is not comparable"), "{not_compared}");
         assert!(
-            history
-                .description()
-                .contains("not with the PR base commit")
+            not_compared.contains("20261015-225515-old"),
+            "{not_compared}"
+        );
+        let compared = history.description(&regression::tests::TestRegression {
+            comparison_status: regression::tests::CoverageComparisonStatus::Comparable,
+            ..Default::default()
+        });
+        assert!(
+            compared.contains(
+                "compares source/test-change matching with previous run `20261015-225515-old`"
+            ),
+            "{compared}"
+        );
+        assert!(
+            compared.contains("not with the PR base commit"),
+            "{compared}"
         );
         let report = regression::RegressionReport::default();
         let mut emitted = regression_with_coverage_history(&report, Some(&history));
@@ -496,6 +564,16 @@ mod dogfood_tests {
             .unwrap();
         assert_eq!(metadata["kind"], "previous_run");
         assert_eq!(metadata["pr_base_comparison"], false);
+        assert_eq!(
+            metadata["current_metric_fingerprint"],
+            regression::tests::COVERAGE_METRIC_FINGERPRINT
+        );
+        assert_eq!(metadata["comparison_status"], "unavailable"); // default report has no comparison
+        assert_eq!(
+            metadata["source"]["metric_fingerprint"],
+            regression::tests::COVERAGE_METRIC_FINGERPRINT
+        );
+        assert_eq!(metadata["source"]["repo_identity"], "acme/widgets");
         assert_eq!(metadata["source"]["run_id"], "20261015-225515-old");
         assert_eq!(metadata["source"]["review_range"], range);
         assert_eq!(metadata["source"]["run_freshness"]["base_sha"], "old-base");
@@ -522,7 +600,11 @@ mod dogfood_tests {
             let history = load_previous_coverage(&current);
             assert_eq!(history.ratio, None);
             assert_eq!(history.untested_count, Some(0));
-            assert!(history.description().contains("20261017-empty"));
+            assert!(
+                history
+                    .description(&regression::tests::TestRegression::default())
+                    .contains("20261017-empty")
+            );
             let value = regression_with_coverage_history(
                 &regression::RegressionReport::default(),
                 Some(&history),
@@ -562,5 +644,200 @@ mod dogfood_tests {
         );
         assert!(emitted["tests"]["coverage_comparison"]["source"]["review_range"].is_null());
         assert!(emitted["tests"]["coverage_comparison"]["source"]["run_freshness"].is_null());
+    }
+
+    #[test]
+    fn previous_run_without_fingerprint_keeps_provenance_but_is_not_comparable() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous = temp.path().join("20261015-225515-old");
+        let current = temp.path().join("20261018-053545-new");
+        fs::create_dir_all(previous.join("00_summary")).unwrap();
+        fs::create_dir_all(&current).unwrap();
+        fs::write(
+            previous.join("report.json"),
+            json!({"regression":{"tests":{"coverage_ratio":0.8,"untested_code_count":1}}})
+                .to_string(),
+        )
+        .unwrap();
+        let history = load_previous_coverage(&current);
+        assert_eq!(history.ratio, Some(0.8));
+        assert_eq!(history.metric_fingerprint, None);
+        assert_eq!(history.repo_identity, None);
+
+        let ctx = regression::RegressionContext {
+            coverage_ratio: Some(0.2),
+            base_coverage_ratio: history.ratio,
+            base_untested_critical_count: history.untested_count,
+            base_metric_fingerprint: history.metric_fingerprint.clone(),
+            repo_identity: Some("acme/widgets".into()),
+            base_repo_identity: history.repo_identity.clone(),
+            untested_critical_files: vec!["src/a.rs".into(), "src/b.rs".into()],
+            ..Default::default()
+        };
+        let report = regression::compute_regression(&ctx);
+        assert_eq!(
+            report.tests.comparison_status,
+            regression::tests::CoverageComparisonStatus::NotComparable
+        );
+        assert!(!report.tests.coverage_regression_detected);
+        assert_eq!(report.tests.base_coverage_ratio, Some(0.8));
+        let emitted = regression_with_coverage_history(&report, Some(&history));
+        assert_eq!(
+            emitted["tests"]["coverage_comparison"]["comparison_status"],
+            "not_comparable"
+        );
+        assert_eq!(
+            emitted["tests"]["coverage_comparison"]["source_status"],
+            "recorded"
+        );
+        assert!(emitted["tests"]["coverage_comparison"]["source"]["metric_fingerprint"].is_null());
+        assert!(emitted["tests"]["coverage_comparison"]["source"]["repo_identity"].is_null());
+    }
+
+    fn previous_run_dir(temp: &Path, name: &str, report: serde_json::Value) -> PathBuf {
+        let previous = temp.join(name);
+        fs::create_dir_all(previous.join("00_summary")).unwrap();
+        fs::write(previous.join("report.json"), report.to_string()).unwrap();
+        previous
+    }
+
+    fn analyze_against(
+        history: &PreviousCoverage,
+        current_repo: &str,
+        ratio: Option<f64>,
+        untested: &[&str],
+    ) -> regression::tests::TestRegression {
+        let ctx = regression::RegressionContext {
+            coverage_ratio: ratio,
+            base_coverage_ratio: history.ratio,
+            base_untested_critical_count: history.untested_count,
+            base_metric_fingerprint: history.metric_fingerprint.clone(),
+            repo_identity: Some(current_repo.to_string()),
+            base_repo_identity: history.repo_identity.clone(),
+            untested_critical_files: untested.iter().map(|path| path.to_string()).collect(),
+            file_stats: untested
+                .iter()
+                .map(|path| (path.to_string(), 'M', 10, 5))
+                .collect(),
+            ..Default::default()
+        };
+        regression::compute_regression(&ctx).tests
+    }
+
+    /// A docs-only previous run (ratio null, count 0) with the current
+    /// fingerprint measured nothing: through the real loader it must not turn
+    /// one untested source file into a historical regression.
+    #[test]
+    fn count_only_previous_run_is_loaded_as_provenance_but_not_compared() {
+        let temp = tempfile::tempdir().unwrap();
+        previous_run_dir(
+            temp.path(),
+            "20261015-225515-old",
+            json!({
+                "meta": {"repo": {"full_name": "acme/widgets"}},
+                "regression": {"tests": {"coverage_ratio": null, "untested_code_count": 0,
+                    "metric_fingerprint": regression::tests::COVERAGE_METRIC_FINGERPRINT}}
+            }),
+        );
+        let current = temp.path().join("20261018-053545-new");
+        fs::create_dir_all(&current).unwrap();
+        let history = load_previous_coverage(&current);
+        assert_eq!(history.ratio, None);
+        assert_eq!(history.untested_count, Some(0));
+        assert!(
+            history.source.is_some(),
+            "count-only record still supplies provenance"
+        );
+
+        let tests = analyze_against(&history, "acme/widgets", Some(0.0), &["src/a.rs"]);
+        assert_eq!(
+            tests.comparison_status,
+            regression::tests::CoverageComparisonStatus::NotComparable
+        );
+        assert!(
+            tests
+                .comparison_reason
+                .as_deref()
+                .unwrap()
+                .contains("count-only")
+        );
+        assert!(!tests.coverage_regression_detected);
+        assert!(tests.low_test_match_detected);
+    }
+
+    /// A measured previous ratio does not make a current run without changed
+    /// source files comparable.
+    #[test]
+    fn unmeasured_current_run_is_not_compared_with_a_measured_previous_run() {
+        let temp = tempfile::tempdir().unwrap();
+        previous_run_dir(
+            temp.path(),
+            "20261015-225515-old",
+            json!({
+                "meta": {"repo": {"full_name": "acme/widgets"}},
+                "regression": {"tests": {"coverage_ratio": 0.9, "untested_code_count": 1,
+                    "metric_fingerprint": regression::tests::COVERAGE_METRIC_FINGERPRINT}}
+            }),
+        );
+        let current = temp.path().join("20261018-053545-new");
+        fs::create_dir_all(&current).unwrap();
+        let history = load_previous_coverage(&current);
+        assert_eq!(history.ratio, Some(0.9));
+
+        let tests = analyze_against(&history, "acme/widgets", None, &[]);
+        assert_eq!(
+            tests.comparison_status,
+            regression::tests::CoverageComparisonStatus::NotComparable
+        );
+        assert_eq!(tests.coverage_delta, None);
+        assert!(!tests.coverage_regression_detected);
+    }
+
+    /// Two repositories writing into one explicit output directory: the loader
+    /// finds the other project's run, the comparison refuses it by identity.
+    #[test]
+    fn previous_run_of_another_repository_is_not_compared() {
+        let temp = tempfile::tempdir().unwrap();
+        previous_run_dir(
+            temp.path(),
+            "20261015-225515-old",
+            json!({
+                "meta": {"repo": {"full_name": "acme/widgets"}},
+                "regression": {"tests": {"coverage_ratio": 0.9, "untested_code_count": 1,
+                    "metric_fingerprint": regression::tests::COVERAGE_METRIC_FINGERPRINT}}
+            }),
+        );
+        let current = temp.path().join("20261018-053545-new");
+        fs::create_dir_all(&current).unwrap();
+        let history = load_previous_coverage(&current);
+        assert_eq!(history.repo_identity.as_deref(), Some("acme/widgets"));
+
+        let tests = analyze_against(&history, "acme/gadgets", Some(0.1), &["src/a.rs"]);
+        assert_eq!(
+            tests.comparison_status,
+            regression::tests::CoverageComparisonStatus::NotComparable
+        );
+        assert!(
+            tests
+                .comparison_reason
+                .as_deref()
+                .unwrap()
+                .contains("acme/widgets")
+        );
+        assert!(!tests.coverage_regression_detected);
+
+        // Same repository, same fingerprint, measured both sides, another
+        // review range: comparable, and the decline is detected.
+        let tests = analyze_against(&history, "acme/widgets", Some(0.1), &["src/a.rs"]);
+        assert_eq!(
+            tests.comparison_status,
+            regression::tests::CoverageComparisonStatus::Comparable
+        );
+        assert!(tests.coverage_regression_detected);
+        assert!(
+            tests
+                .coverage_delta
+                .is_some_and(|delta| (delta + 0.8).abs() < 1e-9)
+        );
     }
 }

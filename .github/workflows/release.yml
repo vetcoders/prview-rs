@@ -199,6 +199,10 @@ jobs:
           # build.rs bakes this into PRVIEW_BUILD_SOURCE_SHA. Without it the
           # official binaries report "unknown" provenance.
           PRVIEW_SOURCE_SHA: ${{ env.PRVIEW_RELEASE_SHA }}
+          # Only the validated publication continuation supplies generator-tag
+          # metadata. The workflow's general tag/ref also exists during branch
+          # dry runs and cargo package, where it is not an attested build input.
+          PRVIEW_GENERATOR_RELEASE_TAG: ${{ github.event_name == 'repository_dispatch' && env.PRVIEW_RELEASE_TAG || '' }}
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Strip binary
         shell: bash

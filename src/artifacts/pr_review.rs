@@ -371,8 +371,20 @@ pub(crate) fn generate_pr_review(
 
     let mut md = String::new();
 
+    // Copy canonical permission and classified failure counts from the gate.
+    // A missing/legacy/malformed gate never earns a fabricated zero.
+    let gate = read_to_string_within(dir, Path::new("00_summary/MERGE_GATE.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or(serde_json::Value::Null);
     // Header
     writeln!(md, "# PR Review")?;
+    writeln!(
+        md,
+        "\n{}\n\n{}\n",
+        gate_readout_summary(&gate),
+        CHANGE_QUALITY_SCOPE
+    )?;
     writeln!(md)?;
     writeln!(
         md,
@@ -886,4 +898,61 @@ pub(crate) fn generate_pr_review(
 
     fs::write(dir.join("PR_REVIEW.md"), md)?;
     Ok(())
+}
+
+/// Append the same structural evidence that report.json and the dashboard use.
+pub(crate) fn append_api_evidence(dir: &Path, evidence: &BreakingEvidence) -> Result<()> {
+    let path = dir.join("PR_REVIEW.md");
+    let mut md = fs::read_to_string(&path)?;
+    md.push_str(&format!(
+        "\n## Public API Evidence\n\n{}\n",
+        evidence.summary
+    ));
+    fs::write(path, md)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod api_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn api_missing_comparison_reaches_narrative_and_consolidated_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("PR_REVIEW.md"), "# PR Review\n").unwrap();
+        append_api_evidence(dir.path(), &breaking_evidence(&[], None, false)).unwrap();
+        super::super::review_html::generate_review_summary(dir.path(), &[]).unwrap();
+        for file in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+            let md = fs::read_to_string(dir.path().join(file)).unwrap();
+            assert!(md.contains("analysis: NOT_RUN; Rust: NOT_RUN"));
+            assert!(!md.contains("analysis: MEASURED"));
+        }
+    }
+
+    #[test]
+    fn api_unknown_reaches_narrative_and_consolidated_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("PR_REVIEW.md"), "# PR Review\n").unwrap();
+        let view = api_delta::ApiArtifactView {
+            view: api_delta::ApiArtifactViewKind::BreakingChanges,
+            analysis_source: "fixture",
+            base_revision: "base".into(),
+            target_revision: "target".into(),
+            counts: api_delta::ApiDeltaCounts {
+                added: 0,
+                removed: 1,
+                changed: 0,
+                relocated: 0,
+                visibility_changed: 0,
+                unknown: 1,
+            },
+            findings: vec![],
+        };
+        append_api_evidence(dir.path(), &breaking_evidence(&[], Some(&view), true)).unwrap();
+        super::super::review_html::generate_review_summary(dir.path(), &[]).unwrap();
+        for file in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+            let md = fs::read_to_string(dir.path().join(file)).unwrap();
+            assert!(md.contains("1 known; 1 unresolved; analysis: UNKNOWN"));
+        }
+    }
 }

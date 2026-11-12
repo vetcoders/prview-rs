@@ -1,7 +1,6 @@
 //! Hot files — top changed files by churn (insertions + deletions)
 
-use crate::git::git_cmd;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 
 /// Maximum number of hot files shown in display outputs (CLI, TUI, JSON).
@@ -14,37 +13,25 @@ pub struct HotFile {
 }
 
 pub fn get_hot_files(root: &Path) -> Result<Vec<HotFile>> {
-    let output = git_cmd()
-        .args(["diff", "HEAD", "--numstat"])
-        .current_dir(root)
-        .output()
-        .context("git diff --numstat")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "git diff --numstat failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut files: Vec<HotFile> = Vec::new();
-
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() == 3 {
-            // Binary files show "-" for insertions/deletions
-            let insertions: usize = parts[0].parse().unwrap_or(0);
-            let deletions: usize = parts[1].parse().unwrap_or(0);
-            let total = insertions + deletions;
-            if total > 0 {
+    let mut files = super::diff::with_worktree_diff(root, |diff| {
+        let mut files = Vec::new();
+        for (index, delta) in diff.deltas().enumerate() {
+            let Some(patch) = git2::Patch::from_diff(diff, index)? else {
+                continue;
+            };
+            let (_, insertions, deletions) = patch.line_stats()?;
+            let lines = insertions + deletions;
+            if lines > 0
+                && let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path())
+            {
                 files.push(HotFile {
-                    lines: total,
-                    path: parts[2].to_string(),
+                    lines,
+                    path: path.to_string_lossy().into_owned(),
                 });
             }
         }
-    }
+        Ok(files)
+    })?;
 
     files.sort_by_key(|file| std::cmp::Reverse(file.lines));
     Ok(files)

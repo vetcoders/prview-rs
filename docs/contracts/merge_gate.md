@@ -9,6 +9,21 @@ document disagree, the code is the contract and this document is the bug.
 
 ## Top-level object
 
+Project execution requires the invocation's explicit acknowledgement. Without
+CLI `--allow-project-execution` or MCP `allow_project_execution: true`, project
+checks have `execution_state: skipped`, no executed result/command/exit code,
+and reason `project execution not authorized; use --allow-project-execution (NOT_RUN)`.
+PolicyEngine maps this loss of evidence to `incomplete` and `review_required`,
+including severity `ignore`; it cannot produce unconditional `allow_merge: true`.
+This is a confidence ratchet within the existing canonical decision pipeline,
+not a second permission policy. Existing failures can still make the result BLOCK.
+
+RUN.json adds `project_execution: {"allowed": false, "authority": "invocation",
+"host_write_confinement": false}` (with `allowed: true` after acknowledgement).
+The field is evidence about this invocation, never authority for a future one.
+It is additive; absence in an older pack cannot authorize execution or update
+reuse. Consent does not provide a sandbox or change finding severity/score weights.
+
 | Field | Type | Notes |
 |---|---|---|
 | `schema_version` | string | `"3.2"` |
@@ -26,6 +41,7 @@ document disagree, the code is the contract and this document is the bug.
 | `stale_cache_caveats` | object[] | Advisory, additive: gate rows replayed from an old or age-unverifiable cache (see below) |
 | `provenance_contradictions` | object[] | Advisory, additive: substrate statements the run and a check make that cannot both be true (see below) |
 | `decision` | object | The merge decision (see below) |
+| `decision_readout` | object | Additive advisory projection of canonical permission and failed-check counts; does not rank the verdict |
 | `files` | object | Artifact-root-relative paths (see below) |
 | `rust_api_delta` | object \| null | Additive lossless Rust API delta; `null` on non-Rust runs (see below) |
 
@@ -234,6 +250,19 @@ startup/progress output.
 |---|---|---|
 | `properties.in_diff` | boolean \| null | `true` when the reported location is in a file this diff touches, `false` when it is outside, `null` when the origin was not established |
 | `properties.classification` | string | `introduced` (`in_diff == true`), `preexisting` (`in_diff == false`), `unclassified` (`in_diff == null`) |
+| `properties.finding_class` | string | `dependency` for structured Cargo audit advisories, `source` for a parsed/extracted source diagnostic with a nonempty, non-placeholder path and a positive line, `general` for an unlocated check result |
+
+Observation kind and diff origin are independent. A dependency advisory remains
+`dependency` whether its origin is introduced, preexisting or unclassified;
+its location points at the checked lockfile. A general check result points at
+`20_quality/full-checks.log`, without inventing a source line. A structured
+parser's placeholder (for example Cargo test's `(test)` with line 0), empty
+path or nonpositive line is likewise general evidence: no SARIF region,
+`in_diff: null`, `classification: unclassified` and no dashboard file/line.
+Positive source locations outside the diff remain `source`. Pytest rows are `source` with
+`classification: unclassified`. The new property is additive; consumers must
+retain an unknown-kind fallback for legacy or future producers. These classes
+are not changes to the gate's severity, count or merge policy.
 
 Outside Pytest, `introduced` is derived from the diff intersection alone: the
 tool reported the finding in a file this diff touches. That is a location
@@ -718,6 +747,46 @@ just the row shapes:
   duplicated one covering a second row, or a signal no row supports is rejected.
   When rows exist, an absent or non-array `decision.review_caveats` is rejected
   for the same reason.
+
+## `decision_readout`
+
+This root-level advisory object is also emitted at the root of `report.json`.
+It is outside the closed `decision` object and changes no policy, verdict,
+enforcement or score. `decision.allow_merge` remains authoritative; the mirrored
+permission is never a reason to override that scalar or infer it from a human
+review recommendation.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `automatic_merge` | boolean | Projection of canonical `decision.allow_merge` |
+| `details_complete` | boolean | The quality-summary names and detail names have exact multiset coverage |
+| `introduced_failures` | integer \| null | Actual failing results classified introduced |
+| `preexisting_failures` | integer \| null | Actual failing results proven pre-existing |
+| `mixed_failures` | integer \| null | Actual failing results with mixed provenance |
+| `unclassified_failures` | integer \| null | Actual failing results without established provenance |
+
+Only `quality_failure_details.origin == "failure"` contributes to these counts.
+Legacy quality buckets can also contain warning-level signals, so their lengths
+are not failure counts. Missing, malformed, extra or incomplete detail coverage
+produces null counters, rendered as UNKNOWN rather than trusted zero. A known
+canonical YES/NO is retained even when classification counts are unknown.
+The previous-run API observations badge is a neutral comparison of structural
+facts, not a semantic breaking-change regression or improvement. Legacy JS/TS
+relocations remain observations on the same current/report/history count axis;
+this presentation does not alter the canonical gate or typed breaking facts. A
+present non-array `quality_failure_details` container is malformed even when
+`quality_failures` is empty. An absent legacy field remains compatible only
+when no failure names are recorded.
+
+The dashboard hero/card, PR narrative, consolidated summary and copied comment
+display permission independently of change quality, policy allowance and human
+review recommendation. Overall PASS/FAIL/WARN counts come from actual check
+results. Semgrep source scanning and Cargo dependency auditing retain separate
+recorded statuses; when a scope has multiple results, the copied comment lists
+them instead of selecting an optimistic first record.
+When no execution row exists, an explicit `not_executed` entry in the recorded
+security inventory preserves `NOT_RUN`; a requested setting alone is not such
+evidence. Missing evidence remains UNKNOWN.
 
 ## `decision`
 
@@ -1376,9 +1445,39 @@ contains the report path, run ID, nullable ratio and count JSON pointers
 `review_range`/adjacent `RUN.json.freshness`, when available. Missing historical
 revision metadata stays null; a branch label is not promoted to a SHA. A prior
 0/0 run still supplies provenance when its untested-file count is consumed, even
-though its ratio is null. Existing
-`base_coverage_ratio`, delta and regression flags are unchanged: this comparison
-is a previous-run trend, not a coverage scan of the current PR's base commit.
-Public Rust regression structs are unchanged. The CLI JSON summary keeps its
+though its ratio is null. `base_coverage_ratio` keeps the raw previous-run value:
+this comparison is a previous-run trend, not a coverage scan of the current PR's
+base commit.
+
+`regression.tests` additionally carries `metric_fingerprint` (the current
+definition of the test-file classifier and matching,
+`source_test_change_match/xctest-v5`), `comparison_status` (`comparable`,
+`not_comparable`, `unavailable`), `comparison_reason` (present only when the
+status is not `comparable`) and `low_test_match_detected`. A comparison is
+`comparable` only when both runs record the same repository
+(`meta.repo.full_name`, inferred from a GitHub `origin` only and compared
+case-insensitively; an explicit `--output-dir` may hold runs of several
+repositories, and a repository without a GitHub `origin` is `not_comparable`
+because its identity is not recorded), both carry a
+measured ratio in `0..=1` (a count-only or 0/0 record of a run without changed
+source files is provenance, not a measurement) and the previous run carries
+the identical fingerprint. The v5 definition classifies Swift source extensions
+and matches XCTest pairs case-insensitively, including `Foo.SWIFT` and
+`FooTests.swift`; v2/v3/v4 previous runs retain their source and raw ratio but are
+not comparable to v5. A different review range alone does not break
+comparability. `coverage_comparison` repeats the current fingerprint as
+`current_metric_fingerprint`, the status as `comparison_status`, and the
+previous run's `source.metric_fingerprint` and `source.repo_identity` (null
+when that run predates them). `coverage_delta` and
+`coverage_regression_detected` are derived only when the status is
+`comparable`; `low_test_match_detected` describes the current change and needs
+no previous run. Reports written before these fields deserialize with an empty
+fingerprint, `unavailable` status and `false` for the current signal; an older
+`coverage_regression_detected:true` is kept as written and is not reinterpreted
+as a confirmed historical regression. Dependency-availability metadata adds
+explicit fields to the Rust regression and context records, plus optional
+baseline scan scope in heuristics metadata. Exhaustive Rust constructors must
+supply those fields or use their defaults; older serialized availability
+defaults to UNKNOWN, never a measured zero. The CLI JSON summary keeps its
 existing schema and public Rust shape; it carries the clarified review caveats
 and links to these canonical artifacts.

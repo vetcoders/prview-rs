@@ -164,9 +164,35 @@ pub(crate) fn generate_ai_index(
     if dir.join("30_context/INLINE_FINDINGS.sarif").exists() {
         writeln!(
             md,
-            "{}. `30_context/INLINE_FINDINGS.sarif` — structured inline findings.",
+            "{}. `30_context/INLINE_FINDINGS.sarif` — tool observations: source diagnostics, dependency advisories and general check evidence.",
             step
         )?;
+        if let Ok(raw) = read_to_string_within(dir, Path::new("30_context/INLINE_FINDINGS.sarif"))
+            && let Ok(sarif) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            // Count emitted rows, preserving unknown/legacy classes explicitly.
+            // Origin (`classification`) is a separate axis and never a kind.
+            let mut counts = [0usize; 4];
+            for row in sarif["runs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|run| run["results"].as_array().into_iter().flatten())
+            {
+                let index = match row["properties"]["finding_class"].as_str() {
+                    Some("source") => 0,
+                    Some("dependency") => 1,
+                    Some("general") => 2,
+                    _ => 3,
+                };
+                counts[index] += 1;
+            }
+            writeln!(
+                md,
+                "   Observation classes: {} source, {} dependency, {} general, {} unknown. Origin is reported separately by each row's `classification`.",
+                counts[0], counts[1], counts[2], counts[3]
+            )?;
+        }
     }
     writeln!(md)?;
 
@@ -177,7 +203,7 @@ pub(crate) fn generate_ai_index(
     )?;
     writeln!(
         md,
-        "- `10_diff/` — full patch and per-commit/per-file diffs."
+        "- `10_diff/` — full patch, per-file diffs and bounded per-commit context."
     )?;
     writeln!(
         md,
@@ -193,13 +219,33 @@ pub(crate) fn generate_ai_index(
     }
     writeln!(md)?;
 
+    writeln!(md, "## Self-check scope\n")?;
+    writeln!(
+        md,
+        "`00_summary/SANITY.json` and `00_summary/CONSISTENCY_CHECK.json` check selected artifact invariants, counters, provenance and checklist consistency. Manifest verification samples at most five files. Passing self-checks do not independently validate classifier or matching results, security-scan completeness, or the reviewed code.\n"
+    )?;
     writeln!(md, "## If you need deeper context\n")?;
     writeln!(md, "- `20_quality/full-checks.log` — combined quality log.")?;
     writeln!(md, "- `10_diff/full.patch` — canonical patch text.")?;
-    writeln!(
-        md,
-        "- `10_diff/per-commit-diffs/` — commit-by-commit patches."
-    )?;
+    if dir.join("10_diff/per-commit-diffs/00-SUMMARY.md").is_file() {
+        if commit_count > MAX_COMMITS_FOR_PER_COMMIT_DIFFS {
+            writeln!(
+                md,
+                "- `10_diff/per-commit-diffs/00-SUMMARY.md` — summary-only: {} commits exceed the limit of {}; top-10 churn summary, no per-commit patch files. Use `10_diff/full.patch` for the complete reviewed range.",
+                commit_count, MAX_COMMITS_FOR_PER_COMMIT_DIFFS
+            )?;
+        } else {
+            writeln!(
+                md,
+                "- `10_diff/per-commit-diffs/00-SUMMARY.md` — index of generated individual or batched commit patches."
+            )?;
+        }
+    } else {
+        writeln!(
+            md,
+            "- `10_diff/per-commit-diffs/` — no per-commit context was emitted for this run; use `10_diff/full.patch`."
+        )?;
+    }
     if dir.join("00_summary/file-status.txt").exists() {
         writeln!(
             md,

@@ -2,6 +2,36 @@
 
 use super::*;
 
+/// Observation kind is independent of the finding's origin relative to the diff.
+/// Producers choose the class from structured evidence, never from message text.
+#[derive(Clone, Copy)]
+enum InlineFindingClass {
+    Source,
+    Dependency,
+    General,
+}
+
+impl InlineFindingClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Dependency => "dependency",
+            Self::General => "general",
+        }
+    }
+}
+
+/// A parser can report a failure without locating it in source. Do not turn
+/// placeholders or zero-based sentinels into SARIF physical source locations.
+fn source_location_is_reported(file: &str, line: u32) -> bool {
+    let file = file.trim();
+    if line == 0 || file.is_empty() {
+        return false;
+    }
+    !((file.starts_with('(') && file.ends_with(')'))
+        || (file.starts_with('<') && file.ends_with('>')))
+}
+
 #[derive(Debug)]
 pub(super) struct InlineFindingsSummary {
     pub(super) status: String,
@@ -454,11 +484,49 @@ pub(super) fn policy_severity_to_str(level: PolicySeverity) -> &'static str {
 
 /// Classify a commit message into a Conventional Commits type.
 pub(super) fn classify_commit_type(message: &str) -> &'static str {
-    let lower = message.to_lowercase();
-    let first = lower.split(':').next().unwrap_or(&lower).trim();
-    // Strip scope: "feat(cli)" → "feat"
-    let prefix = first.split('(').next().unwrap_or(first);
-    match prefix {
+    let title = message.lines().next().unwrap_or("").trim();
+    // Agent provenance may prefix the title once. Bound and validate that
+    // envelope so arbitrary bracketed prose cannot hide another prefix.
+    let title = if let Some(rest) = title.strip_prefix('[') {
+        let Some((agent, rest)) = rest.split_once(']') else {
+            return "other";
+        };
+        if agent.is_empty()
+            || agent.len() > 64
+            || !agent
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+            || !rest.starts_with(' ')
+        {
+            return "other";
+        }
+        rest.trim_start()
+    } else {
+        title
+    };
+    let Some((header, description)) = title.split_once(':') else {
+        return "other";
+    };
+    if description.trim().is_empty() {
+        return "other";
+    }
+    let header = header.strip_suffix('!').unwrap_or(header);
+    let commit_type = if let Some((kind, scope)) = header.split_once('(') {
+        let Some(scope) = scope.strip_suffix(')') else {
+            return "other";
+        };
+        if scope.is_empty()
+            || scope
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '(' | ')'))
+        {
+            return "other";
+        }
+        kind
+    } else {
+        header
+    };
+    match commit_type.to_ascii_lowercase().as_str() {
         "feat" | "feature" => "feat",
         "fix" | "bugfix" | "hotfix" => "fix",
         "refactor" => "refactor",
@@ -519,7 +587,20 @@ pub(super) fn build_heuristics_gate_check(
     (check, blocking_issue, disposition)
 }
 
+// Existing parser fixtures explicitly exercise the authorized baseline lane.
+#[cfg(test)]
 pub(super) fn generate_inline_findings(
+    dir: &Path,
+    checks: &[CheckResult],
+    diffs: &[crate::git::Diff],
+    repo: Option<&crate::git::Repository>,
+    cargo_root: Option<&Path>,
+) -> Result<InlineFindingsSummary> {
+    generate_inline_findings_with_execution(true, dir, checks, diffs, repo, cargo_root)
+}
+
+pub(super) fn generate_inline_findings_with_execution(
+    allow_project_execution: bool,
     dir: &Path,
     checks: &[CheckResult],
     diffs: &[crate::git::Diff],
@@ -583,11 +664,12 @@ pub(super) fn generate_inline_findings(
             let audit_findings = parse_cargo_audit_findings(&check.output);
             let current_advisories = cargo_audit_report_advisory_keys(&check.output);
             let cargo_lock_changed = cargo_audit_lock_changed(repo, diffs, cargo_root);
-            let base_audit_cache = if cargo_lock_changed && current_advisories.is_some() {
-                get_base_cargo_audit_findings(repo, diffs, cargo_root)?
-            } else {
-                None
-            };
+            let base_audit_cache =
+                if allow_project_execution && cargo_lock_changed && current_advisories.is_some() {
+                    get_base_cargo_audit_findings(repo, diffs, cargo_root)?
+                } else {
+                    None
+                };
             let baseline = cargo_audit_baseline_counts(
                 current_advisories.as_ref(),
                 cargo_lock_changed,
@@ -688,6 +770,7 @@ pub(super) fn generate_inline_findings(
                     },
                     "properties": {
                         "check": "cargo_audit",
+                        "finding_class": InlineFindingClass::Dependency.as_str(),
                         "in_diff": current_audit_in_diff,
                         "classification": origin_classification(current_audit_in_diff),
                         "package": finding.package_display(),
@@ -846,7 +929,13 @@ pub(super) fn generate_inline_findings(
             .unwrap_or("No details provided");
 
         // Extract file:line from output for proper SARIF locations.
-        let extracted = extract_file_line_from_output(&check.output);
+        let extracted = extract_file_line_from_output(&check.output)
+            .filter(|(file, line)| source_location_is_reported(file, *line));
+        let finding_class = if extracted.is_some() {
+            InlineFindingClass::Source
+        } else {
+            InlineFindingClass::General
+        };
         let (sarif_location, generic_in_diff) = if let Some((ref file, line_num)) = extracted {
             let in_diff_val = is_in_diff(file);
             dashboard_findings.push(DashboardFinding {
@@ -907,6 +996,7 @@ pub(super) fn generate_inline_findings(
             "properties": {
                 "in_diff": generic_in_diff,
                 "classification": origin_classification(generic_in_diff),
+                "finding_class": finding_class.as_str(),
                 "source": &check_id,
             }
         }));
@@ -948,9 +1038,18 @@ pub(super) fn generate_inline_findings(
                 }));
             }
 
+            // Structured failures may still lack source locations: Cargo test
+            // uses `(test)` and line 0 when there is no panic frame.
+            let has_source_location = source_location_is_reported(&finding.file, finding.line);
+            let finding_class = if has_source_location {
+                InlineFindingClass::Source
+            } else {
+                InlineFindingClass::General
+            };
             // A test can fail because of inputs or its environment. Its
             // traceback location alone cannot classify the failure's origin.
-            let in_diff = (tool_set.source != "pytest").then(|| is_in_diff(&finding.file));
+            let in_diff = (has_source_location && tool_set.source != "pytest")
+                .then(|| is_in_diff(&finding.file));
             let classification = origin_classification(in_diff);
             match in_diff {
                 Some(true) => in_diff_count += 1,
@@ -959,8 +1058,8 @@ pub(super) fn generate_inline_findings(
             }
 
             dashboard_findings.push(DashboardFinding {
-                file: Some(finding.file.clone()),
-                line: Some(finding.line),
+                file: has_source_location.then(|| finding.file.clone()),
+                line: has_source_location.then_some(finding.line),
                 level: finding.level,
                 check_name: tool_set.tool_name.to_string(),
                 check_id: tool_set.check_id.clone(),
@@ -968,13 +1067,21 @@ pub(super) fn generate_inline_findings(
                 in_diff,
             });
 
-            let mut location = json!({
-                "physicalLocation": {
-                    "artifactLocation": { "uri": &finding.file },
-                    "region": { "startLine": finding.line }
-                }
-            });
-            if let Some(col) = finding.column {
+            let mut location = if has_source_location {
+                json!({
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": &finding.file },
+                        "region": { "startLine": finding.line }
+                    }
+                })
+            } else {
+                json!({
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": "20_quality/full-checks.log" }
+                    }
+                })
+            };
+            if has_source_location && let Some(col) = finding.column {
                 location["physicalLocation"]["region"]["startColumn"] = json!(col);
             }
 
@@ -993,6 +1100,7 @@ pub(super) fn generate_inline_findings(
                 "properties": {
                     "in_diff": in_diff,
                     "classification": classification,
+                    "finding_class": finding_class.as_str(),
                     "source": tool_set.source,
                 }
             }));

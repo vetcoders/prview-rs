@@ -13,6 +13,40 @@ main properties:
 - typed code (easier maintenance)
 - parallel checks (rayon/tokio)
 
+## Project execution authority
+
+`Cli::allow_project_execution` and `Config::allow_project_execution` carry one
+per-invocation acknowledgement, default false. Project manifests and merge policy
+cannot set it. MCP `allow_project_execution` is an optional boolean, defaults
+false, and explicitly forwards the flag to both quick and detached deep children.
+The public Rust structs gained this field; exhaustive constructors/destructures
+must add it. This is a source compatibility change, with no artifact schema
+version bump: RUN.json's `project_execution` object is additive.
+The command-backed `read_cargo_workspace` helper is now private; library callers
+use the consent-aware `resolve_run_scope` entrypoint instead.
+
+Both check dispatchers gate before cache replay, scope discovery and Python
+presync. Each concrete `Check::run` also refuses independently. The artifact
+context planner, audit baseline and version probes use the same authority.
+Watch/direct artifact generation supplies NOT_RUN check rows even when no
+dispatcher ran. Update reuse requires current consent and an authorized prior
+RUN.json; consent is never recovered from an old result. PolicyEngine projects
+suppression to incomplete/review-required through the existing decision pipeline.
+
+Snapshot preparation precedes check dispatch. Native worktree registration uses
+`--no-checkout`, disabled hooks and disabled fsmonitor; libgit2 materializes the
+checkout/index without executing external Git filters. State and watch diff
+reads also use libgit2. PrView's fetches disable hooks, automatic maintenance and
+submodule recursion. Operator-supplied Git/gh/tar executables and transport helpers
+remain trusted infrastructure; Rust API source parsing and owned Loctree workers
+are static analysis, not project builds.
+
+The acknowledgement does not claim isolation. `host_write_confinement` stays
+false. Low-level explicit command utilities are execution APIs, not a review
+authorization boundary; Config-driven review and concrete check entrypoints
+enforce the default. Existing internal test fixture builders explicitly opt in
+to retain coverage of the authorized lane.
+
 ## Directory structure
 
 ```
@@ -227,6 +261,17 @@ impl Repository {
 Artifact diffs use `resolve_diff_bases()` before `generate_diffs()`, so the
 review pack matches GitHub's three-dot "Files changed" model: branch names stay
 displayable as bases, while each diff is anchored at the target/base merge-base.
+
+The four diffs behind the review pack's line counts and patches — `diff_refs`
+(per-file additions/deletions and totals), `full_diff`, `file_diff` and
+`scoped_full_diff` — are built from one `canonical_diff_options()`: libgit2's
+default Myers algorithm with three context lines pinned explicitly (a
+`diff.context` git setting no longer changes them), the same hunks
+`git diff --numstat` and GitHub count. Only the pathspec of a single-file diff
+and rename/copy detection are added per call. `changed_paths` deliberately uses
+zero context because it reads deltas, not hunks; the per-commit patches
+(`commit_patch`, `commit_patch_scoped`) are separate Myers diffs that do not feed
+the numstat.
 
 `Config::required_base_exact` is the single opt-out, set by `prview gate --base
 <REF> --exact-base`. It keeps the one requested base pinned at the commit it
@@ -2887,10 +2932,19 @@ The core artifact generator. Builds the numbered directory layout
 
 - Root: `AI_INDEX.md`, `REVIEW_SUMMARY.md`, `PR_REVIEW.md`, `report.json`, `dashboard.html` (or `review.html` with `--no-dashboard`), `artifacts.zip`
 - `00_summary/`: `RUN.json`, `PROVENANCE.json`, `FAILURES_SUMMARY.md`, `MANIFEST.json`, `SANITY.json`, `MERGE_GATE.json/md`, metadata
-- `10_diff/`: `full.patch`, `per-commit-diffs/` (batching + thematic labels), `per-file-diffs/` (hotspots)
+- `10_diff/`: `full.patch`, `per-commit-diffs/` (individual patches through 10 commits, batches through 50, summary-only top-10 churn above 50), `per-file-diffs/` (hotspots)
 - `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `PUBLIC_API_DIFF.json/md`, `BREAKING_CHANGES.json/md`
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)
 - `latest` symlink in the parent dir (completed runs only)
+
+SARIF producers assign `properties.finding_class` from structured evidence:
+Cargo audit advisories are dependency observations, parsed/extracted source
+locations with a nonempty, non-placeholder path and a positive line are source
+observations. Unlocated generic or structured results are general observations
+pointing at the check log, with unknown origin and no fabricated source region. That axis is independent of diff-origin `classification`;
+the AI index counts emitted result rows rather than inferring kind from origin
+or title text. PR narrative categorization uses the shared commit classifier,
+which accepts one bounded optional agent prefix and retains original titles.
 
 The default run generates one HTML entry point, `dashboard.html`.
 `--no-dashboard` selects the static `review.html` export instead. `AI_INDEX.md`
@@ -2899,6 +2953,148 @@ source evidence, including `REVIEW_SUMMARY.md`, `PROVENANCE.json` and `RUN.json`
 has been written. Manifest and sanity generation follow HTML generation; those
 artifacts are available as original files rather than embedded copies of
 records that depend on the HTML itself.
+
+#### Generator identity
+
+The generator is distinct from the repository being reviewed. Additive fields
+in `report.json.meta.tool` and `00_summary/RUN.json.runner` identify the same
+executable: `git_sha`, `binary_build_id`, `binary_build_id_status`,
+`binary_build_id_reason`, and `release_tag`. `system_meta.txt` exposes the same
+values with a `generator_` prefix. The existing tool name/version and runner
+OS/architecture remain available.
+
+`git_sha` is the embedded `PRVIEW_BUILD_SOURCE_SHA`; an unstamped build reports
+`unknown`. A process-wide identity value hashes the executable with streaming
+SHA256 once, yielding `binary_build_id: "sha256:<64 lowercase hex digits>"`.
+An unreadable executable produces a null build ID, status `unavailable`, and an
+explicit reason. On Linux, the file is opened through `/proc/self/exe`, so an
+upgrade that replaces or unlinks the installed path still hashes the running
+image. On macOS, an opened file is hashed only after its device/inode match the
+native vnode backing the loaded main Mach-O image. The same file handle is
+verified and read. Null/short/unavailable native evidence or a replaced pathname
+yields explicit unavailable; a normal verifiable image retains its digest.
+Other platforms retain their executable-path lookup.
+The digest identifies executable bytes; it is not a signature
+or build attestation. Neither the reviewed HEAD, the current directory nor
+runtime environment overrides supply generator identity.
+
+`release_tag` is optional build-provided metadata, embedded only with an exact
+source stamp and a tag matching the package version. The release workflow owns
+verification that the tag actually resolves to that source commit. Syntax and
+version checks in `build.rs` do not independently attest a release. A normal
+unstamped/untagged build retains null rather than inferring publication from
+the Cargo version.
+
+These additive identity fields preserve report schema `3.2`, RUN schema `1.0`,
+PROVENANCE schema `2.0`, and artifact layout `1.0`; each record's own version is
+authoritative. `PROVENANCE.json.target_sha` and `base_sha` still identify the
+reviewed input. Normal manifest hashing and ZIP export carry the generator
+record unchanged, so a copied pack remains attributable without the original
+host or executable path.
+
+#### Checkout conversion completeness
+
+`create_worktree_snapshot` can retain raw Git objects for raw Git operations.
+Source consumers require a confirmed materialized checkout instead. The planner,
+artifact generator, and Semgrep's independently owned Ambient baseline enforce
+`ensure_checkout_complete` before consuming source; the process-owned evidence
+registry covers canonical roots and descendant overrides, including pinned
+submodules. Attribute lookup uses a private bare handle with an in-memory pinned
+index, so dirty operator workdir symlinks cannot hide target attributes.
+
+Independent remote repositories retain the caller's effective filter
+requirements separately from executable Git configuration. Root and module
+stores capture per-driver checkout/clean requirements as boolean or unknown
+data, keyed by the owned common directory and retained for the owned review's
+lifetime. This preserves required/smudge/process behavior, including explicit
+identity overrides, without copying driver commands or arbitrary caller config.
+Snapshot attribute views read this captured context after repository rebasing;
+an undefined driver is an identity conversion only when it was undefined in
+that caller context. The context is removed when the owned review is dropped.
+
+Effective required/process/smudge settings determine whether checkout conversion
+is needed. Optional undefined and clean-only checkout drivers do not block an
+identity checkout; an explicitly empty process suppresses the one-shot side as
+in native Git. Unsupported encodings and non-string encoding declarations remain
+unconfirmed. Actual missing transformations refuse source analysis even without
+execution consent, rather than publishing empty structural scans from pointers.
+Pinned modules retain raw blobs. A separate libgit2 checkout at the pinned
+attribute tree, without external drivers, checks built-in conversions such as
+CRLF and ident expansion. Its private repository handle is bound to the owned
+scratch workdir for nested-gitlink inspection, without persisting Git links,
+configuration or index changes in the operator repository. Changed bytes or an unavailable comparison leave module
+materialization unconfirmed; byte-identical conversions remain available.
+Live state probes separately require the clean side of conversion. Actual regular
+files are checked even when their index entries are symlinks or gitlinks, while
+actual symlinks are never followed. Unsupported normalization produces a typed
+unavailable error without executing callbacks.
+Deep/CI baseline heuristics confirm checkout-conversion availability at the pinned
+base before extracting and reading its archive. A failed proof leaves the baseline
+unavailable and produces no comparison; archive success cannot override it.
+After a successful proof, its checkout is dropped before extracting the same
+immutable base commit. The archive is the sole retained baseline source copy
+during heuristic comparison; cancellation is checked again before extraction.
+
+#### Availability of structural evidence
+
+`breaking_evidence` projects the existing legacy findings and typed Rust
+`ApiArtifactView` into one presentation value. It preserves known
+compatibility-impact counts and unknown observations independently. Report
+`quality.breaking_changes.status` and `analysis_complete`, the dashboard's
+hero/details/navigation, narrative and copied comment use that value. The
+legacy `has_breaking` bool retains its count-only meaning; it is not proof of
+completeness. Rust additions remain in the typed view and are not relabelled as
+breaking. `rust_status: NOT_APPLICABLE` denotes a run outside Rust scope while
+the existing JS/TS structural scan remains measured. Neither `MEASURED` nor
+`analysis_complete` claims semantic compatibility.
+
+The presentation also receives `has_api_comparison` from the actual `Diff`
+collection. No comparison means `NOT_RUN` and incomplete analysis, even when
+the finding count is zero. A real comparison with an empty diff still provides
+structural input. This availability fact is independent of the global verdict
+and does not alter reference resolution or the canonical merge policy.
+Changes to `Cargo.toml`, including deletion, retain Rust API scope even when the
+target profile is generic; the existing analyzer determines exact base/target
+availability. The dashboard compares prior structural observation counts only
+when both runs are complete and `MEASURED`, and all five historical count fields
+are available. Missing legacy evidence, `NOT_RUN`, and `UNKNOWN` are not comparable;
+measured zero remains comparable. Relocation totals include both JS/TS and Rust.
+The previous-run badge is labelled API observations and is neutral in both count
+directions: these structural observations include legacy non-breaking JS/TS
+relocations, so a total alone does not prove regression or improvement. Typed
+breaking facts, risk, and merge policy retain their independent classification.
+
+Dependency regression carries current and baseline evidence separately through
+`RegressionContext`. A current measurement requires enabled heuristics, an
+available Loctree result and a positive scan scope. `HeuristicsRegression`
+records optional `base_scanned_files` from the actual available baseline;
+historical records lacking the field deserialize safely without inventing a
+measurement. Comparison is `MEASURED` only when both sides have positive
+measured scope and all baseline counters exist. A zero-file baseline is
+`NOT_RUN`; absent historical proof is `UNKNOWN`. Additive status/reason fields
+on `DepsRegression` qualify its legacy counters. This metadata changes neither
+the delta algorithm nor scoring or merge policy.
+
+#### Decision presentation
+
+`build_decision_readout` is a pure advisory projection of canonical
+`allow_merge` and quality-summary details. The identical value is serialized
+as root `decision_readout` in the gate and report; it never enters the closed
+`decision` object or the policy calculation. It counts only Failure-origin
+records, classifies them separately, and requires exact multiset name coverage
+before publishing numeric counters. Incomplete legacy coverage yields nulls.
+Permission remains known independently of classification availability. A present
+non-array `quality_failure_details` value is malformed and yields unknown class
+counts; an absent legacy field remains compatible when no failures are recorded.
+
+Hero, merge card, both narratives and the clipboard handler expose that axis
+explicitly. Change-quality labels explain their scope instead of claiming that
+all checks passed. Overall warning totals use actual check results; no broad
+advisory-warning total is inferred from the selected baseline-warning details.
+The clipboard always uses the canonical report gate bool and lists all matching
+Semgrep/Cargo audit statuses, preserving failures and missing data rather than
+choosing the first result. Existing recommendation vocabulary and verdict rules
+remain unchanged.
 
 The dashboard has one evidence reader, including file-row patches. It does not
 fall back to a second fetch-based diff modal. Complete original text is stored
@@ -4241,9 +4437,35 @@ The same pure projections feed gate/report/RUN and the narrative warning.
 its original review-range and run-freshness metadata travel to report/RUN under
 `regression.tests.coverage_comparison`. Legacy ratio/delta fields still describe
 a previous-run trend. They never become measurements of the PR base commit.
-Missing historical metadata stays unknown. The source/test matching ratio and
+Missing historical metadata stays unknown. The source/test matching ratio formula and
 its thresholds are unchanged; `measured` retains its legacy availability meaning
 and `execution_coverage_measured:false` states the narrower evidence explicitly.
+
+`regression::tests::analyze` separates two signals. `low_test_match_detected`
+describes the current change only: fewer than 40% of its changed code files have
+a matching test change, or more than ten untested files below 50%. It needs no
+previous run. `coverage_regression_detected` is historical and requires a
+comparable previous run: the previous `report.json` must carry the same
+`regression.tests.metric_fingerprint` (`COVERAGE_METRIC_FINGERPRINT`, the
+definition of the test-file classifier and the matching; bumped when either
+changes, independent of the generator SHA and of the review range). The current
+`source_test_change_match/xctest-v5` definition classifies Swift source extensions
+case-insensitively and strips the CamelCase `Tests` suffix only for Swift
+matching, so `FooTests.SWIFT` can pair with `Foo.SwIfT`.
+It preserves the existing confidence rules: a stem match across different
+modules remains low confidence. Previous v2/v3/v4 metrics retain their provenance
+but are not compared to v5. Otherwise
+`comparison_status` is `not_comparable` (fingerprint missing or different, the
+previous run recorded another or no `meta.repo.full_name`, or either side has
+no measured ratio: a count-only previous record or a current run without
+changed source files) or `unavailable` (no previous metric), `coverage_delta`
+is null, no historical regression is derived and the score awards no
+"coverage dropped" points. The `PR_REVIEW.md` notice is written after the
+regression is computed and states whether the previous run was compared.
+Known limit: `meta.repo.full_name` is inferred from a GitHub `origin` only
+(compared case-insensitively), so repositories hosted elsewhere or without a
+remote are `not_comparable` until a host-independent identity is recorded.
+`base_coverage_ratio` keeps the raw previous value as provenance either way.
 
 #### signal/coverage.rs — source-to-test matching
 
@@ -4317,6 +4539,22 @@ Unrelated languages such as JavaScript and Rust cannot match each other:
 
 A nearby `tests.rs` or tests directory does not by itself match every source
 in that directory. Test files are excluded from the evaluated source count.
+
+Test files are recognised by one shared rule set, `regression::tests::is_test_file`,
+which every consumer reads (report `diff.files` categories, dashboard filters,
+this matching, risk/breaking/perf signals and the regression analysis): the
+`tests/`, `test/`, `__tests__/`, `e2e/`, `spec/`, `__mocks__/`, `__fixtures__/`
+directory markers, the `_test`/`_tests`/`.test`/`_spec`/`.spec` stem suffixes,
+the `test_` basename prefix, a bare `tests`/`test` stem, and the Swift XCTest
+convention: a `.swift` file inside a `<Target>Tests/` directory or named
+`SomethingTests.swift`. `Tests` is a CamelCase word boundary there, so
+`Protests.swift` is not a test; and the XCTest rule is Swift-only, so a README
+or JSON fixture inside the test target stays non-code. The boundary is a plain
+suffix check, so a domain name ending in `Tests` (`BloodTests.swift`, a
+`LabTests/` feature folder) is classified as a test as well; Objective-C XCTest
+files are not covered. The 184-path reference
+fixture `tests/fixtures/review_file_paths/codescribe_pr225.paths` pins the
+corrected classification (86 code / 83 test / 15 other).
 
 #### signal/diffs.rs — per-file diff generation
 

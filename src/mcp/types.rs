@@ -15,6 +15,7 @@ pub const SCHEMA_VERSION: &str = "prview.mcp.v1";
 pub mod error_class {
     pub const REPO_NOT_FOUND: &str = "repo_not_found";
     pub const NOT_A_GIT_REPO: &str = "not_a_git_repo";
+    pub const STATE_UNAVAILABLE: &str = "state_unavailable";
     pub const RUN_FAILED: &str = "run_failed";
     pub const RUN_TIMEOUT: &str = "run_timeout";
     pub const RUN_NOT_FOUND: &str = "run_not_found";
@@ -95,4 +96,57 @@ pub fn tool_error(class: &str, message: &str, extra: Value) -> CallToolResult {
 pub fn tool_success(value: Value) -> CallToolResult {
     let body = stamp_schema(value);
     CallToolResult::success(json_content(&body))
+}
+
+pub(crate) fn state_read_error_class(error: &anyhow::Error) -> &'static str {
+    if crate::git::WorktreeSnapshot::is_materialization_error(error) {
+        error_class::STATE_UNAVAILABLE
+    } else {
+        error_class::NOT_A_GIT_REPO
+    }
+}
+
+#[cfg(test)]
+mod state_error_tests {
+    use super::*;
+
+    #[test]
+    fn review80_round2_state_conversion_has_unavailable_error_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("asset.txt"), "canonical\n").unwrap();
+        std::fs::write(
+            dir.path().join(".gitattributes"),
+            "asset.txt filter=review80state\n",
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "fixture", &tree, &[])
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("filter.review80state.clean", "review80-never-executed")
+            .unwrap();
+        let error = crate::state::collect_state(
+            dir.path(),
+            &crate::state::StateOpts {
+                fast: true,
+                json: true,
+                hot: false,
+            },
+        )
+        .unwrap_err()
+        .context("state probe");
+        assert_eq!(state_read_error_class(&error), "state_unavailable");
+        assert_eq!(
+            state_read_error_class(&anyhow::anyhow!("not a git repository")),
+            error_class::NOT_A_GIT_REPO
+        );
+    }
 }

@@ -135,6 +135,15 @@ MCP lifecycle contract.
 | `base` | no | Base ref to diff against. Default: detected repo default branch (`origin/HEAD`, then `remote.origin.HEAD`); if detection fails, falls back to existing `develop` / `main` / `master` candidates and marks `base_fallback: true`. |
 | `profile` | no | `"quick"` (default) or `"deep"`. An unknown value is a fail-loud `run_failed`. |
 | `full_tests` | no | `false` (default) or `true`: run every test instead of the ones related to the change (the CLI's `--full-tests`). |
+| `allow_project_execution` | no | Boolean, default `false`. Explicitly acknowledge project tools, build scripts, plugins, dependency setup and tests on the host. Not a sandbox. |
+
+Without `allow_project_execution: true`, both profiles produce analytical packs
+with project checks **NOT_RUN** and an incomplete/review-required canonical
+decision. MCP never prompts for consent. `profile: "deep"`, `full_tests: true`
+and project policy do not authorize execution. The same explicit boolean is
+forwarded to synchronous quick and detached deep children; omitted/false stays
+false, and strings, numbers or null are invalid. An authorized invocation still
+obeys its selected preset. Host-write confinement remains false.
 
 **A review over MCP is change-scoped, including `deep`.** Both profiles run on
 the caller's machine, so prview narrows each ecosystem's test suite to what the
@@ -567,6 +576,7 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 |---------------|------|
 | `repo_not_found` | The `repo` path does not exist. |
 | `not_a_git_repo` | The path exists but is not a readable git repository. |
+| `state_unavailable` | The repository is valid, but unsupported Git clean/process conversion or encoding prevents a trustworthy state/implicit-head lookup without executing project callbacks. No guessed counts are returned. |
 | `run_failed` | The review process failed to produce a completed pack (or an unknown `profile` was requested). |
 | `run_timeout` | A `quick` review exceeded the 120s budget. Carries `run_id`, `containment_confirmed`, and `retry_hint.profile: "deep"`. |
 | `run_not_found` | No run matches the given `run_id` / HEAD; call `run_review`. |

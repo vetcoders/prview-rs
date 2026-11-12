@@ -822,7 +822,10 @@ pub(super) fn generate_per_commit_diffs(
                 })
                 .collect::<String>()
         );
-        summary.push('\n');
+        summary.push_str(
+            "\nSummary-only: no per-commit patch files were emitted. \
+             Full reviewed range: `10_diff/full.patch` (pack-root relative).\n",
+        );
 
         fs::write(dir.join("00-SUMMARY.md"), summary)?;
         return Ok(());

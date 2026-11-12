@@ -23,6 +23,12 @@ pub(super) fn generate_review_summary(
         if let Ok(raw) = read_to_string_within(out_dir, gate_path)
             && let Ok(gate) = serde_json::from_str::<serde_json::Value>(&raw)
         {
+            writeln!(
+                md,
+                "{}\n\n{}\n",
+                gate_readout_summary(&gate),
+                CHANGE_QUALITY_SCOPE
+            )?;
             let verdict = gate["decision"]["verdict"].as_str().unwrap_or("UNKNOWN");
             let reason = gate["decision"]["decision_reason"]
                 .as_str()

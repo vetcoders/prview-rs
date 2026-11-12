@@ -405,7 +405,15 @@ impl<'a> PolicyEngine<'a> {
         reason: &str,
         empty_test_scope: bool,
     ) -> (PolicyConclusion, AnalysisStatus, MergeRecommendation) {
-        if reason.starts_with("profile") {
+        if reason.starts_with("project execution not authorized") {
+            // Consent is independent of project severity: even an ignored gate
+            // cannot turn an unexecuted review into unconditional approval.
+            (
+                PolicyConclusion::Advisory,
+                AnalysisStatus::Incomplete,
+                MergeRecommendation::ReviewRequired,
+            )
+        } else if reason.starts_with("profile") {
             // Profile mismatches (e.g. running a rust check on a JS repo) are
             // totally fine — the check simply does not apply here.
             (
@@ -572,14 +580,15 @@ fn proved_empty_test_scope(result: &CheckResult, reason: &str) -> bool {
 }
 
 fn is_mode_skip_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "security disabled"
-            | "lint disabled"
-            | "tests disabled"
-            | "heuristics disabled"
-            | "requires --security-full"
-    )
+    reason.starts_with("project execution not authorized")
+        || matches!(
+            reason,
+            "security disabled"
+                | "lint disabled"
+                | "tests disabled"
+                | "heuristics disabled"
+                | "requires --security-full"
+        )
 }
 
 /// Whether a check is a semgrep scan whose output reports scan/parse errors —
@@ -666,6 +675,30 @@ fn display_status_label(status: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_execution_consent_loss_never_approves_even_ignored_checks() {
+        let mut config = crate::config::test_config();
+        config.allow_project_execution = false;
+        config.policy.default_severity = crate::policy::PolicySeverity::Ignore;
+        let skipped = crate::checks::SkippedCheck {
+            id: "cargo".to_owned(),
+            name: "Cargo check".to_owned(),
+            reason: crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED.to_owned(),
+        };
+        let evaluation = super::PolicyEngine::new(&config).evaluate_skip(&skipped);
+        assert_eq!(
+            evaluation.execution_state,
+            super::CheckExecutionState::Skipped
+        );
+        assert_eq!(
+            evaluation.confidence_impact,
+            super::AnalysisStatus::Incomplete
+        );
+        assert_eq!(
+            evaluation.merge_impact,
+            super::MergeRecommendation::ReviewRequired
+        );
+    }
     use super::*;
 
     /// The two enum decision axes reach MERGE_GATE.json through `serde`, and

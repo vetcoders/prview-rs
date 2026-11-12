@@ -189,11 +189,11 @@ async fn run() -> Result<()> {
             }
             CliCommand::Doctor => {
                 let config = supervised_config_result(&cli).await?;
-                run_doctor_command(config).await
+                run_doctor_command(config, cli.allow_project_execution).await
             }
             CliCommand::Runs(args) => run_runs_command(args),
             CliCommand::Open(args) => run_open_command(args),
-            CliCommand::Fix => run_fix_command().await,
+            CliCommand::Fix => run_fix_command(cli.allow_project_execution).await,
             CliCommand::Init => run_init_command(&cli).await,
             CliCommand::Completions(args) => {
                 args.run();
@@ -543,7 +543,11 @@ fn print_gate_summary(summary: &prview::gate::GateJsonOutput) {
     }
 }
 
-async fn run_fix_command() -> Result<()> {
+async fn run_fix_command(allow_project_execution: bool) -> Result<()> {
+    anyhow::ensure!(
+        allow_project_execution,
+        prview::checks::PROJECT_EXECUTION_NOT_AUTHORIZED
+    );
     println!(
         "{}",
         "Applying automatic fixes for common findings...".cyan()
@@ -799,7 +803,7 @@ async fn run_state_command(_config: Option<&Config>, args: &StateArgs) -> Result
     prview::state::run(&root, &opts)
 }
 
-async fn run_doctor_command(config: Result<Config>) -> Result<()> {
+async fn run_doctor_command(config: Result<Config>, allow_project_execution: bool) -> Result<()> {
     use colored::Colorize;
     println!(
         "{}",
@@ -904,6 +908,10 @@ async fn run_doctor_command(config: Result<Config>) -> Result<()> {
         ]);
     }
 
+    if !allow_project_execution {
+        println!("{}", prview::checks::PROJECT_EXECUTION_NOT_AUTHORIZED);
+        return Ok(());
+    }
     for (name, cmd) in tools {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         let mut command = std::process::Command::new(parts[0]);

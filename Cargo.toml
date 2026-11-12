@@ -120,6 +120,11 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 assert_cmd = "2"
 predicates = "3"
 
+# Hashing large debug executables must stay within normal review deadlines.
+# The test profile inherits this override from dev.
+[profile.dev.package."sha2@0.10.9"]
+opt-level = 3
+
 [profile.release]
 lto = true
 strip = true

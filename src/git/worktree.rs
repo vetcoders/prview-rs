@@ -1166,6 +1166,45 @@ impl Drop for WorktreeRegistrationRollback {
     }
 }
 
+fn snapshot_filter_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<String>>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<String>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[derive(Clone)]
+struct CapturedFilterRequirement {
+    checkout: std::result::Result<bool, ()>,
+    clean: std::result::Result<bool, ()>,
+}
+
+type CapturedFilterPolicy = std::collections::BTreeMap<String, CapturedFilterRequirement>;
+
+fn caller_filter_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, CapturedFilterPolicy>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, CapturedFilterPolicy>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[derive(Debug)]
+struct UnsupportedGitConversion(Vec<String>);
+
+impl std::fmt::Display for UnsupportedGitConversion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Git byte conversion incomplete ({}); source analysis NOT_RUN; project execution NOT_RUN; result UNKNOWN; no verdict can be earned from unconverted bytes",
+            self.0.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedGitConversion {}
+
 /// An ephemeral detached `git worktree` checked out at a specific commit. Kept
 /// alive for the duration of a scan; the worktree is deregistered and its files
 /// removed on drop, on every path (scan success or error).
@@ -1173,6 +1212,7 @@ pub struct WorktreeSnapshot {
     pub repo_root: PathBuf,
     pub worktree_path: PathBuf,
     pub(crate) original_target_sha: String,
+    filter_registry_key: PathBuf,
     registered: bool,
     // Owns the enclosing temp dir; dropped after the worktree is deregistered so
     // the directory removal is the backstop for the `git worktree remove` call.
@@ -1181,6 +1221,9 @@ pub struct WorktreeSnapshot {
 
 impl Drop for WorktreeSnapshot {
     fn drop(&mut self) {
+        if let Ok(mut registry) = snapshot_filter_registry().lock() {
+            registry.remove(&self.filter_registry_key);
+        }
         #[cfg(unix)]
         if let Ok(mut registry) = snapshot_borrow_registry().lock() {
             registry.remove(&self.worktree_path);
@@ -1201,6 +1244,129 @@ impl Drop for WorktreeSnapshot {
 }
 
 impl WorktreeSnapshot {
+    /// Preserve conversion requirements across the independent-repository
+    /// boundary as process-owned data, never as executable Git configuration.
+    pub(crate) fn retain_caller_filter_requirements(
+        source: &git2::Repository,
+        destination: &git2::Repository,
+    ) -> Result<PathBuf> {
+        let inherited = caller_filter_registry()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("caller filter evidence unavailable"))?
+            .get(&comparable_worktree_path(source.commondir()))
+            .cloned();
+        let policy = match inherited {
+            Some(policy) => policy,
+            None => {
+                let config = source.config()?.snapshot()?;
+                let mut drivers = std::collections::BTreeSet::new();
+                let mut entries = config.entries(Some(r"^filter\."))?;
+                while let Some(entry) = entries.next() {
+                    let entry = entry?;
+                    let key = entry
+                        .name()
+                        .context("filter configuration key is not UTF-8")?;
+                    if let Some((driver, variable)) = key
+                        .strip_prefix("filter.")
+                        .and_then(|key| key.rsplit_once('.'))
+                        && matches!(variable, "required" | "process" | "smudge" | "clean")
+                    {
+                        drivers.insert(driver.to_owned());
+                    }
+                }
+                drivers
+                    .into_iter()
+                    .map(|driver| {
+                        let requirement = CapturedFilterRequirement {
+                            checkout: configured_filter_required(
+                                &config,
+                                &driver,
+                                GitConversion::Checkout,
+                            )
+                            .map_err(|_| ()),
+                            clean: configured_filter_required(
+                                &config,
+                                &driver,
+                                GitConversion::Clean,
+                            )
+                            .map_err(|_| ()),
+                        };
+                        (driver, requirement)
+                    })
+                    .collect()
+            }
+        };
+        let key = comparable_worktree_path(destination.commondir());
+        caller_filter_registry()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("caller filter evidence unavailable"))?
+            .entry(key.clone())
+            .or_insert(policy);
+        Ok(key)
+    }
+
+    pub(crate) fn release_caller_filter_requirements(key: &Path) {
+        if let Ok(mut registry) = caller_filter_registry().lock() {
+            registry.remove(key);
+        }
+    }
+
+    /// Raw objects remain available to inert analysis, but external Git
+    /// filters were deliberately never run. Only snapshots owned by this
+    /// process carry this materialization evidence; arbitrary caller trees
+    /// retain their existing planning semantics.
+    pub(crate) fn ensure_checkout_complete(snapshot_root: &Path) -> Result<()> {
+        let registry = snapshot_filter_registry()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot filter evidence is unavailable"))?;
+        let path = comparable_worktree_path(snapshot_root);
+        if let Some(filters) = path.ancestors().find_map(|ancestor| registry.get(ancestor))
+            && !filters.is_empty()
+        {
+            return Err(UnsupportedGitConversion(filters.clone()).into());
+        }
+        Ok(())
+    }
+
+    /// Preserve a typed distinction from invalid repositories and I/O errors.
+    pub(crate) fn is_materialization_error(error: &anyhow::Error) -> bool {
+        error.is::<UnsupportedGitConversion>()
+    }
+
+    /// Comparing live worktree bytes with Git blobs requires the clean side
+    /// of each effective conversion. Refuse unknown normalization instead of
+    /// reporting either false churn or a false clean state. Stat-cache hits do
+    /// not establish that an unsupported converter would preserve the bytes.
+    pub(crate) fn ensure_worktree_comparison_complete(repo: &git2::Repository) -> Result<()> {
+        let workdir = repo
+            .workdir()
+            .context("worktree comparison requires a workdir")?;
+        let mut issues = Vec::new();
+        for entry in repo.index()?.iter() {
+            let path = git_tree_component(&entry.path)?;
+            match std::fs::symlink_metadata(workdir.join(&path)) {
+                Ok(metadata) if metadata.file_type().is_file() => {}
+                Ok(_) => continue, // Symlinks/directories are compared as types, without clean filters.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+            issues.extend(
+                path_conversion_issues(
+                    repo,
+                    &path,
+                    git2::AttrCheckFlags::FILE_THEN_INDEX,
+                    GitConversion::Clean,
+                )?
+                .into_iter()
+                .map(|issue| format!("{} ({issue})", path.display())),
+            );
+        }
+        if !issues.is_empty() {
+            return Err(UnsupportedGitConversion(issues).into());
+        }
+        Ok(())
+    }
+
     /// Deregister this snapshot with an owned Git child or its path-exact,
     /// in-process cancellation fallback.
     pub fn cleanup(&mut self) -> Result<()> {
@@ -1471,6 +1637,270 @@ fn materialize_pinned_gitlinks(
     Ok(())
 }
 
+fn git_tree_component(bytes: &[u8]) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(std::str::from_utf8(bytes)?))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GitConversion {
+    Checkout,
+    Clean,
+}
+
+fn optional_config_string(config: &git2::Config, key: &str) -> Result<Option<String>> {
+    match config.get_string(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("cannot read Git configuration {key}")),
+    }
+}
+
+/// A configured process driver takes precedence even when explicitly empty.
+/// An optional missing command is Git's identity conversion; required missing
+/// drivers and all commands that would execute remain unsupported.
+fn external_filter_required(
+    repo: &git2::Repository,
+    driver: &str,
+    conversion: GitConversion,
+) -> Result<bool> {
+    {
+        let registry = caller_filter_registry()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("caller filter evidence unavailable"))?;
+        if let Some(policy) = registry.get(&comparable_worktree_path(repo.commondir())) {
+            return match policy.get(driver) {
+                None => Ok(false),
+                Some(requirement) => match conversion {
+                    GitConversion::Checkout => requirement.checkout,
+                    GitConversion::Clean => requirement.clean,
+                }
+                .map_err(|()| {
+                    anyhow::anyhow!("caller filter configuration could not be classified")
+                }),
+            };
+        }
+    }
+    let config = repo.config()?;
+    configured_filter_required(&config, driver, conversion)
+}
+
+fn configured_filter_required(
+    config: &git2::Config,
+    driver: &str,
+    conversion: GitConversion,
+) -> Result<bool> {
+    let required = match config.get_bool(&format!("filter.{driver}.required")) {
+        Ok(value) => value,
+        Err(error) if error.code() == git2::ErrorCode::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if required {
+        return Ok(true);
+    }
+    let process = optional_config_string(config, &format!("filter.{driver}.process"))?;
+    let command = match process {
+        Some(process) => Some(process),
+        None => optional_config_string(
+            config,
+            &format!(
+                "filter.{driver}.{}",
+                match conversion {
+                    GitConversion::Checkout => "smudge",
+                    GitConversion::Clean => "clean",
+                }
+            ),
+        )?,
+    };
+    Ok(command.is_some_and(|command| !command.is_empty()))
+}
+
+fn path_conversion_issues(
+    repo: &git2::Repository,
+    path: &Path,
+    flags: git2::AttrCheckFlags,
+    conversion: GitConversion,
+) -> Result<Vec<String>> {
+    let mut issues = Vec::new();
+    match git2::AttrValue::from_bytes(repo.get_attr_bytes(path, "working-tree-encoding", flags)?) {
+        git2::AttrValue::True => {
+            issues.push("working-tree-encoding requires a string value".to_owned())
+        }
+        git2::AttrValue::String(encoding)
+            if !encoding.eq_ignore_ascii_case("UTF-8")
+                && !encoding.eq_ignore_ascii_case("UTF8") =>
+        {
+            issues.push(format!("working-tree-encoding={encoding}"));
+        }
+        git2::AttrValue::Bytes(bytes) => issues.push(format!(
+            "working-tree-encoding=git-attribute-bytes:{bytes:02x?}"
+        )),
+        _ => {}
+    }
+    match git2::AttrValue::from_bytes(repo.get_attr_bytes(path, "filter", flags)?) {
+        git2::AttrValue::String(driver) if !driver.is_empty() => {
+            match external_filter_required(repo, driver, conversion) {
+                Ok(false) => {}
+                Ok(true) => issues.push(format!("filter={driver}")),
+                Err(error) => issues.push(format!(
+                    "filter={driver}; effective configuration unknown: {error:#}"
+                )),
+            }
+        }
+        git2::AttrValue::Bytes(bytes) => {
+            issues.push(format!("filter=git-attribute-bytes:{bytes:02x?}"))
+        }
+        _ => {}
+    }
+    Ok(issues)
+}
+
+fn collect_tree_filters(
+    repo: &git2::Repository,
+    tree: &git2::Tree<'_>,
+    relative: &Path,
+    display_prefix: &Path,
+    filters: &mut Vec<String>,
+    builtin_checkout: Option<&Path>,
+) -> Result<()> {
+    for entry in tree {
+        let path = relative.join(git_tree_component(entry.name_bytes())?);
+        if entry.kind() == Some(git2::ObjectType::Tree) {
+            collect_tree_filters(
+                repo,
+                &repo.find_tree(entry.id())?,
+                &path,
+                display_prefix,
+                filters,
+                builtin_checkout,
+            )?;
+        } else if matches!(entry.filemode(), 0o100644 | 0o100755) {
+            for issue in path_conversion_issues(
+                repo,
+                &path,
+                git2::AttrCheckFlags::INDEX_ONLY,
+                GitConversion::Checkout,
+            )? {
+                filters.push(format!(
+                    "{} ({issue})",
+                    display_prefix.join(&path).display()
+                ));
+            }
+            if let Some(checkout) = builtin_checkout {
+                let converted_path = checkout.join(&path);
+                let converted = (|| -> Result<Vec<u8>> {
+                    anyhow::ensure!(
+                        std::fs::symlink_metadata(&converted_path)?
+                            .file_type()
+                            .is_file(),
+                        "built-in checkout did not produce a regular file"
+                    );
+                    Ok(std::fs::read(&converted_path)?)
+                })();
+                match converted {
+                    Ok(bytes) if bytes.as_slice() != repo.find_blob(entry.id())?.content() => {
+                        filters.push(format!(
+                            "{} (built-in checkout conversion changes raw gitlink bytes)",
+                            display_prefix.join(&path).display()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => filters.push(format!(
+                        "{} (built-in checkout conversion unconfirmed: {error:#})",
+                        display_prefix.join(&path).display()
+                    )),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Attribute lookup must read the pinned target, including each pinned
+/// submodule, rather than the operator's possibly dirty .gitattributes. Attach
+/// an in-memory target index to a private bare view: INDEX_ONLY on a workdir
+/// view still canonicalizes dirty operator symlinks before matching attributes.
+/// Info/global attribute precedence remains Git's own. Never write the
+/// caller's index or run clean/smudge/process drivers.
+fn collect_checkout_filters(
+    repo: &git2::Repository,
+    operator_root: &Path,
+    commit: git2::Oid,
+    display_prefix: &Path,
+    depth: usize,
+    filters: &mut Vec<String>,
+) -> Result<()> {
+    anyhow::ensure!(
+        depth < 16,
+        "nested submodule depth exceeds offline snapshot limit"
+    );
+    let attributes_repo = git2::Repository::open_bare(repo.path())?;
+    let tree = attributes_repo.find_commit(commit)?.tree()?;
+    let mut index = git2::Index::new()?;
+    index.read_tree(&tree)?;
+    attributes_repo.set_index(&mut index)?;
+    // Root bytes already went through libgit2 checkout. Gitlinks deliberately
+    // contain raw blobs, so prove any built-in conversion separately without
+    // changing those materialized bytes or executing external filter drivers.
+    // The bare view and no-refresh target index keep operator HEAD/attributes
+    // out of this proof; no-update-index protects the caller's on-disk index.
+    let builtin_checkout = if depth > 0 {
+        let scratch = tempfile::tempdir()?;
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout
+            .force()
+            .target_dir(scratch.path())
+            .update_index(false)
+            .refresh(false);
+        // libgit2 inspects nested gitlinks during checkout and requires a
+        // workdir even with an explicit target directory. Bind only this
+        // private handle to the owned scratch; false keeps Git links and
+        // core.worktree/core.bare out of the caller's persistent configuration.
+        let proof = attributes_repo
+            .set_workdir(scratch.path(), false)
+            .and_then(|()| attributes_repo.checkout_tree(tree.as_object(), Some(&mut checkout)));
+        match proof {
+            Ok(()) => Some(scratch),
+            Err(error) => {
+                filters.push(format!(
+                    "{} (built-in checkout conversion unconfirmed: {error})",
+                    display_prefix.display()
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    collect_tree_filters(
+        &attributes_repo,
+        &tree,
+        Path::new(""),
+        display_prefix,
+        filters,
+        builtin_checkout.as_ref().map(tempfile::TempDir::path),
+    )?;
+    for (relative, pinned) in pinned_gitlinks(repo, commit, false)? {
+        let sub_repo = open_pinned_gitlink(repo, operator_root, &relative, pinned)?;
+        collect_checkout_filters(
+            &sub_repo,
+            &operator_root.join(&relative),
+            pinned,
+            &display_prefix.join(relative),
+            depth + 1,
+            filters,
+        )?;
+    }
+    Ok(())
+}
+
 /// Create an ephemeral detached worktree of `commit` under a fresh temp dir.
 pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<WorktreeSnapshot> {
     // Resolve symbolic inputs once, before creating the checkout. All later
@@ -1502,7 +1932,8 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     command
         .arg("-c")
         .arg(hooks_config)
-        .args(["worktree", "add", "--detach", "--force"])
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["worktree", "add", "--detach", "--force", "--no-checkout"])
         .arg(&worktree_path)
         .arg(&original_target_sha)
         .current_dir(repo_root);
@@ -1517,6 +1948,11 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
         anyhow::bail!("git worktree add failed: {}", stderr.trim());
     }
 
+    // libgit2 does not execute configured external clean/smudge/process drivers.
+    // Native Git only registered the worktree; it never checked out project bytes.
+    let snapshot_repo = git2::Repository::open(&worktree_path)?;
+    snapshot_repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
+
     let source_repo = git2::Repository::discover(repo_root)?;
     materialize_pinned_gitlinks(
         &source_repo,
@@ -1524,6 +1960,15 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
         git2::Oid::from_str(&original_target_sha)?,
         &worktree_path,
         0,
+    )?;
+    let mut unsupported_filters = Vec::new();
+    collect_checkout_filters(
+        &source_repo,
+        repo_root,
+        git2::Oid::from_str(&original_target_sha)?,
+        Path::new(""),
+        0,
+        &mut unsupported_filters,
     )?;
 
     // Symlink untracked dependencies (node_modules and .venv) to bypass reinstall overhead.
@@ -1589,11 +2034,17 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
             .insert(worktree_path.clone(), borrowed_links);
     }
 
+    let filter_registry_key = std::fs::canonicalize(&worktree_path)?;
+    snapshot_filter_registry()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("snapshot filter registry is unavailable"))?
+        .insert(filter_registry_key.clone(), unsupported_filters);
     registration_rollback.disarm();
     Ok(WorktreeSnapshot {
         repo_root: repo_root.to_path_buf(),
         worktree_path,
         original_target_sha,
+        filter_registry_key,
         registered: true,
         _tmp: tmp,
     })
@@ -1620,6 +2071,491 @@ mod tests {
                 .expect("initial commit");
         }
         (tmp, repo)
+    }
+
+    #[test]
+    fn review80_round2_boolean_working_tree_encoding_is_not_a_valid_encoding() {
+        for (attribute, complete) in [
+            ("working-tree-encoding", false),
+            ("-working-tree-encoding", true),
+            ("!working-tree-encoding", true),
+        ] {
+            let (tmp, repo) = repo_with_commit();
+            std::fs::write(tmp.path().join("asset.txt"), "hello\n").unwrap();
+            std::fs::write(
+                tmp.path().join(".gitattributes"),
+                format!("asset.txt {attribute}\n"),
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("asset.txt")).unwrap();
+            index.add_path(Path::new(".gitattributes")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let sig = repo.signature().unwrap();
+            let target = repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    "encoding fixture",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            let snapshot = create_worktree_snapshot(tmp.path(), &target.to_string()).unwrap();
+            assert_eq!(
+                WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path).is_ok(),
+                complete,
+                "{attribute}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review80_snapshot_filters_allow_analysis_but_refuse_execution() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for driver in ["review80", "lfs"] {
+            let (tmp, repo) = repo_with_commit();
+            let pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:0000000000000000000000000000000000000000000000000000000000000000\nsize 17\n";
+            std::fs::write(tmp.path().join("asset.txt"), pointer).unwrap();
+            std::fs::write(
+                tmp.path().join(".gitattributes"),
+                format!("asset.txt filter={driver}\n"),
+            )
+            .unwrap();
+            // Store the target's raw object without invoking a filter at add.
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("asset.txt")).unwrap();
+            index.add_path(Path::new(".gitattributes")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let signature = repo.signature().unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let target = repo
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "filtered fixture",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap()
+                .to_string();
+            let marker = tmp.path().join("filter-marker");
+            let script = tmp.path().join("owned-smudge");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\ncat >/dev/null\nprintf 'hydrated fixture\\n'\nprintf x >> '{}'\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            repo.config()
+                .unwrap()
+                .set_str(&format!("filter.{driver}.smudge"), script.to_str().unwrap())
+                .unwrap();
+
+            // Ignore installed Git LFS process drivers in this owned oracle.
+            // An owned native-Git oracle establishes what a normal checkout
+            // materializes. This mock LFS driver has no network behavior.
+            let native = git_cmd()
+                .args(["cat-file", "--filters", "HEAD:asset.txt"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(
+                native.status.success(),
+                "{}",
+                String::from_utf8_lossy(&native.stderr)
+            );
+            assert_eq!(native.stdout, b"hydrated fixture\n");
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+            std::fs::remove_file(&marker).unwrap();
+
+            // INDEX_ONLY on an operator workdir view still canonicalizes this
+            // symlink and loses asset.txt's filter. Native cached attributes
+            // and filtered target bytes continue to identify the regular file.
+            std::fs::remove_file(tmp.path().join("asset.txt")).unwrap();
+            std::os::unix::fs::symlink(&script, tmp.path().join("asset.txt")).unwrap();
+            let cached_attributes = git_cmd()
+                .args(["check-attr", "--cached", "filter", "--", "asset.txt"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(cached_attributes.status.success());
+            assert_eq!(
+                cached_attributes.stdout,
+                format!("asset.txt: filter: {driver}\n").into_bytes()
+            );
+            let native_after_symlink = git_cmd()
+                .args(["cat-file", "--filters", "HEAD:asset.txt"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(native_after_symlink.status.success());
+            assert_eq!(native_after_symlink.stdout, b"hydrated fixture\n");
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+            std::fs::remove_file(&marker).unwrap();
+
+            // A dirty/staged operator attribute cannot erase a filter that
+            // still applies to the pinned review target.
+            std::fs::write(tmp.path().join(".gitattributes"), "asset.txt -filter\n").unwrap();
+            index.add_path(Path::new(".gitattributes")).unwrap();
+            index.write().unwrap();
+            let original_index = std::fs::read(repo.path().join("index")).unwrap();
+
+            let snapshot = create_worktree_snapshot(tmp.path(), &target)
+                .expect("raw target objects must remain available for inert analysis");
+            assert!(!marker.exists(), "snapshot must never invoke the driver");
+            assert_eq!(
+                std::fs::read_to_string(snapshot.worktree_path.join("asset.txt")).unwrap(),
+                pointer
+            );
+            assert_eq!(
+                std::fs::read(repo.path().join("index")).unwrap(),
+                original_index
+            );
+            // libgit2 returns a canonical workdir on macOS (/private/tmp),
+            // while TempDir and callers can retain /tmp or another alias.
+            let aliases = tempfile::tempdir().unwrap();
+            let alias = aliases.path().join("snapshot-alias");
+            std::os::unix::fs::symlink(&snapshot.worktree_path, &alias).unwrap();
+            assert!(WorktreeSnapshot::ensure_checkout_complete(&alias).is_err());
+            let substrate =
+                crate::checks::resolve_scan_substrate(&snapshot.worktree_path, tmp.path(), &[]);
+            assert_eq!(substrate.target_sha.as_deref(), Some(target.as_str()));
+            assert_eq!(
+                substrate.tree_state, None,
+                "raw filtered bytes are not a certified checkout"
+            );
+            let mut config = crate::Config::for_state_viewer(tmp.path()).unwrap();
+            config.target = Some(target.clone());
+            config.scan_dir_override = Some(snapshot.worktree_path.clone());
+            config.allow_project_execution = false;
+            assert!(
+                crate::checks::plan_check_run(&config).is_err(),
+                "inert source analysis also needs a complete checkout"
+            );
+            config.allow_project_execution = true;
+            let error = match crate::checks::plan_check_run(&config) {
+                Ok(_) => panic!("raw pointer bytes must not be accepted for project execution"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains("filter"), "{error}");
+            assert!(error.contains("asset.txt"), "{error}");
+            assert!(
+                !marker.exists(),
+                "authorized planning must not invoke the driver"
+            );
+            let observation = crate::checks::snapshot_integrity::SnapshotObservation::observe(
+                &snapshot.worktree_path,
+                tmp.path(),
+                &target,
+            );
+            assert_eq!(
+                observation.status,
+                crate::checks::snapshot_integrity::SnapshotIntegrityStatus::Unknown,
+                "unmaterialized filter bytes cannot certify a complete checkout"
+            );
+            let registry_key = snapshot.filter_registry_key.clone();
+            drop(snapshot);
+            assert!(
+                !snapshot_filter_registry()
+                    .lock()
+                    .unwrap()
+                    .contains_key(&registry_key)
+            );
+            assert!(
+                repo.worktrees().unwrap().is_empty(),
+                "snapshot registration must be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn review80_snapshot_unset_filters_keep_authorized_planning_available() {
+        for attributes in [
+            "",
+            "asset.txt filter=lfs\nasset.txt -filter\n",
+            "asset.txt filter=lfs\nasset.txt !filter\n",
+        ] {
+            let (tmp, repo) = repo_with_commit();
+            std::fs::write(tmp.path().join("asset.txt"), "ordinary source\n").unwrap();
+            std::fs::write(tmp.path().join(".gitattributes"), attributes).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("asset.txt")).unwrap();
+            index.add_path(Path::new(".gitattributes")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = repo.signature().unwrap();
+            let target = repo
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "ordinary fixture",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap()
+                .to_string();
+            let snapshot = create_worktree_snapshot(tmp.path(), &target).unwrap();
+            let mut config = crate::Config::for_state_viewer(tmp.path()).unwrap();
+            config.target = Some(target.clone());
+            config.scan_dir_override = Some(snapshot.worktree_path.clone());
+            config.allow_project_execution = true;
+            assert!(
+                crate::checks::plan_check_run(&config).is_ok(),
+                "{attributes:?}"
+            );
+            let substrate =
+                crate::checks::resolve_scan_substrate(&snapshot.worktree_path, tmp.path(), &[]);
+            assert_eq!(
+                substrate.tree_state,
+                Some(crate::checks::TreeState::Snapshot)
+            );
+            assert_eq!(substrate.target_sha.as_deref(), Some(target.as_str()));
+            assert_eq!(
+                crate::checks::snapshot_integrity::SnapshotObservation::observe(
+                    &snapshot.worktree_path,
+                    tmp.path(),
+                    &target,
+                )
+                .status,
+                crate::checks::snapshot_integrity::SnapshotIntegrityStatus::Clean,
+            );
+        }
+    }
+
+    #[test]
+    fn review80_pinned_submodule_filters_are_not_hidden_by_operator_attributes() {
+        let (tmp, repo) = repo_with_commit();
+        let sub_path = tmp.path().join("module");
+        std::fs::create_dir(&sub_path).unwrap();
+        let sub_repo = git2::Repository::init(&sub_path).unwrap();
+        std::fs::write(sub_path.join("asset.txt"), "raw pointer\n").unwrap();
+        std::fs::write(sub_path.join(".gitattributes"), "asset.txt filter=lfs\n").unwrap();
+        sub_repo
+            .config()
+            .unwrap()
+            .set_bool("filter.lfs.required", true)
+            .unwrap();
+        let mut sub_index = sub_repo.index().unwrap();
+        sub_index.add_path(Path::new("asset.txt")).unwrap();
+        sub_index.add_path(Path::new(".gitattributes")).unwrap();
+        sub_index.write().unwrap();
+        let sub_tree_id = sub_index.write_tree().unwrap();
+        let sub_tree = sub_repo.find_tree(sub_tree_id).unwrap();
+        let signature = repo.signature().unwrap();
+        let pinned = sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "filtered module",
+                &sub_tree,
+                &[],
+            )
+            .unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder.insert("module", pinned, 0o160000).unwrap();
+        let tree_id = builder.write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let target = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "pinned module",
+                &tree,
+                &[&parent],
+            )
+            .unwrap()
+            .to_string();
+        std::fs::write(sub_path.join(".gitattributes"), "asset.txt -filter\n").unwrap();
+        sub_index.add_path(Path::new(".gitattributes")).unwrap();
+        sub_index.write().unwrap();
+        let original_index = std::fs::read(sub_repo.path().join("index")).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(sub_path.join("asset.txt")).unwrap();
+            std::os::unix::fs::symlink(sub_path.join(".gitattributes"), sub_path.join("asset.txt"))
+                .unwrap();
+        }
+
+        let snapshot = create_worktree_snapshot(tmp.path(), &target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(snapshot.worktree_path.join("module/asset.txt")).unwrap(),
+            "raw pointer\n"
+        );
+        let error =
+            WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path).unwrap_err();
+        let expected = format!(
+            "{} (filter=lfs)",
+            Path::new("module").join("asset.txt").display()
+        );
+        assert!(error.to_string().contains(&expected), "{error}");
+        assert_eq!(
+            std::fs::read(sub_repo.path().join("index")).unwrap(),
+            original_index
+        );
+    }
+
+    fn round2_target_fixture(attributes: &str) -> (tempfile::TempDir, git2::Repository, String) {
+        let (tmp, repo) = repo_with_commit();
+        std::fs::create_dir(tmp.path().join("member")).unwrap();
+        std::fs::write(tmp.path().join("member/asset.txt"), "hello\n").unwrap();
+        std::fs::write(tmp.path().join(".gitattributes"), attributes).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("member/asset.txt")).unwrap();
+        index.add_path(Path::new(".gitattributes")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = repo.signature().unwrap();
+        let target = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "conversion fixture",
+                &tree,
+                &[&parent],
+            )
+            .unwrap()
+            .to_string();
+        drop(tree);
+        drop(parent);
+        (tmp, repo, target)
+    }
+
+    #[test]
+    fn review80_round2_materialization_guard_covers_descendants_and_component_boundaries() {
+        let (tmp, repo, target) = round2_target_fixture("member/asset.txt filter=round2\n");
+        repo.config()
+            .unwrap()
+            .set_bool("filter.round2.required", true)
+            .unwrap();
+        let snapshot = create_worktree_snapshot(tmp.path(), &target).unwrap();
+        for path in [
+            &snapshot.worktree_path,
+            &snapshot.worktree_path.join("member"),
+            &snapshot.worktree_path.join("member/asset.txt"),
+        ] {
+            assert!(
+                WorktreeSnapshot::ensure_checkout_complete(path).is_err(),
+                "{}",
+                path.display()
+            );
+        }
+        let sibling = snapshot.worktree_path.with_file_name("snapshot-neighbor");
+        std::fs::create_dir(&sibling).unwrap();
+        assert!(WorktreeSnapshot::ensure_checkout_complete(&sibling).is_ok());
+    }
+
+    #[test]
+    fn review80_round2_checkout_filter_configuration_distinguishes_identity() {
+        for (settings, expected_complete) in [
+            (vec![], true),
+            (vec![("clean", "cat")], true),
+            (vec![("smudge", "")], true),
+            (vec![("process", ""), ("smudge", "cat")], true),
+            (vec![("smudge", "cat")], false),
+            (vec![("process", "owned-process-never-executed")], false),
+            (vec![("required", "true")], false),
+            (vec![("required", "true"), ("clean", "cat")], false),
+        ] {
+            let (tmp, repo, target) = round2_target_fixture("member/asset.txt filter=round2\n");
+            for (key, value) in &settings {
+                repo.config()
+                    .unwrap()
+                    .set_str(&format!("filter.round2.{key}"), value)
+                    .unwrap();
+            }
+            let original_index = std::fs::read(repo.path().join("index")).unwrap();
+            let snapshot = create_worktree_snapshot(tmp.path(), &target).unwrap();
+            assert_eq!(
+                WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path).is_ok(),
+                expected_complete,
+                "{settings:?}"
+            );
+            assert_eq!(
+                std::fs::read(repo.path().join("index")).unwrap(),
+                original_index
+            );
+            if expected_complete {
+                let native = git_cmd()
+                    .args(["cat-file", "--filters", "HEAD:member/asset.txt"])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .current_dir(tmp.path())
+                    .output()
+                    .unwrap();
+                assert!(native.status.success());
+                assert_eq!(native.stdout, b"hello\n");
+            }
+        }
+    }
+
+    #[test]
+    fn review80_round2_working_tree_encoding_matches_native_checkout_contract() {
+        for (encoding, expected_complete) in [("UTF-16LE", false), ("UTF-8", true), ("UTF8", true)]
+        {
+            let (tmp, repo, target) = round2_target_fixture(&format!(
+                "member/asset.txt working-tree-encoding={encoding}\n"
+            ));
+            let original_index = std::fs::read(repo.path().join("index")).unwrap();
+            let native = git_cmd()
+                .args(["cat-file", "--filters", "HEAD:member/asset.txt"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(native.status.success());
+            assert_eq!(
+                native.stdout,
+                if expected_complete {
+                    b"hello\n".to_vec()
+                } else {
+                    "hello\n"
+                        .encode_utf16()
+                        .flat_map(u16::to_le_bytes)
+                        .collect::<Vec<_>>()
+                }
+            );
+            let snapshot = create_worktree_snapshot(tmp.path(), &target).unwrap();
+            assert_eq!(
+                std::fs::read(snapshot.worktree_path.join("member/asset.txt")).unwrap(),
+                b"hello\n"
+            );
+            assert_eq!(
+                WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path).is_ok(),
+                expected_complete
+            );
+            assert_eq!(
+                std::fs::read(repo.path().join("index")).unwrap(),
+                original_index
+            );
+        }
     }
 
     /// A snapshot-shaped directory holding one executable tool, with no
@@ -2370,6 +3306,361 @@ mod tests {
             .collect()
     }
 
+    fn round3_gitlink_builtin_case(attributes: &str, raw: &[u8], expected_complete: bool) {
+        round3_gitlink_builtin_fixture_case(attributes, raw, expected_complete, false);
+    }
+
+    fn round3_gitlink_builtin_fixture_case(
+        attributes: &str,
+        raw: &[u8],
+        expected_complete: bool,
+        nested_gitlink: bool,
+    ) {
+        round4_gitlink_builtin_fixture_case(
+            attributes,
+            raw,
+            expected_complete,
+            nested_gitlink,
+            None,
+        );
+    }
+
+    fn round4_gitlink_builtin_fixture_case(
+        attributes: &str,
+        raw: &[u8],
+        expected_complete: bool,
+        nested_gitlink: bool,
+        nested_conversion: Option<(&str, &[u8])>,
+    ) {
+        let (tmp, repo) = repo_with_commit();
+        let module = tmp.path().join("module");
+        std::fs::create_dir(&module).unwrap();
+        let sub_repo = git2::Repository::init(&module).unwrap();
+        sub_repo
+            .config()
+            .unwrap()
+            .set_bool("core.autocrlf", false)
+            .unwrap();
+        // A clean-only driver is identity on checkout. Do not run it while
+        // probing built-in eol/ident conversion, or from PrView at all.
+        sub_repo
+            .config()
+            .unwrap()
+            .set_str(
+                "filter.round3clean.clean",
+                "unavailable-round3-clean-driver",
+            )
+            .unwrap();
+        std::fs::write(module.join(".gitattributes"), attributes).unwrap();
+        std::fs::write(module.join("asset.txt"), raw).unwrap();
+        let attributes_oid = sub_repo.blob(attributes.as_bytes()).unwrap();
+        let raw_oid = sub_repo.blob(raw).unwrap();
+        let mut builder = sub_repo.treebuilder(None).unwrap();
+        builder
+            .insert(".gitattributes", attributes_oid, 0o100644)
+            .unwrap();
+        builder.insert("asset.txt", raw_oid, 0o100644).unwrap();
+        let nested_repo = if nested_gitlink {
+            let nested_path = module.join("engine");
+            std::fs::create_dir(&nested_path).unwrap();
+            let nested = git2::Repository::init(&nested_path).unwrap();
+            nested
+                .config()
+                .unwrap()
+                .set_bool("core.autocrlf", false)
+                .unwrap();
+            let nested_raw =
+                nested_conversion.map_or(b"pinned nested bytes\n".as_slice(), |(_, raw)| raw);
+            std::fs::write(nested_path.join("payload.txt"), nested_raw).unwrap();
+            let blob = nested.blob(nested_raw).unwrap();
+            let mut nested_builder = nested.treebuilder(None).unwrap();
+            nested_builder
+                .insert("payload.txt", blob, 0o100644)
+                .unwrap();
+            if let Some((attributes, _)) = nested_conversion {
+                std::fs::write(nested_path.join(".gitattributes"), attributes).unwrap();
+                nested_builder
+                    .insert(
+                        ".gitattributes",
+                        nested.blob(attributes.as_bytes()).unwrap(),
+                        0o100644,
+                    )
+                    .unwrap();
+            }
+            let tree_id = nested_builder.write().unwrap();
+            let nested_tree = nested.find_tree(tree_id).unwrap();
+            let signature = repo.signature().unwrap();
+            let pinned = nested
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "pinned engine",
+                    &nested_tree,
+                    &[],
+                )
+                .unwrap();
+            let mut nested_index = nested.index().unwrap();
+            nested_index.read_tree(&nested_tree).unwrap();
+            nested_index.write().unwrap();
+            if nested_conversion.is_some() {
+                let native = git_cmd()
+                    .args(["cat-file", "--filters", "HEAD:payload.txt"])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .current_dir(&nested_path)
+                    .output()
+                    .unwrap();
+                assert!(native.status.success());
+                assert_ne!(
+                    native.stdout, nested_raw,
+                    "the depth-two conversion is the only nonidentity checkout"
+                );
+            }
+            builder.insert("engine", pinned, 0o160000).unwrap();
+            drop(nested_tree);
+            drop(nested_builder);
+            Some(nested)
+        } else {
+            None
+        };
+        let tree_oid = builder.write().unwrap();
+        let tree = sub_repo.find_tree(tree_oid).unwrap();
+        let signature = repo.signature().unwrap();
+        let pinned = sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "pinned module",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let mut index = sub_repo.index().unwrap();
+        index.read_tree(&tree).unwrap();
+        index.write().unwrap();
+        let native = git_cmd()
+            .args(["cat-file", "--filters", "HEAD:asset.txt"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(&module)
+            .output()
+            .unwrap();
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert_eq!(
+            native.stdout == raw,
+            expected_complete || nested_conversion.is_some(),
+            "{attributes}"
+        );
+
+        // Move the operator's own HEAD/index/attributes to a different
+        // policy: the superproject still pins the earlier attribute tree.
+        let mut next_builder = sub_repo.treebuilder(Some(&tree)).unwrap();
+        next_builder
+            .insert(
+                ".gitattributes",
+                sub_repo.blob(b"asset.txt -text -ident -filter\n").unwrap(),
+                0o100644,
+            )
+            .unwrap();
+        let next_tree_id = next_builder.write().unwrap();
+        let next_tree = sub_repo.find_tree(next_tree_id).unwrap();
+        let parent = sub_repo.find_commit(pinned).unwrap();
+        sub_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "operator policy changed",
+                &next_tree,
+                &[&parent],
+            )
+            .unwrap();
+        index.read_tree(&next_tree).unwrap();
+        index.write().unwrap();
+        std::fs::write(
+            module.join(".gitattributes"),
+            "asset.txt -text -ident -filter\n",
+        )
+        .unwrap();
+        let original_index = std::fs::read(sub_repo.path().join("index")).unwrap();
+        let super_parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let mut super_builder = repo.treebuilder(None).unwrap();
+        super_builder.insert("module", pinned, 0o160000).unwrap();
+        let super_tree_id = super_builder.write().unwrap();
+        let super_tree = repo.find_tree(super_tree_id).unwrap();
+        let target = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "pinned gitlink",
+                &super_tree,
+                &[&super_parent],
+            )
+            .unwrap()
+            .to_string();
+        let original_config = std::fs::read(sub_repo.path().join("config")).unwrap();
+        let original_root_config = std::fs::read(repo.path().join("config")).unwrap();
+        let original_root_index = std::fs::read(repo.path().join("index")).ok();
+        let original_nested = nested_repo.as_ref().map(|nested| {
+            (
+                std::fs::read(nested.path().join("config")).unwrap(),
+                std::fs::read(nested.path().join("index")).unwrap(),
+            )
+        });
+        let snapshot = create_worktree_snapshot(tmp.path(), &target).unwrap();
+        assert_eq!(
+            std::fs::read(snapshot.worktree_path.join("module/asset.txt")).unwrap(),
+            raw
+        );
+        assert_eq!(
+            std::fs::read(sub_repo.path().join("index")).unwrap(),
+            original_index
+        );
+        assert_eq!(
+            std::fs::read(sub_repo.path().join("config")).unwrap(),
+            original_config
+        );
+        assert_eq!(
+            std::fs::read(repo.path().join("config")).unwrap(),
+            original_root_config
+        );
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).ok(),
+            original_root_index
+        );
+        assert!(
+            !snapshot.worktree_path.join("module/.git").exists(),
+            "the probe must not add a Git link inside materialized modules"
+        );
+        if let Some(nested) = &nested_repo {
+            assert_eq!(
+                std::fs::read(snapshot.worktree_path.join("module/engine/payload.txt")).unwrap(),
+                nested_conversion.map_or(b"pinned nested bytes\n".as_slice(), |(_, raw)| raw)
+            );
+            assert!(!snapshot.worktree_path.join("module/engine/.git").exists());
+            assert_eq!(
+                Some((
+                    std::fs::read(nested.path().join("config")).unwrap(),
+                    std::fs::read(nested.path().join("index")).unwrap(),
+                )),
+                original_nested
+            );
+        }
+        let completeness = WorktreeSnapshot::ensure_checkout_complete(&snapshot.worktree_path);
+        assert_eq!(
+            completeness.is_ok(),
+            expected_complete,
+            "{attributes}: {completeness:?}"
+        );
+        if !expected_complete {
+            if nested_conversion.is_some() {
+                assert!(
+                    completeness.as_ref().unwrap_err().to_string().contains(
+                        &Path::new("module")
+                            .join("engine/payload.txt")
+                            .display()
+                            .to_string()
+                    ),
+                    "{completeness:?}"
+                );
+            }
+            assert!(
+                completeness
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("built-in checkout conversion changes raw gitlink bytes"),
+                "{completeness:?}"
+            );
+            assert!(WorktreeSnapshot::is_materialization_error(
+                &completeness.unwrap_err()
+            ));
+            assert_eq!(
+                crate::checks::snapshot_integrity::SnapshotObservation::observe(
+                    &snapshot.worktree_path,
+                    tmp.path(),
+                    &target
+                )
+                .status,
+                crate::checks::snapshot_integrity::SnapshotIntegrityStatus::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn review80_round4_depth_two_builtin_conversion_cannot_hide_behind_identity_parent() {
+        for (attributes, raw) in [
+            ("payload.txt text eol=crlf\n", b"hello\n".as_slice()),
+            ("payload.txt ident\n", b"$Id$\n".as_slice()),
+        ] {
+            round4_gitlink_builtin_fixture_case(
+                "asset.txt -text -ident\n",
+                b"identity parent\n",
+                false,
+                true,
+                Some((attributes, raw)),
+            );
+        }
+    }
+
+    #[test]
+    fn review80_round3_nested_gitlink_builtin_probe_preserves_pinned_bytes_and_caller_state() {
+        round3_gitlink_builtin_fixture_case(
+            "asset.txt ident filter=round3clean\n",
+            b"no ident placeholder\n",
+            true,
+            true,
+        );
+        round3_gitlink_builtin_fixture_case(
+            "asset.txt text eol=crlf filter=round3clean\n",
+            b"hello\n",
+            false,
+            true,
+        );
+        round3_gitlink_builtin_fixture_case(
+            "asset.txt ident filter=round3clean\n",
+            b"$Id$\n",
+            false,
+            true,
+        );
+    }
+
+    #[test]
+    fn review80_round3_raw_gitlinks_do_not_certify_builtin_checkout_conversions() {
+        round3_gitlink_builtin_case(
+            "asset.txt text eol=crlf filter=round3clean\n",
+            b"hello\n",
+            false,
+        );
+        round3_gitlink_builtin_case("asset.txt ident filter=round3clean\n", b"$Id$\n", false);
+    }
+
+    #[test]
+    fn review80_round3_identity_gitlink_attributes_keep_checkout_available() {
+        round3_gitlink_builtin_case(
+            "asset.txt ident filter=round3clean\n",
+            b"no ident placeholder\n",
+            true,
+        );
+        round3_gitlink_builtin_case(
+            "asset.txt text eol=crlf filter=round3clean\n",
+            b"already\r\n",
+            true,
+        );
+        round3_gitlink_builtin_case(
+            "asset.txt -text -ident filter=round3clean\n",
+            b"ordinary bytes\n",
+            true,
+        );
+    }
+
     #[test]
     fn exact_snapshot_materializes_pinned_local_submodule_bytes() {
         let (super_tmp, super_repo) = repo_with_commit();
@@ -3098,7 +4389,7 @@ mod tests {
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\ngit \"$@\"\nstatus=$?\nif [ \"$3\" = worktree ] && [ \"$4\" = add ] && [ \"$status\" -eq 0 ]; then\n  printf '%s\\n' \"$7\" > '{}'\n  sleep 30\nfi\nexit \"$status\"\n",
+                "#!/bin/sh\nprevious=''\npenultimate=''\nis_worktree_add=0\nfor arg in \"$@\"; do\n  if [ \"$previous\" = worktree ] && [ \"$arg\" = add ]; then\n    is_worktree_add=1\n  fi\n  penultimate=$previous\n  previous=$arg\ndone\ngit \"$@\"\nstatus=$?\nif [ \"$is_worktree_add\" -eq 1 ] && [ \"$status\" -eq 0 ]; then\n  printf '%s\\n' \"$penultimate\" > '{}'\n  sleep 30\nfi\nexit \"$status\"\n",
                 ready.display()
             ),
         )

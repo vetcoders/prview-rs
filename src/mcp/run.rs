@@ -474,6 +474,7 @@ pub async fn start(
     base: Option<String>,
     profile: Profile,
     full_tests: bool,
+    allow_project_execution: bool,
 ) -> Result<serde_json::Value, ToolError> {
     // A durable RUNNING.json marker must name one process incarnation, not
     // merely a recyclable PID. Refuse before taking a lock or spawning the
@@ -524,6 +525,9 @@ pub async fn start(
         run_dir.to_string_lossy().to_string(),
         profile.cli_flag().to_string(),
     ];
+    if allow_project_execution {
+        args.push("--allow-project-execution".to_string());
+    }
     // Contract §9: a review over MCP runs on the caller's machine, so it narrows
     // its test suites like any local run. The caller who knows this change
     // travels through a channel no import graph describes asks for everything
