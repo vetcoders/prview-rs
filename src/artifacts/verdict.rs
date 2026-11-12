@@ -840,6 +840,7 @@ pub(crate) fn build_merge_decision_view(
     policy_allow_merge: bool,
     quality_pass: bool,
     recommended_merge: bool,
+    analysis_status: crate::policy::engine::AnalysisStatus,
     quality_failures: &[String],
     quality_failure_details: &[QualityFailureDetail],
     blocking_issues: &[String],
@@ -885,7 +886,15 @@ pub(crate) fn build_merge_decision_view(
             "{}{} review signal{} need attention",
             quality_failure_reason_text(quality_failures, quality_failure_details)
                 .map(|reason| format!("{reason}; "))
-                .unwrap_or_else(|| "Change quality gate passed, but ".to_string()),
+                .unwrap_or_else(|| {
+                    // "Passed" would claim an evaluation that did not happen:
+                    // an incomplete analysis has checks that never ran.
+                    if analysis_status == crate::policy::engine::AnalysisStatus::Incomplete {
+                        "Analysis incomplete; ".to_string()
+                    } else {
+                        "Change quality gate passed, but ".to_string()
+                    }
+                }),
             review_caveats.len(),
             if review_caveats.len() == 1 { "" } else { "s" }
         ),
@@ -2747,14 +2756,50 @@ mod tests {
             true,  // policy_allow_merge
             true,  // quality_pass
             false, // recommended_merge (review_required)
-            &[],   // quality_failures
-            &[],   // quality_failure_details
-            &[],   // blocking_issues
+            crate::policy::engine::AnalysisStatus::Complete,
+            &[], // quality_failures
+            &[], // quality_failure_details
+            &[], // blocking_issues
             vec!["3 inline findings".to_string()],
         );
         assert_eq!(view.state, MergeDecisionState::AllowWithReview);
         assert_eq!(view.state.gate_label(), "MERGE WITH REVIEW");
         assert_eq!(view.state.card_label(), "GO WITH REVIEW");
+    }
+
+    #[test]
+    fn incomplete_analysis_never_reads_as_a_passed_quality_gate() {
+        let signals = vec!["Clippy skipped: project execution not authorized".to_string()];
+        let incomplete = build_merge_decision_view(
+            true,
+            true,
+            false,
+            crate::policy::engine::AnalysisStatus::Incomplete,
+            &[],
+            &[],
+            &[],
+            signals.clone(),
+        );
+        assert_eq!(incomplete.state, MergeDecisionState::AllowWithReview);
+        assert_eq!(
+            incomplete.reason,
+            "Analysis incomplete; 1 review signal need attention"
+        );
+
+        let complete = build_merge_decision_view(
+            true,
+            true,
+            false,
+            crate::policy::engine::AnalysisStatus::Complete,
+            &[],
+            &[],
+            &[],
+            signals,
+        );
+        assert_eq!(
+            complete.reason,
+            "Change quality gate passed, but 1 review signal need attention"
+        );
     }
 
     #[test]
@@ -2764,6 +2809,7 @@ mod tests {
             true,
             true,
             false,
+            crate::policy::engine::AnalysisStatus::Complete,
             &["clippy".to_string()],
             &[QualityFailureDetail {
                 name: "clippy".to_string(),
@@ -2783,6 +2829,7 @@ mod tests {
             true,
             true,
             false,
+            crate::policy::engine::AnalysisStatus::Complete,
             &["Semgrep scan".to_string()],
             &[QualityFailureDetail {
                 name: "Semgrep scan".to_string(),
@@ -2803,6 +2850,7 @@ mod tests {
             false,
             false,
             false,
+            crate::policy::engine::AnalysisStatus::Complete,
             &["semgrep".to_string()],
             &[],
             &["secret leak".to_string()],
@@ -2813,7 +2861,16 @@ mod tests {
 
     #[test]
     fn clean_approve_is_allow() {
-        let view = build_merge_decision_view(true, true, true, &[], &[], &[], vec![]);
+        let view = build_merge_decision_view(
+            true,
+            true,
+            true,
+            crate::policy::engine::AnalysisStatus::Complete,
+            &[],
+            &[],
+            &[],
+            vec![],
+        );
         assert_eq!(view.state, MergeDecisionState::Allow);
         assert_eq!(view.state.gate_label(), "MERGE");
     }
@@ -4905,6 +4962,7 @@ mod tests {
             true,  // policy_allow_merge
             true,  // quality_pass (no longer broken by the warning)
             false, // recommended_merge — policy still says review required
+            crate::policy::engine::AnalysisStatus::Complete,
             &["Cargo audit".to_string()],
             &[QualityFailureDetail {
                 name: "Cargo audit".to_string(),

@@ -430,6 +430,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         policy_allow_merge,
         quality_pass,
         legacy_recommended_merge,
+        worst_confidence,
         &quality_failures.quality_failures,
         &quality_failures.details,
         &blocking_issues,

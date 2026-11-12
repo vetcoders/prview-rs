@@ -765,6 +765,7 @@ fn build_report_for_range(
         ctx.policy_allow_merge,
         ctx.quality_pass,
         ctx.recommended_merge,
+        ctx.analysis_status,
         &ctx.quality_failures,
         &ctx.quality_failure_details,
         &ctx.blocking_issues,
