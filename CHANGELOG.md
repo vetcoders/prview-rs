@@ -332,6 +332,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dashboard HTML sanitizer picks up the fix for RUSTSEC-2026-0533.** `ammonia`
+  moves from 4.1.8 to 4.1.9, which closes a mutation XSS through embedded SVG
+  and MathML in sanitized Markdown. The requirement stays on the patched 4.1
+  line (`~4.1.9`).
 - A review that needs an object missing from a partial clone (`--filter=blob:none`)
   now explains the partial clone and how to proceed, instead of leaving a bare
   libgit2 `object not found`. The "make sure you're running prview from inside a
