@@ -1044,7 +1044,7 @@ impl Config {
             has_pyproject,
             has_python_source,
             has_js_source,
-            cargo_root: cargo_root.as_deref().map(&path),
+            cargo_root: cargo_root.as_deref().map(path),
             rust_dirs: rust_dirs.iter().map(|dir| path(dir)).collect(),
             is_workspace,
         };
@@ -1731,7 +1731,7 @@ impl Config {
             }
             Ok(self.repo_root.join(path.strip_prefix(tree_root)?))
         };
-        profile.cargo_root = profile.cargo_root.as_deref().map(&rebase).transpose()?;
+        profile.cargo_root = profile.cargo_root.as_deref().map(rebase).transpose()?;
         profile.rust_dirs = profile
             .rust_dirs
             .iter()

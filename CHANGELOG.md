@@ -332,6 +332,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A review that needs an object missing from a partial clone (`--filter=blob:none`)
+  now explains the partial clone and how to proceed, instead of leaving a bare
+  libgit2 `object not found`. The "make sure you're running prview from inside a
+  git repository" hint is limited to an actually missing repository; it used to
+  follow any error mentioning "git" or "repository", including Git transport
+  failures inside a healthy repository.
 - The repository's Gate Shadow job explicitly acknowledges project execution
   so its Cargo check continues to run with the new analytical default.
 - CI dependency auditing applies the maintainer-approved RUSTSEC-2026-0457/0462

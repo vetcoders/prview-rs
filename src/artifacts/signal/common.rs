@@ -641,13 +641,11 @@ fn js_ts_declaration(declaration: &str) -> Option<(JsDeclKind, String)> {
         strip_js_keyword(rest, "interface").or_else(|| strip_js_keyword(rest, "type"))
     {
         (JsDeclKind::Type, after)
-    } else if let Some(after) = ["enum", "namespace", "module"]
-        .iter()
-        .find_map(|keyword| strip_js_keyword(rest, keyword))
-    {
-        (JsDeclKind::Other, after)
     } else {
-        return None;
+        let after = ["enum", "namespace", "module"]
+            .iter()
+            .find_map(|keyword| strip_js_keyword(rest, keyword))?;
+        (JsDeclKind::Other, after)
     };
     let name: String = rest
         .chars()
