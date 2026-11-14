@@ -110,8 +110,9 @@ schemars = "1.2.1"
 # (syntect-fancy) avoids the onig C dependency, and disabling defaults drops the
 # comrak CLI/clap/xdg surface we do not use.
 comrak = { version = "0.55", default-features = false, features = ["syntect-fancy"] }
-# Keep the patched 4.1 line: a caret here would also admit affected 4.2.0–4.2.2.
-ammonia = "~4.1.8"
+# Keep the patched 4.1 line: a caret here would also admit affected 4.2.0–4.2.4
+# (RUSTSEC-2026-0533 is fixed in 4.1.9 and 4.2.5).
+ammonia = "~4.1.9"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
