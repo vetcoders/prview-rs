@@ -1340,6 +1340,11 @@ fn describe_run_mode(config: &Config) -> String {
 }
 
 fn describe_enabled_steps(config: &Config) -> String {
+    if !config.allow_project_execution {
+        // Selected tools will be recorded NOT_RUN; listing them as checks
+        // would announce work this run is not allowed to do.
+        return "diff only; project tools not run (pass --allow-project-execution)".to_string();
+    }
     let mut steps = vec!["diff".to_string()];
 
     if !config.skip_security && which::which("semgrep").is_ok() {
@@ -1368,6 +1373,9 @@ fn describe_enabled_steps(config: &Config) -> String {
 }
 
 fn describe_expensive_steps(config: &Config) -> String {
+    if !config.allow_project_execution {
+        return "none (project execution not authorized)".to_string();
+    }
     let mut steps = Vec::new();
     let fast_lint_skipped = config.is_fast_remote_only_standard() && !config.lint_forced;
     if !config.skip_security && which::which("semgrep").is_ok() {
@@ -1445,17 +1453,28 @@ fn print_artifact_tree(dir: &std::path::Path) {
         diff_items.push("full.patch".to_string());
     }
     if exists("10_diff/per-commit-diffs") {
+        // The directory also holds a summary; only patch files are patches.
         let count = std::fs::read_dir(dir.join("10_diff/per-commit-diffs"))
-            .map(|rd| rd.count())
+            .map(|rd| {
+                rd.filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "patch"))
+                    .count()
+            })
             .unwrap_or(0);
-        diff_items.push(format!("per-commit-diffs/ ({count} patches)"));
+        diff_items.push(format!(
+            "per-commit-diffs/ ({count} patch file{})",
+            if count == 1 { "" } else { "s" }
+        ));
     }
     if exists("10_diff/per-file-diffs") {
         let count = std::fs::read_dir(dir.join("10_diff/per-file-diffs"))
             .map(|rd| rd.count())
             .unwrap_or(0);
         if count > 0 {
-            diff_items.push(format!("per-file-diffs/ ({count} hotspots)"));
+            diff_items.push(format!(
+                "per-file-diffs/ ({count} file{})",
+                if count == 1 { "" } else { "s" }
+            ));
         }
     }
     if !diff_items.is_empty() {
@@ -1551,11 +1570,7 @@ fn print_artifact_tree(dir: &std::path::Path) {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".zip") {
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                let size_str = if size > 1024 * 1024 {
-                    format!("{:.1}M", size as f64 / (1024.0 * 1024.0))
-                } else {
-                    format!("{:.1}K", size as f64 / 1024.0)
-                };
+                let size_str = format_file_size(size);
                 println!("   - {name} ({size_str})");
             }
         }
@@ -1658,6 +1673,15 @@ pub fn print_summary(report: &Report) {
         "📦".blue(),
         report.artifacts_dir.display()
     );
+}
+
+/// One size spelling for every place a run names the same file.
+pub(crate) fn format_file_size(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1} kB", bytes as f64 / 1_000.0)
+    }
 }
 
 fn format_duration(d: Duration) -> String {
@@ -2529,6 +2553,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn config_banner_does_not_announce_tools_the_run_may_not_execute() {
+        let mut config = test_config();
+        config.profile = test_rust_profile(true);
+        config.run_lint = true;
+        config.allow_project_execution = false;
+        assert_eq!(
+            describe_enabled_steps(&config),
+            "diff only; project tools not run (pass --allow-project-execution)"
+        );
+        assert_eq!(
+            describe_expensive_steps(&config),
+            "none (project execution not authorized)"
+        );
+
+        config.allow_project_execution = true;
+        assert!(describe_enabled_steps(&config).contains("cargo-check"));
+        assert!(describe_expensive_steps(&config).contains("cargo/rustc"));
+    }
+
+    #[test]
+    fn file_size_has_one_spelling() {
+        assert_eq!(format_file_size(4_255_517), "4.3 MB");
+        assert_eq!(format_file_size(67_400), "67.4 kB");
+        assert_eq!(format_file_size(1_000_000), "1.0 MB");
     }
 
     #[test]

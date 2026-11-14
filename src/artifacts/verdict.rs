@@ -836,15 +836,29 @@ fn semgrep_partial_caveat_names_unparsed_files() {
     assert!(caveats[0].contains("src/ffi.rs"));
 }
 
+/// The scalar decision axes a reason is worded from. Named fields, because
+/// three adjacent booleans are easy to pass in the wrong order.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecisionAxes {
+    pub policy_allow_merge: bool,
+    pub quality_pass: bool,
+    pub recommended_merge: bool,
+    pub analysis_status: crate::policy::engine::AnalysisStatus,
+}
+
 pub(crate) fn build_merge_decision_view(
-    policy_allow_merge: bool,
-    quality_pass: bool,
-    recommended_merge: bool,
+    axes: DecisionAxes,
     quality_failures: &[String],
     quality_failure_details: &[QualityFailureDetail],
     blocking_issues: &[String],
     review_caveats: Vec<String>,
 ) -> MergeDecisionView {
+    let DecisionAxes {
+        policy_allow_merge,
+        quality_pass,
+        recommended_merge,
+        analysis_status,
+    } = axes;
     // Mirrors `QualityFailureSummary::has_new_failures`: only a real failure
     // (not a warning-level signal) that is new or indeterminate holds the merge.
     // Keeping the two predicates aligned is what stops the hero label from
@@ -885,7 +899,15 @@ pub(crate) fn build_merge_decision_view(
             "{}{} review signal{} need attention",
             quality_failure_reason_text(quality_failures, quality_failure_details)
                 .map(|reason| format!("{reason}; "))
-                .unwrap_or_else(|| "Change quality gate passed, but ".to_string()),
+                .unwrap_or_else(|| {
+                    // "Passed" would claim an evaluation that did not happen:
+                    // an incomplete analysis has checks that never ran.
+                    if analysis_status == crate::policy::engine::AnalysisStatus::Incomplete {
+                        "Analysis incomplete; ".to_string()
+                    } else {
+                        "Change quality gate passed, but ".to_string()
+                    }
+                }),
             review_caveats.len(),
             if review_caveats.len() == 1 { "" } else { "s" }
         ),
@@ -2744,12 +2766,15 @@ mod tests {
         // policy allows merge, nothing failed, only non-blocking review signals.
         // This must read as "mergeable with advisories", not a stop-sign HOLD.
         let view = build_merge_decision_view(
-            true,  // policy_allow_merge
-            true,  // quality_pass
-            false, // recommended_merge (review_required)
-            &[],   // quality_failures
-            &[],   // quality_failure_details
-            &[],   // blocking_issues
+            crate::artifacts::verdict::DecisionAxes {
+                policy_allow_merge: true,
+                quality_pass: true,
+                recommended_merge: false,
+                analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            },
+            &[], // quality_failures
+            &[], // quality_failure_details
+            &[], // blocking_issues
             vec!["3 inline findings".to_string()],
         );
         assert_eq!(view.state, MergeDecisionState::AllowWithReview);
@@ -2758,12 +2783,54 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_analysis_never_reads_as_a_passed_quality_gate() {
+        let signals = vec!["Clippy skipped: project execution not authorized".to_string()];
+        let incomplete = build_merge_decision_view(
+            crate::artifacts::verdict::DecisionAxes {
+                policy_allow_merge: true,
+                quality_pass: true,
+                recommended_merge: false,
+                analysis_status: crate::policy::engine::AnalysisStatus::Incomplete,
+            },
+            &[],
+            &[],
+            &[],
+            signals.clone(),
+        );
+        assert_eq!(incomplete.state, MergeDecisionState::AllowWithReview);
+        assert_eq!(
+            incomplete.reason,
+            "Analysis incomplete; 1 review signal need attention"
+        );
+
+        let complete = build_merge_decision_view(
+            crate::artifacts::verdict::DecisionAxes {
+                policy_allow_merge: true,
+                quality_pass: true,
+                recommended_merge: false,
+                analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            },
+            &[],
+            &[],
+            &[],
+            signals,
+        );
+        assert_eq!(
+            complete.reason,
+            "Change quality gate passed, but 1 review signal need attention"
+        );
+    }
+
+    #[test]
     fn new_failure_review_required_stays_hold() {
         // A failing check that belongs to this change keeps a true HOLD.
         let view = build_merge_decision_view(
-            true,
-            true,
-            false,
+            crate::artifacts::verdict::DecisionAxes {
+                policy_allow_merge: true,
+                quality_pass: true,
+                recommended_merge: false,
+                analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            },
             &["clippy".to_string()],
             &[QualityFailureDetail {
                 name: "clippy".to_string(),
@@ -2780,9 +2847,12 @@ mod tests {
     #[test]
     fn preexisting_only_failure_is_allow_with_review_not_hold() {
         let view = build_merge_decision_view(
-            true,
-            true,
-            false,
+            crate::artifacts::verdict::DecisionAxes {
+                policy_allow_merge: true,
+                quality_pass: true,
+                recommended_merge: false,
+                analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            },
             &["Semgrep scan".to_string()],
             &[QualityFailureDetail {
                 name: "Semgrep scan".to_string(),
@@ -2800,9 +2870,12 @@ mod tests {
     #[test]
     fn blocking_policy_violation_is_block() {
         let view = build_merge_decision_view(
-            false,
-            false,
-            false,
+            crate::artifacts::verdict::DecisionAxes {
+                policy_allow_merge: false,
+                quality_pass: false,
+                recommended_merge: false,
+                analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            },
             &["semgrep".to_string()],
             &[],
             &["secret leak".to_string()],
@@ -2813,7 +2886,18 @@ mod tests {
 
     #[test]
     fn clean_approve_is_allow() {
-        let view = build_merge_decision_view(true, true, true, &[], &[], &[], vec![]);
+        let view = build_merge_decision_view(
+            crate::artifacts::verdict::DecisionAxes {
+                policy_allow_merge: true,
+                quality_pass: true,
+                recommended_merge: true,
+                analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            },
+            &[],
+            &[],
+            &[],
+            vec![],
+        );
         assert_eq!(view.state, MergeDecisionState::Allow);
         assert_eq!(view.state.gate_label(), "MERGE");
     }
@@ -4902,9 +4986,12 @@ mod tests {
         // Blast radius of the origin split on the hero label: with no real
         // failure left, a warnings-only run is "mergeable with advisories".
         let view = build_merge_decision_view(
-            true,  // policy_allow_merge
-            true,  // quality_pass (no longer broken by the warning)
-            false, // recommended_merge — policy still says review required
+            crate::artifacts::verdict::DecisionAxes {
+                policy_allow_merge: true,
+                quality_pass: true,
+                recommended_merge: false,
+                analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            },
             &["Cargo audit".to_string()],
             &[QualityFailureDetail {
                 name: "Cargo audit".to_string(),
