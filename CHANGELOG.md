@@ -332,6 +332,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dashboard HTML sanitizer picks up the fix for RUSTSEC-2026-0533.** `ammonia`
+  moves from 4.1.8 to 4.1.9, which closes a mutation XSS through embedded SVG
+  and MathML in sanitized Markdown. The requirement stays on the patched 4.1
+  line (`~4.1.9`).
 - An incomplete analysis no longer reads "Change quality gate passed": when
   checks did not run, `decision_reason` in `MERGE_GATE.json`, `report.json`, the
   dashboard and the terminal verdict starts with "Analysis incomplete". The
