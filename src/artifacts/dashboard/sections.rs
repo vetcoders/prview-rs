@@ -460,9 +460,12 @@ pub(super) fn merge_decision_view(ctx: &DashboardContext) -> crate::artifacts::M
     };
 
     build_merge_decision_view(
-        ctx.policy_allow_merge,
-        ctx.quality_pass,
-        ctx.recommended_merge,
+        crate::artifacts::verdict::DecisionAxes {
+            policy_allow_merge: ctx.policy_allow_merge,
+            quality_pass: ctx.quality_pass,
+            recommended_merge: ctx.recommended_merge,
+            analysis_status: ctx.analysis_status,
+        },
         &ctx.quality_failures,
         &ctx.quality_failure_details,
         &ctx.blocking_issues,

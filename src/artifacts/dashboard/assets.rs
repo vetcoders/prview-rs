@@ -2121,6 +2121,7 @@ const JS_SUFFIX: &str = r##"
         }
         match = text.match(/^(\d+) review signal(?:s)? need attention$/);
         if (match) return match[1] + ' ' + polishPlural(Number(match[1]), 'sygnał wymaga uwagi', 'sygnały wymagają uwagi', 'sygnałów wymaga uwagi');
+        if (text === 'Analysis incomplete') return 'Analiza niepełna';
         if (text === 'Merge not recommended') return 'Scalenie nie jest zalecane';
         match = text.match(/^(\d+) blocking issue(?:s)? found: (.+)$/);
         if (match) {

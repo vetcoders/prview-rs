@@ -3076,11 +3076,7 @@ fn create_zip(dir: &Path, emit_human_stdout: bool) -> Result<()> {
     verify_zip_contains_metadata(&zip_path)?;
 
     let size = fs::metadata(&zip_path)?.len();
-    let size_str = if size > 1_000_000 {
-        format!("{:.1}M", size as f64 / 1_000_000.0)
-    } else {
-        format!("{:.1}K", size as f64 / 1_000.0)
-    };
+    let size_str = crate::output::format_file_size(size);
 
     if emit_human_stdout {
         println!(
