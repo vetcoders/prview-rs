@@ -34,7 +34,7 @@ async-trait = "0.1"
 # Own complete external-tool trees on Windows even after the direct wrapper
 # exits; Unix continues to use the explicit process groups configured in
 # `src/proc.rs`.
-process-wrap = { version = "9.1", default-features = false, features = ["std", "tokio1", "job-object", "kill-on-drop"] }
+process-wrap = { version = "10.0", default-features = false, features = ["std", "tokio1", "job-object", "kill-on-drop"] }
 
 # Git operations. prview only reads local repositories through libgit2; every
 # network operation (fetch, clone) goes through the `git` CLI in `src/git`.
