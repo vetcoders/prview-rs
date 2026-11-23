@@ -22,7 +22,12 @@ pub(crate) fn preflight(config: &Config) -> String {
     let checks = get_checks_for_profile(config)
         .into_iter()
         .filter(|check| is_security_check(check.name()))
-        .map(|check| (check.name().to_owned(), check.check_eligibility(config)))
+        .map(|check| {
+            // The same authorization gate the run applies, so the plan cannot
+            // name a different skip reason than the recorded result.
+            let eligibility = super::authorized_eligibility(check.as_ref(), config);
+            (check.name().to_owned(), eligibility)
+        })
         .collect::<Vec<_>>();
     describe_plan(requested_mode(config), &checks)
 }
@@ -95,6 +100,19 @@ mod tests {
         );
         assert!(eligible.contains("eligible"));
         assert!(!eligible.contains("executed"));
+    }
+
+    #[test]
+    fn preflight_names_the_authorization_gate_the_run_will_record() {
+        let mut config = test_config();
+        config.allow_project_execution = false;
+        let plan = preflight(&config);
+        assert!(
+            plan.contains(crate::checks::PROJECT_EXECUTION_NOT_AUTHORIZED),
+            "{plan}"
+        );
+        assert!(!plan.contains("semgrep not available"), "{plan}");
+        assert!(!plan.contains("eligible"), "{plan}");
     }
 
     #[test]
