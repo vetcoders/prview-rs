@@ -336,6 +336,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moves from 4.1.8 to 4.1.9, which closes a mutation XSS through embedded SVG
   and MathML in sanitized Markdown. The requirement stays on the patched 4.1
   line (`~4.1.9`).
+- An incomplete analysis no longer reads "Change quality gate passed": when
+  checks did not run, `decision_reason` in `MERGE_GATE.json`, `report.json`, the
+  dashboard and the terminal verdict starts with "Analysis incomplete". The
+  terminal configuration box no longer lists project tools as checks or expensive
+  steps when project execution is not authorized, the security preflight names
+  the same skip reason the run records, the ZIP size is spelled one way, and the
+  artifact tree counts patch files and per-file diffs as what they are.
 - A review that needs an object missing from a partial clone (`--filter=blob:none`)
   now explains the partial clone and how to proceed, instead of leaving a bare
   libgit2 `object not found`. The "make sure you're running prview from inside a
